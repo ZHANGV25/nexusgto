@@ -460,10 +460,17 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
 
     # ── Upload to S3 (with retries) ──
     if args.s3_bucket:
+        # Always upload latest (for resume)
         uploads = [
             (regret_path, "checkpoints/regrets_latest.bin"),
             (meta_path, "checkpoint_meta.json"),
         ]
+        # Also save a timestamped copy of every checkpoint for later analysis
+        iter_tag = f"{iters_done // 1_000_000_000}B" if iters_done >= 1_000_000_000 \
+            else f"{iters_done // 1_000_000}M"
+        uploads.append((regret_path, f"checkpoints/regrets_{iter_tag}.bin"))
+        uploads.append((meta_path, f"checkpoints/meta_{iter_tag}.json"))
+
         if label == "final" and os.path.exists(bps_path):
             uploads.append((bps_path, "unified_blueprint.bps"))
         for local, s3key in uploads:
