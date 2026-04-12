@@ -909,6 +909,217 @@ int bps_hand_to_bucket(const BPSReader *r,
     return r->textures.bucket_cache[tex_idx * BPS_MAX_HANDS + hidx];
 }
 
+/* ── Cache serialization ─────────────────────────────────────────────── */
+
+/*
+ * Cache file format (BPSC):
+ *
+ * Header (64 bytes):
+ *   magic:            "BPSC" (4B)
+ *   version:          uint32 (4B) — currently 1
+ *   use_legacy_mixer: int32 (4B)
+ *   postflop_buckets: int32 (4B)
+ *   preflop_buckets:  int32 (4B)
+ *   table_size:       int64 (8B)
+ *   num_nodes:        int64 (8B)
+ *   num_ev_nodes:     int64 (8B)
+ *   strat_data_used:  uint64 (8B)
+ *   ev_data_used:     uint64 (8B) — in floats
+ *   _reserved:        4B
+ *
+ * Body (sequential arrays, full table_size for hash table arrays):
+ *   keys[table_size]     — BPSNodeKey (12B each)
+ *   meta[table_size]     — BPSNodeMeta (24B each)
+ *   occupied[table_size] — uint8 (1B each)
+ *   strat_data[strat_data_used] — uint8
+ *   ev_data[ev_data_used]       — float32
+ *
+ * Writing the full table (including empty slots) makes reload a trivial
+ * fread → the hash table is ready to use immediately with no re-hashing.
+ * This wastes some disk (empty slots) but makes reload O(1) instead of
+ * O(num_nodes) for re-insertion.
+ */
+
+#define BPSC_VERSION 1
+
+int bps_save_cache(const BPSReader *r, const char *path) {
+    if (!r || !r->strategies_loaded || !path) return -1;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[bps_reader] Cannot create cache file: %s\n", path);
+        return -1;
+    }
+
+    const BPSTable *t = &r->table;
+
+    /* Header */
+    fwrite("BPSC", 1, 4, f);
+    uint32_t ver = BPSC_VERSION;
+    fwrite(&ver, 4, 1, f);
+    int32_t mixer = (int32_t)r->use_legacy_mixer;
+    fwrite(&mixer, 4, 1, f);
+    int32_t pb = (int32_t)r->num_postflop_buckets;
+    fwrite(&pb, 4, 1, f);
+    int32_t ppb = (int32_t)r->num_preflop_buckets;
+    fwrite(&ppb, 4, 1, f);
+    fwrite(&t->table_size, 8, 1, f);
+    fwrite(&t->num_nodes, 8, 1, f);
+    fwrite(&t->num_ev_nodes, 8, 1, f);
+    uint64_t sdu = (uint64_t)t->strat_data_used;
+    fwrite(&sdu, 8, 1, f);
+    uint64_t edu = (uint64_t)t->ev_data_used;
+    fwrite(&edu, 8, 1, f);
+    uint32_t reserved = 0;
+    fwrite(&reserved, 4, 1, f);
+    /* Header = 4+4+4+4+4+8+8+8+8+8+4 = 64 bytes */
+
+    /* Body */
+    fwrite(t->keys, sizeof(BPSNodeKey), (size_t)t->table_size, f);
+    fwrite(t->meta, sizeof(BPSNodeMeta), (size_t)t->table_size, f);
+    fwrite(t->occupied, 1, (size_t)t->table_size, f);
+    fwrite(t->strat_data, 1, t->strat_data_used, f);
+    if (t->ev_data && t->ev_data_used > 0) {
+        fwrite(t->ev_data, sizeof(float), t->ev_data_used, f);
+    }
+
+    fclose(f);
+
+    /* Report size */
+    size_t total = 64
+        + (size_t)t->table_size * (sizeof(BPSNodeKey) + sizeof(BPSNodeMeta) + 1)
+        + t->strat_data_used
+        + t->ev_data_used * sizeof(float);
+    printf("[bps_reader] Saved cache: %zu MB (%lld nodes, %zu strat bytes, "
+           "%zu ev floats) to %s\n",
+           total / (1024*1024), (long long)t->num_nodes,
+           t->strat_data_used, t->ev_data_used, path);
+    fflush(stdout);
+
+    return 0;
+}
+
+int bps_load_cache(BPSReader *r, const char *path) {
+    if (!r || !path) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    /* Header */
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "BPSC", 4) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint32_t ver;
+    if (fread(&ver, 4, 1, f) != 1 || ver != BPSC_VERSION) {
+        fprintf(stderr, "[bps_reader] Cache version mismatch: got %u, expected %u\n",
+                ver, BPSC_VERSION);
+        fclose(f);
+        return -1;
+    }
+
+    int32_t mixer, pb, ppb;
+    fread(&mixer, 4, 1, f);
+    fread(&pb, 4, 1, f);
+    fread(&ppb, 4, 1, f);
+
+    int64_t table_size, num_nodes, num_ev_nodes;
+    fread(&table_size, 8, 1, f);
+    fread(&num_nodes, 8, 1, f);
+    fread(&num_ev_nodes, 8, 1, f);
+
+    uint64_t strat_data_used, ev_data_used;
+    fread(&strat_data_used, 8, 1, f);
+    fread(&ev_data_used, 8, 1, f);
+
+    uint32_t reserved;
+    fread(&reserved, 4, 1, f);
+
+    /* Sanity checks */
+    if (table_size <= 0 || table_size > (int64_t)1 << 32) {
+        fprintf(stderr, "[bps_reader] Cache has invalid table_size: %lld\n",
+                (long long)table_size);
+        fclose(f);
+        return -1;
+    }
+
+    printf("[bps_reader] Loading cache: %lld slots, %lld nodes, "
+           "%llu strat bytes, %llu ev floats...\n",
+           (long long)table_size, (long long)num_nodes,
+           (unsigned long long)strat_data_used,
+           (unsigned long long)ev_data_used);
+    fflush(stdout);
+
+    /* Store config */
+    r->use_legacy_mixer = (int)mixer;
+    r->num_postflop_buckets = (int)pb;
+    r->num_preflop_buckets = (int)ppb;
+
+    BPSTable *t = &r->table;
+    t->table_size = table_size;
+    t->num_nodes = num_nodes;
+    t->num_ev_nodes = num_ev_nodes;
+    t->strat_data_used = (size_t)strat_data_used;
+    t->strat_data_cap = (size_t)strat_data_used;
+    t->ev_data_used = (size_t)ev_data_used;
+    t->ev_data_cap = (size_t)ev_data_used;
+
+    /* Allocate and read arrays */
+    t->keys = (BPSNodeKey *)malloc((size_t)table_size * sizeof(BPSNodeKey));
+    t->meta = (BPSNodeMeta *)malloc((size_t)table_size * sizeof(BPSNodeMeta));
+    t->occupied = (uint8_t *)malloc((size_t)table_size);
+    t->strat_data = (uint8_t *)malloc((size_t)strat_data_used);
+
+    if (!t->keys || !t->meta || !t->occupied || !t->strat_data) {
+        fprintf(stderr, "[bps_reader] OOM allocating cache arrays\n");
+        bps_reader_free(r);
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(t->keys, sizeof(BPSNodeKey), (size_t)table_size, f) != (size_t)table_size ||
+        fread(t->meta, sizeof(BPSNodeMeta), (size_t)table_size, f) != (size_t)table_size ||
+        fread(t->occupied, 1, (size_t)table_size, f) != (size_t)table_size ||
+        fread(t->strat_data, 1, (size_t)strat_data_used, f) != (size_t)strat_data_used) {
+        fprintf(stderr, "[bps_reader] Truncated cache file\n");
+        bps_reader_free(r);
+        fclose(f);
+        return -1;
+    }
+
+    r->strategies_loaded = 1;
+
+    /* EV data (optional) */
+    if (ev_data_used > 0) {
+        t->ev_data = (float *)malloc((size_t)ev_data_used * sizeof(float));
+        if (!t->ev_data) {
+            fprintf(stderr, "[bps_reader] OOM allocating EV cache\n");
+            /* strategies still loaded, just no EVs */
+        } else if (fread(t->ev_data, sizeof(float), (size_t)ev_data_used, f) != (size_t)ev_data_used) {
+            fprintf(stderr, "[bps_reader] Truncated EV cache\n");
+            free(t->ev_data);
+            t->ev_data = NULL;
+            t->ev_data_used = 0;
+            t->ev_data_cap = 0;
+        } else {
+            r->evs_loaded = 1;
+        }
+    }
+
+    fclose(f);
+
+    printf("[bps_reader] Cache loaded: %lld nodes, %lld ev nodes (%.1f MB total)\n",
+           (long long)num_nodes, (long long)num_ev_nodes,
+           ((size_t)table_size * (sizeof(BPSNodeKey) + sizeof(BPSNodeMeta) + 1)
+            + strat_data_used + ev_data_used * sizeof(float))
+           / (1024.0 * 1024.0));
+    fflush(stdout);
+
+    return 0;
+}
+
 /* ── Utility functions ───────────────────────────────────────────────── */
 
 int bps_has_action_evs(const BPSReader *r) {

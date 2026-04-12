@@ -267,6 +267,31 @@ BPS_EXPORT int bps_hand_to_bucket(const BPSReader *r,
                                     const int *board, int c0, int c1);
 
 /**
+ * Save the loaded hash table state to a binary cache file.
+ *
+ * Writes keys, meta, occupied, strat_data, and ev_data to a compact
+ * binary format that can be reloaded in ~1 second via bps_load_cache().
+ * Only occupied slots are written (no empty hash table padding).
+ *
+ * Call after bps_load_strategies() + bps_load_evs() complete.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+BPS_EXPORT int bps_save_cache(const BPSReader *r, const char *path);
+
+/**
+ * Load a previously saved cache file, bypassing LZMA decompression
+ * and hash table construction entirely.
+ *
+ * On success, the reader is fully functional (strategies_loaded=1,
+ * evs_loaded=1 if EVs were in the cache). Returns 0 on success.
+ *
+ * Returns -1 if the file doesn't exist, is corrupt, or has a version
+ * mismatch. Caller should fall back to the slow bps_load_strategies path.
+ */
+BPS_EXPORT int bps_load_cache(BPSReader *r, const char *path);
+
+/**
  * Free all memory owned by the reader. Safe to call on a zero-initialized
  * or partially-loaded reader.
  */

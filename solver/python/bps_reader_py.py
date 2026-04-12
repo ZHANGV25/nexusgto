@@ -147,6 +147,12 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.bps_reader_stats.restype = None
 
+    lib.bps_save_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.bps_save_cache.restype = ctypes.c_int
+
+    lib.bps_load_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.bps_load_cache.restype = ctypes.c_int
+
     lib.bps_reader_free.argtypes = [ctypes.c_void_p]
     lib.bps_reader_free.restype = None
 
@@ -180,7 +186,56 @@ class BPSReaderC:
         self._load(bps_path)
 
     def _load(self, bps_path: str) -> None:
-        """Load the .bps file: decompress in Python, build tables in C."""
+        """Load the .bps file. Tries a binary cache first (~1s), falls back
+        to LZMA decompression + hash table build (~21 min) and saves the
+        cache for next time."""
+        cache_path = bps_path + ".cache"
+
+        # Try fast cache load first
+        if os.path.exists(cache_path):
+            bps_mtime = os.path.getmtime(bps_path)
+            cache_mtime = os.path.getmtime(cache_path)
+            if cache_mtime >= bps_mtime:
+                print(
+                    f"[BPSReaderC] Loading from cache: {cache_path}",
+                    flush=True,
+                )
+                import time as _time
+                t0 = _time.monotonic()
+                ret = self._lib.bps_load_cache(
+                    self._reader, cache_path.encode("utf-8")
+                )
+                if ret == 0:
+                    elapsed = _time.monotonic() - t0
+                    print(
+                        f"[BPSReaderC] Cache loaded in {elapsed:.1f}s",
+                        flush=True,
+                    )
+                    # Still need metadata for bucket counts etc.
+                    self._load_metadata_only(bps_path)
+                    self._load_texture_cache_auto(bps_path)
+                    self._report_stats()
+                    return
+                print(
+                    f"[BPSReaderC] Cache load failed, falling back to full load",
+                    flush=True,
+                )
+
+        self._load_full(bps_path, cache_path)
+
+    def _load_metadata_only(self, bps_path: str) -> None:
+        """Read just the JSON metadata from the .bps without decompressing."""
+        with open(bps_path, "rb") as f:
+            magic = f.read(4)
+            if magic != b"BPS3":
+                return
+            compressed_size, meta_size = struct.unpack("<QI", f.read(12))
+            f.seek(4 + 12 + compressed_size)
+            meta_bytes = f.read(meta_size)
+            self._metadata = json.loads(meta_bytes.decode("utf-8"))
+
+    def _load_full(self, bps_path: str, cache_path: str) -> None:
+        """Full slow load: LZMA decompress + hash table build + save cache."""
         with open(bps_path, "rb") as f:
             magic = f.read(4)
             if magic != b"BPS3":
@@ -285,15 +340,33 @@ class BPSReaderC:
                         flush=True,
                     )
 
-        # Try to auto-load texture cache from well-known locations
+        # Save cache for fast reload next time
+        if cache_path:
+            print(
+                f"[BPSReaderC] Saving cache to {cache_path}...",
+                flush=True,
+            )
+            self._lib.bps_save_cache(
+                self._reader, cache_path.encode("utf-8")
+            )
+
+        self._load_texture_cache_auto(bps_path)
+        self._report_stats()
+
+    def _load_texture_cache_auto(self, bps_path: str) -> None:
+        """Try to auto-load texture cache from well-known locations."""
+        mixer_tag = self._metadata.get("hash_mixer", "boost")
+        force_boost = os.environ.get("BPS_FORCE_BOOST_MIXER", "0") == "1"
+        use_legacy = 1 if (mixer_tag == "boost" or force_boost) else 0
+
         bps_dir = Path(bps_path).parent
         repo_root = Path(__file__).resolve().parent.parent
-        texture_candidates = [
+        candidates = [
             bps_dir / "texture_cache.bin",
             repo_root / "texture_cache.bin",
             Path("texture_cache.bin"),
         ]
-        for tc_path in texture_candidates:
+        for tc_path in candidates:
             if tc_path.exists():
                 ret = self._lib.bps_load_texture_cache(
                     self._reader,
@@ -303,7 +376,8 @@ class BPSReaderC:
                 if ret > 0:
                     break
 
-        # Report stats
+    def _report_stats(self) -> None:
+        """Print loaded reader statistics."""
         n_nodes = ctypes.c_int64(0)
         n_ev = ctypes.c_int64(0)
         strat_bytes = ctypes.c_int64(0)
