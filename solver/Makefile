@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 blueprint
+.PHONY: all clean bench dll test test_phase_1_3 blueprint bps_reader
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -38,7 +38,13 @@ $(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.
 $(BUILD_DIR)/solver$(SHLIB_EXT): $(SRC_DIR)/solver.c $(SRC_DIR)/solver.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/solver.c -o $@ $(LDFLAGS)
 
-dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT)
+# ── BPS reader (standalone, no OpenMP/card_abstraction) ──
+bps_reader: $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
+
+$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/bps_reader.c -o $@ $(LDFLAGS)
+
+dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
 
 # ── Benchmarks ──
 $(BUILD_DIR)/bench_v2: $(BENCH_DIR)/bench_v2.c $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)

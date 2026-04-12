@@ -403,6 +403,155 @@ def compute_flop_leaf_values(
     return leaf_values
 
 
+# ── Flop leaf values via BPR3 per-action EVs (unified .bps) ──────────────
+
+
+def compute_flop_leaf_values_bpr3(
+    flop_board: List[int],
+    player_hands: List[List[Tuple[int, int, float]]],
+    blueprint_v2,
+    game_action_indices: List[int],
+    leaf_infos: List[LeafInfo],
+    max_hands: int,
+    starting_pot: int,
+) -> Optional[np.ndarray]:
+    """Compute flop leaf values using per-action EVs from the unified .bps.
+
+    Uses BlueprintV2.get_all_bucket_action_evs() to look up the per-action
+    expected values at the flop root for the given game_action_indices
+    (preflop action sequence). Combines with 4 bias profiles per Pluribus §4
+    to produce 4^N continuation values per leaf.
+
+    This is faster than rollout (~instant lookup vs Monte Carlo simulation)
+    and more accurate than the equity-only first-order approximation, because
+    it uses the trained blueprint's actual strategic values.
+
+    Falls back to None if the blueprint lookup misses (info set not visited
+    during the Phase 1.3 EV walk), in which case the caller should use
+    compute_flop_leaf_equity as a fallback.
+
+    Args:
+        flop_board: [card0, card1, card2] ints
+        player_hands: list of per-player hands [(c0, c1, weight), ...]
+        blueprint_v2: BlueprintV2 instance with loaded action EVs
+        game_action_indices: full game action indices from preflop
+        leaf_infos: from extract_leaf_info_from_tree()
+        max_hands: max hands across all players
+        starting_pot: pot in chips at start of this street
+
+    Returns:
+        np.array[num_total_leaves, num_players, max_hands] float32
+        or None if blueprint lookup fails.
+    """
+    num_players = len(player_hands)
+    num_orig_leaves = len(leaf_infos)
+    cont_per_leaf = 4 ** num_players
+    total_leaves = num_orig_leaves * cont_per_leaf
+
+    # Look up per-action EVs and strategies at the flop root for each player.
+    # The action_hash is computed from game_action_indices (preflop sequence).
+    # board=[] and street=1 (flop) with board_hash=0 per the unified format.
+    player_evs = []
+    player_strats = []
+    for p in range(num_players):
+        evs = blueprint_v2.get_all_bucket_action_evs(
+            board=[], action_history=game_action_indices,
+            player=p, street=1,
+        )
+        strats = blueprint_v2.get_all_bucket_strategies(
+            board=[], action_history=game_action_indices,
+            player=p, street=1,
+        )
+        if evs is None or strats is None:
+            return None  # lookup missed — caller falls back to equity
+        player_evs.append(evs)
+        player_strats.append(strats)
+
+    # Compute biased strategies (4 profiles per player)
+    player_biased = []
+    for p in range(num_players):
+        strats = player_strats[p]  # [num_buckets, num_actions]
+        na = strats.shape[1]
+        # Flop root is first-to-act (OOP): check/bet, no fold
+        cats = classify_actions(na, first_action_is_fold=False)
+        biased = [bias_strategy(strats, bt, cats, 5.0) for bt in range(4)]
+        player_biased.append(biased)
+
+    # Build hand → bucket mapping for each player.
+    # Uses the precomputed texture cache via blueprint_v2.hand_to_bucket()
+    # when available (BPSReaderC with loaded texture_cache.bin). This gives
+    # the exact k-means bucket assignments from training — Pluribus-faithful.
+    # Falls back to EHS percentile approximation if no texture cache.
+    num_buckets = player_evs[0].shape[0]  # typically 200
+
+    has_texture_cache = hasattr(blueprint_v2, 'hand_to_bucket')
+    board_set = set(flop_board)
+    player_buckets = []
+    for p in range(num_players):
+        buckets = []
+        for h in range(len(player_hands[p])):
+            c0, c1 = player_hands[p][h][0], player_hands[p][h][1]
+            if c0 in board_set or c1 in board_set:
+                buckets.append(0)  # blocked hand — bucket 0 as placeholder
+                continue
+
+            if has_texture_cache:
+                bucket = blueprint_v2.hand_to_bucket(flop_board, c0, c1)
+                if bucket >= 0:
+                    buckets.append(bucket)
+                    continue
+
+            # Fallback: EHS percentile approximation (inaccurate but functional)
+            ehs_approx = h / max(len(player_hands[p]) - 1, 1)
+            bucket = int(ehs_approx * (num_buckets - 1))
+            bucket = max(0, min(bucket, num_buckets - 1))
+            buckets.append(bucket)
+        player_buckets.append(buckets)
+
+    # Compute leaf values: for each leaf × bias combo × player × hand
+    leaf_values = np.zeros((total_leaves, num_players, max_hands), dtype=np.float32)
+
+    for li_idx, li in enumerate(leaf_infos):
+        leaf_pot = li.pot
+
+        for combo in range(cont_per_leaf):
+            flat_idx = li.leaf_idx * cont_per_leaf + combo
+            if flat_idx >= total_leaves:
+                continue
+
+            # Decode bias choices
+            biases = []
+            tmp = combo
+            for _ in range(num_players):
+                biases.append(tmp % 4)
+                tmp //= 4
+
+            for p in range(num_players):
+                evs = player_evs[p]       # [num_buckets, num_actions]
+                biased = player_biased[p]  # list of 4 [num_buckets, num_actions]
+                na = evs.shape[1]
+                s_p = biases[p]
+                biased_strat = biased[s_p]  # [num_buckets, num_actions]
+
+                for h in range(min(len(player_hands[p]), max_hands)):
+                    bucket = player_buckets[p][h]
+                    if bucket >= evs.shape[0]:
+                        continue
+
+                    # EV = sum_a(biased_strategy[bucket, a] * action_ev[bucket, a])
+                    ev = 0.0
+                    for a in range(na):
+                        ev += float(biased_strat[bucket, a]) * float(evs[bucket, a])
+
+                    # Scale by leaf pot relative to starting pot
+                    if starting_pot > 0:
+                        ev *= leaf_pot / starting_pot
+
+                    leaf_values[flat_idx, p, h] = ev
+
+    return leaf_values
+
+
 # ── Flop leaf equity (v2 blueprint fallback) ─────────────────────────────
 
 def compute_flop_leaf_equity(
