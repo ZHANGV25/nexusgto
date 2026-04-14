@@ -132,10 +132,19 @@ typedef struct {
     /* Per-hand EV at root for ALL players */
     float *root_ev;               /* [num_players][max_hands] */
 
-    /* Weighted average strategies at ALL decision nodes */
+    /* Weighted average strategies (sigma-bar) at ALL decision nodes.
+     * Used for range narrowing / belief updates. */
     float *avg_strategies;
     int *avg_strategy_node_ids;
     int num_avg_nodes;
+
+    /* Final-iteration strategies at ALL decision nodes (Pluribus: used for
+     * play decisions at postflop subgame roots). Parallel to avg_strategies.
+     * Extracted from d_strategy after the last CFR iteration; regret-matched,
+     * not running-averaged. */
+    float *final_strategies;
+    int *final_strategy_node_ids;
+    int num_final_nodes;
 
     /* Number of players (for interpreting arrays) */
     int num_players;

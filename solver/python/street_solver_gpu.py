@@ -111,14 +111,21 @@ class SSTreeData(ctypes.Structure):
     ]
 
 class SSOutput(ctypes.Structure):
+    # Field order must match street_solve.cuh SSOutput exactly.
     _fields_ = [
         ("root_strategy", ctypes.POINTER(ctypes.c_float)),
         ("root_num_actions", ctypes.c_int),
         ("root_player", ctypes.c_int),
         ("root_ev", ctypes.POINTER(ctypes.c_float)),
+        # sigma-bar at all decision nodes — belief-update path.
         ("avg_strategies", ctypes.POINTER(ctypes.c_float)),
         ("avg_strategy_node_ids", ctypes.POINTER(ctypes.c_int)),
         ("num_avg_nodes", ctypes.c_int),
+        # Final-iteration strategy at all decision nodes — play-decision
+        # path (Pluribus §4). Parallel shape to avg_strategies.
+        ("final_strategies", ctypes.POINTER(ctypes.c_float)),
+        ("final_strategy_node_ids", ctypes.POINTER(ctypes.c_int)),
+        ("num_final_nodes", ctypes.c_int),
         ("num_players_out", ctypes.c_int),
         ("max_hands", ctypes.c_int),
     ]
@@ -374,7 +381,13 @@ class StreetSolverGPU:
 
     def get_strategy(self, player, hand_str=None, hand_idx=None,
                      frozen_actions=None):
-        """Get strategy for a specific hand at this player's CURRENT decision.
+        """Get PLAY strategy (final iteration, Pluribus §4) for a specific hand
+        at this player's CURRENT decision.
+
+        Play vs belief update: this method returns the FINAL-iteration
+        regret-matched strategy — the Pluribus play-path at postflop subgame
+        roots. For range narrowing / Bayesian belief updates, use
+        get_avg_strategy() which returns sigma-bar.
 
         Implements Pluribus A3 (strategy freezing): when hero has already
         acted at a node earlier this street, the strategy at that node is
@@ -419,7 +432,7 @@ class StreetSolverGPU:
                         result[labels[a]] = float(freq)
                 return result
             else:
-                return self._get_strategy_at_player_node(player_idx, hand_idx)
+                return self._get_final_strategy_at_player_node(player_idx, hand_idx)
 
         # Walk the tree following frozen actions to find the current node.
         # frozen_actions contains ALL actions (both hero and opponent) that
@@ -454,22 +467,23 @@ class StreetSolverGPU:
         # Now current_node should be at hero's next decision (or we exhausted frozen actions)
         node = self._tree.nodes[current_node]
         if node.type == 0 and node.player == player_idx:
-            # Found hero's current decision node — extract avg strategy
-            return self._get_strategy_at_node(current_node, player_idx, hand_idx)
+            # Found hero's current decision — use final-iter (play path).
+            return self._get_final_strategy_at_node(current_node, player_idx, hand_idx)
 
         # Fallback: return strategy at hero's first unfrozen decision node
-        return self._get_strategy_at_player_node(player_idx, hand_idx)
+        return self._get_final_strategy_at_player_node(player_idx, hand_idx)
 
     @staticmethod
     def _match_action_label(tree_label, frozen_label):
         """Fuzzy match action labels (e.g. "Check" matches "check")."""
         return tree_label.lower().strip() == frozen_label.lower().strip()
 
-    def _get_strategy_at_node(self, node_idx, player_idx, hand_idx):
-        """Extract avg strategy at a specific tree node for a specific hand."""
+    def _get_final_strategy_at_node(self, node_idx, player_idx, hand_idx):
+        """PLAY PATH: final-iteration strategy at a specific tree node.
+        Reads from final_strategies (Pluribus §4 iter-N for play)."""
         max_h = self._max_hands
-        for di in range(self._output.num_avg_nodes):
-            nidx = self._output.avg_strategy_node_ids[di]
+        for di in range(self._output.num_final_nodes):
+            nidx = self._output.final_strategy_node_ids[di]
             if nidx != node_idx:
                 continue
             node = self._tree.nodes[nidx]
@@ -479,18 +493,18 @@ class StreetSolverGPU:
             labels = _build_labels_at_node(self._tree, nidx)
             result = {}
             for a in range(min(na, len(labels))):
-                freq = self._output.avg_strategies[
+                freq = self._output.final_strategies[
                     di * SS_MAX_ACTIONS * max_h + a * max_h + hand_idx]
                 if freq > 0.001:
                     result[labels[a]] = float(freq)
             return result
         return {}
 
-    def _get_strategy_at_player_node(self, player_idx, hand_idx):
-        """Find first decision node for this player, extract avg strategy."""
+    def _get_final_strategy_at_player_node(self, player_idx, hand_idx):
+        """PLAY PATH: final-iter strategy at this player's first decision node."""
         max_h = self._max_hands
-        for di in range(self._output.num_avg_nodes):
-            nidx = self._output.avg_strategy_node_ids[di]
+        for di in range(self._output.num_final_nodes):
+            nidx = self._output.final_strategy_node_ids[di]
             node = self._tree.nodes[nidx]
             if node.player != player_idx or node.type != 0:
                 continue
@@ -498,7 +512,7 @@ class StreetSolverGPU:
             labels = _build_labels_at_node(self._tree, nidx)
             result = {}
             for a in range(min(na, len(labels))):
-                freq = self._output.avg_strategies[
+                freq = self._output.final_strategies[
                     di * SS_MAX_ACTIONS * max_h + a * max_h + hand_idx]
                 if freq > 0.001:
                     result[labels[a]] = float(freq)
