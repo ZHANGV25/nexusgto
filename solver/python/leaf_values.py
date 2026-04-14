@@ -473,6 +473,11 @@ def compute_flop_leaf_values_bpr3(
     # Look up per-action EVs and strategies at the flop root for each player.
     # The action_hash is computed from game_action_indices (preflop sequence).
     # board=[] and street=1 (flop) with board_hash=0 per the unified format.
+    try:
+        from leaf_coverage import record as _cov_record
+    except ImportError:
+        from python.leaf_coverage import record as _cov_record  # type: ignore
+
     player_evs = []
     player_strats = []
     for p in range(num_players):
@@ -485,11 +490,14 @@ def compute_flop_leaf_values_bpr3(
             player=p, street=1,
         )
         if evs is None or strats is None:
+            _cov_record("bpr3_flop_root", hit=False,
+                        detail=f"p{p}_ah{len(game_action_indices)}")
             raise RuntimeError(
                 f"BPR3 lookup failed for player {p}, action_history="
                 f"{game_action_indices}, street=1. "
                 f"Run bps_compute_evs() to populate EV data."
             )
+        _cov_record("bpr3_flop_root", hit=True)
         player_evs.append(evs)
         player_strats.append(strats)
 
