@@ -188,6 +188,36 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         ]
         lib.bps_compute_evs.restype = ctypes.c_int
 
+    if hasattr(lib, "bps_compute_evs_checkpointed"):
+        c_float_p = ctypes.POINTER(ctypes.c_float)
+        lib.bps_compute_evs_checkpointed.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_int64,          # num_iterations
+            ctypes.c_int,            # num_threads
+            ctypes.c_int,            # num_players
+            ctypes.c_int,            # small_blind
+            ctypes.c_int,            # big_blind
+            ctypes.c_int,            # initial_stack
+            c_float_p,              # postflop_bet_sizes
+            ctypes.c_int,            # num_postflop_bet_sizes
+            c_float_p,              # subsequent_bet_sizes
+            ctypes.c_int,            # num_subsequent_bet_sizes
+            c_float_p,              # preflop_tier0
+            ctypes.c_int,            # n_tier0
+            c_float_p,              # preflop_tier1
+            ctypes.c_int,            # n_tier1
+            c_float_p,              # preflop_tier2
+            ctypes.c_int,            # n_tier2
+            c_float_p,              # preflop_tier3
+            ctypes.c_int,            # n_tier3
+            ctypes.c_int,            # preflop_max_raises
+            c_float_p,              # turn_centroids
+            ctypes.c_int,            # turn_k
+            ctypes.c_int64,          # checkpoint_interval
+            ctypes.c_char_p,         # checkpoint_path
+        ]
+        lib.bps_compute_evs_checkpointed.restype = ctypes.c_int
+
 
 class BPSReaderC:
     """C-backed reader for unified .bps blueprint files.
@@ -584,6 +614,8 @@ class BPSReaderC:
         preflop_tiers: Optional[List[List[float]]] = None,
         preflop_max_raises: int = 4,
         turn_centroids: Optional[np.ndarray] = None,
+        checkpoint_interval: int = 0,
+        checkpoint_path: Optional[str] = None,
     ) -> None:
         """Compute per-action EVs via Monte Carlo EV walk.
 
@@ -599,10 +631,26 @@ class BPSReaderC:
             preflop_tiers: list of up to 4 lists of bet fractions per tier
             preflop_max_raises: cap on preflop raises
             turn_centroids: [k, 3] array of turn k-means centroids
+            checkpoint_interval: if >0, snapshot EVs to checkpoint_path every
+                N iterations. Writes are atomic (tmp + rename) so a crash
+                leaves the previous checkpoint intact.
+            checkpoint_path: destination for periodic snapshots. Required
+                when checkpoint_interval > 0.
         """
         if not hasattr(self._lib, "bps_compute_evs"):
             raise RuntimeError(
                 "bps_compute_evs not available. Build with 'make bps_ev_walk'."
+            )
+        if checkpoint_interval > 0 and not checkpoint_path:
+            raise ValueError(
+                "checkpoint_path is required when checkpoint_interval > 0"
+            )
+        if checkpoint_interval > 0 and not hasattr(
+            self._lib, "bps_compute_evs_checkpointed"
+        ):
+            raise RuntimeError(
+                "bps_compute_evs_checkpointed not available. Rebuild "
+                "bps_ev_walk after updating src/bps_ev_walk.c."
             )
 
         # Defaults: Pluribus bet sizes
@@ -645,23 +693,44 @@ class BPSReaderC:
             tc_flat = turn_centroids.astype(np.float32).flatten()
             tc_ptr = tc_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        ret = self._lib.bps_compute_evs(
-            self._reader,
-            ctypes.c_int64(num_iterations),
-            num_threads,
-            num_players,
-            small_blind,
-            big_blind,
-            initial_stack,
-            pf_arr, len(postflop_bet_sizes),
-            sb_arr, len(subsequent_bet_sizes),
-            tier_arrs[0], tier_lens[0],
-            tier_arrs[1], tier_lens[1],
-            tier_arrs[2], tier_lens[2],
-            tier_arrs[3], tier_lens[3],
-            preflop_max_raises,
-            tc_ptr, tc_k,
-        )
+        if checkpoint_interval > 0:
+            ret = self._lib.bps_compute_evs_checkpointed(
+                self._reader,
+                ctypes.c_int64(num_iterations),
+                num_threads,
+                num_players,
+                small_blind,
+                big_blind,
+                initial_stack,
+                pf_arr, len(postflop_bet_sizes),
+                sb_arr, len(subsequent_bet_sizes),
+                tier_arrs[0], tier_lens[0],
+                tier_arrs[1], tier_lens[1],
+                tier_arrs[2], tier_lens[2],
+                tier_arrs[3], tier_lens[3],
+                preflop_max_raises,
+                tc_ptr, tc_k,
+                ctypes.c_int64(checkpoint_interval),
+                checkpoint_path.encode("utf-8"),
+            )
+        else:
+            ret = self._lib.bps_compute_evs(
+                self._reader,
+                ctypes.c_int64(num_iterations),
+                num_threads,
+                num_players,
+                small_blind,
+                big_blind,
+                initial_stack,
+                pf_arr, len(postflop_bet_sizes),
+                sb_arr, len(subsequent_bet_sizes),
+                tier_arrs[0], tier_lens[0],
+                tier_arrs[1], tier_lens[1],
+                tier_arrs[2], tier_lens[2],
+                tier_arrs[3], tier_lens[3],
+                preflop_max_raises,
+                tc_ptr, tc_k,
+            )
         if ret != 0:
             raise RuntimeError(f"bps_compute_evs failed (ret={ret})")
 

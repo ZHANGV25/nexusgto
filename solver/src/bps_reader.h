@@ -335,6 +335,37 @@ BPS_EXPORT int bps_compute_evs(BPSReader *r, int64_t num_iterations,
                                 const float *turn_centroids, int turn_k);
 
 /**
+ * Checkpointed variant of bps_compute_evs. Identical semantics except
+ * that every `checkpoint_interval` iterations the accumulated EVs are
+ * written into the reader's ev_data and persisted to
+ * `checkpoint_path`. Writes are atomic (tmp + rename) so a crash during
+ * the checkpoint leaves the previous checkpoint intact.
+ *
+ * The accumulator is preserved across checkpoints — snapshots are
+ * observer-only. The final state is written after the last chunk
+ * completes (same as the non-checkpointed path).
+ *
+ * Pass `checkpoint_interval = 0` or `checkpoint_path = NULL` to disable
+ * checkpointing (equivalent to bps_compute_evs).
+ */
+BPS_EXPORT int bps_compute_evs_checkpointed(BPSReader *r, int64_t num_iterations,
+                                int num_threads,
+                                int num_players, int small_blind, int big_blind,
+                                int initial_stack,
+                                const float *postflop_bet_sizes,
+                                int num_postflop_bet_sizes,
+                                const float *subsequent_bet_sizes,
+                                int num_subsequent_bet_sizes,
+                                const float *preflop_tier0, int n_tier0,
+                                const float *preflop_tier1, int n_tier1,
+                                const float *preflop_tier2, int n_tier2,
+                                const float *preflop_tier3, int n_tier3,
+                                int preflop_max_raises,
+                                const float *turn_centroids, int turn_k,
+                                int64_t checkpoint_interval,
+                                const char *checkpoint_path);
+
+/**
  * Free all memory owned by the reader. Safe to call on a zero-initialized
  * or partially-loaded reader.
  */
