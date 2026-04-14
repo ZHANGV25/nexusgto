@@ -2005,17 +2005,110 @@ static void accumulate_snapshot(BPInfoTable *t) {
     }
 }
 
-/* ── Linear CFR discount ─────────────────────────────────────────── */
+/* ── Linear CFR / DCFR discount ───────────────────────────────────── */
 
-/* Called from within an existing outer parallel region. */
-static void apply_discount(BPInfoTable *t, float discount) {
+/*
+ * Linear CFR uses a single scalar `d` = t/(t+1) applied uniformly to both
+ * positive and negative regrets and (on round 1 only) to strategy_sum.
+ *
+ * DCFR (Brown & Sandholm, AAAI 2019, arXiv:1809.04040) generalizes to three
+ * parameters α, β, γ with distinct discounts:
+ *     positive regrets: tᵅ / (tᵅ + 1)
+ *     negative regrets: tᵝ / (tᵝ + 1)
+ *     strategy_sum:     (t / (t+1))ᵞ
+ *
+ * Paper default is α=1.5, β=0, γ=2. We default to β=0.5 rather than 0
+ * because β=0 zeroes the negative-regret tail at every discount step,
+ * which collides with negative-regret pruning (BP_PRUNE_THRESHOLD relies
+ * on the accumulated negative reaching the threshold). β=0.5 preserves a
+ * discounted tail long enough for pruning to fire as designed.
+ *
+ * Toggle via environment:
+ *     BPS_DCFR_ALPHA, BPS_DCFR_BETA, BPS_DCFR_GAMMA
+ * If any of the three is unset (or set empty), we fall back to Linear CFR
+ * for all three schedules — this keeps the default behavior unchanged for
+ * the 30+ ctypes callers that don't set DCFR env vars.
+ */
+
+static float dcfr_alpha = 1.0f;    /* effective α; Linear CFR = 1 */
+static float dcfr_beta  = 1.0f;    /* effective β; Linear CFR = 1 */
+static float dcfr_gamma = 1.0f;    /* effective γ; Linear CFR = 1 */
+static int   dcfr_enabled = 0;
+static int   dcfr_initialized = 0;
+
+static void dcfr_init_from_env(void) {
+    if (dcfr_initialized) return;
+    dcfr_initialized = 1;
+    const char *a = getenv("BPS_DCFR_ALPHA");
+    const char *b = getenv("BPS_DCFR_BETA");
+    const char *g = getenv("BPS_DCFR_GAMMA");
+    if (a && *a && b && *b && g && *g) {
+        float av = (float)atof(a);
+        float bv = (float)atof(b);
+        float gv = (float)atof(g);
+        if (av > 0 && bv >= 0 && gv > 0) {
+            dcfr_alpha = av;
+            dcfr_beta = bv;
+            dcfr_gamma = gv;
+            dcfr_enabled = 1;
+            fprintf(stderr,
+                    "[BP] DCFR enabled: alpha=%.3f beta=%.3f gamma=%.3f\n",
+                    dcfr_alpha, dcfr_beta, dcfr_gamma);
+        } else {
+            fprintf(stderr, "[BP] DCFR env vars invalid "
+                    "(alpha>0, beta>=0, gamma>0 required); using Linear CFR\n");
+        }
+    }
+}
+
+/**
+ * Compute the discount factor for a given step count `t` and exponent `p`.
+ * Matches the formula used in the DCFR paper: t^p / (t^p + 1).
+ * With p == 1 this is the Linear CFR schedule (t/(t+1)).
+ */
+static inline float dcfr_factor(float t, float p) {
+    if (p <= 0.0f) return 0.0f;
+    if (p == 1.0f) return t / (t + 1.0f);
+    float tp = powf(t, p);
+    return tp / (tp + 1.0f);
+}
+
+/* Called from within an existing outer parallel region.
+ *
+ * `discount` is the Linear CFR value d = t/(t+1) computed by the caller.
+ * When DCFR is enabled we recover t from `discount` via t = d/(1-d) and
+ * then apply α/β/γ separately. This keeps the call site in bp_solve
+ * unchanged so no other structs or ABI need to move. */
+static void apply_discount(BPInfoTable *t_tab, float discount) {
+    dcfr_init_from_env();
+
+    float d_pos, d_neg, d_strat;
+    if (dcfr_enabled) {
+        /* Recover t from the linear-CFR discount passed in by the caller. */
+        float one_minus = 1.0f - discount;
+        float t_step = (one_minus > 1e-9f) ? (discount / one_minus) : 1.0f;
+
+        d_pos = dcfr_factor(t_step, dcfr_alpha);
+        d_neg = dcfr_factor(t_step, dcfr_beta);
+        /* γ discounts (t/(t+1))^γ = discount^γ. Use powf for clarity. */
+        d_strat = powf(discount, dcfr_gamma);
+    } else {
+        d_pos = discount;
+        d_neg = discount;
+        d_strat = discount;
+    }
+
     #pragma omp for schedule(static, 65536) nowait
-    for (int64_t i = 0; i < t->table_size; i++) {
-        if (!t->occupied[i]) continue;
-        BPInfoSet *is = &t->sets[i];
+    for (int64_t i = 0; i < t_tab->table_size; i++) {
+        if (!t_tab->occupied[i]) continue;
+        BPInfoSet *is = &t_tab->sets[i];
         int na = is->num_actions;
         for (int a = 0; a < na; a++) {
-            is->regrets[a] = (int)((float)is->regrets[a] * discount);
+            int r = is->regrets[a];
+            float scaled = (r >= 0)
+                ? (float)r * d_pos
+                : (float)r * d_neg;
+            is->regrets[a] = (int)scaled;
             if (is->regrets[a] < BP_REGRET_FLOOR)
                 is->regrets[a] = BP_REGRET_FLOOR;
         }
@@ -2026,16 +2119,11 @@ static void apply_discount(BPInfoTable *t, float discount) {
          * rounds 2-4 strategy_sum is constructed from snapshots taken AFTER
          * the discount phase ends, and Pluribus does NOT discount those.
          *
-         * Currently this fix is defensive — discount_stop_iter (e.g. 35M)
-         * is always less than snapshot_start_iter (e.g. 70M) under our
-         * canonical Python config, so rounds 2-4 strategy_sum is NULL when
-         * apply_discount fires and the original `if (is->strategy_sum)`
-         * check skipped them. But that's a config-fragile invariant. Adding
-         * an explicit street filter makes the discount semantics correct
-         * regardless of how the timing parameters get tuned. */
-        if (is->strategy_sum && t->keys[i].street == 0) {
+         * DCFR uses the γ schedule for strategy_sum (same restriction to
+         * round 1 applies). */
+        if (is->strategy_sum && t_tab->keys[i].street == 0) {
             for (int a = 0; a < na; a++)
-                is->strategy_sum[a] *= discount;
+                is->strategy_sum[a] *= d_strat;
         }
     }
 }
