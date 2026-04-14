@@ -39,7 +39,13 @@
 #define SS_MAX_BOARD      5
 #define SS_MAX_LEAVES     64      /* max depth-limit leaves before cont expansion */
 #define SS_NUM_CONT_STRATS 4      /* unmodified, fold-biased, call-biased, raise-biased */
-#define SS_MAX_RAISES     3       /* max raises per street */
+#define SS_MAX_RAISES     3       /* max raises per street (2p or river) */
+/* Pluribus Science 2019 supplement §4: multi-way non-river subgames cap at
+ * 2 raises ahead to keep the tree tractable. Override via compile-time
+ * -DSS_MULTIWAY_MAX_RAISES=<n> if needed for experimentation. */
+#ifndef SS_MULTIWAY_MAX_RAISES
+#define SS_MULTIWAY_MAX_RAISES 2
+#endif
 
 /* Node types */
 #define SS_NODE_DECISION  0
