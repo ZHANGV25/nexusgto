@@ -36,23 +36,26 @@ _MAX_ACTIONS = 16
 
 
 def _find_lib() -> ctypes.CDLL:
-    """Locate and load the bps_reader shared library."""
-    # Try relative to this file's directory (poker-solver/python/ -> poker-solver/build/)
-    base = Path(__file__).resolve().parent.parent / "build"
+    """Locate and load the bps_reader shared library.
 
-    if sys.platform == "win32":
-        candidates = [base / "bps_reader.dll"]
-    else:
-        candidates = [base / "bps_reader.so"]
+    Prefers bps_ev_walk (which includes both reader + EV walk support).
+    Falls back to bps_reader (read-only, no EV computation).
+    """
+    base = Path(__file__).resolve().parent.parent / "build"
+    ext = ".dll" if sys.platform == "win32" else ".so"
+
+    # Prefer the ev_walk build (superset of bps_reader)
+    candidates = [
+        base / f"bps_ev_walk{ext}",
+        base / f"bps_reader{ext}",
+    ]
 
     # Also check POKER_SOLVER_PATH env var
     env_path = os.environ.get("POKER_SOLVER_PATH")
     if env_path:
         build_dir = Path(env_path) / "build"
-        if sys.platform == "win32":
-            candidates.append(build_dir / "bps_reader.dll")
-        else:
-            candidates.append(build_dir / "bps_reader.so")
+        candidates.append(build_dir / f"bps_ev_walk{ext}")
+        candidates.append(build_dir / f"bps_reader{ext}")
 
     for path in candidates:
         if path.exists():
@@ -61,7 +64,7 @@ def _find_lib() -> ctypes.CDLL:
     searched = ", ".join(str(c) for c in candidates)
     raise FileNotFoundError(
         f"bps_reader shared library not found. Searched: {searched}. "
-        f"Run 'make bps_reader' in the poker-solver directory."
+        f"Run 'make bps_ev_walk' or 'make bps_reader' in the poker-solver directory."
     )
 
 
@@ -155,6 +158,35 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
 
     lib.bps_reader_free.argtypes = [ctypes.c_void_p]
     lib.bps_reader_free.restype = None
+
+    # EV walk (bps_ev_walk.c) — only available in bps_ev_walk.dll/so
+    if hasattr(lib, "bps_compute_evs"):
+        c_float_p = ctypes.POINTER(ctypes.c_float)
+        lib.bps_compute_evs.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_int64,          # num_iterations
+            ctypes.c_int,            # num_threads
+            ctypes.c_int,            # num_players
+            ctypes.c_int,            # small_blind
+            ctypes.c_int,            # big_blind
+            ctypes.c_int,            # initial_stack
+            c_float_p,              # postflop_bet_sizes
+            ctypes.c_int,            # num_postflop_bet_sizes
+            c_float_p,              # subsequent_bet_sizes
+            ctypes.c_int,            # num_subsequent_bet_sizes
+            c_float_p,              # preflop_tier0
+            ctypes.c_int,            # n_tier0
+            c_float_p,              # preflop_tier1
+            ctypes.c_int,            # n_tier1
+            c_float_p,              # preflop_tier2
+            ctypes.c_int,            # n_tier2
+            c_float_p,              # preflop_tier3
+            ctypes.c_int,            # n_tier3
+            ctypes.c_int,            # preflop_max_raises
+            c_float_p,              # turn_centroids
+            ctypes.c_int,            # turn_k
+        ]
+        lib.bps_compute_evs.restype = ctypes.c_int
 
 
 class BPSReaderC:
@@ -538,6 +570,108 @@ class BPSReaderC:
         """
         board_arr = (ctypes.c_int * 3)(*board[:3])
         return self._lib.bps_hand_to_bucket(self._reader, board_arr, c0, c1)
+
+    def compute_evs(
+        self,
+        num_iterations: int = 50_000_000,
+        num_threads: int = 8,
+        num_players: int = 6,
+        small_blind: int = 50,
+        big_blind: int = 100,
+        initial_stack: int = 10000,
+        postflop_bet_sizes: Optional[List[float]] = None,
+        subsequent_bet_sizes: Optional[List[float]] = None,
+        preflop_tiers: Optional[List[List[float]]] = None,
+        preflop_max_raises: int = 4,
+        turn_centroids: Optional[np.ndarray] = None,
+    ) -> None:
+        """Compute per-action EVs via Monte Carlo EV walk.
+
+        Requires bps_ev_walk library (build with 'make bps_ev_walk').
+
+        Args:
+            num_iterations: MC iterations (50M ~1hr, 500M ~overnight)
+            num_threads: OpenMP threads
+            num_players: 2-6
+            small_blind, big_blind, initial_stack: game parameters
+            postflop_bet_sizes: first-raise pot fractions (default Pluribus)
+            subsequent_bet_sizes: re-raise pot fractions (default Pluribus)
+            preflop_tiers: list of up to 4 lists of bet fractions per tier
+            preflop_max_raises: cap on preflop raises
+            turn_centroids: [k, 3] array of turn k-means centroids
+        """
+        if not hasattr(self._lib, "bps_compute_evs"):
+            raise RuntimeError(
+                "bps_compute_evs not available. Build with 'make bps_ev_walk'."
+            )
+
+        # Defaults: Pluribus bet sizes
+        if postflop_bet_sizes is None:
+            postflop_bet_sizes = [0.5, 1.0]
+        if subsequent_bet_sizes is None:
+            subsequent_bet_sizes = [1.0]
+        if preflop_tiers is None:
+            # Pluribus-style tiered preflop sizing
+            preflop_tiers = [
+                [2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],  # open raise
+                [2.0, 3.0, 4.0],  # 3-bet
+                [2.0, 3.0],       # 4-bet
+                [2.0],            # 5-bet
+            ]
+
+        def _to_c_float_array(lst: List[float]) -> ctypes.Array:
+            return (ctypes.c_float * len(lst))(*lst)
+
+        pf_arr = _to_c_float_array(postflop_bet_sizes)
+        sb_arr = _to_c_float_array(subsequent_bet_sizes)
+
+        # Preflop tiers (up to 4)
+        tier_arrs = []
+        tier_lens = []
+        for i in range(4):
+            if i < len(preflop_tiers) and preflop_tiers[i]:
+                arr = _to_c_float_array(preflop_tiers[i])
+                tier_arrs.append(arr)
+                tier_lens.append(len(preflop_tiers[i]))
+            else:
+                tier_arrs.append(None)
+                tier_lens.append(0)
+
+        # Turn centroids
+        tc_ptr = None
+        tc_k = 0
+        if turn_centroids is not None and len(turn_centroids) > 0:
+            tc_k = len(turn_centroids)
+            tc_flat = turn_centroids.astype(np.float32).flatten()
+            tc_ptr = tc_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        ret = self._lib.bps_compute_evs(
+            self._reader,
+            ctypes.c_int64(num_iterations),
+            num_threads,
+            num_players,
+            small_blind,
+            big_blind,
+            initial_stack,
+            pf_arr, len(postflop_bet_sizes),
+            sb_arr, len(subsequent_bet_sizes),
+            tier_arrs[0], tier_lens[0],
+            tier_arrs[1], tier_lens[1],
+            tier_arrs[2], tier_lens[2],
+            tier_arrs[3], tier_lens[3],
+            preflop_max_raises,
+            tc_ptr, tc_k,
+        )
+        if ret != 0:
+            raise RuntimeError(f"bps_compute_evs failed (ret={ret})")
+
+    def save_cache(self, cache_path: str) -> None:
+        """Save strategies + EVs to binary cache for fast reload."""
+        ret = self._lib.bps_save_cache(
+            self._reader, cache_path.encode("utf-8")
+        )
+        if ret != 0:
+            raise RuntimeError(f"bps_save_cache failed (ret={ret})")
 
     def get_metadata(self, texture_key: str = "__unified__") -> Optional[dict]:
         """Get metadata from the loaded .bps file."""

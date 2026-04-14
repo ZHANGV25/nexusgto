@@ -292,6 +292,49 @@ BPS_EXPORT int bps_save_cache(const BPSReader *r, const char *path);
 BPS_EXPORT int bps_load_cache(BPSReader *r, const char *path);
 
 /**
+ * Compute per-action expected values via Monte Carlo traversal.
+ *
+ * Runs num_iterations of σ̄-sampled tree walks (same algorithm as
+ * mccfr_blueprint.c:bp_compute_action_evs) but reads strategies from
+ * the reader's compact hash table instead of the 95 GB training table.
+ *
+ * After this returns, bps_query_all_evs() works. Call bps_save_cache()
+ * to persist both strategies and EVs for instant reload.
+ *
+ * Game config parameters must match the training configuration exactly
+ * (Pluribus defaults: 6 players, SB=50, BB=100, stack=10000).
+ *
+ * Args:
+ *   r: loaded reader (strategies_loaded must be 1)
+ *   num_iterations: number of MC iterations (50M = ~1hr, 500M = overnight)
+ *   num_threads: OpenMP threads (0 = auto)
+ *   num_players: 2-6
+ *   small_blind, big_blind, initial_stack: game parameters
+ *   postflop_bet_sizes, num_postflop_bet_sizes: first-raise fractions
+ *   subsequent_bet_sizes, num_subsequent_bet_sizes: re-raise fractions
+ *   preflop_tier0..3, n_tier0..3: tiered preflop bet sizes per raise level
+ *   preflop_max_raises: cap on preflop raises (typically 4)
+ *   turn_centroids: [k][3] float array of turn k-means centroids (NULL = skip)
+ *   turn_k: number of turn centroids (0 = use EHS percentile for turn)
+ *
+ * Returns 0 on success, -1 on error.
+ */
+BPS_EXPORT int bps_compute_evs(BPSReader *r, int64_t num_iterations,
+                                int num_threads,
+                                int num_players, int small_blind, int big_blind,
+                                int initial_stack,
+                                const float *postflop_bet_sizes,
+                                int num_postflop_bet_sizes,
+                                const float *subsequent_bet_sizes,
+                                int num_subsequent_bet_sizes,
+                                const float *preflop_tier0, int n_tier0,
+                                const float *preflop_tier1, int n_tier1,
+                                const float *preflop_tier2, int n_tier2,
+                                const float *preflop_tier3, int n_tier3,
+                                int preflop_max_raises,
+                                const float *turn_centroids, int turn_k);
+
+/**
  * Free all memory owned by the reader. Safe to call on a zero-initialized
  * or partially-loaded reader.
  */

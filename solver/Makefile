@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 blueprint bps_reader
+.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -44,7 +44,13 @@ bps_reader: $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
 $(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/bps_reader.c -o $@ $(LDFLAGS)
 
-dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
+# ── BPS EV walk (reader + card_abstraction + OpenMP) ──
+bps_ev_walk: $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT)
+
+$(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+
+dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT)
 
 # ── Benchmarks ──
 $(BUILD_DIR)/bench_v2: $(BENCH_DIR)/bench_v2.c $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
@@ -69,6 +75,13 @@ $(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_b
 test_phase_1_3: $(BUILD_DIR)/test_phase_1_3
 	./$(BUILD_DIR)/test_phase_1_3 $(BUILD_DIR)/phase_1_3_synthetic.tbn
 	python3 tests/test_phase_1_3_synthetic.py $(BUILD_DIR)/phase_1_3_synthetic.tbn
+
+# ── BPS EV walk tests ──
+$(BUILD_DIR)/test_bps_ev_walk: tests/test_bps_ev_walk.c $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp -I$(SRC_DIR) tests/test_bps_ev_walk.c $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS) -static
+
+test_ev_walk: $(BUILD_DIR)/test_bps_ev_walk
+	./$(BUILD_DIR)/test_bps_ev_walk
 
 clean:
 	rm -rf $(BUILD_DIR)

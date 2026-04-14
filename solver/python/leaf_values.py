@@ -426,9 +426,9 @@ def compute_flop_leaf_values_bpr3(
     and more accurate than the equity-only first-order approximation, because
     it uses the trained blueprint's actual strategic values.
 
-    Falls back to None if the blueprint lookup misses (info set not visited
-    during the Phase 1.3 EV walk), in which case the caller should use
-    compute_flop_leaf_equity as a fallback.
+    Raises RuntimeError if the blueprint lookup misses (info set not visited
+    during the EV walk). Callers must ensure bps_compute_evs() has been run
+    with sufficient iterations before using this function.
 
     Args:
         flop_board: [card0, card1, card2] ints
@@ -463,7 +463,11 @@ def compute_flop_leaf_values_bpr3(
             player=p, street=1,
         )
         if evs is None or strats is None:
-            return None  # lookup missed — caller falls back to equity
+            raise RuntimeError(
+                f"BPR3 lookup failed for player {p}, action_history="
+                f"{game_action_indices}, street=1. "
+                f"Run bps_compute_evs() to populate EV data."
+            )
         player_evs.append(evs)
         player_strats.append(strats)
 
