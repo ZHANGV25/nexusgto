@@ -43,6 +43,28 @@ from typing import Dict, List, Optional, Tuple
 from collections import namedtuple
 
 
+class LeafValueUnavailable(RuntimeError):
+    """Raised when no trustworthy leaf-value oracle is available for a spot.
+
+    Per STATUS.md §G2 (remove silent fallbacks) and B2's finding (2026-04-14)
+    that the equity-only N-player fallback produces degenerate strategies,
+    the BPST per-scenario blueprint store nor the BPS3 per-action EV path
+    this as an explicit "data unavailable" error rather than fall through
+    to a plausible-looking but wrong strategy.
+
+    Attributes:
+        street:   "flop" | "turn" | "river"
+        reason:   human-readable explanation (why no oracle is available)
+        num_players: player count in the spot
+    """
+
+    def __init__(self, street: str, reason: str, num_players: int = 0) -> None:
+        self.street = street
+        self.reason = reason
+        self.num_players = num_players
+        super().__init__(f"[{street} {num_players}p] leaf oracle unavailable: {reason}")
+
+
 # ── First-order bias approximation (v3 fix for v2 .bps path) ─────────────
 #
 # Pluribus's depth-limited solving uses 4 continuation strategies (unmodified,
