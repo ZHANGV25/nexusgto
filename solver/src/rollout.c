@@ -555,10 +555,17 @@ static int rollout_simulate_one(
             int32_t c1 = sampled_hands_c1[p];
             int bucket = bps_hand_to_bucket(r, board, c0, c1);
             if (bucket < 0) {
+                char board_desc[64] = {0};
+                int off = 0;
+                for (int32_t bi = 0; bi < n_board && off < 60; bi++) {
+                    off += snprintf(board_desc + off, 64 - off,
+                                    "%d%s", board[bi], bi + 1 < n_board ? "," : "");
+                }
                 rollout_set_error(street, num_players,
-                    "hand_to_bucket returned %d for (%d,%d) on %d-card board "
-                    "(street=%d) — likely turn/river lookup where only flop "
-                    "buckets are cached", bucket, c0, c1, n_board, street);
+                    "hand_to_bucket returned %d for (%d,%d) on %d-card board [%s] "
+                    "(street=%d, player=%d) — turn/river bucket lookup, no "
+                    "bucketizer yet; see STATUS.md §C1 follow-up",
+                    bucket, c0, c1, n_board, board_desc, street, p);
                 return -1;
             }
 
