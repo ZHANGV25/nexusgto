@@ -327,6 +327,7 @@ def compute_subgame_leaf_values_c(
     stack_chips: int,
     max_hands: int,
     num_rollouts: int = 3,
+    rng=None,                  # accepted for drop-in compat with python/rollout.py
     master_seed: int = 0x5a17_e8c0_feed_beef,
 ) -> np.ndarray:
     """Drop-in faster replacement for python/rollout.py::compute_subgame_leaf_values.
@@ -338,6 +339,16 @@ def compute_subgame_leaf_values_c(
     """
     if street not in _STREET_NUM:
         raise ValueError(f"bad street {street!r}")
+    # `rng` kwarg is accepted for drop-in-compat with python/rollout.py
+    # but unused — the C path uses per-tuple splitmix64 from master_seed.
+    # If caller passes a numpy Generator, optionally derive a 64-bit
+    # seed from it so two calls with the same generator produce the
+    # same C-side stream.
+    if rng is not None:
+        try:
+            master_seed = int(rng.integers(0, 2**64 - 1, dtype=np.uint64))
+        except Exception:
+            pass
     lib = _lib()
 
     # BPSReader * — the existing BPSReaderC exposes this as self._reader.
