@@ -419,6 +419,14 @@ def _simulate_one(
         # On entry the leaf's `street` is already dealt; we simulate
         # that street's betting, then deal next street's card(s), etc.
 
+        # If every live player is all-in (stack 0), no more betting
+        # action is possible. Skip directly to chance / showdown. Without
+        # this check, a post-allin river would query σ̄ at a closed
+        # betting line that doesn't exist in the trained tree.
+        n_live_can_act = sum(
+            1 for i in range(num_players) if active[i] and stacks[i] > 0
+        )
+
         # ── Betting round for the current street ──
         street_bets = [0] * num_players
         current_bet = 0
@@ -427,7 +435,7 @@ def _simulate_one(
         safety = num_players * (POSTFLOP_MAX_RAISES + 2) + 4
 
         iter_idx = 0
-        while iter_idx < safety:
+        while iter_idx < safety and n_live_can_act >= 2:
             iter_idx += 1
 
             # Find next active player in acting_order who still owes action
@@ -435,6 +443,8 @@ def _simulate_one(
             for p in acting_order:
                 if not active[p]:
                     continue
+                if stacks[p] <= 0:
+                    continue  # all-in player can't act
                 if not acted[p] or street_bets[p] < current_bet:
                     chosen = p
                     break
@@ -455,7 +465,16 @@ def _simulate_one(
                 continue
 
             c0, c1 = pair
-            bucket = blueprint.hand_to_bucket(board, c0, c1)
+            # Dispatch by street / board length so turn and river
+            # decisions use their own bucketizers, not a silent flop
+            # fallback. Fallback to plain hand_to_bucket for mocks that
+            # don't define the new methods (e.g. tests/test_rollout_v2.py).
+            if len(board) == 4 and hasattr(blueprint, "hand_to_bucket_turn"):
+                bucket = blueprint.hand_to_bucket_turn(board, c0, c1)
+            elif len(board) == 5 and hasattr(blueprint, "hand_to_bucket_river"):
+                bucket = blueprint.hand_to_bucket_river(board, c0, c1)
+            else:
+                bucket = blueprint.hand_to_bucket(board, c0, c1)
             if bucket < 0:
                 raise LeafValueUnavailable(
                     street=street,

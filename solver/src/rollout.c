@@ -519,6 +519,19 @@ static int rollout_simulate_one(
     int32_t street = leaf_street;
 
     while (1) {
+        /* If every live player has gone all-in (no chips left), there
+         * is no more betting action possible. Skip straight to chance /
+         * showdown. Without this check, a post-allin river node would
+         * query σ̄ at a closed betting line (ah_len overflow into a
+         * terminal info set), producing spurious blueprint misses. */
+        {
+            int32_t n_live_can_act = 0;
+            for (int32_t i = 0; i < num_players; i++) {
+                if (active[i] && stacks[i] > 0) n_live_can_act++;
+            }
+            if (n_live_can_act < 2) goto street_closed;
+        }
+
         /* Betting round for current street */
         int32_t street_bets[ROLLOUT_MAX_PLAYERS] = {0};
         int32_t current_bet = 0;
@@ -532,6 +545,7 @@ static int rollout_simulate_one(
             for (int32_t k = 0; k < acting_order_len; k++) {
                 int32_t p = acting_order[k];
                 if (!active[p]) continue;
+                if (stacks[p] <= 0) continue;  /* allin player can't act */
                 if (!acted[p] || street_bets[p] < current_bet) {
                     chosen = p;
                     break;
@@ -553,7 +567,21 @@ static int rollout_simulate_one(
 
             int32_t c0 = sampled_hands_c0[p];
             int32_t c1 = sampled_hands_c1[p];
-            int bucket = bps_hand_to_bucket(r, board, c0, c1);
+            /* Dispatch bucket lookup by current street / board size.
+             * Flop uses the precomputed texture cache; turn uses
+             * k-means centroids; river uses deterministic 200-sample
+             * EHS percentile. All three match training-time bucketing
+             * exactly (bps_ev_walk.c:855-898 is the precedent). */
+            int bucket;
+            if (n_board == 3) {
+                bucket = bps_hand_to_bucket(r, board, c0, c1);
+            } else if (n_board == 4) {
+                bucket = bps_hand_to_bucket_turn(r, board, c0, c1);
+            } else if (n_board == 5) {
+                bucket = bps_hand_to_bucket_river(r, board, c0, c1);
+            } else {
+                bucket = -1;
+            }
             if (bucket < 0) {
                 char board_desc[64] = {0};
                 int off = 0;
@@ -562,10 +590,10 @@ static int rollout_simulate_one(
                                     "%d%s", board[bi], bi + 1 < n_board ? "," : "");
                 }
                 rollout_set_error(street, num_players,
-                    "hand_to_bucket returned %d for (%d,%d) on %d-card board [%s] "
-                    "(street=%d, player=%d) — turn/river bucket lookup, no "
-                    "bucketizer yet; see STATUS.md §C1 follow-up",
-                    bucket, c0, c1, n_board, board_desc, street, p);
+                    "hand_to_bucket returned %d for (%d,%d) on %d-card board "
+                    "[%s] (street=%d, player=%d); turn centroids loaded=%d",
+                    bucket, c0, c1, n_board, board_desc, street, p,
+                    r->turn_centroids_k);
                 return -1;
             }
 
@@ -585,9 +613,18 @@ static int rollout_simulate_one(
                 full_seat, bucket, street,
                 strat_full, BPS_MAX_ACTIONS);
             if (bp_na <= 0) {
+                /* Dump action history for debugging — which sequence of
+                 * actions did the rollout produce to land at this miss? */
+                char ah_desc[256] = {0};
+                int ah_off = 0;
+                for (int32_t j = 0; j < gah_len && ah_off < 250; j++) {
+                    ah_off += snprintf(ah_desc + ah_off, 256 - ah_off,
+                                       "%d%s", game_history[j],
+                                       j + 1 < gah_len ? "," : "");
+                }
                 rollout_set_error(street, num_players,
                     "blueprint sigma missing: player=%d(seat=%d) bucket=%d "
-                    "street=%d ah_len=%d", p, full_seat, bucket, street, gah_len);
+                    "street=%d ah=[%s]", p, full_seat, bucket, street, ah_desc);
                 return -1;
             }
 
@@ -699,10 +736,13 @@ static int rollout_simulate_one(
             if (n_active2 <= 1) break;
         }
 
+street_closed:
         /* End of street */
-        int32_t n_live = 0;
-        for (int32_t i = 0; i < num_players; i++) if (active[i]) n_live++;
-        if (n_live <= 1) break;
+        {
+            int32_t n_live = 0;
+            for (int32_t i = 0; i < num_players; i++) if (active[i]) n_live++;
+            if (n_live <= 1) break;
+        }
 
         /* Deal next street */
         int32_t next_street;
