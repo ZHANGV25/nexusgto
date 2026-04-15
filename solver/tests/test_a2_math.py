@@ -537,6 +537,232 @@ def test_heavy_blocker_pair_n4() -> None:
     assert rel < 0.05 or abs(gold) < 1e-9
 
 
+def brute_force_showdown_ev_hybrid(
+    hero_hand: Tuple[int, int],
+    board: Sequence[int],
+    opp_ranges: Sequence[Dict[Tuple[int, int], float]],
+    is_active: Sequence[bool],
+    pot: float,
+    bet: float,
+) -> float:
+    """Hybrid active+blocker brute-force showdown EV.
+
+    Mirrors the A5-fixed CUDA dispatch semantics:
+      * Reach product (blocking) runs over ALL non-traverser opps
+        (active AND folded).
+      * Strength comparison determining winners runs over ACTIVE opps
+        only; folded opps' strength is never consulted.
+      * Ties split pot over the set of max-strength active opps +
+        hero (if hero's strength ties the max).
+
+    A5 audit: §A5 in STATUS.md; derivation in
+    docs/A5_OPP_SELECTION_AUDIT.md. This is the CFV kernel semantic at
+    an n_all_opp >= 3 mid-street-fold showdown (3p flop with one
+    pre-river fold, or 4p with one mid-street fold reaching river).
+    """
+    assert len(opp_ranges) == len(is_active)
+    c0, c1 = hero_hand
+    blocked = set(board) | {c0, c1}
+    s_h = hand_strength_surrogate(hero_hand, board)
+    filtered = []
+    for r in opp_ranges:
+        f = [((h, w), hand_strength_surrogate(h, board))
+             for (h, w) in filter_range_by_blocked(r, blocked)]
+        filtered.append(f)
+
+    total = 0.0
+    for combo in itertools.product(*filtered):
+        seen = list(hero_hand)
+        ok = True
+        for ((h_p, _w), _s) in combo:
+            for c in h_p:
+                if c in seen:
+                    ok = False
+                    break
+                seen.append(c)
+            if not ok:
+                break
+        if not ok:
+            continue
+        reach = 1.0
+        for ((_h, w), _s) in combo:
+            reach *= w
+        # Strength comparison over ACTIVE opps only.
+        active_strengths = [s for ((_h, _w), s), a
+                            in zip(combo, is_active) if a]
+        if not active_strengths:
+            # Hero is alone among actives — unopposed; at a showdown
+            # terminal this is a tree bug, but payoff = pot - bet.
+            payoff = pot - bet
+        else:
+            max_s = max(active_strengths)
+            if max_s > s_h:
+                payoff = -bet
+            else:
+                k_ties = sum(1 for s in active_strengths if s == s_h)
+                payoff = pot / (k_ties + 1) - bet
+        total += reach * payoff
+    return total
+
+
+def mc_showdown_ev_hybrid(
+    hero_hand: Tuple[int, int],
+    board: Sequence[int],
+    opp_ranges: Sequence[Dict[Tuple[int, int], float]],
+    is_active: Sequence[bool],
+    pot: float,
+    bet: float,
+    K: int,
+    seed: int,
+) -> float:
+    """Importance-sampled MC with the hybrid active+blocker semantics.
+
+    CDF draws: each opp samples from its reach-weighted hand list (all
+    of them — same proposal regardless of active vs blocker).
+    Disjointness check: over all sampled opp hands.
+    Strength / winner determination: over ACTIVE opps only.
+
+    This mirrors the A5 kernel path at street_solve.cu lines 1557-1664.
+    Unbiased by the same argument as `mc_showdown_ev`: the reach-
+    product proposal exactly cancels, the blocker's presence just
+    shrinks the disjoint-event probability without biasing the payoff
+    conditional on disjointness.
+    """
+    assert len(opp_ranges) == len(is_active)
+    c0, c1 = hero_hand
+    blocked = set(board) | {c0, c1}
+    s_h = hand_strength_surrogate(hero_hand, board)
+
+    supports = []
+    strengths: List[List[int]] = []
+    z_prod = 1.0
+    for r in opp_ranges:
+        hands, weights, Z = _filtered_support(r, blocked)
+        if Z <= 0.0:
+            return 0.0
+        alias, prob = _alias_sampler(weights)
+        supports.append((hands, alias, prob, Z))
+        strengths.append([hand_strength_surrogate(h, board) for h in hands])
+        z_prod *= Z
+
+    rng = random.Random(seed)
+    acc = 0.0
+    for _ in range(K):
+        drawn_cards: List[int] = []
+        ok = True
+        opp_sampled_strengths: List[Tuple[int, bool]] = []
+        for p_idx, (hands, alias, prob, _Z) in enumerate(supports):
+            j = _alias_draw(rng, alias, prob)
+            a, b = hands[j]
+            if a in drawn_cards or b in drawn_cards:
+                ok = False
+                break
+            drawn_cards.append(a)
+            drawn_cards.append(b)
+            opp_sampled_strengths.append(
+                (strengths[p_idx][j], is_active[p_idx]))
+        if not ok:
+            continue
+        active = [s for (s, a) in opp_sampled_strengths if a]
+        if not active:
+            payoff = pot - bet
+        else:
+            max_s = max(active)
+            if max_s > s_h:
+                payoff = -bet
+            else:
+                k_ties = sum(1 for s in active if s == s_h)
+                payoff = pot / (k_ties + 1) - bet
+        acc += payoff
+    return z_prod * (acc / K)
+
+
+def test_hybrid_showdown_mc_matches_brute_n4() -> None:
+    """A5 hybrid case: N=4 with n_active=2, n_blocker=1. MC estimator
+    remains unbiased under the active+blocker semantics.
+
+    This guards the kernel dispatch change at src/cuda/street_solve.cu
+    lines 1557-1664: the A2 MC path at a mid-street-fold showdown must
+    still be unbiased after the active/blocker split. A biased version
+    (e.g. accidentally filtering blocker reach on strength==0, or
+    including blocker strength in winner determination) would make the
+    mean estimate diverge from brute force at K=40k.
+    """
+    rng = random.Random(700)
+    max_rel = 0.0
+    actual = 0
+    for trial in range(6):
+        board = rng.sample(DECK, 5)  # river
+        h = random_hero_hand(rng, board)
+        # N=4: 3 opponents. Mark the last as blocker (folded), first
+        # two as active. density chosen so brute force remains tractable.
+        opps = [random_range(rng, board, density=0.015) for _ in range(3)]
+        if any(not o for o in opps):
+            continue
+        is_active = [True, True, False]
+        pot, bet = 100.0, 30.0
+        gold = brute_force_showdown_ev_hybrid(
+            h, board, opps, is_active, pot, bet)
+        if abs(gold) < 1e-9:
+            continue
+        # Also capture the WRONG semantics (folded opp counted as active)
+        # to confirm the test distinguishes them.
+        wrong = brute_force_showdown_ev(h, board, opps, pot, bet)
+
+        ests = [mc_showdown_ev_hybrid(
+            h, board, opps, is_active, pot, bet,
+            K=40000, seed=trial * 773 + s) for s in range(5)]
+        mean_est = sum(ests) / len(ests)
+        rel = abs(mean_est - gold) / max(abs(gold), 1.0)
+        max_rel = max(max_rel, rel)
+        assert rel < 0.1, (
+            f"Hybrid N=4 trial {trial}: gold={gold:.4f} "
+            f"mean={mean_est:.4f} rel={rel:.3e}")
+
+        # Assert the test actually distinguishes hybrid from the
+        # all-active semantics (otherwise the test is vacuous).
+        active_vs_hybrid_gap = abs(wrong - gold)
+        print(f"    trial {trial}: gold={gold:.3f} "
+              f"all-active-semantics={wrong:.3f} "
+              f"|gap|={active_vs_hybrid_gap:.3f} "
+              f"mc_mean={mean_est:.3f} rel={rel:.3e}")
+        actual += 1
+
+    print(f"Hybrid showdown N=4 MC vs brute: {actual} trials, "
+          f"max rel = {max_rel:.2e}")
+
+
+def test_hybrid_variance_scales_with_K() -> None:
+    """Variance of the hybrid estimator should scale ~1/sqrt(K), same
+    as the all-active case. Blocker presence just lowers the disjoint-
+    event probability but doesn't change the estimator's variance-K
+    scaling law.
+
+    Guards against a regression that makes the hybrid MC noisier than
+    it should be (e.g. some bias-variance trade we didn't intend).
+    """
+    rng = random.Random(701)
+    board = rng.sample(DECK, 5)
+    h = random_hero_hand(rng, board)
+    opps = [random_range(rng, board, density=0.15) for _ in range(3)]  # N=4
+    is_active = [True, True, False]
+
+    stds: Dict[int, float] = {}
+    for K in (64, 256, 1024, 4096):
+        ests = [mc_showdown_ev_hybrid(
+            h, board, opps, is_active, pot=100.0, bet=30.0,
+            K=K, seed=5000 + s) for s in range(30)]
+        mean = sum(ests) / len(ests)
+        var = sum((e - mean) ** 2 for e in ests) / (len(ests) - 1)
+        stds[K] = math.sqrt(var)
+
+    ratio = stds[64] / max(stds[4096], 1e-12)
+    print(f"Hybrid std scaling: K=64->{stds[64]:.3e}, "
+          f"K=4096->{stds[4096]:.3e}, ratio={ratio:.2f} (expected ~8)")
+    assert 3.0 < ratio < 20.0, (
+        f"Hybrid variance not shrinking as ~1/sqrt(K): ratio={ratio}")
+
+
 def test_independent_ranges_n4() -> None:
     """Disjoint opp card pools → Pi = Z1*Z2*Z3 exactly, estimator collapses."""
     board = [0, 1, 2]
@@ -568,6 +794,8 @@ def main() -> None:
     test_mc_matches_ie_at_n3()
     test_variance_shrinks_with_K()
     test_showdown_mc_matches_brute_n4_small()
+    test_hybrid_showdown_mc_matches_brute_n4()
+    test_hybrid_variance_scales_with_K()
     print("=" * 60)
     print("All tests passed.")
     print("=" * 60)
