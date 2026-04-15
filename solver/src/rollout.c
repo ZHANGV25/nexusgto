@@ -131,9 +131,11 @@ BPS_EXPORT void rollout_apply_bias_c(
         return;
     }
 
+    /* Python uses x / sum(x), not x * (1/sum). We mirror that to stay
+     * bit-exact — (1/sum) introduces a sub-ULP reciprocal error that
+     * breaks bit-for-bit parity on the apply_bias unit tests. */
     if (bias_profile == 0) {
-        double inv = 1.0 / s_sum;
-        for (int32_t i = 0; i < n; i++) out[i] = strategy[i] * inv;
+        for (int32_t i = 0; i < n; i++) out[i] = strategy[i] / s_sum;
         return;
     }
 
@@ -143,18 +145,14 @@ BPS_EXPORT void rollout_apply_bias_c(
         case 2:  target = ROLLOUT_CAT_CALL;  break;
         case 3:  target = ROLLOUT_CAT_RAISE; break;
         default: {
-            /* Unknown profile — unbiased (safer than uniform). */
-            double inv = 1.0 / s_sum;
-            for (int32_t i = 0; i < n; i++) out[i] = strategy[i] * inv;
+            for (int32_t i = 0; i < n; i++) out[i] = strategy[i] / s_sum;
             return;
         }
     }
 
     double biased[ROLLOUT_MAX_ACTIONS_PER_NODE];
     if (n > ROLLOUT_MAX_ACTIONS_PER_NODE) {
-        /* Oversized input — shouldn't happen given our tree, but guard. */
-        double inv = 1.0 / s_sum;
-        for (int32_t i = 0; i < n; i++) out[i] = strategy[i] * inv;
+        for (int32_t i = 0; i < n; i++) out[i] = strategy[i] / s_sum;
         return;
     }
     double total = 0.0;
@@ -167,14 +165,11 @@ BPS_EXPORT void rollout_apply_bias_c(
     }
 
     if (total <= 0.0) {
-        /* No mass on target — unbiased fallback. */
-        double inv = 1.0 / s_sum;
-        for (int32_t i = 0; i < n; i++) out[i] = strategy[i] * inv;
+        for (int32_t i = 0; i < n; i++) out[i] = strategy[i] / s_sum;
         return;
     }
 
-    double inv = 1.0 / total;
-    for (int32_t i = 0; i < n; i++) out[i] = biased[i] * inv;
+    for (int32_t i = 0; i < n; i++) out[i] = biased[i] / total;
 }
 
 /* ── classify_postflop_actions ───────────────────────────────────────── */
