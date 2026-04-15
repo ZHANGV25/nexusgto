@@ -115,6 +115,11 @@ typedef struct {
     int      num_preflop_buckets;   /* typically 169 */
     int      strategies_loaded;     /* 1 after bps_load_strategies succeeds */
     int      evs_loaded;            /* 1 after bps_load_evs succeeds */
+
+    /* Turn k-means centroids (TCN1 format, loaded via
+     * bps_load_turn_centroids). 0 = not loaded; 1..200 after load. */
+    float    turn_centroids[200][3];
+    int      turn_centroids_k;
 } BPSReader;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -265,6 +270,65 @@ BPS_EXPORT int bps_load_texture_cache(BPSReader *r, const char *path,
  */
 BPS_EXPORT int bps_hand_to_bucket(const BPSReader *r,
                                     const int *board, int c0, int c1);
+
+/**
+ * Load turn k-means centroids (TCN1 format) into the reader.
+ *
+ * Format: "TCN1" magic (4B) + int32 k (4B) + float32[k][3] centroids.
+ * The centroids are produced at training time via k-means on
+ * 2000 random turn boards × ~1200 hands each. See
+ * mccfr_blueprint.c:2519 for the producer; matches that format exactly.
+ *
+ * Args:
+ *   r: reader handle (already loaded)
+ *   path: explicit path, or NULL to search standard locations:
+ *         <bps_dir>/turn_centroids.bin, /tmp/turn_centroids.bin,
+ *         C:/tmp/turn_centroids.bin, ./turn_centroids.bin.
+ *         (bps_dir is taken from the texture cache path if available.)
+ *
+ * Returns k on success (centroid count, typically 200), -1 on error.
+ * After a successful load, bps_hand_to_bucket_turn() works.
+ */
+BPS_EXPORT int bps_load_turn_centroids(BPSReader *r, const char *path);
+
+/**
+ * Map a hand on a 4-card turn board to its bucket index.
+ *
+ * Uses ca_compute_features (EHS, PPot, NPot) + ca_nearest_centroid
+ * against the loaded turn centroids. This is the SAME math the EV
+ * walk uses at training time (see bps_ev_walk.c:855-867).
+ *
+ * Args:
+ *   r: reader with turn centroids loaded
+ *   board: 4 turn cards (flop + turn)
+ *   c0, c1: hero's hole cards
+ *
+ * Returns bucket index [0, k-1], or -1 if:
+ *   - turn centroids not loaded (call bps_load_turn_centroids first)
+ *   - hand conflicts with board cards
+ *   - feature computation fails
+ */
+BPS_EXPORT int bps_hand_to_bucket_turn(const BPSReader *r,
+                                         const int *board, int c0, int c1);
+
+/**
+ * Map a hand on a 5-card river board to its bucket index.
+ *
+ * Uses the same deterministic 200-sample EHS percentile as training
+ * (see bps_ev_walk.c:880-898). RNG seed is derived from
+ * (c0, c1, board) so the same hand on the same board always maps
+ * to the same bucket.
+ *
+ * Args:
+ *   r: loaded reader
+ *   board: 5 river cards (flop + turn + river)
+ *   c0, c1: hero's hole cards
+ *
+ * Returns bucket index [0, num_postflop_buckets-1], or -1 if the
+ * hand conflicts with the board.
+ */
+BPS_EXPORT int bps_hand_to_bucket_river(const BPSReader *r,
+                                          const int *board, int c0, int c1);
 
 /**
  * Save the loaded hash table state to a binary cache file.

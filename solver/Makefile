@@ -38,11 +38,13 @@ $(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.
 $(BUILD_DIR)/solver$(SHLIB_EXT): $(SRC_DIR)/solver.c $(SRC_DIR)/solver.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/solver.c -o $@ $(LDFLAGS)
 
-# ── BPS reader (standalone, no OpenMP/card_abstraction) ──
+# ── BPS reader (pure reader + turn/river bucketizer) ──
+# Links card_abstraction.c for bps_hand_to_bucket_turn/river (EHS/k-means).
+# No OpenMP needed — bucketizer is single-hand at a time.
 bps_reader: $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
 
-$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/bps_reader.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
 
 # ── BPS EV walk (reader + card_abstraction + OpenMP) ──
 bps_ev_walk: $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT)
@@ -55,8 +57,8 @@ $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_re
 # Links bps_reader.c (blueprint queries); eval7 is header-only.
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
-$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
 

@@ -144,6 +144,24 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.bps_hand_to_bucket.restype = ctypes.c_int
 
+    # Turn/river bucketizers (added 2026-04-15 alongside the rollout port).
+    # Not present in older bps_reader.dll builds — guard with hasattr.
+    if hasattr(lib, "bps_load_turn_centroids"):
+        lib.bps_load_turn_centroids.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+        ]
+        lib.bps_load_turn_centroids.restype = ctypes.c_int
+    if hasattr(lib, "bps_hand_to_bucket_turn"):
+        lib.bps_hand_to_bucket_turn.argtypes = [
+            ctypes.c_void_p, c_int_p, ctypes.c_int, ctypes.c_int,
+        ]
+        lib.bps_hand_to_bucket_turn.restype = ctypes.c_int
+    if hasattr(lib, "bps_hand_to_bucket_river"):
+        lib.bps_hand_to_bucket_river.argtypes = [
+            ctypes.c_void_p, c_int_p, ctypes.c_int, ctypes.c_int,
+        ]
+        lib.bps_hand_to_bucket_river.restype = ctypes.c_int
+
     lib.bps_reader_stats.argtypes = [
         ctypes.c_void_p,
         c_int64_p, c_int64_p, c_int64_p, c_int64_p,
@@ -438,6 +456,39 @@ class BPSReaderC:
                 if ret > 0:
                     break
 
+        # Auto-load turn centroids so hand_to_bucket_turn works. Required
+        # for rollouts that reach a turn decision. Silently skipped if
+        # the lib doesn't have the symbol (older DLL build) or no
+        # centroids file exists anywhere.
+        self._load_turn_centroids_auto(bps_path)
+
+    def _load_turn_centroids_auto(self, bps_path: str) -> None:
+        """Auto-load TCN1 turn centroids from standard locations."""
+        if not hasattr(self._lib, "bps_load_turn_centroids"):
+            return
+        bps_dir = Path(bps_path).parent
+        repo_root = Path(__file__).resolve().parent.parent
+        candidates = [
+            bps_dir / "turn_centroids.bin",
+            repo_root / "turn_centroids.bin",
+            Path("turn_centroids.bin"),
+            Path("/tmp/turn_centroids.bin"),
+            Path("C:/tmp/turn_centroids.bin"),
+        ]
+        for tc in candidates:
+            try:
+                if tc.exists():
+                    ret = self._lib.bps_load_turn_centroids(
+                        self._reader, str(tc).encode("utf-8"),
+                    )
+                    if ret > 0:
+                        return
+            except (OSError, ValueError):
+                continue
+        # Pass NULL to let C search its internal candidate list too
+        # (catches /tmp paths that exist on Linux training boxes).
+        self._lib.bps_load_turn_centroids(self._reader, None)
+
     def _report_stats(self) -> None:
         """Print loaded reader statistics."""
         n_nodes = ctypes.c_int64(0)
@@ -600,6 +651,58 @@ class BPSReaderC:
         """
         board_arr = (ctypes.c_int * 3)(*board[:3])
         return self._lib.bps_hand_to_bucket(self._reader, board_arr, c0, c1)
+
+    def hand_to_bucket_turn(self, board: List[int], c0: int, c1: int) -> int:
+        """Map a hand on a 4-card turn board to its bucket index.
+
+        Uses k-means centroids (must be auto-loaded at init or via
+        load_turn_centroids()). Matches bps_ev_walk.c training-time
+        bucketing exactly.
+
+        Args:
+            board: 4 turn cards
+            c0, c1: hero's hole cards
+
+        Returns bucket index (0 to k-1), or -1 if centroids not loaded
+        or hand conflicts with board.
+        """
+        if not hasattr(self._lib, "bps_hand_to_bucket_turn"):
+            return -1
+        board_arr = (ctypes.c_int * 4)(*board[:4])
+        return self._lib.bps_hand_to_bucket_turn(self._reader, board_arr, c0, c1)
+
+    def hand_to_bucket_river(self, board: List[int], c0: int, c1: int) -> int:
+        """Map a hand on a 5-card river board to its bucket index.
+
+        Uses deterministic 200-sample EHS percentile bucketing.
+        Matches bps_ev_walk.c training-time bucketing exactly (same
+        RNG seed derivation from cards + board).
+
+        Args:
+            board: 5 river cards
+            c0, c1: hero's hole cards
+
+        Returns bucket index (0 to num_postflop_buckets-1), or -1 if
+        hand conflicts with board.
+        """
+        if not hasattr(self._lib, "bps_hand_to_bucket_river"):
+            return -1
+        board_arr = (ctypes.c_int * 5)(*board[:5])
+        return self._lib.bps_hand_to_bucket_river(self._reader, board_arr, c0, c1)
+
+    def load_turn_centroids(self, path: Optional[str] = None) -> int:
+        """Load turn k-means centroids (TCN1 format).
+
+        Args:
+            path: explicit path, or None to search standard locations
+                (turn_centroids.bin in cwd, /tmp, C:/tmp, /dev/shm).
+
+        Returns k (centroid count) on success, -1 on miss.
+        """
+        if not hasattr(self._lib, "bps_load_turn_centroids"):
+            return -1
+        encoded = path.encode("utf-8") if path else None
+        return self._lib.bps_load_turn_centroids(self._reader, encoded)
 
     def compute_evs(
         self,

@@ -8,6 +8,8 @@
  */
 
 #include "bps_reader.h"
+#include "card_abstraction.h"   /* ca_compute_features, ca_nearest_centroid */
+#include "hand_eval.h"          /* eval7 (header-only) for river EHS */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -907,6 +909,140 @@ int bps_hand_to_bucket(const BPSReader *r,
     if (hidx < 0 || hidx >= BPS_MAX_HANDS) return -1;
 
     return r->textures.bucket_cache[tex_idx * BPS_MAX_HANDS + hidx];
+}
+
+/* ── Turn / river bucketizer ─────────────────────────────────────────── */
+
+/* xorshift64 — matches bps_ev_walk.c:46-52 exactly. Must stay in sync
+ * so runtime river buckets match training-time buckets bit-for-bit. */
+static inline uint64_t bpr_rng_next(uint64_t *state) {
+    uint64_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return x;
+}
+
+static inline int bpr_rng_int(uint64_t *state, int n) {
+    return (int)(bpr_rng_next(state) % (uint64_t)n);
+}
+
+/* Partial Fisher-Yates — matches bps_ev_walk.c:63-68 exactly. */
+static void bpr_partial_shuffle(int *arr, int n, int k, uint64_t *rng) {
+    for (int i = 0; i < k && i < n; i++) {
+        int j = i + bpr_rng_int(rng, n - i);
+        int tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+}
+
+int bps_load_turn_centroids(BPSReader *r, const char *path) {
+    if (!r) return -1;
+
+    /* Candidate paths in order of preference. */
+    const char *candidates[8];
+    int n_cand = 0;
+    char bps_dir_candidate[1024];
+    if (path && path[0]) {
+        candidates[n_cand++] = path;
+    }
+    candidates[n_cand++] = "turn_centroids.bin";  /* cwd */
+    candidates[n_cand++] = "/tmp/turn_centroids.bin";
+    candidates[n_cand++] = "C:/tmp/turn_centroids.bin";
+    candidates[n_cand++] = "/dev/shm/turn_centroids.bin";
+
+    for (int ci = 0; ci < n_cand; ci++) {
+        FILE *f = fopen(candidates[ci], "rb");
+        if (!f) continue;
+
+        char magic[4];
+        if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "TCN1", 4) != 0) {
+            fclose(f);
+            continue;
+        }
+        int k_saved = 0;
+        if (fread(&k_saved, sizeof(int), 1, f) != 1 ||
+            k_saved <= 0 || k_saved > 200) {
+            fclose(f);
+            continue;
+        }
+        size_t n_floats = (size_t)k_saved * 3;
+        if (fread(r->turn_centroids, sizeof(float), n_floats, f) != n_floats) {
+            fclose(f);
+            continue;
+        }
+        fclose(f);
+        r->turn_centroids_k = k_saved;
+        fprintf(stderr, "[bps_reader] Loaded %d turn centroids from %s\n",
+                k_saved, candidates[ci]);
+        (void)bps_dir_candidate;  /* reserved for future bps-dir derivation */
+        return k_saved;
+    }
+    return -1;
+}
+
+int bps_hand_to_bucket_turn(const BPSReader *r,
+                             const int *board, int c0, int c1) {
+    if (!r || !board || r->turn_centroids_k <= 0) return -1;
+
+    /* Hand must not collide with the 4-card turn board. */
+    for (int i = 0; i < 4; i++) {
+        if (board[i] == c0 || board[i] == c1) return -1;
+    }
+
+    int hand[1][2] = {{c0, c1}};
+    float feat[1][3];
+    /* Match bps_ev_walk.c:863 — 200 samples for features on the turn. */
+    ca_compute_features(board, 4, (const int(*)[2])hand, 1, 200, feat);
+    return ca_nearest_centroid(feat[0],
+                                (const float(*)[3])r->turn_centroids,
+                                r->turn_centroids_k);
+}
+
+int bps_hand_to_bucket_river(const BPSReader *r,
+                              const int *board, int c0, int c1) {
+    if (!r || !board) return -1;
+    int k = r->num_postflop_buckets > 0 ? r->num_postflop_buckets : 200;
+
+    /* Hand must not collide with the 5-card river board. */
+    for (int i = 0; i < 5; i++) {
+        if (board[i] == c0 || board[i] == c1) return -1;
+    }
+
+    /* Build available deck (52 minus board minus hero hand). */
+    int blk[52] = {0};
+    for (int b = 0; b < 5; b++) blk[board[b]] = 1;
+    blk[c0] = 1;
+    blk[c1] = 1;
+    int av[52];
+    int nav = 0;
+    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
+    if (nav < 2) return -1;
+
+    /* Deterministic RNG seed — MUST match bps_ev_walk.c:880-882 exactly. */
+    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
+    for (int brd = 0; brd < 5; brd++) {
+        erng = erng * 6364136223846793005ULL + (uint64_t)board[brd];
+    }
+
+    int wins = 0, ties = 0, total = 0;
+    int h7[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
+    uint32_t hs = eval7(h7);
+    for (int si = 0; si < 200 && nav >= 2; si++) {
+        bpr_partial_shuffle(av, nav, 2, &erng);
+        int o7[7] = { board[0], board[1], board[2], board[3], board[4],
+                      av[0], av[1] };
+        uint32_t os_ = eval7(o7);
+        if (hs > os_) wins++;
+        else if (hs == os_) ties++;
+        total++;
+    }
+    float ehs = (total > 0) ? ((float)wins + 0.5f * (float)ties) / (float)total
+                            : 0.5f;
+    int bucket = (int)(ehs * (float)k);
+    if (bucket < 0) bucket = 0;
+    if (bucket >= k) bucket = k - 1;
+    return bucket;
 }
 
 /* ── Cache serialization ─────────────────────────────────────────────── */
