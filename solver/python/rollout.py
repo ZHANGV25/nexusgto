@@ -731,3 +731,137 @@ def compute_leaf_value(
     if payoffs_recorded == 0:
         return 0.0
     return payoff_sum / payoffs_recorded
+
+
+# ─── Multi-hand and multi-leaf wrappers (API-facing) ─────────────────────
+
+
+def compute_leaf_values_all_hands(
+    leaf: RolloutLeaf,
+    bias_profile: Sequence[int],
+    blueprint,
+    max_hands: int,
+    num_rollouts: int = NUM_ROLLOUTS_DEFAULT,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Compute per-player per-hand leaf value for ALL hands in the leaf.
+
+    Returns [num_players, max_hands] float32, matching the array shape
+    the old rollout_leaves.compute_leaf_value_via_rollout produced.
+    Inactive players get 0 across all their hand slots.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+    num_players = len(leaf.active)
+    out = np.zeros((num_players, max_hands), dtype=np.float32)
+
+    for p in range(num_players):
+        if not leaf.active[p]:
+            continue
+        hands = leaf.player_hands[p]
+        n = min(len(hands), max_hands)
+        for h_idx in range(n):
+            c0, c1, w = hands[h_idx]
+            if w <= 0.0 or c0 in leaf.board or c1 in leaf.board:
+                continue
+            v = compute_leaf_value(
+                leaf=leaf, bias_profile=bias_profile,
+                blueprint=blueprint, hero_player=p, hero_hand_idx=h_idx,
+                num_rollouts=num_rollouts, rng=rng,
+            )
+            out[p, h_idx] = np.float32(v)
+    return out
+
+
+def compute_subgame_leaf_values(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    starting_pot_chips: int,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int = NUM_ROLLOUTS_DEFAULT,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Build the full [total_leaves × num_players × max_hands] array.
+
+    This is the Pluribus-faithful replacement for the old
+    rollout_leaves.compute_flop_leaf_values_rollout. The solver calls
+    this once per CFR iteration (or once at setup, depending on how
+    the cont-strat values are cached).
+
+    Each leaf is enumerated against all 4^num_players bias combos;
+    flat leaf index = leaf_infos[i].leaf_idx * cont_per_leaf + combo.
+
+    Args:
+        leaf_infos: from leaf_values.extract_leaf_info_from_tree.
+            Each has .leaf_idx, .pot, and optionally .bets.
+        board: current street's full board (3/4/5 card ints).
+        street: "flop" | "turn" | "river".
+        player_hands: per-compact-slot (c0, c1, reach_weight) lists.
+        active: per-compact-slot bool. Folded players False.
+        acting_order: compact slots, postflop order, filtered to
+            active-at-leaf players.
+        player_seats: compact slot -> blueprint full seat (0-5).
+        game_action_history: full preflop+prior-postflop indices.
+        blueprint: BPSReaderC or BlueprintV2.
+        starting_pot_chips: pot entering this street.
+        stack_chips: starting stack (same for every active player,
+            pre-deduction of leaf bets).
+        max_hands: max hands per player across the range.
+        num_rollouts: Pluribus uses 3. More reduces variance.
+        rng: numpy Generator; if None, seeds with 42 for determinism.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    num_players = len(player_hands)
+    cont_per_leaf = NUM_BIAS_PROFILES ** num_players
+    num_orig = len(leaf_infos)
+    total = num_orig * cont_per_leaf
+
+    out = np.zeros((total, num_players, max_hands), dtype=np.float32)
+
+    for li in leaf_infos:
+        leaf_bets = list(li.bets) if hasattr(li, "bets") else [0] * num_players
+        # Stacks at this leaf: starting stack minus chips invested so
+        # far (approximated by leaf_bets here). This is what the solver
+        # provides per-leaf via its extract_leaf_info_from_tree.
+        stacks = [max(0, stack_chips - b) for b in leaf_bets]
+
+        leaf = RolloutLeaf(
+            board=list(board),
+            pot_chips=int(li.pot),
+            active=list(active),
+            stacks=stacks,
+            bets=leaf_bets,
+            street=street,
+            player_hands=player_hands,
+            acting_order=list(acting_order),
+            game_action_history=list(game_action_history),
+            player_seats=list(player_seats),
+        )
+
+        for combo in range(cont_per_leaf):
+            bias = [(combo // (NUM_BIAS_PROFILES ** p)) % NUM_BIAS_PROFILES
+                    for p in range(num_players)]
+            flat = li.leaf_idx * cont_per_leaf + combo
+            if flat >= total:
+                continue
+            try:
+                arr = compute_leaf_values_all_hands(
+                    leaf=leaf, bias_profile=bias,
+                    blueprint=blueprint, max_hands=max_hands,
+                    num_rollouts=num_rollouts, rng=rng,
+                )
+            except LeafValueUnavailable:
+                # Propagate — the whole subgame is uncovered.
+                raise
+            out[flat] = arr
+    return out
