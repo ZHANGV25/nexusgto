@@ -402,6 +402,363 @@ def test_timing_crossover() -> None:
     assert rel_err < 1e-9
 
 
+## ═══════════════════════════════════════════════════════════════════════
+## A5 extension — hybrid active+blocker CFV
+##
+## At a LEAF terminal (continuation-strategy), payoff depends only on the
+## traverser's hand:
+##     cfv(h) = payoff(h) · Π_full(h)
+## where Π_full sums reach products over ALL pairwise-disjoint non-
+## traverser opp combos — active AND folded — disjoint from board and
+## hero. Folded opps contribute frozen reach as card-blockers; they do
+## NOT enter the payoff sum (that is scalar in h at a cont-strat leaf).
+##
+## The defect the A5 audit catches is that the current leaf/showdown
+## kernels compute Π over ACTIVE opps only, dropping the folded-opp
+## blocker contribution.
+##
+## The fix at the leaf kernel is algorithmically trivial under this
+## derivation: use the existing n_opp inclusion-exclusion formula
+## over all non-traverser opps (fast_pi_n3 handles both "2 active" and
+## "1 active + 1 blocker" cases identically — the IE does not care
+## about active vs blocker status, only about cards).
+##
+## These tests exercise the hybrid case directly to make that
+## derivation explicit and guarded.
+## ═══════════════════════════════════════════════════════════════════════
+
+
+def brute_force_leaf_cfv(
+    traverser_hand: Tuple[int, int],
+    board: List[int],
+    opp_ranges: List[Dict[Tuple[int, int], float]],
+    active: List[bool],
+    payoff_by_hand: float,
+) -> float:
+    """Brute-force CFV at a cont-strat leaf.
+
+    cfv = payoff_by_hand * Σ Π_p reach_p(o_p)
+    sum over all opp N-tuples pairwise disjoint, disjoint from h+board.
+    ALL non-traverser opps contribute to reach product (active AND folded);
+    `active` is captured here only to document the semantic — at a cont-
+    strat leaf the payoff is already scalar in h, so active_mask does NOT
+    influence the product. The test asserts that active/all give the same
+    reach product — which is the A5 defect when the kernel only sums
+    active.
+    """
+    del active  # not used in the corrected semantics
+    pi_full = brute_force_pi(traverser_hand, board, opp_ranges)
+    return payoff_by_hand * pi_full
+
+
+def active_only_leaf_cfv_BUGGY(
+    traverser_hand: Tuple[int, int],
+    board: List[int],
+    opp_ranges: List[Dict[Tuple[int, int], float]],
+    active: List[bool],
+    payoff_by_hand: float,
+) -> float:
+    """The current (buggy) leaf kernel semantics.
+
+    Filters opps to active-only BEFORE forming the reach product. Folded
+    opps are dropped, so their blocker contribution is lost.
+    """
+    active_ranges = [r for r, a in zip(opp_ranges, active) if a]
+    pi_active = brute_force_pi(traverser_hand, board, active_ranges)
+    return payoff_by_hand * pi_active
+
+
+def test_a5_hybrid_leaf_single_active_single_blocker(
+    num_trials: int = 30, seed: int = 20260414
+) -> None:
+    """3p leaf: 1 active + 1 folded. Verify:
+    1. The correct CFV (brute force over BOTH opps) equals
+       payoff · fast_pi_n3(h, board, [active, blocker]).
+    2. The buggy CFV (active-only) produces a DIFFERENT number whenever
+       the blocker's range has nonzero reach compatible with the residual
+       card space — i.e. the A5 defect manifests.
+
+    Both claims together prove the fix: the fast formula, applied over
+    ALL non-traverser opps, recovers the correct CFV at 1e-12 precision.
+    """
+    rng = random.Random(seed)
+    max_err = 0.0
+    num_defect_observed = 0
+    for trial in range(num_trials):
+        num_board = rng.choice([3, 4, 5])
+        board = rng.sample(DECK, num_board)
+        while True:
+            h = tuple(sorted(rng.sample(DECK, 2)))
+            if h[0] not in board and h[1] not in board:
+                break
+        active_range = random_range(rng, board, density=0.08)
+        blocker_range = random_range(rng, board, density=0.08)
+        if not active_range or not blocker_range:
+            continue
+        # Synthetic payoff (any hand-only scalar works; exercise both signs).
+        payoff = rng.uniform(-10.0, 10.0)
+
+        # Claim 1: fast formula over both opps == brute force.
+        gold = brute_force_leaf_cfv(
+            h, board, [active_range, blocker_range],
+            active=[True, False], payoff_by_hand=payoff,
+        )
+        fast_pi = fast_pi_n3(h, board, [active_range, blocker_range])
+        fast_cfv = payoff * fast_pi
+        err = abs(gold - fast_cfv)
+        max_err = max(max_err, err)
+        if err > 1e-9:
+            print(f"  HYBRID FAIL trial {trial}: gold={gold:.9f} "
+                  f"fast={fast_cfv:.9f} err={err:.2e}")
+
+        # Claim 2: buggy (active-only) CFV differs from correct whenever
+        # the blocker has live reach over the residual card space.
+        buggy = active_only_leaf_cfv_BUGGY(
+            h, board, [active_range, blocker_range],
+            active=[True, False], payoff_by_hand=payoff,
+        )
+        if abs(gold - buggy) > 1e-6 * max(abs(gold), abs(buggy), 1e-9):
+            num_defect_observed += 1
+
+    print(f"A5 hybrid leaf (1 active + 1 blocker): {num_trials} trials, "
+          f"max fast-vs-brute err = {max_err:.2e}")
+    print(f"  defect manifest on {num_defect_observed}/{num_trials} trials "
+          f"(non-zero blocker contribution)")
+    assert max_err < 1e-9, f"hybrid fast formula mismatch: {max_err}"
+    # On random trials with density=0.08 per opp, expect the defect to
+    # manifest on essentially every trial — if it doesn't, either the
+    # synthetic setup is degenerate or the fix already landed (which
+    # means this test should be downgraded to a pure correctness gate).
+    assert num_defect_observed >= num_trials // 2, (
+        "defect did not manifest on >=50% of trials — either the setup is "
+        "degenerate or the kernel already matches"
+    )
+
+
+def test_a5_blocker_only_reduces_reach() -> None:
+    """Sanity: adding a blocker with nonzero reach strictly REDUCES the
+    reach product (more disjointness constraints). Confirms the sign of
+    the A5 bias: current kernel overestimates Π at leaves with mid-street
+    folds."""
+    rng = random.Random(7777)
+    board = rng.sample(DECK, 3)
+    while True:
+        h = tuple(sorted(rng.sample(DECK, 2)))
+        if h[0] not in board and h[1] not in board:
+            break
+    # One active, one folded with broad range.
+    active_range = random_range(rng, board, density=0.15)
+    blocker_range = random_range(rng, board, density=0.30)
+    pi_active_only = single_opp_reach(
+        h, board, active_range
+    )  # N=2: just active
+    # Multiply blocker reach by total raw sum (if independent — but they're
+    # not independent because of card coupling). Use fast_pi_n3 to get the
+    # actual coupled value.
+    pi_both = fast_pi_n3(h, board, [active_range, blocker_range])
+    total_blocker_reach = sum(blocker_range.values())
+    naive_product = pi_active_only * total_blocker_reach
+    print(
+        f"A5 sign check: Pi_active_only={pi_active_only:.4f}, "
+        f"total_blocker_reach={total_blocker_reach:.4f}, "
+        f"naive_product={naive_product:.4f}, "
+        f"true_Pi_both={pi_both:.4f}"
+    )
+    # With coupling the true combined Pi is ≤ naive product.
+    assert pi_both <= naive_product + 1e-9, (
+        "coupled reach product must not exceed uncoupled product"
+    )
+    # And it should be meaningfully less (card coupling is the whole
+    # reason A5 cannot be fixed by naive "multiply by folded total reach").
+    coupling_gap = naive_product - pi_both
+    assert coupling_gap > 1e-6, (
+        "coupling gap should be nonzero on this setup — if it's zero, "
+        "the test is not exercising the blocker constraint"
+    )
+
+
+def precompute_card_tables_strength_sliced(
+    board: List[int],
+    opp_range: Dict[Tuple[int, int], float],
+    strength_fn,
+    hero_strength: int,
+    klass: str,  # "lt" or "eq"
+) -> Tuple[float, Dict[int, float], Dict[Tuple[int, int], float]]:
+    """S-tables restricted to hands in the given strength class.
+
+    Used to test the hybrid SHOWDOWN formula: one active opp sliced by
+    strength, one blocker opp unsliced. Returns (S0, S1, S2) over hands
+    in range whose strength stands in the requested relation to hero.
+    """
+    board_set = set(board)
+    S2: Dict[Tuple[int, int], float] = {}
+    for (a, b), w in opp_range.items():
+        if a in board_set or b in board_set:
+            continue
+        s = strength_fn((a, b))
+        if s == 0:
+            continue
+        if klass == "lt" and not (s < hero_strength):
+            continue
+        if klass == "eq" and not (s == hero_strength):
+            continue
+        key = (a, b) if a < b else (b, a)
+        S2[key] = w
+    S0 = sum(S2.values())
+    S1: Dict[int, float] = {}
+    for (a, b), w in S2.items():
+        S1[a] = S1.get(a, 0.0) + w
+        S1[b] = S1.get(b, 0.0) + w
+    return S0, S1, S2
+
+
+def brute_force_showdown_cfv_hybrid(
+    traverser_hand: Tuple[int, int],
+    board: List[int],
+    active_range: Dict[Tuple[int, int], float],
+    blocker_range: Dict[Tuple[int, int], float],
+    strength_fn,
+    trav_bet: float,
+    pot: float,
+) -> float:
+    """Brute-force showdown CFV for 3p river with 1 active + 1 folded.
+
+    v(h) = Σ_{(oa, of) disjoint, disjoint from h,B}
+           reach_a(oa) · reach_f(of) · payoff(h, oa)
+    where payoff(h, oa) depends only on strength(h) vs strength(oa)
+    (pot/n_winners for win/tie, -trav_bet for loss). The folded opp
+    enters ONLY via the reach product and disjointness constraint.
+    """
+    c0, c1 = traverser_hand
+    blocked_by_hero = set(board) | {c0, c1}
+    hs = strength_fn(traverser_hand)
+    if hs == 0:
+        return 0.0
+    total = 0.0
+    for (oa0, oa1), wa in active_range.items():
+        if oa0 in blocked_by_hero or oa1 in blocked_by_hero:
+            continue
+        os_a = strength_fn((oa0, oa1))
+        if os_a == 0:
+            continue
+        # Active opp's payoff contribution
+        if hs > os_a:
+            pay = pot - trav_bet
+        elif hs < os_a:
+            pay = -trav_bet
+        else:  # tie 1v1 means split between hero + active opp (2 winners)
+            pay = 0.5 * pot - trav_bet
+        # Sum blocker reach over hands disjoint from {h, B, active opp}
+        extra_blocked = blocked_by_hero | {oa0, oa1}
+        blocker_sum = 0.0
+        for (of0, of1), wf in blocker_range.items():
+            if of0 in extra_blocked or of1 in extra_blocked:
+                continue
+            blocker_sum += wf
+        total += wa * blocker_sum * pay
+    return total
+
+
+def fast_showdown_cfv_hybrid(
+    traverser_hand: Tuple[int, int],
+    board: List[int],
+    active_range: Dict[Tuple[int, int], float],
+    blocker_range: Dict[Tuple[int, int], float],
+    strength_fn,
+    trav_bet: float,
+    pot: float,
+) -> float:
+    """Fast showdown CFV for 3p river with 1 active + 1 folded.
+
+    Decompose:
+      v(h) = -trav_bet · Π_full(h)
+             + pot · [ Π_{<}(h) + 0.5 · Π_{=}(h) ]
+    where Π_full = full 2-opp IE over (active, blocker);
+    Π_{κ}    = 2-opp IE with active-opp range sliced to strength class κ,
+               blocker-opp range unchanged.
+
+    Both Π's use the standard 2-opp IE: A - B1 + B2.
+    """
+    c0, c1 = traverser_hand
+    hs = strength_fn(traverser_hand)
+    if hs == 0:
+        return 0.0
+
+    # Full Π over both opps (no strength slicing)
+    pi_full = fast_pi_n3(traverser_hand, board,
+                         [active_range, blocker_range])
+
+    # Strength-sliced Π's: active opp's range restricted; blocker unsliced.
+    # Build both active slices; the blocker S-tables are unchanged per class.
+    active_lt_range = {
+        h: w for h, w in active_range.items()
+        if strength_fn(h) != 0 and strength_fn(h) < hs
+    }
+    active_eq_range = {
+        h: w for h, w in active_range.items()
+        if strength_fn(h) == hs
+    }
+    pi_lt = fast_pi_n3(traverser_hand, board,
+                       [active_lt_range, blocker_range])
+    pi_eq = fast_pi_n3(traverser_hand, board,
+                       [active_eq_range, blocker_range])
+
+    return -trav_bet * pi_full + pot * (pi_lt + 0.5 * pi_eq)
+
+
+def test_a5_hybrid_showdown_single_active_single_blocker(
+    num_trials: int = 20, seed: int = 20260414 + 1
+) -> None:
+    """3p river showdown, 1 active + 1 folded opp. The fast formula
+    (Π_full, Π_<, Π_=) must match brute-force CFV at double-precision.
+
+    Uses a synthetic strength function (rank-based) so we don't drag in
+    the full card-strength evaluator; the IE structure is what's under
+    test, not poker hand ranking."""
+
+    def strength_fn(hand: Tuple[int, int]) -> int:
+        """Simple synthetic strength: rank*13 + min_rank; treats pairs as
+        strong. Returns 0 for no-trap (never, since no board involved)."""
+        a, b = hand
+        ra, rb = a >> 2, b >> 2
+        if ra == rb:
+            return 100 + ra
+        return max(ra, rb) * 13 + min(ra, rb) + 1
+
+    rng = random.Random(seed)
+    max_err = 0.0
+    for trial in range(num_trials):
+        num_board = rng.choice([3, 5])  # 5 = river
+        board = rng.sample(DECK, num_board)
+        while True:
+            h = tuple(sorted(rng.sample(DECK, 2)))
+            if h[0] not in board and h[1] not in board:
+                break
+        active_range = random_range(rng, board, density=0.08)
+        blocker_range = random_range(rng, board, density=0.08)
+        if not active_range or not blocker_range:
+            continue
+        trav_bet = rng.uniform(1.0, 10.0)
+        pot = rng.uniform(trav_bet * 2.0, trav_bet * 20.0)
+
+        gold = brute_force_showdown_cfv_hybrid(
+            h, board, active_range, blocker_range,
+            strength_fn, trav_bet, pot,
+        )
+        fast = fast_showdown_cfv_hybrid(
+            h, board, active_range, blocker_range,
+            strength_fn, trav_bet, pot,
+        )
+        err = abs(gold - fast)
+        max_err = max(max_err, err)
+        if err > 1e-7:  # looser than pure Π tests (ranges sliced by strength)
+            print(f"  HYBRID SHOWDOWN FAIL trial {trial}: "
+                  f"gold={gold:.9f} fast={fast:.9f} err={err:.2e}")
+
+    print(f"A5 hybrid showdown: {num_trials} trials, max err = {max_err:.2e}")
+    assert max_err < 1e-7, f"hybrid showdown formula mismatch: {max_err}"
+
+
 def main() -> None:
     print("=" * 60)
     print("Opponent-reach inclusion-exclusion verification")
@@ -414,6 +771,12 @@ def main() -> None:
     test_n3_random(num_trials=30)
     test_realistic_density()
     test_timing_crossover()
+    print("-" * 60)
+    print("A5 hybrid active+blocker extensions")
+    print("-" * 60)
+    test_a5_hybrid_leaf_single_active_single_blocker(num_trials=30)
+    test_a5_blocker_only_reduces_reach()
+    test_a5_hybrid_showdown_single_active_single_blocker(num_trials=20)
     print("=" * 60)
     print("All tests passed.")
     print("=" * 60)
