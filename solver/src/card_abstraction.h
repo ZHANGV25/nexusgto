@@ -324,6 +324,78 @@ CA_EXPORT void ca_compute_ehs_distribution(
     int n_bins
 );
 
+/**
+ * Batch version: compute equity distributions for all hands on a board.
+ *
+ * Equivalent to calling ca_compute_ehs_distribution for each hand, but
+ * as a single call for pipeline convenience.
+ *
+ * Args:
+ *   board:       board cards (3/4/5)
+ *   n_board:     number of board cards
+ *   hands:       [num_hands][2] hero hands
+ *   num_hands:   number of hands
+ *   num_samples: MC samples per hand
+ *   out_hists:   [num_hands * n_bins] flat row-major output
+ *   n_bins:      bins per histogram (e.g. 50)
+ */
+CA_EXPORT void ca_compute_ehs_distribution_batch(
+    const int *board, int n_board,
+    const int hands[][2], int num_hands,
+    int num_samples,
+    float *out_hists,
+    int n_bins
+);
+
+/**
+ * K-means clustering using Earth Mover's Distance on equity distributions.
+ *
+ * Replacement for ca_assign_buckets_kmeans that uses PA-EMD distance
+ * instead of L2 on [EHS, PPot, NPot]. Each hand is represented by its
+ * n_bins-dimensional equity histogram; distances between hands are
+ * measured by 1D EMD. Centroid update uses element-wise histogram
+ * averaging (the Wasserstein barycenter for 1D histograms on a grid).
+ *
+ * Args:
+ *   hists:       [num_hands * n_bins] flat row-major equity histograms
+ *   num_hands:   number of hands
+ *   n_bins:      bins per histogram
+ *   num_buckets: target k
+ *   n_iters:     Lloyd iterations (20 is standard)
+ *   bucket_out:  [num_hands] output bucket index for each hand
+ *
+ * Returns actual number of non-empty buckets.
+ */
+CA_EXPORT int ca_assign_buckets_kmeans_emd(
+    const float *hists, int num_hands, int n_bins,
+    int num_buckets, int n_iters,
+    int *bucket_out
+);
+
+/**
+ * Convenience: compute distributions + run EMD k-means in one call.
+ *
+ * Computes equity distributions for all hands, then clusters them
+ * using EMD k-means. Equivalent to ca_compute_ehs_distribution_batch +
+ * ca_assign_buckets_kmeans_emd.
+ *
+ * Args:
+ *   board, n_board: board cards
+ *   hands, num_hands: hero hands
+ *   num_buckets: target k
+ *   n_samples: MC samples per hand for distribution
+ *   n_bins: histogram bins (50 default)
+ *   bucket_out: [num_hands] output bucket assignments
+ *
+ * Returns actual number of non-empty buckets.
+ */
+CA_EXPORT int ca_assign_buckets_pa_emd(
+    const int *board, int n_board,
+    const int hands[][2], int num_hands,
+    int num_buckets, int n_samples, int n_bins,
+    int *bucket_out
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -949,3 +949,147 @@ void ca_compute_ehs_distribution(
         for (int i = 0; i < n_bins; i++) out_hist[i] *= inv;
     }
 }
+
+void ca_compute_ehs_distribution_batch(
+    const int *board, int n_board,
+    const int hands[][2], int num_hands,
+    int num_samples,
+    float *out_hists,
+    int n_bins
+) {
+    if (!board || !hands || !out_hists || num_hands <= 0) return;
+    for (int h = 0; h < num_hands; h++) {
+        ca_compute_ehs_distribution(
+            board, n_board,
+            hands[h],
+            num_samples,
+            out_hists + (size_t)h * n_bins,
+            n_bins
+        );
+    }
+}
+
+/* ── EMD k-means (Phase 2) ──────────────────────────────────────── */
+
+/*
+ * Compute mean EHS from a histogram (for percentile seeding).
+ * EHS ≈ sum_i (bin_center_i * hist[i]) where bin_center_i = i/(n_bins-1).
+ */
+static float hist_mean_ehs(const float *hist, int n_bins) {
+    if (n_bins <= 1) return 0.5f;
+    double sum = 0.0;
+    double inv = 1.0 / (double)(n_bins - 1);
+    for (int i = 0; i < n_bins; i++) {
+        sum += (double)i * inv * (double)hist[i];
+    }
+    return (float)sum;
+}
+
+int ca_assign_buckets_kmeans_emd(
+    const float *hists, int num_hands, int n_bins,
+    int num_buckets, int n_iters,
+    int *bucket_out
+) {
+    if (num_hands <= 0 || n_bins <= 0 || num_buckets <= 0) return 0;
+    int k = (num_buckets < num_hands) ? num_buckets : num_hands;
+    if (k <= 1) {
+        for (int i = 0; i < num_hands; i++) bucket_out[i] = 0;
+        return 1;
+    }
+
+    /*
+     * Step 1: Percentile seed centroids on mean EHS (same strategy as
+     * ca_assign_buckets_kmeans, but seeding from histogram means).
+     */
+    EhsPair *sorted = (EhsPair*)malloc(num_hands * sizeof(EhsPair));
+    for (int i = 0; i < num_hands; i++) {
+        sorted[i].idx = i;
+        sorted[i].ehs = hist_mean_ehs(hists + (size_t)i * n_bins, n_bins);
+    }
+    qsort(sorted, num_hands, sizeof(EhsPair), cmp_ehs);
+
+    /* Centroids are histograms: [k × n_bins] */
+    float *centroids = (float*)malloc((size_t)k * n_bins * sizeof(float));
+    for (int c = 0; c < k; c++) {
+        int si = (int)((float)c / k * num_hands);
+        if (si >= num_hands) si = num_hands - 1;
+        int fi = sorted[si].idx;
+        memcpy(centroids + (size_t)c * n_bins,
+               hists + (size_t)fi * n_bins,
+               n_bins * sizeof(float));
+    }
+    free(sorted);
+
+    /*
+     * Step 2: Lloyd's k-means with EMD distance.
+     *
+     * Assignment: each hand goes to the centroid with smallest EMD.
+     * Update: centroid = element-wise average of member histograms.
+     * (For 1D histograms on a fixed grid, the element-wise mean IS
+     * the Wasserstein-2 barycenter — Cuturi & Doucet 2014.)
+     */
+    int *counts = (int*)calloc(k, sizeof(int));
+    float *sums = (float*)calloc((size_t)k * n_bins, sizeof(float));
+
+    for (int iter = 0; iter < n_iters; iter++) {
+        memset(counts, 0, k * sizeof(int));
+        memset(sums, 0, (size_t)k * n_bins * sizeof(float));
+
+        /* Assign each hand to nearest centroid by EMD */
+        for (int h = 0; h < num_hands; h++) {
+            const float *hh = hists + (size_t)h * n_bins;
+            float best_d = 1e30f;
+            int best_c = 0;
+            for (int c = 0; c < k; c++) {
+                float d = ca_emd_1d(hh, centroids + (size_t)c * n_bins, n_bins);
+                if (d < best_d) { best_d = d; best_c = c; }
+            }
+            bucket_out[h] = best_c;
+            counts[best_c]++;
+            float *sc = sums + (size_t)best_c * n_bins;
+            for (int b = 0; b < n_bins; b++) sc[b] += hh[b];
+        }
+
+        /* Update centroids: element-wise mean */
+        for (int c = 0; c < k; c++) {
+            if (counts[c] > 0) {
+                float *cc = centroids + (size_t)c * n_bins;
+                float *sc = sums + (size_t)c * n_bins;
+                float inv = 1.0f / (float)counts[c];
+                for (int b = 0; b < n_bins; b++) cc[b] = sc[b] * inv;
+            }
+        }
+    }
+
+    int actual = 0;
+    for (int c = 0; c < k; c++)
+        if (counts[c] > 0) actual++;
+
+    free(centroids);
+    free(counts);
+    free(sums);
+    return actual;
+}
+
+int ca_assign_buckets_pa_emd(
+    const int *board, int n_board,
+    const int hands[][2], int num_hands,
+    int num_buckets, int n_samples, int n_bins,
+    int *bucket_out
+) {
+    if (num_hands <= 0 || num_buckets <= 0 || n_bins <= 0) return 0;
+
+    /* Step 1: compute distributions for all hands */
+    float *hists = (float*)malloc((size_t)num_hands * n_bins * sizeof(float));
+    if (!hists) return 0;
+
+    ca_compute_ehs_distribution_batch(board, n_board, hands, num_hands,
+                                       n_samples, hists, n_bins);
+
+    /* Step 2: EMD k-means */
+    int actual = ca_assign_buckets_kmeans_emd(hists, num_hands, n_bins,
+                                               num_buckets, 20, bucket_out);
+
+    free(hists);
+    return actual;
+}

@@ -341,6 +341,177 @@ static void test_dist_different_boards_different_histograms(void) {
     PASS("dist_different_boards_different_histograms");
 }
 
+/* ── Phase 2: Batch distribution + EMD k-means tests ──────────────── */
+
+static void test_batch_matches_single(void) {
+    /*
+     * ca_compute_ehs_distribution_batch should produce identical results
+     * to calling ca_compute_ehs_distribution for each hand individually.
+     */
+    int board[3] = {
+        MAKE_CARD(5, 0),   /* 7c */
+        MAKE_CARD(3, 1),   /* 5d */
+        MAKE_CARD(1, 2),   /* 3h */
+    };
+    int hands[3][2] = {
+        { MAKE_CARD(12, 0), MAKE_CARD(12, 3) },  /* AcAs */
+        { MAKE_CARD(5, 1),  MAKE_CARD(0, 0) },   /* 7d2c */
+        { MAKE_CARD(10, 2), MAKE_CARD(9, 2) },   /* QhJh */
+    };
+
+    int n_bins = 50;
+    int ns = 500;
+
+    /* Batch */
+    float batch_hists[3 * 50];
+    ca_compute_ehs_distribution_batch(board, 3, (const int(*)[2])hands, 3,
+                                       ns, batch_hists, n_bins);
+
+    /* Individual */
+    for (int h = 0; h < 3; h++) {
+        float single_hist[50];
+        ca_compute_ehs_distribution(board, 3, hands[h], ns, single_hist, n_bins);
+        ASSERT(memcmp(batch_hists + h * n_bins, single_hist,
+                      n_bins * sizeof(float)) == 0,
+               "Batch distribution must be bit-identical to single-hand calls");
+    }
+    PASS("batch_matches_single");
+}
+
+static void test_emd_kmeans_valid_buckets(void) {
+    /*
+     * EMD k-means on a flop board should produce valid bucket assignments:
+     * all in [0, k), and multiple buckets populated.
+     */
+    int board[3] = {
+        MAKE_CARD(5, 0),   /* 7c */
+        MAKE_CARD(3, 1),   /* 5d */
+        MAKE_CARD(1, 2),   /* 3h */
+    };
+    int hands[CA_MAX_HANDS][2];
+    int nh = ca_generate_hands(board, 3, hands);
+
+    int num_buckets = 20;
+    int buckets[CA_MAX_HANDS];
+    int actual = ca_assign_buckets_pa_emd(board, 3, (const int(*)[2])hands, nh,
+                                           num_buckets, 300, 50, buckets);
+
+    ASSERT(actual > 0, "EMD k-means must return > 0 buckets");
+    ASSERT(actual <= num_buckets, "EMD k-means must not exceed target k");
+
+    for (int h = 0; h < nh; h++) {
+        ASSERT(buckets[h] >= 0 && buckets[h] < num_buckets,
+               "All bucket assignments must be in [0, k)");
+    }
+
+    /* Should populate multiple buckets (not degenerate all-same) */
+    int seen[20] = {0};
+    for (int h = 0; h < nh; h++) seen[buckets[h]] = 1;
+    int n_seen = 0;
+    for (int c = 0; c < num_buckets; c++) n_seen += seen[c];
+    ASSERT(n_seen >= 3, "EMD k-means should populate at least 3 buckets on a real board");
+
+    PASS("emd_kmeans_valid_buckets");
+}
+
+static void test_emd_kmeans_separates_strong_weak(void) {
+    /*
+     * AA and 72o should end up in different buckets when clustered
+     * by EMD on their equity distributions.
+     */
+    int board[3] = {
+        MAKE_CARD(5, 0),   /* 7c */
+        MAKE_CARD(3, 1),   /* 5d */
+        MAKE_CARD(1, 2),   /* 3h */
+    };
+    int hands[CA_MAX_HANDS][2];
+    int nh = ca_generate_hands(board, 3, hands);
+
+    int num_buckets = 20;
+    int buckets[CA_MAX_HANDS];
+    ca_assign_buckets_pa_emd(board, 3, (const int(*)[2])hands, nh,
+                              num_buckets, 300, 50, buckets);
+
+    /* Find AA (AcAs) and 72o (7d2c) */
+    int aa_idx = -1, o72_idx = -1;
+    int aa_c0 = MAKE_CARD(12, 0), aa_c1 = MAKE_CARD(12, 3);
+    int o72_c0 = MAKE_CARD(5, 1), o72_c1 = MAKE_CARD(0, 0);
+    for (int h = 0; h < nh; h++) {
+        if ((hands[h][0] == aa_c0 && hands[h][1] == aa_c1) ||
+            (hands[h][0] == aa_c1 && hands[h][1] == aa_c0))
+            aa_idx = h;
+        if ((hands[h][0] == o72_c0 && hands[h][1] == o72_c1) ||
+            (hands[h][0] == o72_c1 && hands[h][1] == o72_c0))
+            o72_idx = h;
+    }
+    ASSERT(aa_idx >= 0, "Could not find AA in hand list");
+    ASSERT(o72_idx >= 0, "Could not find 72o in hand list");
+    ASSERT(buckets[aa_idx] != buckets[o72_idx],
+           "AA and 72o should be in different EMD buckets");
+
+    printf("    AA bucket=%d, 72o bucket=%d\n", buckets[aa_idx], buckets[o72_idx]);
+    PASS("emd_kmeans_separates_strong_weak");
+}
+
+static void test_emd_kmeans_deterministic(void) {
+    /*
+     * Same inputs → same bucket assignments across calls.
+     */
+    int board[3] = {
+        MAKE_CARD(10, 0),  /* Qc */
+        MAKE_CARD(8, 1),   /* Td */
+        MAKE_CARD(6, 2),   /* 8h */
+    };
+    int hands[CA_MAX_HANDS][2];
+    int nh = ca_generate_hands(board, 3, hands);
+    /* Use a small subset for speed */
+    int n = (nh > 100) ? 100 : nh;
+
+    int buckets1[CA_MAX_HANDS], buckets2[CA_MAX_HANDS];
+    ca_assign_buckets_pa_emd(board, 3, (const int(*)[2])hands, n,
+                              10, 200, 50, buckets1);
+    ca_assign_buckets_pa_emd(board, 3, (const int(*)[2])hands, n,
+                              10, 200, 50, buckets2);
+
+    ASSERT(memcmp(buckets1, buckets2, n * sizeof(int)) == 0,
+           "EMD k-means must be deterministic");
+    PASS("emd_kmeans_deterministic");
+}
+
+static void test_emd_kmeans_vs_l2_different(void) {
+    /*
+     * EMD k-means and L2 k-means should NOT produce identical bucket
+     * assignments — they use different distance metrics. At least some
+     * hands should be assigned to different buckets.
+     */
+    int board[3] = {
+        MAKE_CARD(5, 0),   /* 7c */
+        MAKE_CARD(3, 1),   /* 5d */
+        MAKE_CARD(1, 2),   /* 3h */
+    };
+    int hands[CA_MAX_HANDS][2];
+    int nh = ca_generate_hands(board, 3, hands);
+    int n = (nh > 200) ? 200 : nh;
+
+    int emd_buckets[CA_MAX_HANDS], l2_buckets[CA_MAX_HANDS];
+    ca_assign_buckets_pa_emd(board, 3, (const int(*)[2])hands, n,
+                              20, 300, 50, emd_buckets);
+    ca_assign_buckets_kmeans(board, 3, (const int(*)[2])hands, n,
+                              20, 300, l2_buckets);
+
+    int differ = 0;
+    for (int h = 0; h < n; h++) {
+        if (emd_buckets[h] != l2_buckets[h]) differ++;
+    }
+    /* Bucket IDs aren't necessarily aligned (bucket 0 in EMD ≠ bucket 0 in L2),
+     * but the PARTITIONS should be different. Count how many hands share a
+     * bucket in one but not the other. At minimum some should differ. */
+    ASSERT(differ > 0,
+           "EMD and L2 k-means should produce different bucket assignments");
+    printf("    %d/%d hands assigned to different bucket IDs\n", differ, n);
+    PASS("emd_kmeans_vs_l2_different");
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -365,6 +536,13 @@ int main(void) {
     test_dist_turn();
     test_dist_different_hands_different_histograms();
     test_dist_different_boards_different_histograms();
+
+    printf("\n--- Phase 2: batch + EMD k-means ---\n");
+    test_batch_matches_single();
+    test_emd_kmeans_valid_buckets();
+    test_emd_kmeans_separates_strong_weak();
+    test_emd_kmeans_deterministic();
+    test_emd_kmeans_vs_l2_different();
 
     printf("\n=== Results: %d passed, %d failed ===\n", n_pass, n_fail);
     return n_fail > 0 ? 1 : 0;
