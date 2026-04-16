@@ -174,6 +174,21 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     lib.bps_load_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.bps_load_cache.restype = ctypes.c_int
 
+    # PA-EMD loaders (card_abstraction.c PA-EMD integration)
+    if hasattr(lib, "bps_load_pa_emd_flop_cache"):
+        lib.bps_load_pa_emd_flop_cache.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_char_p,         # path
+        ]
+        lib.bps_load_pa_emd_flop_cache.restype = ctypes.c_int
+
+    if hasattr(lib, "bps_load_pa_emd_turn_centroids"):
+        lib.bps_load_pa_emd_turn_centroids.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_char_p,         # path
+        ]
+        lib.bps_load_pa_emd_turn_centroids.restype = ctypes.c_int
+
     lib.bps_reader_free.argtypes = [ctypes.c_void_p]
     lib.bps_reader_free.restype = None
 
@@ -703,6 +718,32 @@ class BPSReaderC:
             return -1
         encoded = path.encode("utf-8") if path else None
         return self._lib.bps_load_turn_centroids(self._reader, encoded)
+
+    def load_pa_emd_flop_cache(self, path: str) -> int:
+        """Load PA-EMD flop bucket cache (PAEB format).
+
+        After load, hand_to_bucket() uses PA-EMD buckets for all textures.
+
+        Returns num_textures on success, -1 on error.
+        """
+        if not hasattr(self._lib, "bps_load_pa_emd_flop_cache"):
+            return -1
+        return self._lib.bps_load_pa_emd_flop_cache(
+            self._reader, path.encode("utf-8")
+        )
+
+    def load_pa_emd_turn_centroids(self, path: str) -> int:
+        """Load PA-EMD turn centroids (TCNE format).
+
+        After load, hand_to_bucket_turn() uses EMD path instead of L2.
+
+        Returns k on success, -1 on error.
+        """
+        if not hasattr(self._lib, "bps_load_pa_emd_turn_centroids"):
+            return -1
+        return self._lib.bps_load_pa_emd_turn_centroids(
+            self._reader, path.encode("utf-8")
+        )
 
     def compute_evs(
         self,
