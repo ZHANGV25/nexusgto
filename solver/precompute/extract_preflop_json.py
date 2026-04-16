@@ -46,10 +46,10 @@ PLAYER_TO_POS = {v: k for k, v in POS_TO_PLAYER.items()}
 #
 # Level n = num_raises at that node. Level 0 = unraised (UTG opens).
 PREFLOP_TIERS = {
-    0: [0.5, 0.7, 1.0],   # open raise: 3 sizes
-    1: [0.7, 1.0],         # 3-bet: 2 sizes
-    2: [1.0],              # 4-bet: 1 size
-    3: [8.0],              # 5-bet: shove (8x pot ≫ stack → coerced to allin)
+    0: [0.5, 0.7, 1.0, 1.5, 2.0],   # open raise: 5 sizes
+    1: [0.5, 0.7, 1.0, 1.5],         # 3-bet: 4 sizes
+    2: [0.7, 1.0, 1.5],              # 4-bet: 3 sizes
+    3: [8.0],                        # 5-bet: shove (8x pot ≫ stack → coerced to allin)
 }
 PREFLOP_MAX_RAISES = 4
 

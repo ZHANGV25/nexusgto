@@ -49,14 +49,18 @@ PREFLOP_BET_SIZES = [0.5, 0.7, 1.0]
 # (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
 POSTFLOP_BET_SIZES = [0.5, 1.0]
 
-# Tiered preflop sizing (Pluribus-style: fewer sizes at deeper raise levels).
-# Open gets fine-grained sizes; 3-bet/4-bet/5-bet get progressively fewer.
-# Enumerated tree: 2.28M preflop nodes × 169 = 386M preflop info sets (vs 7.4B flat).
+# Tiered preflop sizing (Pluribus uses up to 14 sizes per decision; we ship a
+# coarser tier but cover the bands humans actually open/3-bet/4-bet at).
+#
+# Enumerated tree (6p, 100BB): 6.80M preflop decision nodes × 169 buckets
+# = 1.15B preflop info sets (vs 197M at the old 3/2/1/1 tier, 5.83× growth).
+# Tree count is from tests/count_preflop_tiered.py. Fits within 4.5B hash
+# slots at ~2B total entries (44% load, safe margin for postflop growth).
 PREFLOP_TIERS = {
-    0: [0.5, 0.7, 1.0],    # open raise: 3 sizes (1.75BB, 2.05BB, 2.5BB)
-    1: [0.7, 1.0],          # 3-bet: 2 sizes
-    2: [1.0],               # 4-bet: 1 size
-    3: [8.0],               # 5-bet: shove only
+    0: [0.5, 0.7, 1.0, 1.5, 2.0],   # open raise: 5 sizes (1.75-3.5BB band)
+    1: [0.5, 0.7, 1.0, 1.5],         # 3-bet: 4 sizes
+    2: [0.7, 1.0, 1.5],              # 4-bet: 3 sizes
+    3: [8.0],                        # 5-bet: shove only (pot-ratio ≫ stack)
 }
 PREFLOP_MAX_RAISES = 4
 
