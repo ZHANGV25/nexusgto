@@ -443,12 +443,11 @@ def main():
     # Target: 8B iterations. Every checkpoint uploaded to S3 so any restart
     # loses at most one checkpoint's worth of iterations.
     #
-    # v3 cadence: checkpoint every 100M iters for the entire run. At
-    # ~35K iter/s on c7a.metal-48xl, 100M = ~48 min wall-clock, so a
-    # kernel hiccup or spot reclaim loses <~1 hour of work. 27 GB
-    # checkpoint write takes ~1-2 min = ~3% overhead, acceptable for
-    # preventing a v1/v2-class multi-day wasted run.
-    checkpoint_interval_iters = 100_000_000
+    # v3 cadence: checkpoint every 250M iters. At ~35K iter/s on
+    # c7a.metal-48xl, 250M = ~2h wall-clock, so a spot reclaim loses
+    # at most ~2h of work. 32 checkpoints over 8B iters. Checkpoint
+    # write (~27 GB) takes ~1-2 min = ~1.5% overhead.
+    checkpoint_interval_iters = 250_000_000
     checkpoint_milestones = [
         (i + 1) * checkpoint_interval_iters
         for i in range(max(1, int(total_iters // checkpoint_interval_iters)))
@@ -569,7 +568,75 @@ def main():
                            label="final")
 
     bp_lib.bp_free(solver)
-    print("\nDone.")
+    print("\nTraining complete.")
+
+    # ── Auto-chain EV walk ──────────────────────────────────────────
+    # The .bps is on local disk. Load it into a BPSReaderC and run the
+    # 500M EV walk in-process. On c7a.metal-48xl (192 vCPU), this takes
+    # ~15 min. The EV walk populates per-action EVs needed by the runtime
+    # solver's leaf-value computation (rollout.c).
+    if args.output_dir and os.environ.get("BPS_AUTO_EV_WALK", "1") == "1":
+        bps_path = os.path.join(args.output_dir, "unified_blueprint.bps")
+        if os.path.exists(bps_path):
+            print("\n" + "=" * 60)
+            print("  AUTO EV WALK — 500M iterations")
+            print("=" * 60)
+            try:
+                sys.path.insert(0, os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)), "python"))
+                from bps_reader_py import BPSReaderC
+
+                ev_t0 = time.time()
+                print(f"Loading final blueprint from {bps_path}...", flush=True)
+                reader = BPSReaderC(bps_path)
+                print(f"Loaded in {time.time() - ev_t0:.1f}s", flush=True)
+
+                ev_iters = int(os.environ.get("BPS_EV_WALK_ITERS", "500000000"))
+                ev_threads = max(args.num_threads, 1)
+                ev_checkpoint_interval = 50_000_000  # 50M
+                ev_cache_path = bps_path + ".cache"
+
+                print(f"Starting {ev_iters:,} EV walk iterations on "
+                      f"{ev_threads} threads (checkpoint every "
+                      f"{ev_checkpoint_interval:,})...", flush=True)
+
+                reader.compute_evs(
+                    num_iterations=ev_iters,
+                    num_threads=ev_threads,
+                    num_players=NUM_PLAYERS,
+                    small_blind=SMALL_BLIND,
+                    big_blind=BIG_BLIND,
+                    initial_stack=INITIAL_STACK,
+                    checkpoint_interval=ev_checkpoint_interval,
+                    checkpoint_path=ev_cache_path,
+                )
+                ev_elapsed = time.time() - ev_t0
+                print(f"EV walk complete in {ev_elapsed:.0f}s "
+                      f"({ev_elapsed / 60:.1f} min)", flush=True)
+
+                # Save the final cache with EVs
+                print(f"Saving EV cache to {ev_cache_path}...", flush=True)
+                reader.save_cache(ev_cache_path)
+
+                # Upload EV-enriched files to S3 (if S3 bucket is set)
+                s3_bucket = os.environ.get("S3_BUCKET")
+                if s3_bucket:
+                    import subprocess
+                    for fpath in [ev_cache_path, bps_path]:
+                        fname = os.path.basename(fpath)
+                        print(f"Uploading {fname} to {s3_dest}...", flush=True)
+                        subprocess.run(
+                            ["aws", "s3", "cp", fpath, s3_dest],
+                            check=True
+                        )
+                print("EV walk + upload done.")
+            except Exception as e:
+                print(f"[WARN] Auto EV walk failed: {e}", flush=True)
+                print("Manual EV walk will be needed.", flush=True)
+        else:
+            print(f"[WARN] No .bps at {bps_path}, skipping auto EV walk")
+
+    print("\nAll done.")
 
 
 def _probe_preflop(bp_lib, solver):
