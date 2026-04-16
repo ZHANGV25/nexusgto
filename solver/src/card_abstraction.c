@@ -820,3 +820,132 @@ int ca_compute_river_centroids(
     free(features); free(labels); free(counts); free(sums);
     return actual;
 }
+
+/* ── PA-EMD (Potential-Aware Earth Mover's Distance) ─────────────── */
+
+float ca_emd_1d(
+    const float *hist_a, const float *hist_b,
+    int n_bins
+) {
+    if (n_bins <= 0 || !hist_a || !hist_b) return 0.0f;
+
+    /*
+     * For 1D histograms on a uniform grid, EMD equals the L1 norm of the
+     * difference of CDFs:  EMD = sum_{i=0}^{n-1} |CDF_a(i) - CDF_b(i)|
+     *
+     * Equivalently, maintain a running sum of (hist_a[i] - hist_b[i]).
+     * The absolute value of this running sum at each step is the CDF gap.
+     * Sum those absolute values.
+     */
+    double running = 0.0;
+    double emd = 0.0;
+    for (int i = 0; i < n_bins; i++) {
+        running += (double)hist_a[i] - (double)hist_b[i];
+        emd += (running >= 0.0) ? running : -running;
+    }
+    return (float)emd;
+}
+
+/*
+ * Deterministic seed for EHS distribution: mix board + hand cards into
+ * a 64-bit seed via splitmix64-style finalizer. Same inputs → same seed
+ * on any platform (no pointer-dependent state).
+ */
+static uint64_t ca_ehs_dist_seed(const int *board, int n_board,
+                                  const int *hand) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL;  /* golden ratio constant */
+    for (int i = 0; i < n_board; i++) {
+        h ^= (uint64_t)(unsigned)board[i];
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 31;
+    }
+    h ^= (uint64_t)(unsigned)hand[0];
+    h *= 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    h ^= (uint64_t)(unsigned)hand[1];
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 31;
+    /* Ensure nonzero (xorshift requires it) */
+    if (h == 0) h = 1;
+    return h;
+}
+
+void ca_compute_ehs_distribution(
+    const int *board, int n_board,
+    const int *hand,
+    int num_samples,
+    float *out_hist,
+    int n_bins
+) {
+    if (n_bins <= 0 || num_samples <= 0 || !board || !hand || !out_hist) return;
+    if (n_board < 3 || n_board > 5) return;
+
+    /* Zero histogram */
+    for (int i = 0; i < n_bins; i++) out_hist[i] = 0.0f;
+
+    int c0 = hand[0], c1 = hand[1];
+
+    /* Build blocked set: board + hero hand */
+    int blocked[52] = {0};
+    for (int i = 0; i < n_board; i++) blocked[board[i]] = 1;
+    blocked[c0] = 1;
+    blocked[c1] = 1;
+
+    /* Available cards */
+    int avail[52];
+    int n_avail = 0;
+    for (int c = 0; c < 52; c++)
+        if (!blocked[c]) avail[n_avail++] = c;
+
+    /* We need 2 (opponent) + (5 - n_board) (remaining board) cards per sample */
+    int runout_cards = 5 - n_board;
+    int cards_needed = 2 + runout_cards;
+    if (n_avail < cards_needed) return;
+
+    /* Deterministic RNG seeded from board + hand */
+    uint64_t rng = ca_ehs_dist_seed(board, n_board, hand);
+
+    int total = 0;
+
+    for (int s = 0; s < num_samples; s++) {
+        /* Fisher-Yates partial shuffle to pick cards_needed cards */
+        partial_shuffle(avail, n_avail, cards_needed, &rng);
+
+        int oc0 = avail[0], oc1 = avail[1];
+
+        /* Build complete 5-card board */
+        int full_board[5];
+        for (int i = 0; i < n_board; i++) full_board[i] = board[i];
+        for (int i = 0; i < runout_cards; i++)
+            full_board[n_board + i] = avail[2 + i];
+
+        /* Evaluate hero vs opponent on final board */
+        int hero7[7] = {full_board[0], full_board[1], full_board[2],
+                        full_board[3], full_board[4], c0, c1};
+        int opp7[7]  = {full_board[0], full_board[1], full_board[2],
+                        full_board[3], full_board[4], oc0, oc1};
+
+        uint32_t hero_str = eval7(hero7);
+        uint32_t opp_str  = eval7(opp7);
+
+        /* Equity outcome: 1.0 (win), 0.5 (tie), 0.0 (loss) */
+        float eq;
+        if (hero_str > opp_str) eq = 1.0f;
+        else if (hero_str == opp_str) eq = 0.5f;
+        else eq = 0.0f;
+
+        /* Map equity to bin index: [0, 1] → [0, n_bins-1] */
+        int bin = (int)(eq * (n_bins - 1) + 0.5f);
+        if (bin < 0) bin = 0;
+        if (bin >= n_bins) bin = n_bins - 1;
+
+        out_hist[bin] += 1.0f;
+        total++;
+    }
+
+    /* Normalize to probability distribution (sum = 1.0) */
+    if (total > 0) {
+        float inv = 1.0f / (float)total;
+        for (int i = 0; i < n_bins; i++) out_hist[i] *= inv;
+    }
+}

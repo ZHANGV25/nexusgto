@@ -268,6 +268,62 @@ CA_EXPORT int ca_compute_river_centroids(
     float *centroids_out
 );
 
+/* ── PA-EMD (Potential-Aware Earth Mover's Distance) ─────────────── */
+
+/**
+ * 1D Earth Mover's Distance between two histograms.
+ *
+ * For normalized 1D histograms, EMD = sum_i |CDF_a(i) - CDF_b(i)|.
+ * Closed-form O(n_bins) — no linear programming needed.
+ *
+ * Both histograms must sum to 1.0 (or at least to the same total).
+ * If either is all-zero, returns 0.0.
+ *
+ * Args:
+ *   hist_a, hist_b: [n_bins] histogram vectors (probability mass per bin)
+ *   n_bins: number of bins (must be > 0)
+ *
+ * Returns EMD in [0, n_bins - 1]. Distance 0 means identical distributions.
+ */
+CA_EXPORT float ca_emd_1d(
+    const float *hist_a, const float *hist_b,
+    int n_bins
+);
+
+/**
+ * Compute hand equity distribution as a histogram (potential-aware
+ * representation per Ganzfried & Sandholm 2014 / Johanson 2013).
+ *
+ * For each MC sample, draws an opponent hand + any remaining board cards,
+ * evaluates showdown equity (1.0 win, 0.5 tie, 0.0 loss), and bins the
+ * result into the histogram. The histogram captures the DISTRIBUTION of
+ * outcomes — not just the scalar mean — preserving information about
+ * hand volatility (draw potential, vulnerability).
+ *
+ * Street behavior:
+ *   - Flop (n_board=3): samples opp hand + turn + river
+ *   - Turn (n_board=4): samples opp hand + river
+ *   - River (n_board=5): samples opp hand only
+ *
+ * RNG is deterministic: seeded from board + hand cards. Same inputs
+ * produce identical output across calls and platforms.
+ *
+ * Args:
+ *   board:       board cards (3/4/5)
+ *   n_board:     number of board cards
+ *   hand:        hero's 2 hole cards [c0, c1]
+ *   num_samples: MC samples for opponent + runout (e.g. 1000)
+ *   out_hist:    [n_bins] output histogram, normalized to sum=1.0
+ *   n_bins:      number of histogram bins (e.g. 50)
+ */
+CA_EXPORT void ca_compute_ehs_distribution(
+    const int *board, int n_board,
+    const int *hand,
+    int num_samples,
+    float *out_hist,
+    int n_bins
+);
+
 #ifdef __cplusplus
 }
 #endif

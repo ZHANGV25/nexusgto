@@ -93,5 +93,12 @@ $(BUILD_DIR)/test_bps_ev_walk: tests/test_bps_ev_walk.c $(SRC_DIR)/bps_ev_walk.c
 test_ev_walk: $(BUILD_DIR)/test_bps_ev_walk
 	./$(BUILD_DIR)/test_bps_ev_walk
 
+# ── PA-EMD tests (ca_emd_1d + ca_compute_ehs_distribution) ──
+$(BUILD_DIR)/test_pa_emd: tests/test_pa_emd.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_pa_emd.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+
+test_pa_emd: $(BUILD_DIR)/test_pa_emd
+	./$(BUILD_DIR)/test_pa_emd
+
 clean:
 	rm -rf $(BUILD_DIR)
