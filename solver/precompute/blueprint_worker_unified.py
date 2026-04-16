@@ -720,6 +720,7 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
         "postflop_buckets": 200,
         "checkpoint": label or f"iter_{iters_done}",
         "config_hash": _compute_config_hash(),
+        "hash_mixer": "splitmix64",
         "dcfr": {
             "alpha": os.environ.get("BPS_DCFR_ALPHA", ""),
             "beta": os.environ.get("BPS_DCFR_BETA", ""),
