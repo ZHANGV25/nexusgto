@@ -94,6 +94,9 @@ def _compute_config_hash():
         # vice versa) without producing garbage.
         "river_ochs": os.environ.get("BPS_RIVER_OCHS", "0"),
         "river_ochs_clusters": os.environ.get("BPS_RIVER_OCHS_CLUSTERS", ""),
+        # Hash table size determines slot layout — a checkpoint trained on
+        # 3B slots cannot resume on 3.5B (probe sequences differ).
+        "hash_table_size": os.environ.get("BPS_HASH_SIZE", "3500000000"),
     }
     canon = json.dumps(payload, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canon.encode('utf-8')).hexdigest()
@@ -404,17 +407,37 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 
+    t0 = time.time()
+
+    # Mutable state for the signal handler to checkpoint on SIGTERM.
+    # On spot reclaim AWS sends SIGTERM with 2-min warning — enough time
+    # to flush regrets to disk and upload to S3, saving up to 48 min of
+    # work that would otherwise be lost.
+    _sig_state = {"iters_done": iters_done, "solver": solver}
+
     def _signal_handler(signum, frame):
-        print(f"\n[FATAL] Caught signal {signum} ({signal.Signals(signum).name})",
-              flush=True)
+        sig_name = signal.Signals(signum).name
+        if signum == signal.SIGTERM:
+            print(f"\n[SIGTERM] Spot reclaim or shutdown — saving emergency checkpoint...",
+                  flush=True)
+            try:
+                elapsed = time.time() - t0
+                n_is = bp_lib.bp_num_info_sets(_sig_state["solver"])
+                _export_checkpoint(bp_lib, _sig_state["solver"], args,
+                                   _sig_state["iters_done"], elapsed, n_is,
+                                   label="emergency")
+                print("[SIGTERM] Emergency checkpoint saved.", flush=True)
+            except Exception as e:
+                print(f"[SIGTERM] Checkpoint save failed: {e}", flush=True)
+        else:
+            print(f"\n[FATAL] Caught signal {signum} ({sig_name})", flush=True)
         sys.exit(128 + signum)
+
     for sig in (signal.SIGTERM, signal.SIGABRT, signal.SIGSEGV, signal.SIGBUS):
         try:
             signal.signal(sig, _signal_handler)
         except (OSError, ValueError):
             pass
-
-    t0 = time.time()
 
     # Checkpoint schedule: dense early, then every 300M for spot safety.
     # Target: 8B iterations. Every checkpoint uploaded to S3 so any restart
@@ -463,6 +486,7 @@ def main():
         if ret != 0:
             print(f"[Solve] bp_solve returned {ret}", flush=True)
         iters_done += call_size
+        _sig_state["iters_done"] = iters_done
 
         elapsed = time.time() - t0
         n_is = bp_lib.bp_num_info_sets(solver)
