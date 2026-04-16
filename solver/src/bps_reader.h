@@ -120,6 +120,18 @@ typedef struct {
      * bps_load_turn_centroids). 0 = not loaded; 1..200 after load. */
     float    turn_centroids[200][3];
     int      turn_centroids_k;
+
+    /* PA-EMD turn centroids (TCNE format, loaded via
+     * bps_load_pa_emd_turn_centroids). Histogram centroids, n_bins-dim.
+     * When pa_emd_turn_k > 0, bps_hand_to_bucket_turn uses EMD path. */
+    float   *pa_emd_turn_centroids;  /* [pa_emd_turn_k * pa_emd_turn_bins] or NULL */
+    int      pa_emd_turn_k;
+    int      pa_emd_turn_bins;
+
+    /* PA-EMD flop bucket cache (PAEB format, loaded via
+     * bps_load_pa_emd_flop_cache). When pa_emd_flop_loaded=1,
+     * the texture cache was populated from the PAEB file. */
+    int      pa_emd_flop_loaded;
 } BPSReader;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -329,6 +341,36 @@ BPS_EXPORT int bps_hand_to_bucket_turn(const BPSReader *r,
  */
 BPS_EXPORT int bps_hand_to_bucket_river(const BPSReader *r,
                                           const int *board, int c0, int c1);
+
+/* ── PA-EMD integration ──────────────────────────────────────────── */
+
+/**
+ * Load PA-EMD flop bucket cache (PAEB format) into the reader's
+ * texture cache. Replaces the inline-computed L2 k-means buckets.
+ *
+ * Format: "PAEB" magic (4B) + int32 version (4B) + int32 num_textures (4B)
+ *       + int32 num_buckets (4B) + int32 n_bins (4B) + int32 mc_samples (4B)
+ *       + uint64[num_textures] hashes + int32[num_textures * 1326] buckets
+ *
+ * After load, bps_hand_to_bucket() uses PA-EMD buckets for any texture
+ * present in the cache.
+ *
+ * Returns num_textures on success, -1 on error.
+ */
+BPS_EXPORT int bps_load_pa_emd_flop_cache(BPSReader *r, const char *path);
+
+/**
+ * Load PA-EMD turn centroids (TCNE format).
+ *
+ * Format: "TCNE" magic (4B) + int32 version (4B) + int32 k (4B)
+ *       + int32 n_bins (4B) + float32[k * n_bins] centroids
+ *
+ * After load, bps_hand_to_bucket_turn() uses EMD path: computes
+ * equity distribution for the hand, then finds nearest centroid by EMD.
+ *
+ * Returns k on success, -1 on error.
+ */
+BPS_EXPORT int bps_load_pa_emd_turn_centroids(BPSReader *r, const char *path);
 
 /**
  * Save the loaded hash table state to a binary cache file.

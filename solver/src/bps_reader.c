@@ -983,16 +983,30 @@ int bps_load_turn_centroids(BPSReader *r, const char *path) {
 
 int bps_hand_to_bucket_turn(const BPSReader *r,
                              const int *board, int c0, int c1) {
-    if (!r || !board || r->turn_centroids_k <= 0) return -1;
+    if (!r || !board) return -1;
 
     /* Hand must not collide with the 4-card turn board. */
     for (int i = 0; i < 4; i++) {
         if (board[i] == c0 || board[i] == c1) return -1;
     }
 
+    /* PA-EMD path: compute equity distribution, find nearest centroid by EMD */
+    if (r->pa_emd_turn_k > 0 && r->pa_emd_turn_centroids) {
+        int hand[2] = {c0, c1};
+        int n_bins = r->pa_emd_turn_bins;
+        float *hist = (float*)malloc(n_bins * sizeof(float));
+        if (!hist) return -1;
+        ca_compute_ehs_distribution(board, 4, hand, 1000, hist, n_bins);
+        int bucket = ca_nearest_centroid_emd(hist, r->pa_emd_turn_centroids,
+                                              r->pa_emd_turn_k, n_bins);
+        free(hist);
+        return bucket;
+    }
+
+    /* L2 path (default): 3D features + nearest centroid */
+    if (r->turn_centroids_k <= 0) return -1;
     int hand[1][2] = {{c0, c1}};
     float feat[1][3];
-    /* Match bps_ev_walk.c:863 — 200 samples for features on the turn. */
     ca_compute_features(board, 4, (const int(*)[2])hand, 1, 200, feat);
     return ca_nearest_centroid(feat[0],
                                 (const float(*)[3])r->turn_centroids,
@@ -1043,6 +1057,112 @@ int bps_hand_to_bucket_river(const BPSReader *r,
     if (bucket < 0) bucket = 0;
     if (bucket >= k) bucket = k - 1;
     return bucket;
+}
+
+/* ── PA-EMD integration ─────────────────────────────────────────────── */
+
+int bps_load_pa_emd_flop_cache(BPSReader *r, const char *path) {
+    if (!r || !path || !path[0]) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "PAEB", 4) != 0) {
+        fclose(f); return -1;
+    }
+
+    int version, n_tex, n_buckets, n_bins, mc_samples;
+    if (fread(&version, sizeof(int), 1, f) != 1 || version != 1) {
+        fclose(f); return -1;
+    }
+    if (fread(&n_tex, sizeof(int), 1, f) != 1 ||
+        n_tex <= 0 || n_tex > BPS_MAX_TEXTURES) {
+        fclose(f); return -1;
+    }
+    if (fread(&n_buckets, sizeof(int), 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&n_bins, sizeof(int), 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&mc_samples, sizeof(int), 1, f) != 1) { fclose(f); return -1; }
+
+    /* Read hashes */
+    uint64_t hashes[BPS_MAX_TEXTURES];
+    if (fread(hashes, sizeof(uint64_t), n_tex, f) != (size_t)n_tex) {
+        fclose(f); return -1;
+    }
+
+    /* Allocate bucket cache if needed */
+    BPSTextureCache *tc = &r->textures;
+    if (!tc->bucket_cache) {
+        tc->bucket_cache = (int*)calloc((size_t)BPS_MAX_TEXTURES * 1326, sizeof(int));
+        if (!tc->bucket_cache) { fclose(f); return -1; }
+    }
+
+    /* Read bucket data directly into the texture cache */
+    if (fread(tc->bucket_cache, sizeof(int), (size_t)n_tex * 1326, f)
+        != (size_t)n_tex * 1326) {
+        fclose(f); return -1;
+    }
+    fclose(f);
+
+    /* Populate hash keys and rebuild the hash index */
+    for (int i = 0; i < n_tex; i++) {
+        tc->hash_keys[i] = hashes[i];
+    }
+    tc->num_textures = n_tex;
+    tc->num_buckets = n_buckets;
+    tc->loaded = 1;
+
+    /* Rebuild open-addressed hash index */
+    tex_index_rebuild(tc);
+
+    r->pa_emd_flop_loaded = 1;
+    r->num_postflop_buckets = n_buckets;
+
+    fprintf(stderr, "[bps_reader] Loaded PA-EMD flop cache: %d textures, "
+            "%d buckets, %d bins, %d MC samples from %s\n",
+            n_tex, n_buckets, n_bins, mc_samples, path);
+    return n_tex;
+}
+
+int bps_load_pa_emd_turn_centroids(BPSReader *r, const char *path) {
+    if (!r || !path || !path[0]) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "TCNE", 4) != 0) {
+        fclose(f); return -1;
+    }
+
+    int version, k, n_bins;
+    if (fread(&version, sizeof(int), 1, f) != 1 || version != 1) {
+        fclose(f); return -1;
+    }
+    if (fread(&k, sizeof(int), 1, f) != 1 || k <= 0 || k > 500) {
+        fclose(f); return -1;
+    }
+    if (fread(&n_bins, sizeof(int), 1, f) != 1 || n_bins <= 0 || n_bins > 200) {
+        fclose(f); return -1;
+    }
+
+    float *centroids = (float*)malloc((size_t)k * n_bins * sizeof(float));
+    if (!centroids) { fclose(f); return -1; }
+    if (fread(centroids, sizeof(float), (size_t)k * n_bins, f) != (size_t)k * n_bins) {
+        free(centroids); fclose(f); return -1;
+    }
+    fclose(f);
+
+    /* Free any previous PA-EMD turn centroids */
+    if (r->pa_emd_turn_centroids) free(r->pa_emd_turn_centroids);
+
+    r->pa_emd_turn_centroids = centroids;
+    r->pa_emd_turn_k = k;
+    r->pa_emd_turn_bins = n_bins;
+
+    fprintf(stderr, "[bps_reader] Loaded PA-EMD turn centroids: %d centroids × "
+            "%d bins from %s\n", k, n_bins, path);
+    return k;
 }
 
 /* ── Cache serialization ─────────────────────────────────────────────── */

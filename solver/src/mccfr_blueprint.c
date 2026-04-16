@@ -2432,6 +2432,60 @@ int bp_init_unified(BPSolver *s, int num_players,
         printf("[BP] Texture cache loaded (%d textures), skipping precompute\n",
                s->num_cached_textures);
     } else {
+
+    /* PA-EMD opt-in: if BPS_PA_EMD_FLOP_CACHE is set, load precomputed
+     * PA-EMD bucket cache instead of computing L2 k-means inline. */
+    const char *pa_emd_flop_path = getenv("BPS_PA_EMD_FLOP_CACHE");
+    if (pa_emd_flop_path && pa_emd_flop_path[0]) {
+        FILE *pf = fopen(pa_emd_flop_path, "rb");
+        if (pf) {
+            fclose(pf);
+            char magic[4];
+            pf = fopen(pa_emd_flop_path, "rb");
+            int ok = (pf && fread(magic, 1, 4, pf) == 4 &&
+                      memcmp(magic, "PAEB", 4) == 0);
+            if (pf) fclose(pf);
+            if (ok) {
+                /* Parse PAEB header */
+                pf = fopen(pa_emd_flop_path, "rb");
+                char m[4]; int ver, n_tex, n_bk, n_bn, n_mc;
+                fread(m, 1, 4, pf);
+                fread(&ver, sizeof(int), 1, pf);
+                fread(&n_tex, sizeof(int), 1, pf);
+                fread(&n_bk, sizeof(int), 1, pf);
+                fread(&n_bn, sizeof(int), 1, pf);
+                fread(&n_mc, sizeof(int), 1, pf);
+
+                /* Read hashes */
+                uint64_t paeb_hashes[BP_MAX_TEXTURES];
+                fread(paeb_hashes, sizeof(uint64_t), n_tex, pf);
+
+                /* Read bucket data into the texture cache */
+                if (!s->texture_bucket_cache) {
+                    s->texture_bucket_cache = (int*)calloc(
+                        BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
+                }
+                fread(s->texture_bucket_cache, sizeof(int),
+                      (size_t)n_tex * BP_MAX_HANDS, pf);
+                fclose(pf);
+
+                /* Copy hashes and rebuild index */
+                for (int i = 0; i < n_tex; i++)
+                    s->texture_hash_keys[i] = paeb_hashes[i];
+                s->num_cached_textures = n_tex;
+                texture_index_rebuild(s);
+                s->postflop_num_buckets = n_bk;
+
+                printf("[BP] Loaded PA-EMD flop cache: %d textures, %d buckets "
+                       "from %s\n", n_tex, n_bk, pa_emd_flop_path);
+                goto pa_emd_flop_done;
+            }
+        }
+        fprintf(stderr, "[BP] WARNING: BPS_PA_EMD_FLOP_CACHE set to '%s' "
+                "but file not found or invalid, falling back to L2 k-means\n",
+                pa_emd_flop_path);
+    }
+
     printf("[BP] Precomputing postflop buckets for all flop textures...\n");
     fflush(stdout);
 
@@ -2547,6 +2601,7 @@ int bp_init_unified(BPSolver *s, int num_players,
         double pc_elapsed = (double)(clock() - pc_start) / CLOCKS_PER_SEC;
         printf("[BP] Precomputed %d textures in %.1fs\n", tex_count, pc_elapsed);
     }
+    pa_emd_flop_done:;
     } /* end else (skip if cache loaded) */
 
     /* Precompute turn k-means centroids.
@@ -2555,10 +2610,34 @@ int bp_init_unified(BPSolver *s, int num_players,
      * each hand's features are computed inline and mapped to nearest centroid.
      * This replaces floor(ehs * 200) percentile bucketing on the turn.
      *
+     * PA-EMD opt-in: if BPS_PA_EMD_TURN_CENTROIDS is set, load TCNE
+     * histogram centroids. The traversal code in bp_mccfr_traverse uses
+     * ca_compute_features + ca_nearest_centroid for L2 bucketing; when
+     * PA-EMD centroids are loaded, inference code (bps_hand_to_bucket_turn)
+     * auto-switches to the EMD path. Training still uses L2 turn buckets
+     * inline (matching the L2 centroids) — the PA-EMD turn centroids are
+     * for the NEXT retrain's inference. To use PA-EMD for training too,
+     * the traversal bucketing would need to switch; that's a future change.
+     *
      * Skip the precompute if a cached centroids file is found. The file is
      * tiny (~2.4 KB for 200 centroids × 3 floats × 4 bytes) and saves
      * 6 minutes of single-threaded compute on resume. */
     {
+        const char *pa_emd_turn_path = getenv("BPS_PA_EMD_TURN_CENTROIDS");
+        if (pa_emd_turn_path && pa_emd_turn_path[0]) {
+            FILE *ptf = fopen(pa_emd_turn_path, "rb");
+            if (ptf) {
+                char m[4];
+                if (fread(m, 1, 4, ptf) == 4 && memcmp(m, "TCNE", 4) == 0) {
+                    printf("[BP] PA-EMD turn centroids found at %s — "
+                           "will be used by inference (bps_hand_to_bucket_turn).\n"
+                           "[BP] Training-time turn bucketing still uses L2 (TCN1).\n",
+                           pa_emd_turn_path);
+                }
+                fclose(ptf);
+            }
+        }
+
         const char *centroid_paths[] = {
             "/tmp/turn_centroids.bin",
             "/dev/shm/turn_centroids.bin",

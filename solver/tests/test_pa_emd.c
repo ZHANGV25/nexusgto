@@ -512,10 +512,56 @@ static void test_emd_kmeans_vs_l2_different(void) {
     PASS("emd_kmeans_vs_l2_different");
 }
 
+/* ── Integration tests: ca_nearest_centroid_emd ────────────────────── */
+
+static void test_nearest_centroid_emd_exact_match(void) {
+    /*
+     * When the hand's histogram exactly equals a centroid, that centroid
+     * should be selected (EMD = 0 for the match, > 0 for others).
+     */
+    float centroids[3 * 5] = {
+        /* centroid 0: all mass at bin 0 */
+        1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        /* centroid 1: all mass at bin 2 */
+        0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+        /* centroid 2: all mass at bin 4 */
+        0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    float hist[5] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}; /* matches centroid 1 */
+    int result = ca_nearest_centroid_emd(hist, centroids, 3, 5);
+    ASSERT(result == 1, "Nearest centroid should be 1 (exact match)");
+    PASS("nearest_centroid_emd_exact_match");
+}
+
+static void test_nearest_centroid_emd_closest(void) {
+    /*
+     * Hand histogram closest to centroid 2 by EMD.
+     */
+    float centroids[3 * 5] = {
+        1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    /* Mass concentrated near bin 4 → closest to centroid 2 */
+    float hist[5] = {0.0f, 0.0f, 0.0f, 0.3f, 0.7f};
+    int result = ca_nearest_centroid_emd(hist, centroids, 3, 5);
+    ASSERT(result == 2, "Should be closest to centroid 2 (high bins)");
+    PASS("nearest_centroid_emd_closest");
+}
+
+static void test_nearest_centroid_emd_single(void) {
+    /* With one centroid, always returns 0 */
+    float centroid[3] = {0.5f, 0.3f, 0.2f};
+    float hist[3] = {0.1f, 0.1f, 0.8f};
+    int result = ca_nearest_centroid_emd(hist, centroid, 1, 3);
+    ASSERT(result == 0, "Single centroid should return 0");
+    PASS("nearest_centroid_emd_single");
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 int main(void) {
-    printf("=== PA-EMD Phase 1 Tests ===\n\n");
+    printf("=== PA-EMD Tests ===\n\n");
     printf("--- ca_emd_1d ---\n");
     test_emd_identical();
     test_emd_identical_nonuniform();
@@ -543,6 +589,11 @@ int main(void) {
     test_emd_kmeans_separates_strong_weak();
     test_emd_kmeans_deterministic();
     test_emd_kmeans_vs_l2_different();
+
+    printf("\n--- Integration: ca_nearest_centroid_emd ---\n");
+    test_nearest_centroid_emd_exact_match();
+    test_nearest_centroid_emd_closest();
+    test_nearest_centroid_emd_single();
 
     printf("\n=== Results: %d passed, %d failed ===\n", n_pass, n_fail);
     return n_fail > 0 ? 1 : 0;

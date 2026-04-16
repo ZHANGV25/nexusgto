@@ -1093,3 +1093,18 @@ int ca_assign_buckets_pa_emd(
     free(hists);
     return actual;
 }
+
+int ca_nearest_centroid_emd(
+    const float *hist,
+    const float *centroids, int num_centroids,
+    int n_bins
+) {
+    if (!hist || !centroids || num_centroids <= 0 || n_bins <= 0) return 0;
+    float best_d = 1e30f;
+    int best = 0;
+    for (int c = 0; c < num_centroids; c++) {
+        float d = ca_emd_1d(hist, centroids + (size_t)c * n_bins, n_bins);
+        if (d < best_d) { best_d = d; best = c; }
+    }
+    return best;
+}

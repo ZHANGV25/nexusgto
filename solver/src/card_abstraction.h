@@ -396,6 +396,26 @@ CA_EXPORT int ca_assign_buckets_pa_emd(
     int *bucket_out
 );
 
+/**
+ * Find nearest centroid by EMD for a single hand's equity distribution.
+ *
+ * PA-EMD equivalent of ca_nearest_centroid / ca_nearest_centroid_nd.
+ * Used for turn/river bucket lookup against precomputed centroids.
+ *
+ * Args:
+ *   hist:           [n_bins] hand's equity distribution histogram
+ *   centroids:      [num_centroids * n_bins] flat row-major centroid histograms
+ *   num_centroids:  number of centroids (k)
+ *   n_bins:         bins per histogram
+ *
+ * Returns index of nearest centroid [0, num_centroids-1].
+ */
+CA_EXPORT int ca_nearest_centroid_emd(
+    const float *hist,
+    const float *centroids, int num_centroids,
+    int n_bins
+);
+
 #ifdef __cplusplus
 }
 #endif
