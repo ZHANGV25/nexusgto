@@ -163,6 +163,111 @@ CA_EXPORT int ca_preflop_classes(
     const int hands[][2], int num_hands
 );
 
+/* ── OCHS (Opponent Cluster Hand Strength) — Johanson 2013 ──────── */
+
+#define CA_OCHS_DEFAULT_CLUSTERS 8
+#define CA_OCHS_DIMS CA_OCHS_DEFAULT_CLUSTERS
+
+/**
+ * Compute preflop all-in EHS for each of the 169 classes (vs random hand
+ * over 5 random board cards), then k-means cluster the 169 scalars into
+ * `num_opponent_clusters` groups. Output is `cluster_map[169]` in [0, k-1].
+ *
+ * Ordering matches ca_preflop_classes (pairs 0-12, then suited+offsuit
+ * pairs in descending rank order). Pluribus-faithful default: k=8.
+ * Deterministic: fixed RNG seed; same inputs produce same output.
+ *
+ * Returns the number of clusters actually populated (<= num_opponent_clusters).
+ */
+CA_EXPORT int ca_compute_ochs_clusters(
+    int num_opponent_clusters,
+    int ehs_samples,
+    int cluster_map[169]
+);
+
+/**
+ * Serialize OCHS cluster map to disk (magic "OCHS" + version + k + int32[169]).
+ * Returns 0 on success.
+ */
+CA_EXPORT int ca_save_ochs_clusters(
+    const char *path, int num_clusters, const int cluster_map[169]
+);
+
+/**
+ * Load OCHS cluster map from disk. Returns num_clusters on success, -1 on error.
+ */
+CA_EXPORT int ca_load_ochs_clusters(
+    const char *path, int cluster_map[169]
+);
+
+/**
+ * Compute 8-dim OCHS feature vector for each hand on a river board.
+ *
+ * For each hand h and each opponent cluster i, features[h][i] = showdown
+ * equity of h against the uniform distribution over 2-card combos whose
+ * preflop class is in cluster i, excluding combos that conflict with
+ * h or the board. If a cluster has zero valid opponent combos the entry
+ * is 0.5 (uninformative).
+ *
+ * Args:
+ *   board:         river board (5 cards)
+ *   num_board:     must be 5
+ *   hands:         [num_hands][2] hero hand cards
+ *   num_hands:     number of hands
+ *   ochs_cluster_of_169: precomputed cluster map (from ca_compute_ochs_clusters)
+ *   num_clusters:  k (8 for Pluribus-faithful)
+ *   features:      [num_hands][num_clusters] output, each value in [0, 1]
+ *
+ * Returns 0 on success, -1 on invalid input.
+ */
+CA_EXPORT int ca_river_ochs_features(
+    const int *board, int num_board,
+    const int hands[][2], int num_hands,
+    const int *ochs_cluster_of_169,
+    int num_clusters,
+    float *features
+);
+
+/**
+ * Generic n-dim k-means bucketing (L2 distance, percentile-seeded on dim 0).
+ *
+ * Args:
+ *   features:     [num_hands * num_dims] flat row-major input
+ *   num_hands:    number of hands
+ *   num_dims:     feature dimensionality
+ *   num_buckets:  target k
+ *   n_iters:      Lloyd iterations (20 is standard)
+ *   bucket_out:   [num_hands] bucket assignments
+ *
+ * Returns actual number of non-empty buckets.
+ */
+CA_EXPORT int ca_assign_buckets_kmeans_nd(
+    const float *features, int num_hands, int num_dims,
+    int num_buckets, int n_iters,
+    int *bucket_out
+);
+
+/**
+ * Nearest centroid lookup in n-dim L2 space.
+ */
+CA_EXPORT int ca_nearest_centroid_nd(
+    const float *feat, int num_dims,
+    const float *centroids, int num_centroids
+);
+
+/**
+ * Compute num_buckets river centroids for a specific board by k-means on
+ * OCHS features. `centroids_out` must be sized [num_buckets * num_clusters].
+ *
+ * Returns actual number of non-empty centroids.
+ */
+CA_EXPORT int ca_compute_river_centroids(
+    const int *board, int num_board,
+    const int *ochs_cluster_of_169, int num_clusters,
+    int num_buckets, int n_iters,
+    float *centroids_out
+);
+
 #ifdef __cplusplus
 }
 #endif

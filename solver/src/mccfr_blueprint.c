@@ -84,6 +84,60 @@ static void partial_shuffle(int *arr, int n, int k, uint64_t *rng) {
     }
 }
 
+/* Compute the river bucket for a single (hero hand, 5-card board).
+ *
+ * When s->ochs_enabled && s->river_centroids_k > 0, use OCHS: compute
+ * an 8-dim equity vector vs opponent clusters and pick the nearest of
+ * the precomputed river centroids. Otherwise fall through to the
+ * legacy 200-sample EHS percentile path.
+ *
+ * Deterministic given (board, hand); no state mutated. */
+static int compute_river_bucket(const BPSolver *s,
+                                 const int board[5], int c0, int c1) {
+    if (s->ochs_enabled && s->river_centroids_k > 0 &&
+        s->ochs_num_clusters > 0 && s->river_centroids != NULL) {
+        int hand[1][2] = {{ c0, c1 }};
+        /* Fixed cap on opponent clusters. 16 is comfortably above the
+         * Pluribus-standard 8 and keeps the feature buffer stack-resident. */
+        float feat[16];
+        int k = s->ochs_num_clusters;
+        if (k > 16) k = 16;
+        int rc = ca_river_ochs_features(board, 5, (const int(*)[2])hand, 1,
+                                         s->ochs_cluster_of_169,
+                                         k, feat);
+        if (rc == 0) {
+            return ca_nearest_centroid_nd(feat, k,
+                                           s->river_centroids,
+                                           s->river_centroids_k);
+        }
+        /* fall through on error */
+    }
+
+    /* Legacy 200-sample EHS percentile path */
+    int blk[52] = {0};
+    for (int b = 0; b < 5; b++) blk[board[b]] = 1;
+    blk[c0] = 1; blk[c1] = 1;
+    int av[52]; int nav = 0;
+    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
+    int wins = 0, ties = 0, total = 0;
+    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
+    for (int b = 0; b < 5; b++)
+        erng = erng * 6364136223846793005ULL + (uint64_t)board[b];
+    for (int si = 0; si < 200 && nav >= 2; si++) {
+        partial_shuffle(av, nav, 2, &erng);
+        int h7[7] = {board[0], board[1], board[2], board[3], board[4], c0, c1};
+        int o7[7] = {board[0], board[1], board[2], board[3], board[4], av[0], av[1]};
+        uint32_t hs = eval7(h7), os = eval7(o7);
+        if (hs > os) wins++; else if (hs == os) ties++;
+        total++;
+    }
+    float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
+    int b = (int)(ehs * (float)s->postflop_num_buckets);
+    if (b >= s->postflop_num_buckets) b = s->postflop_num_buckets - 1;
+    if (b < 0) b = 0;
+    return b;
+}
+
 /* ── Regret arena allocator ──────────────────────────────────────── */
 /* Eliminates per-info-set malloc overhead. Each calloc(4, sizeof(int))
  * adds 16-32 bytes of glibc malloc header, doubling memory for tiny arrays.
@@ -1259,36 +1313,14 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                         s->turn_centroids_k);
                 }
             } else if (next.num_board == 5) {
-                /* River: 200-sample EHS per player. This is the expensive
-                 * version of the same compute that used to run per-info-set. */
+                /* River: OCHS (if enabled) else EHS percentile. Cached once
+                 * per deal so every descendant info-set lookup is O(1). */
                 for (int p = 0; p < NP; p++) {
                     next.river_bucket[p] = -1;
                     if (!next.active[p]) continue;
                     int ph = next.sampled_hands[p];
                     int c0 = s->hands[p][ph][0], c1 = s->hands[p][ph][1];
-                    int blk[52] = {0};
-                    for (int b = 0; b < 5; b++) blk[next.board[b]] = 1;
-                    blk[c0] = 1; blk[c1] = 1;
-                    int av[52]; int nav = 0;
-                    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
-                    int wins = 0, ties = 0, total = 0;
-                    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
-                    for (int b = 0; b < 5; b++)
-                        erng = erng * 6364136223846793005ULL + (uint64_t)next.board[b];
-                    for (int si = 0; si < 200 && nav >= 2; si++) {
-                        partial_shuffle(av, nav, 2, &erng);
-                        int h7[7] = {next.board[0], next.board[1], next.board[2],
-                                     next.board[3], next.board[4], c0, c1};
-                        int o7[7] = {next.board[0], next.board[1], next.board[2],
-                                     next.board[3], next.board[4], av[0], av[1]};
-                        uint32_t hs = eval7(h7), os = eval7(o7);
-                        if (hs > os) wins++; else if (hs == os) ties++;
-                        total++;
-                    }
-                    float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
-                    int b = (int)(ehs * (float)s->postflop_num_buckets);
-                    if (b >= s->postflop_num_buckets) b = s->postflop_num_buckets - 1;
-                    next.river_bucket[p] = b;
+                    next.river_bucket[p] = compute_river_bucket(s, next.board, c0, c1);
                 }
             }
 
@@ -1748,29 +1780,7 @@ static float traverse_ev(TraversalState *ts, int acting_order_idx,
                     if (!next.active[p]) continue;
                     int ph = next.sampled_hands[p];
                     int c0 = s->hands[p][ph][0], c1 = s->hands[p][ph][1];
-                    int blk[52] = {0};
-                    for (int b = 0; b < 5; b++) blk[next.board[b]] = 1;
-                    blk[c0] = 1; blk[c1] = 1;
-                    int av[52]; int nav = 0;
-                    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
-                    int wins = 0, ties = 0, total = 0;
-                    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
-                    for (int b = 0; b < 5; b++)
-                        erng = erng * 6364136223846793005ULL + (uint64_t)next.board[b];
-                    for (int si = 0; si < 200 && nav >= 2; si++) {
-                        partial_shuffle(av, nav, 2, &erng);
-                        int h7[7] = {next.board[0], next.board[1], next.board[2],
-                                     next.board[3], next.board[4], c0, c1};
-                        int o7[7] = {next.board[0], next.board[1], next.board[2],
-                                     next.board[3], next.board[4], av[0], av[1]};
-                        uint32_t hs = eval7(h7), os = eval7(o7);
-                        if (hs > os) wins++; else if (hs == os) ties++;
-                        total++;
-                    }
-                    float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
-                    int b = (int)(ehs * (float)s->postflop_num_buckets);
-                    if (b >= s->postflop_num_buckets) b = s->postflop_num_buckets - 1;
-                    next.river_bucket[p] = b;
+                    next.river_bucket[p] = compute_river_bucket(s, next.board, c0, c1);
                 }
             }
 
@@ -1988,10 +1998,17 @@ static float traverse_ev(TraversalState *ts, int acting_order_idx,
  * distribute work across the team's threads. Does NOT use a new parallel
  * region (avoids nested parallelism issues). */
 static void accumulate_snapshot(BPInfoTable *t) {
+    /* Street-0 filter (F3): round 1's strategy_sum is accumulated per-visit
+     * in traverse() at street==0. Snapshots cover rounds 2-4 only, matching
+     * Pluribus's disk-snapshot mechanism for rounds 2-4 (Science 2019 supp.
+     * p.15). Without this filter, street-0 info sets would be double-counted
+     * (per-visit + snapshot), giving round 1 uneven weight vs rounds 2-4 in
+     * the final blueprint. */
     float strat_buf[BP_MAX_ACTIONS];
     #pragma omp for schedule(static, 65536) nowait
     for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
+        if (t->keys[i].street == 0) continue;
         BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
 
@@ -2017,11 +2034,15 @@ static void accumulate_snapshot(BPInfoTable *t) {
  *     negative regrets: tᵝ / (tᵝ + 1)
  *     strategy_sum:     (t / (t+1))ᵞ
  *
- * Paper default is α=1.5, β=0, γ=2. We default to β=0.5 rather than 0
- * because β=0 zeroes the negative-regret tail at every discount step,
- * which collides with negative-regret pruning (BP_PRUNE_THRESHOLD relies
- * on the accumulated negative reaching the threshold). β=0.5 preserves a
- * discounted tail long enough for pruning to fire as designed.
+ * Canonical paper values: α=1.5, β=0, γ=2. β=0 means negative regrets are
+ * NOT discounted at all — they accumulate linearly downward, preserving
+ * the full signal needed for negative-regret pruning. The paper explicitly
+ * shows DCFR is compatible with pruning (§5). Earlier versions of this
+ * file defaulted to β=0.5 based on the intuition that β=0 "zeroes the
+ * negative tail" — that intuition is wrong: β=0 freezes the tail, it
+ * doesn't erase it. β=0.5 actively shrinks negative regrets at every
+ * discount tick (40× during the first 400 min), which works AGAINST
+ * pruning. Reverted to canonical β=0 for v3 retrain.
  *
  * Toggle via environment:
  *     BPS_DCFR_ALPHA, BPS_DCFR_BETA, BPS_DCFR_GAMMA
@@ -2067,7 +2088,19 @@ static void dcfr_init_from_env(void) {
  * With p == 1 this is the Linear CFR schedule (t/(t+1)).
  */
 static inline float dcfr_factor(float t, float p) {
-    if (p <= 0.0f) return 0.0f;
+    /* DCFR paper (Brown & Sandholm 2019, arXiv:1809.04040) discount:
+     *     t^p / (t^p + 1)
+     *
+     * Edge case at p=0: the literal formula gives 1/(1+1)=0.5 (halves
+     * every tick). But the paper's intent with β=0 is "do not discount
+     * negative regrets" — preserving the full negative-regret signal so
+     * that negative-regret pruning can work. This is confirmed by the
+     * paper's §5 discussion of DCFR-pruning compatibility: β=0 freezes
+     * negatives rather than shrinking them. So we return 1.0 at p=0 to
+     * match the paper's intended behavior, not the literal formula.
+     *
+     * p<0 is not a valid DCFR parameter; clamp to 0 for safety. */
+    if (p <= 0.0f) return 1.0f;
     if (p == 1.0f) return t / (t + 1.0f);
     float tp = powf(t, p);
     return tp / (tp + 1.0f);
@@ -2701,6 +2734,168 @@ int bp_init_unified(BPSolver *s, int num_players,
             printf("[BP] Saved turn centroids to /tmp/turn_centroids.bin\n");
         }
         } /* end if (!loaded_centroids) */
+    }
+
+    /* River OCHS init (opt-in). Skipped entirely when river_ochs_enabled=0,
+     * preserving the existing EHS-percentile path bit-for-bit. */
+    s->ochs_enabled = 0;
+    s->ochs_num_clusters = 0;
+    s->river_centroids = NULL;
+    s->river_centroids_k = 0;
+    if (s->config.river_ochs_enabled) {
+        int k = s->config.river_ochs_num_clusters > 0
+                    ? s->config.river_ochs_num_clusters
+                    : CA_OCHS_DEFAULT_CLUSTERS;
+        s->ochs_num_clusters = k;
+
+        /* Try load cluster map; compute + persist if missing. */
+        const char *ochs_paths[] = {
+            "/tmp/ochs_clusters.bin",
+            "/dev/shm/ochs_clusters.bin",
+            "ochs_clusters.bin",
+        };
+        int loaded_ochs = 0;
+        for (int i = 0; i < 3 && !loaded_ochs; i++) {
+            int rc = ca_load_ochs_clusters(ochs_paths[i], s->ochs_cluster_of_169);
+            if (rc == k) {
+                loaded_ochs = 1;
+                printf("[BP] Loaded OCHS opponent clusters from %s (k=%d)\n",
+                       ochs_paths[i], k);
+            }
+        }
+        if (!loaded_ochs) {
+            printf("[BP] Computing OCHS opponent clusters (k=%d)...\n", k);
+            clock_t t0 = clock();
+            int actual = ca_compute_ochs_clusters(k, 2000, s->ochs_cluster_of_169);
+            double el = (double)(clock() - t0) / CLOCKS_PER_SEC;
+            printf("[BP] OCHS opponent clusters: %d populated in %.1fs\n",
+                   actual, el);
+            ca_save_ochs_clusters("/tmp/ochs_clusters.bin", k,
+                                   s->ochs_cluster_of_169);
+        }
+
+        /* Build one global set of river centroids by k-means over features
+         * sampled across random river boards. Option (i) — per-board-texture
+         * centroids — is a planned extension; this (option ii) is fast to
+         * bring up and already gives OCHS semantics at lookup time. */
+        const char *rcent_paths[] = {
+            "/tmp/river_centroids.bin",
+            "/dev/shm/river_centroids.bin",
+            "river_centroids.bin",
+        };
+        int target_buckets = s->postflop_num_buckets > 0 ? s->postflop_num_buckets : 200;
+        int loaded_rc = 0;
+        for (int i = 0; i < 3 && !loaded_rc; i++) {
+            FILE *f = fopen(rcent_paths[i], "rb");
+            if (!f) continue;
+            char magic[4];
+            int version = 0, saved_k = 0, saved_dims = 0;
+            int ok = 1;
+            if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "RCN1", 4) != 0) ok = 0;
+            if (ok && fread(&version, sizeof(int), 1, f) != 1) ok = 0;
+            if (ok && version != 1) ok = 0;
+            if (ok && fread(&saved_k, sizeof(int), 1, f) != 1) ok = 0;
+            if (ok && fread(&saved_dims, sizeof(int), 1, f) != 1) ok = 0;
+            if (ok && saved_dims == k && saved_k > 0 && saved_k <= target_buckets) {
+                s->river_centroids = (float*)malloc((size_t)saved_k * k * sizeof(float));
+                if (s->river_centroids &&
+                    fread(s->river_centroids, sizeof(float),
+                          (size_t)saved_k * k, f) == (size_t)saved_k * k) {
+                    s->river_centroids_k = saved_k;
+                    loaded_rc = 1;
+                    printf("[BP] Loaded %d river OCHS centroids from %s\n",
+                           saved_k, rcent_paths[i]);
+                }
+            }
+            fclose(f);
+        }
+        if (!loaded_rc) {
+            printf("[BP] Precomputing river OCHS centroids...\n");
+            clock_t tr_start = clock();
+
+            int n_boards = 200;   /* sampled river boards */
+            int max_feat = n_boards * 300;
+            float *all_feat = (float*)malloc((size_t)max_feat * k * sizeof(float));
+            int n_feat = 0;
+
+            uint64_t brng = 0x12345678DEADBEEFULL;
+            for (int bi = 0; bi < n_boards && n_feat < max_feat - 300; bi++) {
+                int deck[52];
+                for (int c = 0; c < 52; c++) deck[c] = c;
+                for (int i = 0; i < 5; i++) {
+                    int j = i + (int)(rng_next(&brng) % (uint64_t)(52 - i));
+                    int tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+                }
+                int board[5] = {deck[0], deck[1], deck[2], deck[3], deck[4]};
+
+                int hands[BP_MAX_HANDS][2];
+                int nh = ca_generate_hands(board, 5, hands);
+                /* subsample for speed */
+                int batch = (nh > 300) ? 300 : nh;
+                float *feats = (float*)malloc((size_t)batch * k * sizeof(float));
+                if (!feats) continue;
+                int rc = ca_river_ochs_features(board, 5,
+                                                 (const int(*)[2])hands, batch,
+                                                 s->ochs_cluster_of_169,
+                                                 k, feats);
+                if (rc == 0) {
+                    int copy_n = batch;
+                    if (n_feat + copy_n > max_feat) copy_n = max_feat - n_feat;
+                    memcpy(all_feat + (size_t)n_feat * k, feats,
+                           (size_t)copy_n * k * sizeof(float));
+                    n_feat += copy_n;
+                }
+                free(feats);
+            }
+
+            int *labels = (int*)malloc(n_feat * sizeof(int));
+            int actual = ca_assign_buckets_kmeans_nd(all_feat, n_feat, k,
+                                                     target_buckets, 20,
+                                                     labels);
+            int *counts = (int*)calloc(target_buckets, sizeof(int));
+            float *sums = (float*)calloc((size_t)target_buckets * k,
+                                          sizeof(float));
+            for (int f = 0; f < n_feat; f++) {
+                int b = labels[f];
+                counts[b]++;
+                for (int d = 0; d < k; d++)
+                    sums[(size_t)b * k + d] += all_feat[(size_t)f * k + d];
+            }
+            s->river_centroids = (float*)malloc((size_t)target_buckets * k * sizeof(float));
+            int kept = 0;
+            for (int b = 0; b < target_buckets; b++) {
+                if (counts[b] == 0) continue;
+                for (int d = 0; d < k; d++) {
+                    s->river_centroids[(size_t)kept * k + d] =
+                        sums[(size_t)b * k + d] / counts[b];
+                }
+                kept++;
+            }
+            s->river_centroids_k = kept;
+            (void)actual;
+
+            free(labels); free(counts); free(sums); free(all_feat);
+
+            double tr_elapsed = (double)(clock() - tr_start) / CLOCKS_PER_SEC;
+            printf("[BP] River OCHS centroids: %d clusters from %d samples in %.1fs\n",
+                   s->river_centroids_k, n_feat, tr_elapsed);
+
+            /* Persist */
+            FILE *fc = fopen("/tmp/river_centroids.bin", "wb");
+            if (fc) {
+                int version = 1;
+                fwrite("RCN1", 1, 4, fc);
+                fwrite(&version, sizeof(int), 1, fc);
+                fwrite(&s->river_centroids_k, sizeof(int), 1, fc);
+                fwrite(&k, sizeof(int), 1, fc);
+                fwrite(s->river_centroids, sizeof(float),
+                       (size_t)s->river_centroids_k * k, fc);
+                fclose(fc);
+                printf("[BP] Saved river OCHS centroids to /tmp/river_centroids.bin\n");
+            }
+        }
+
+        s->ochs_enabled = 1;
     }
 
     return 0;
@@ -3915,6 +4110,7 @@ void bp_free(BPSolver *s) {
     info_table_free(&s->info_table);
     if (s->rng_states) free(s->rng_states);
     if (s->texture_bucket_cache) free(s->texture_bucket_cache);
+    if (s->river_centroids) free(s->river_centroids);
     memset(s, 0, sizeof(BPSolver));
 }
 

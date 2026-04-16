@@ -60,6 +60,44 @@ PREFLOP_TIERS = {
 }
 PREFLOP_MAX_RAISES = 4
 
+# ── Config hash (stale-checkpoint guard) ──────────────────────────
+# Prior incident: a new tiered-sizing run loaded an OLD flat-8 checkpoint
+# and produced garbage for hours before detection. Embedding a SHA256 of
+# the config-relevant fields in the checkpoint meta and refusing to load
+# on mismatch prevents the entire failure class.
+
+def _compute_config_hash():
+    """Hash of everything that shapes the regret table.
+    A mismatch between current config and checkpoint meta means the
+    regret table's action_hash/bucket layout is incompatible and the
+    checkpoint must be rejected.
+    """
+    import hashlib
+    payload = {
+        "num_players": NUM_PLAYERS,
+        "blinds": [SMALL_BLIND, BIG_BLIND],
+        "initial_stack": INITIAL_STACK,
+        "preflop_tiers": {str(k): v for k, v in sorted(PREFLOP_TIERS.items())},
+        "preflop_max_raises": PREFLOP_MAX_RAISES,
+        "postflop_bet_sizes": POSTFLOP_BET_SIZES,
+        "preflop_buckets": 169,
+        "postflop_buckets": 200,
+        # DCFR params affect only regret trajectory (not table layout), but
+        # they DO affect convergence — resuming a Linear CFR checkpoint
+        # under DCFR (or vice versa) is a correctness hazard. Include them.
+        "dcfr_alpha": os.environ.get("BPS_DCFR_ALPHA", ""),
+        "dcfr_beta": os.environ.get("BPS_DCFR_BETA", ""),
+        "dcfr_gamma": os.environ.get("BPS_DCFR_GAMMA", ""),
+        # River OCHS is a card-abstraction change: river_bucket differs
+        # between OCHS and EHS-percentile, so info-set keys differ. A v3
+        # OCHS checkpoint cannot be resumed under the legacy path (or
+        # vice versa) without producing garbage.
+        "river_ochs": os.environ.get("BPS_RIVER_OCHS", "0"),
+        "river_ochs_clusters": os.environ.get("BPS_RIVER_OCHS_CLUSTERS", ""),
+    }
+    canon = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canon.encode('utf-8')).hexdigest()
+
 # ── DLL loading ───────────────────────────────────────────────────
 
 class BPConfig(ctypes.Structure):
@@ -75,6 +113,11 @@ class BPConfig(ctypes.Structure):
         ("snapshot_dir", ctypes.c_char_p),
         ("include_preflop", ctypes.c_int),
         ("postflop_num_buckets", ctypes.c_int),
+        # Opt-in OCHS river abstraction (Johanson 2013 / Pluribus). 0 = legacy
+        # EHS-percentile path; 1 = OCHS with river_ochs_num_clusters opponent
+        # clusters (0 → default of 8).
+        ("river_ochs_enabled", ctypes.c_int),
+        ("river_ochs_num_clusters", ctypes.c_int),
     ]
 
 
@@ -149,6 +192,13 @@ def main():
                         help="Export checkpoint every N iterations")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest regret checkpoint on S3")
+    parser.add_argument("--river-ochs", action="store_true",
+                        default=(os.environ.get("BPS_RIVER_OCHS", "0") == "1"),
+                        help="Enable OCHS river abstraction (Johanson 2013, "
+                             "Pluribus-faithful). Defaults to env BPS_RIVER_OCHS.")
+    parser.add_argument("--river-ochs-clusters", type=int,
+                        default=int(os.environ.get("BPS_RIVER_OCHS_CLUSTERS", "0") or 0),
+                        help="Number of opponent clusters for OCHS (0=default 8).")
     args = parser.parse_args()
 
     print(f"=== Unified 6-Player Blueprint (Pluribus-style) ===")
@@ -169,6 +219,8 @@ def main():
     bp_lib.bp_default_config(ctypes.byref(config))
     config.num_threads = args.num_threads
     config.include_preflop = 1
+    config.river_ochs_enabled = 1 if args.river_ochs else 0
+    config.river_ochs_num_clusters = args.river_ochs_clusters
 
     if args.hash_size > 0:
         config.hash_table_size = args.hash_size
@@ -204,6 +256,8 @@ def main():
     print(f"Discount: first {config.discount_stop_iter:,} iters, every {config.discount_interval:,}")
     print(f"Pruning: after iter {config.prune_start_iter:,}")
     print(f"Snapshots: after iter {config.snapshot_start_iter:,}, every {config.snapshot_interval:,}")
+    print(f"River OCHS: {'ENABLED' if config.river_ochs_enabled else 'disabled'} "
+          f"(clusters={config.river_ochs_num_clusters or 8})")
     print()
 
     # Try to load cached texture buckets from S3 (saves ~65 min precompute)
@@ -306,6 +360,22 @@ def main():
                         with open(meta_local) as mf:
                             cmeta = _json.load(mf)
                         iters_already_done = cmeta.get("iterations", 0)
+                        # Stale-checkpoint guard: refuse to continue if the
+                        # checkpoint's config hash doesn't match the current
+                        # config. Prevents the prior-incident class where a
+                        # new tiered run loaded a flat-8 checkpoint.
+                        ckpt_hash = cmeta.get("config_hash")
+                        cur_hash = _compute_config_hash()
+                        if ckpt_hash and ckpt_hash != cur_hash:
+                            print(f"[FATAL] Config hash mismatch.\n"
+                                  f"  checkpoint: {ckpt_hash}\n"
+                                  f"  current:    {cur_hash}\n"
+                                  f"Refusing to resume — action/bucket layout "
+                                  f"may be incompatible.")
+                            sys.exit(2)
+                        if not ckpt_hash:
+                            print("[WARN] Checkpoint has no config_hash "
+                                  "(pre-v3 format). Resuming at your risk.")
                 except Exception:
                     pass
                 print(f"Resumed from checkpoint: {n_loaded} info sets, "
@@ -347,21 +417,21 @@ def main():
     t0 = time.time()
 
     # Checkpoint schedule: dense early, then every 300M for spot safety.
-    # Target: 8B iterations. Every checkpoint uploaded to S3 so spot
-    # reclamation loses at most one checkpoint's worth of iterations.
+    # Target: 8B iterations. Every checkpoint uploaded to S3 so any restart
+    # loses at most one checkpoint's worth of iterations.
     #
-    # Early checkpoints (50M/100M/150M) were added after the v3 run died to
-    # spot reclamation at 178M iters with no checkpoint to resume from. With
-    # these, worst-case loss from an early spot kill is ~50M iters (~25 min).
+    # v3 cadence: checkpoint every 100M iters for the entire run. At
+    # ~35K iter/s on c7a.metal-48xl, 100M = ~48 min wall-clock, so a
+    # kernel hiccup or spot reclaim loses <~1 hour of work. 27 GB
+    # checkpoint write takes ~1-2 min = ~3% overhead, acceptable for
+    # preventing a v1/v2-class multi-day wasted run.
+    checkpoint_interval_iters = 100_000_000
     checkpoint_milestones = [
-        50_000_000, 100_000_000, 150_000_000,
-        200_000_000, 400_000_000, 600_000_000,
-        900_000_000, 1_200_000_000, 1_500_000_000, 1_800_000_000,
-        2_100_000_000, 2_400_000_000, 2_700_000_000, 3_000_000_000,
-        3_300_000_000, 3_600_000_000, 4_000_000_000,
+        (i + 1) * checkpoint_interval_iters
+        for i in range(max(1, int(total_iters // checkpoint_interval_iters)))
     ]
-    # After last explicit milestone, checkpoint every 300M
-    checkpoint_ramp_interval = 300_000_000
+    # After last explicit milestone, keep the same cadence
+    checkpoint_ramp_interval = checkpoint_interval_iters
     last_milestone = checkpoint_milestones[-1] if checkpoint_milestones else 0
 
     def _next_checkpoint(current):
@@ -625,6 +695,12 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
         "preflop_buckets": 169,
         "postflop_buckets": 200,
         "checkpoint": label or f"iter_{iters_done}",
+        "config_hash": _compute_config_hash(),
+        "dcfr": {
+            "alpha": os.environ.get("BPS_DCFR_ALPHA", ""),
+            "beta": os.environ.get("BPS_DCFR_BETA", ""),
+            "gamma": os.environ.get("BPS_DCFR_GAMMA", ""),
+        },
     }
     meta_path = os.path.join(args.output_dir, "checkpoint_meta.json")
     meta_tmp = meta_path + ".tmp"

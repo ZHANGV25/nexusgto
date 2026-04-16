@@ -130,6 +130,8 @@ typedef struct {
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
     int include_preflop;        /* 1 = start from preflop (unified Pluribus-style), 0 = start from flop */
     int postflop_num_buckets;   /* 0 = default (200). Reduce to shrink game tree. */
+    int river_ochs_enabled;     /* 0 = EHS-percentile (legacy); 1 = OCHS (Johanson 2013, Pluribus-faithful) */
+    int river_ochs_num_clusters;/* 0 = default (8) opponent clusters */
 } BPConfig;
 
 /* Blueprint solver state */
@@ -219,6 +221,22 @@ typedef struct {
      * mapped to nearest centroid. Matches Pluribus bucketing approach. */
     float turn_centroids[200][3];
     int turn_centroids_k;
+
+    /* River OCHS abstraction (Johanson 2013, AAMAS). When
+     * config.river_ochs_enabled == 1, the river bucket comes from nearest
+     * centroid in OCHS feature space instead of EHS percentile.
+     *
+     * ochs_cluster_of_169: preflop class -> opponent cluster. Fixed at init.
+     * river_centroids: flat [river_centroids_k * river_ochs_num_clusters].
+     *   Per-run single global centroid set (option ii from the plan).
+     *   Per-board-texture centroids are a planned extension; for now the
+     *   same centroid set is reused across boards with on-the-fly per-hand
+     *   feature compute at deal time (cached in river_bucket[p]). */
+    int ochs_enabled;            /* mirror of config.river_ochs_enabled */
+    int ochs_num_clusters;       /* k for opponent clusters, typically 8 */
+    int ochs_cluster_of_169[169];
+    float *river_centroids;      /* [river_centroids_k * ochs_num_clusters] */
+    int river_centroids_k;
 
     /* Stats */
     int64_t iterations_run;
