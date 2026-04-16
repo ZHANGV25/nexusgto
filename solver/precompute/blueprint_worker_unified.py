@@ -801,14 +801,19 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
                 except subprocess.CalledProcessError:
                     pass
 
-        # Upload regret file ONCE as latest, then server-side copy for timestamped.
-        # Saves uploading 76GB twice (was ~15-20 min overhead per checkpoint).
+        # Upload regret file as latest (always). Only keep a timestamped
+        # copy every 1B iters to limit S3 storage (~8 snapshots instead of
+        # 80 at ~100 GB each = ~800 GB vs ~8 TB).
         try:
             _s3_upload_with_retry(
-            subprocess.run(
-                ["aws", "s3", "cp",
-                 "--quiet"],
-                check=True, capture_output=True)
+            if iters_done % 1_000_000_000 == 0 or label == "final":
+                subprocess.run(
+                    ["aws", "s3", "cp",
+                     "--quiet"],
+                    check=True, capture_output=True)
+                print(f"  Regrets uploaded + snapshot preserved ({iter_tag})")
+            else:
+                print(f"  Regrets uploaded as latest ({iter_tag}, no snapshot)")
         except subprocess.CalledProcessError as e:
             print(f"  [WARN] regret upload/copy failed: {e}")
 
