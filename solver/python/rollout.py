@@ -881,3 +881,110 @@ def compute_subgame_leaf_values(
                 raise
             out[flat] = arr
     return out
+
+
+def compute_subgame_leaf_values_sampled(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    starting_pot_chips: int,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int = NUM_ROLLOUTS_DEFAULT,
+    num_samples_k: int = 1,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Sampled-cont-strat leaf-value integrator (OP4 / Option c).
+
+    For each betting leaf, draws `num_samples_k` joint bias profiles
+    uniformly from {0,1,2,3}^num_players and averages leaf values
+    across samples. Each sample runs `num_rollouts` Monte Carlo
+    rollouts internally.
+
+    Produces `[num_betting_leaves × num_players × max_hands]` — one
+    leaf_value slot per betting leaf, no cont-strat axis. The CFR
+    kernel sees a tree where each betting leaf is a single terminal
+    (SS_CONT_STRAT_MODE == SAMPLED in street_solve.cuh).
+
+    Pluribus §4 cont-strat is "another action in the subgame,
+    selected via MCCFR". MCCFR external-sampling draws one
+    realization per iteration; this integrator realizes that draw at
+    leaf-evaluation time rather than materializing 4^N terminals in
+    the tree. Closes both the 4^N memory blowup AND the sequential-
+    observation deviation in the old joint chain — the joint draw is
+    atomic, no player observes any other player's choice.
+
+    Variance accounting: at n_active players per betting leaf the
+    joint assignment space has 4^n_active outcomes. num_samples_k=1
+    is unbiased but noisy; at 6p (4^6 = 4096 outcomes) variance may
+    require k=16 or higher for CFR convergence within the existing
+    iter budget. The joint-equivalent variance at n_active=N is
+    achieved at num_samples_k = 4^(N-n_player_target); e.g., k=16
+    at 6p matches the 3p joint variance profile. Tune via
+    tools/op4_bench.py. See docs/OP4_CONT_STRAT_MARGINAL_PLAN.md
+    §"Variance accounting".
+
+    Args (same as compute_subgame_leaf_values, plus):
+        num_samples_k: number of joint cont-strat samples averaged
+            per betting leaf. Default 1.
+    """
+    if num_samples_k < 1:
+        raise ValueError(f"num_samples_k must be >= 1, got {num_samples_k}")
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    num_players = len(player_hands)
+    # num_leaves for the output array is (max leaf_idx + 1) — matches
+    # the SAMPLED-mode tree where each betting leaf has its original
+    # leaf_idx from the betting-tree pass.
+    if not leaf_infos:
+        return np.zeros((0, num_players, max_hands), dtype=np.float32)
+    max_leaf_idx = max(li.leaf_idx for li in leaf_infos)
+    total = max_leaf_idx + 1
+
+    out = np.zeros((total, num_players, max_hands), dtype=np.float32)
+
+    for li in leaf_infos:
+        leaf_bets = list(li.bets) if hasattr(li, "bets") else [0] * num_players
+        stacks = [max(0, stack_chips - b) for b in leaf_bets]
+
+        leaf = RolloutLeaf(
+            board=list(board),
+            pot_chips=int(li.pot),
+            active=list(active),
+            stacks=stacks,
+            bets=leaf_bets,
+            street=street,
+            player_hands=player_hands,
+            acting_order=list(acting_order),
+            game_action_history=list(game_action_history),
+            player_seats=list(player_seats),
+        )
+
+        # Draw K independent joint bias profiles. Each sample's bias
+        # for folded players is irrelevant (they don't act in the
+        # rollout), but we draw for all num_players slots to keep the
+        # RNG stream deterministic regardless of who folded.
+        sample_sum = np.zeros((num_players, max_hands), dtype=np.float64)
+        for sample_idx in range(num_samples_k):
+            bias = rng.integers(0, NUM_BIAS_PROFILES, size=num_players).tolist()
+            try:
+                arr = compute_leaf_values_all_hands(
+                    leaf=leaf, bias_profile=bias,
+                    blueprint=blueprint, max_hands=max_hands,
+                    num_rollouts=num_rollouts, rng=rng,
+                )
+            except LeafValueUnavailable:
+                raise
+            sample_sum += arr.astype(np.float64)
+
+        out[li.leaf_idx] = (sample_sum / float(num_samples_k)).astype(np.float32)
+
+    return out
