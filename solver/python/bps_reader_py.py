@@ -189,6 +189,50 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         ]
         lib.bps_load_pa_emd_turn_centroids.restype = ctypes.c_int
 
+    # OP3+OP1 commit 8: per-flop 500-bucket search-time bucketizer bindings.
+    # Only present in bps_reader.dll builds from commit 7 onward — guard
+    # with hasattr so older DLLs still load (degraded: OP3 full-depth search
+    # would error out at the per-flop centroid lookup, but the rest of the
+    # reader keeps working).
+    if hasattr(lib, "bps_load_op1_per_flop_turn_centroids"):
+        lib.bps_load_op1_per_flop_turn_centroids.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_char_p,         # path
+        ]
+        lib.bps_load_op1_per_flop_turn_centroids.restype = ctypes.c_int
+
+    if hasattr(lib, "bps_load_op1_per_flop_river_centroids"):
+        lib.bps_load_op1_per_flop_river_centroids.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_char_p,         # path
+        ]
+        lib.bps_load_op1_per_flop_river_centroids.restype = ctypes.c_int
+
+    if hasattr(lib, "bps_compute_flop_hash"):
+        lib.bps_compute_flop_hash.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            c_int_p,                 # flop[3]
+        ]
+        lib.bps_compute_flop_hash.restype = ctypes.c_uint64
+
+    if hasattr(lib, "bps_hand_to_bucket_turn_search"):
+        lib.bps_hand_to_bucket_turn_search.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_uint64,         # flop_hash
+            c_int_p,                 # board4[4]
+            ctypes.c_int, ctypes.c_int,  # c0, c1
+        ]
+        lib.bps_hand_to_bucket_turn_search.restype = ctypes.c_int
+
+    if hasattr(lib, "bps_hand_to_bucket_river_search"):
+        lib.bps_hand_to_bucket_river_search.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_uint64,         # flop_hash
+            c_int_p,                 # board5[5]
+            ctypes.c_int, ctypes.c_int,  # c0, c1
+        ]
+        lib.bps_hand_to_bucket_river_search.restype = ctypes.c_int
+
     lib.bps_reader_free.argtypes = [ctypes.c_void_p]
     lib.bps_reader_free.restype = None
 
@@ -744,6 +788,75 @@ class BPSReaderC:
         return self._lib.bps_load_pa_emd_turn_centroids(
             self._reader, path.encode("utf-8")
         )
+
+    # ── OP3+OP1 commit 8: search-time per-flop bucketizer ────────────
+    # Feeds the future-round bucket-keyed regret lookup added in
+    # street_solve.cu (commit 5). Keep the 200-bucket PA-EMD turn
+    # centroids loaded separately for rollout blueprint sigma lookups —
+    # the two code paths coexist.
+
+    def load_op1_per_flop_turn_centroids(self, path: str) -> int:
+        """Load OP1 per-flop 500-bucket PA-EMD turn centroids (TCN3 format).
+
+        Produced by tools/precompute_op1_per_flop_centroids.py. Required
+        for CFR future-round bucket lookups under POKER_SEARCH_DEPTH=full.
+        The texture cache must already be loaded (shape validation).
+
+        Returns k (centroid count) on success, -1 on error.
+        """
+        if not hasattr(self._lib, "bps_load_op1_per_flop_turn_centroids"):
+            return -1
+        return self._lib.bps_load_op1_per_flop_turn_centroids(
+            self._reader, path.encode("utf-8")
+        )
+
+    def load_op1_per_flop_river_centroids(self, path: str) -> int:
+        """Load OP1 per-flop 500-bucket PA-EMD river centroids (TCN3 format)."""
+        if not hasattr(self._lib, "bps_load_op1_per_flop_river_centroids"):
+            return -1
+        return self._lib.bps_load_op1_per_flop_river_centroids(
+            self._reader, path.encode("utf-8")
+        )
+
+    def compute_flop_hash(self, flop: List[int]) -> int:
+        """Compute the canonical flop hash used to index the texture cache
+        and OP1 per-flop centroid slices. Mirrors the C-side compute_board_hash
+        with the reader's loaded mixer mode.
+
+        Args:
+            flop: 3 cards (any order; canonicalized internally).
+
+        Returns: uint64 flop hash, or 0 on error (uninitialized reader /
+        bad flop). Real hashes are essentially never 0 in practice.
+        """
+        if not hasattr(self._lib, "bps_compute_flop_hash"):
+            return 0
+        flop_arr = (ctypes.c_int * 3)(*flop[:3])
+        return int(self._lib.bps_compute_flop_hash(self._reader, flop_arr))
+
+    def hand_to_bucket_turn_search(self, flop_hash: int, board4: List[int],
+                                     c0: int, c1: int) -> int:
+        """Search-time 500-bucket PA-EMD turn bucket for a hand on a
+        4-card turn board. Requires load_op1_per_flop_turn_centroids
+        + texture cache already loaded.
+
+        Strict: flop_hash=0 → -1 (no flop-global fallback).
+        """
+        if not hasattr(self._lib, "bps_hand_to_bucket_turn_search"):
+            return -1
+        board_arr = (ctypes.c_int * 4)(*board4[:4])
+        return int(self._lib.bps_hand_to_bucket_turn_search(
+            self._reader, ctypes.c_uint64(flop_hash), board_arr, c0, c1))
+
+    def hand_to_bucket_river_search(self, flop_hash: int, board5: List[int],
+                                      c0: int, c1: int) -> int:
+        """Search-time 500-bucket PA-EMD river bucket for a hand on a
+        5-card river board."""
+        if not hasattr(self._lib, "bps_hand_to_bucket_river_search"):
+            return -1
+        board_arr = (ctypes.c_int * 5)(*board5[:5])
+        return int(self._lib.bps_hand_to_bucket_river_search(
+            self._reader, ctypes.c_uint64(flop_hash), board_arr, c0, c1))
 
     def compute_evs(
         self,
