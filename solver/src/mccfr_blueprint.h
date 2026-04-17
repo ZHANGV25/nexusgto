@@ -88,8 +88,8 @@ typedef struct {
     float *action_evs;     /* [num_actions] or NULL (populated by bp_compute_action_evs).
                             * Phase 1.3: sum of per-action expected values observed during
                             * the σ̄-sampled EV walk. Average EV = action_evs[a] / ev_visit_count.
-                            * See docs/PHASE_1_3_DESIGN.md. Arena-allocated lazily on first
-                            * traverser visit during the EV walk. NULL until then. */
+                            * Arena-allocated lazily on first traverser visit during the EV
+                            * walk; NULL until then. */
     int ev_visit_count;    /* Phase 1.3: number of traverser visits that contributed to
                             * action_evs during the EV walk. Used to normalize the
                             * accumulated EVs into averages at export time. Relaxed atomic. */
@@ -118,12 +118,13 @@ typedef struct {
     int64_t prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
     int64_t snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
     int64_t snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
-    /* DEPRECATED — F2 fix in v3 (see V3_PLAN.md Phase 2.8). This field is set
-     * by ~30 callers but never read by mccfr_blueprint.c. The original Pluribus
-     * design uses Strategy Interval = 10K to gate sampled UPDATE-STRATEGY calls
-     * for round 1; our implementation accumulates strategy_sum on every visit
-     * (see SOLVER_CONFIG.md §10), so this field is dead code. Kept in the
-     * struct for ABI safety with the 30+ ctypes callers; ignore in new code. */
+    /* DEPRECATED — set by ~30 ctypes callers but never read by
+     * mccfr_blueprint.c. The original Pluribus design uses Strategy Interval
+     * = 10K to gate sampled UPDATE-STRATEGY for round 1; our implementation
+     * accumulates strategy_sum on every visit (SOLVER_CONFIG.md §10), so
+     * this field is dead code. Kept in the struct for ABI safety with the
+     * 30+ ctypes callers; ignore in new code. See STATUS.md §E3 and
+     * BLUEPRINT_BUGS.md (Bug 6 explains why the gated path is unsafe). */
     int64_t strategy_interval;
     int num_threads;            /* OpenMP threads (0 = auto) */
     int64_t hash_table_size;    /* 0 = auto. Supports >2B (e.g. 3B for 376GB instance) */
@@ -461,7 +462,8 @@ BP_EXPORT int64_t bp_load_regrets(BPSolver *s, const char *path);
  *
  * After this runs, `action_evs[a] / ev_visit_count` is an unbiased estimator
  * of `v̄(I, a)` — the counterfactual value of action `a` at info set `I`
- * under the average strategy. See docs/PHASE_1_3_DESIGN.md for the math.
+ * under the average strategy. Math: action_evs[a] / ev_visit_count is an
+ * unbiased σ̄-weighted counterfactual value estimator.
  *
  * Must be called AFTER bp_load_regrets or bp_solve so that strategy_sum is
  * populated. Must be called BEFORE bp_export_action_evs.

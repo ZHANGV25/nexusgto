@@ -96,10 +96,11 @@ class LeafValueUnavailable(RuntimeError):
 # This restores meaningful variance reduction in the GPU CFR's leaf-value pass
 # without requiring any blueprint export changes.
 #
-# **Long-term fix:** still want option B (per-action EVs in .bps via post-hoc
-# tree walk at export time). That gives exact leaf values matching Pluribus.
-# This first-order approximation is documented in V3_PLAN.md Phase 1.3 as the
-# v3 fix, and option B is tracked as a future REALTIME_TODO item for v4.
+# **Long-term fix:** per-action EVs in .bps via post-hoc tree walk at export
+# time. That gives exact leaf values matching Pluribus. Implemented as BPR3
+# (the trailing per-action-EV section on the .bps). This first-order bias
+# approximation is the pre-BPR3 code path; C1/C2 (rollout-based leaf values)
+# is now the canonical flop/turn leaf oracle. See STATUS.md §C1.
 
 # Probability that a player folds on the next street, indexed by bias profile:
 # 0 = unmodified, 1 = fold-bias, 2 = call-bias, 3 = raise-bias

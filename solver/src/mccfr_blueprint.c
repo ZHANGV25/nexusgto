@@ -721,7 +721,7 @@ static void ensure_strategy_sum(BPInfoSet *is) {
 
 /* Phase 1.3: allocate action_evs accumulator for an info set. Lazy
  * allocation on first traverser visit during the EV walk. Arena-backed.
- * See docs/PHASE_1_3_DESIGN.md for the algorithm. */
+ * See STATUS.md §C3 for the per-action-EV pipeline. */
 static void ensure_action_evs(BPInfoSet *is) {
     if (__atomic_load_n((void**)&is->action_evs, __ATOMIC_ACQUIRE) == NULL) {
         float *buf = (float*)arena_alloc(is->num_actions);
@@ -1598,7 +1598,9 @@ static float traverse(TraversalState *ts, int acting_order_idx,
  *      those training pruned away (they may still matter for biased
  *      continuation strategies at depth-limited leaves).
  *
- * See docs/PHASE_1_3_DESIGN.md for the full math. */
+ * Math: action_evs[a] accumulates E[v̄(I, a)] across EV-walk traversals;
+ * dividing by ev_visit_count at export time yields the unbiased
+ * counterfactual value of action `a` at info set `I` under σ̄. */
 static float traverse_ev(TraversalState *ts, int acting_order_idx,
                          const int *acting_order, int num_in_order);
 
@@ -2491,7 +2493,8 @@ int bp_init_unified(BPSolver *s, int num_players,
 
     {
         /* Generate all 1,755 unique flop textures (suit isomorphism).
-         * Same logic as solve_scenarios.py:generate_all_textures(). */
+         * This is the canonical enumeration — `tools/precompute_pa_emd_buckets.py`
+         * and `python/blueprint_v2.py::board_to_texture_key` must match. */
         const char *RANKS_STR = "23456789TJQKA";
         int tex_count = 0;
         clock_t pc_start = clock();
