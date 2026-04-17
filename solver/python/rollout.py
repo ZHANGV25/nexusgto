@@ -1,8 +1,7 @@
 """Pluribus-faithful rollout leaf values.
 
-Replaces rollout_leaves.py. See docs/C1_ROLLOUT_AUDIT.md for the
-list of Pluribus deviations in the old module and why this is a
-ground-up rewrite rather than in-place patches.
+See docs/C1_ROLLOUT_AUDIT.md for the four correctness deviations in the
+pre-C1 implementation that motivated this ground-up rewrite.
 
 Paper reference:
   Brown, Sandholm. "Superhuman AI for multiplayer poker."
@@ -115,8 +114,8 @@ def apply_bias(
 
     Behavior on degenerate bias (no mass on the bias target):
         Falls back to the *unbiased* strategy (renormalized), NOT to
-        uniform. This corrects a defect in rollout_leaves.py where the
-        fallback to uniform could silently replace a blueprint
+        uniform. This corrects a defect in the pre-C1 rollout code where
+        the fallback to uniform could silently replace a blueprint
         distribution that happened to have zero mass on the target
         (e.g., raise-biased at a check-only node).
     """
@@ -765,9 +764,8 @@ def compute_leaf_values_all_hands(
 ) -> np.ndarray:
     """Compute per-player per-hand leaf value for ALL hands in the leaf.
 
-    Returns [num_players, max_hands] float32, matching the array shape
-    the old rollout_leaves.compute_leaf_value_via_rollout produced.
-    Inactive players get 0 across all their hand slots.
+    Returns [num_players, max_hands] float32. Inactive players get 0
+    across all their hand slots.
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -810,10 +808,9 @@ def compute_subgame_leaf_values(
 ) -> np.ndarray:
     """Build the full [total_leaves × num_players × max_hands] array.
 
-    This is the Pluribus-faithful replacement for the old
-    rollout_leaves.compute_flop_leaf_values_rollout. The solver calls
-    this once per CFR iteration (or once at setup, depending on how
-    the cont-strat values are cached).
+    Pluribus-faithful implementation. The solver calls this once per CFR
+    iteration (or once at setup, depending on how the cont-strat values
+    are cached).
 
     Each leaf is enumerated against all 4^num_players bias combos;
     flat leaf index = leaf_infos[i].leaf_idx * cont_per_leaf + combo.

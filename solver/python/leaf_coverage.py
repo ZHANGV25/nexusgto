@@ -112,7 +112,8 @@ def record(category: str, hit: bool, detail: Optional[str] = None) -> None:
 
     Call sites:
         - leaf_values.compute_flop_leaf_values_bpr3: root per-player EV lookup
-        - rollout_leaves._get_blueprint_strategy: per-decision-node σ̄ lookup
+        - rollout.py / rollout_c.py: per-decision-node σ̄ lookup during the
+          rollout walk (used for C1 leaf values).
     """
     stack = getattr(_thread_local, "scopes", None)
     if not stack:

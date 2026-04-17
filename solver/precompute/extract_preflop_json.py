@@ -829,7 +829,7 @@ def main():
     # Parse args: positional bps_path [output_path] [max_depth] [--mixer=...]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
-    bps_path = args[0] if len(args) > 0 else "blueprint_data/unified_blueprint.bps"
+    bps_path = args[0] if len(args) > 0 else "blueprint_data_v3/unified_blueprint_v3_1.5B.bps"
     output_path = args[1] if len(args) > 1 else None
     max_depth = int(args[2]) if len(args) > 2 else 8
 
