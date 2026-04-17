@@ -68,14 +68,21 @@
 #define SS_NODE_DECISION  0
 #define SS_NODE_FOLD      1       /* a player folded; node stores who folded */
 #define SS_NODE_SHOWDOWN  2       /* river terminal — N-way showdown */
+#define SS_NODE_CHANCE    3       /* card-deal outcome (turn or river). children
+                                   * are next-street betting subtree roots, one
+                                   * per valid card. Under MCCFR external
+                                   * sampling only one child is traversed per
+                                   * CFR iteration; selection lives in
+                                   * d_sampled_card_per_chance at runtime.
+                                   * See docs/OP3_OP1_MULTI_STREET_PLAN.md. */
 #define SS_NODE_LEAF      4       /* depth-limit leaf — external value */
 
 /* ── Flat tree node ──────────────────────────────────────────────────── */
 
 typedef struct {
-    int type;                     /* SS_NODE_DECISION/FOLD/SHOWDOWN/LEAF */
-    int player;                   /* which player acts (0..N-1), or -1 for terminal */
-    int num_children;             /* for decision: num actions */
+    int type;                     /* SS_NODE_DECISION/FOLD/SHOWDOWN/CHANCE/LEAF */
+    int player;                   /* which player acts (0..N-1), or -1 for terminal/chance */
+    int num_children;             /* for decision: num actions; for chance: num valid cards */
     int first_child;              /* index into children array */
     int pot;                      /* total pot in chips */
     int bets[SS_MAX_PLAYERS];     /* each player's total bet this street */
@@ -85,6 +92,13 @@ typedef struct {
     int fold_player;              /* for SS_NODE_FOLD: which player folded (-1 if N/A) */
     int num_players;              /* number of active (non-folded) players at this node */
     int active_players[SS_MAX_PLAYERS]; /* which players are still active (1=active, 0=folded) */
+    /* OP3 chance-node fields. SS_NODE_CHANCE only; unused (=0) for other types.
+     * children[first_child .. first_child + num_children) are the num_children
+     * next-street betting subtree roots; each corresponds to dealing the card
+     * indexed by chance_card_per_child[i] (0..51). The child's SSNode.board_cards
+     * and num_board already reflect the dealt card. */
+    int chance_card_per_child_offset; /* offset into SSTreeData.chance_card_per_child */
+    int chance_node_idx;              /* idx into SSTreeData.chance_node_indices; -1 if not SS_NODE_CHANCE */
 } SSNode;
 
 /* ── Input to the GPU solver ────────────────────────────────────────── */
@@ -142,6 +156,54 @@ typedef struct {
      * This ensures the re-solve is "safe" — it won't exploit hero's past actions.
      * Set to NULL if no freezing needed. */
     int *frozen_action;
+
+    /* ── OP3 multi-street fields ─────────────────────────────────────────
+     * All fields below are zero / NULL under single-street mode (the legacy
+     * POKER_SEARCH_DEPTH=single code path). They become populated when
+     * ss_build_tree runs under the §4 depth rule (commit 3 onward).
+     * See docs/OP3_OP1_MULTI_STREET_PLAN.md. */
+
+    /* Subgame root street (3=flop, 4=turn, 5=river) — matches num_board.
+     * Drives the depth-rule dispatch inside the tree builder. */
+    int subgame_root_street;
+
+    /* Indices (into `nodes`) of all SS_NODE_CHANCE nodes, in BFS order.
+     * NULL / num_chance_nodes=0 under single-street mode. */
+    int *chance_node_indices;
+    int num_chance_nodes;
+
+    /* Per-chance-node child cards: for SSNode at chance_node_indices[i],
+     * the valid child-card list lives at
+     *   chance_card_per_child[nodes[chance_node_indices[i]].chance_card_per_child_offset ..]
+     * running for nodes[...].num_children entries. Values are 0..51 card
+     * indices. Populated once at tree build; read by the kernel and by
+     * the per-iter sampled-card redraw. */
+    int *chance_card_per_child;
+    int  chance_card_per_child_total;
+
+    /* OP1: per-iter sampled card index for each chance node. Redrawn on
+     * host (or via a tiny device kernel) at the start of each CFR
+     * iteration — entry i ∈ [0, nodes[chance_node_indices[i]].num_children).
+     * Consumed by reach propagation and CFV traversal to select the
+     * single sampled child per iter (MCCFR external sampling).
+     * NULL under single-street mode. */
+    int *sampled_child_per_chance;
+
+    /* OP1: dense abstract-infoset-id remap for future-round decision
+     * nodes. Entry i = -1 means "node i is current-round, use the
+     * lossless per-hand regret slot as today". Entry i >= 0 means
+     * "node i is future-round, use the bucket-keyed shared slot at
+     * d_regrets_fut[entry * SS_MAX_ACTIONS]". NULL under
+     * single-street mode (all decision nodes are current-round).
+     * Length: num_nodes. */
+    int *future_round_regret_remap;
+    int  num_abstract_future_infosets;
+
+    /* OP1: subgame-root flop used to key the per-flop 500-bucket PA-EMD
+     * centroid slice. Copied from the caller-supplied board (first 3
+     * cards) at build time. Passed through bps_hand_to_bucket_*_search
+     * at CFR traversal for any future-round decision-node bucket lookup. */
+    int subgame_root_flop[3];
 } SSTreeData;
 
 /* ── Output ──────────────────────────────────────────────────────────── */

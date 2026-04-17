@@ -64,6 +64,9 @@ def _get_lib():
 # ── ctypes structure mirrors (must match street_solve.cuh exactly) ───────
 
 class SSNode(ctypes.Structure):
+    # OP3: chance_card_per_child_offset + chance_node_idx appended at tail.
+    # Unused (=0) for non-SS_NODE_CHANCE nodes, so single-street default
+    # behavior is unchanged. Field order must match street_solve.cuh exactly.
     _fields_ = [
         ("type", ctypes.c_int),
         ("player", ctypes.c_int),
@@ -77,9 +80,14 @@ class SSNode(ctypes.Structure):
         ("fold_player", ctypes.c_int),
         ("num_players", ctypes.c_int),
         ("active_players", ctypes.c_int * SS_MAX_PLAYERS),
+        ("chance_card_per_child_offset", ctypes.c_int),
+        ("chance_node_idx", ctypes.c_int),
     ]
 
 class SSTreeData(ctypes.Structure):
+    # OP3 multi-street fields appended at the tail after `frozen_action`.
+    # Zero / NULL under single-street mode so the legacy path is unchanged.
+    # Field order must match street_solve.cuh exactly.
     _fields_ = [
         ("nodes", ctypes.POINTER(SSNode)),
         ("children", ctypes.POINTER(ctypes.c_int)),
@@ -108,6 +116,16 @@ class SSTreeData(ctypes.Structure):
         ("effective_stack", ctypes.c_int),
         ("is_river", ctypes.c_int),
         ("frozen_action", ctypes.POINTER(ctypes.c_int)),
+        # OP3 tail — all zero/NULL under POKER_SEARCH_DEPTH=single.
+        ("subgame_root_street", ctypes.c_int),
+        ("chance_node_indices", ctypes.POINTER(ctypes.c_int)),
+        ("num_chance_nodes", ctypes.c_int),
+        ("chance_card_per_child", ctypes.POINTER(ctypes.c_int)),
+        ("chance_card_per_child_total", ctypes.c_int),
+        ("sampled_child_per_chance", ctypes.POINTER(ctypes.c_int)),
+        ("future_round_regret_remap", ctypes.POINTER(ctypes.c_int)),
+        ("num_abstract_future_infosets", ctypes.c_int),
+        ("subgame_root_flop", ctypes.c_int * 3),
     ]
 
 class SSOutput(ctypes.Structure):
