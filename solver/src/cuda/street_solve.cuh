@@ -57,11 +57,11 @@
  *             both deviations. Shipping mode. */
 #define SS_CONT_STRAT_MODE_JOINT   0
 #define SS_CONT_STRAT_MODE_SAMPLED 1
-/* Default remains JOINT until the sampled leaf-value integrator lands
- * (OP4 commits 3-5). Flipped to SAMPLED in OP4 commit 10 after all
- * regressions are green and the API wire-in is tested. */
+/* Default SAMPLED per OP4 commit 10 (2026-04-17). JOINT retained
+ * for regression diff via -DSS_CONT_STRAT_MODE=0; see
+ * docs/OP4_CONT_STRAT_MARGINAL_PLAN.md and docs/OP4_BENCH.md. */
 #ifndef SS_CONT_STRAT_MODE
-#define SS_CONT_STRAT_MODE SS_CONT_STRAT_MODE_JOINT
+#define SS_CONT_STRAT_MODE SS_CONT_STRAT_MODE_SAMPLED
 #endif
 
 /* Node types */
