@@ -1165,6 +1165,198 @@ int bps_load_pa_emd_turn_centroids(BPSReader *r, const char *path) {
     return k;
 }
 
+/* ── OP1 per-flop search-time centroids ──────────────────────────────── */
+
+uint64_t bps_compute_flop_hash(const BPSReader *r, const int *flop) {
+    if (!r || !flop) return 0ULL;
+    for (int i = 0; i < 3; i++) {
+        if (flop[i] < 0 || flop[i] >= 52) return 0ULL;
+    }
+    /* Use the texture cache's mixer mode if a cache is loaded; otherwise
+     * fall back to the reader's mixer. The two should agree after a proper
+     * load, but we prefer the texture cache's flag since that's what drives
+     * the lookup path in tex_index_lookup. */
+    int mixer = r->textures.loaded
+                ? r->textures.use_legacy_mixer
+                : r->use_legacy_mixer;
+    return compute_board_hash(flop, 3, mixer);
+}
+
+/* TCN3 loader shared between turn and river (format is identical; street
+ * only determines which BPSReader pointer receives the payload). */
+static int bps_load_op1_tcn3(BPSReader *r, const char *path,
+                              float **out_centroids, int *out_loaded,
+                              const char *label) {
+    if (!r || !path || !path[0] || !out_centroids || !out_loaded) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[bps_reader] %s: cannot open %s\n", label, path);
+        return -1;
+    }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "TCN3", 4) != 0) {
+        fprintf(stderr, "[bps_reader] %s: bad magic at %s\n", label, path);
+        fclose(f); return -1;
+    }
+    int version;
+    if (fread(&version, sizeof(int), 1, f) != 1 || version != 1) {
+        fprintf(stderr, "[bps_reader] %s: bad version at %s\n", label, path);
+        fclose(f); return -1;
+    }
+    int num_textures, k, n_bins;
+    if (fread(&num_textures, sizeof(int), 1, f) != 1 ||
+        num_textures <= 0 || num_textures > BPS_MAX_TEXTURES) {
+        fprintf(stderr, "[bps_reader] %s: bad num_textures at %s\n", label, path);
+        fclose(f); return -1;
+    }
+    if (fread(&k, sizeof(int), 1, f) != 1 || k <= 0 || k > 4096) {
+        fprintf(stderr, "[bps_reader] %s: bad k at %s\n", label, path);
+        fclose(f); return -1;
+    }
+    if (fread(&n_bins, sizeof(int), 1, f) != 1 || n_bins <= 0 || n_bins > 200) {
+        fprintf(stderr, "[bps_reader] %s: bad n_bins at %s\n", label, path);
+        fclose(f); return -1;
+    }
+
+    /* Texture cache must be loaded first — we need num_textures to match
+     * so flop_hash lookups index the right centroid slice. */
+    if (!r->textures.loaded) {
+        fprintf(stderr, "[bps_reader] %s: texture cache not loaded; "
+                "call bps_load_texture_cache / bps_load_pa_emd_flop_cache first\n",
+                label);
+        fclose(f); return -1;
+    }
+    if (num_textures != r->textures.num_textures) {
+        fprintf(stderr, "[bps_reader] %s: num_textures mismatch (TCN3=%d, "
+                "texture cache=%d); flop enumeration out of sync\n",
+                label, num_textures, r->textures.num_textures);
+        fclose(f); return -1;
+    }
+
+    /* If we already have a prior table loaded, verify shape compat;
+     * either free-and-reload (if shape changed) or reuse the buffer. */
+    if (r->op1_num_textures > 0
+        && (r->op1_num_textures != num_textures
+            || r->op1_k != k
+            || r->op1_n_bins != n_bins)) {
+        fprintf(stderr, "[bps_reader] %s: TCN3 shape mismatch with prior load "
+                "(was %d×%d×%d, now %d×%d×%d)\n",
+                label, r->op1_num_textures, r->op1_k, r->op1_n_bins,
+                num_textures, k, n_bins);
+        fclose(f); return -1;
+    }
+
+    size_t n_floats = (size_t)num_textures * (size_t)k * (size_t)n_bins;
+    float *centroids = (float*)malloc(n_floats * sizeof(float));
+    if (!centroids) { fclose(f); return -1; }
+    if (fread(centroids, sizeof(float), n_floats, f) != n_floats) {
+        fprintf(stderr, "[bps_reader] %s: short read at %s\n", label, path);
+        free(centroids); fclose(f); return -1;
+    }
+    fclose(f);
+
+    if (*out_centroids) free(*out_centroids);
+    *out_centroids = centroids;
+    *out_loaded = 1;
+    r->op1_num_textures = num_textures;
+    r->op1_k = k;
+    r->op1_n_bins = n_bins;
+
+    fprintf(stderr, "[bps_reader] %s: %d textures × %d buckets × %d bins "
+            "(%.1f MB) from %s\n",
+            label, num_textures, k, n_bins,
+            (double)(n_floats * sizeof(float)) / (1024.0 * 1024.0), path);
+    return k;
+}
+
+int bps_load_op1_per_flop_turn_centroids(BPSReader *r, const char *path) {
+    return bps_load_op1_tcn3(r, path, &r->op1_turn_centroids,
+                             &r->op1_turn_loaded,
+                             "OP1 per-flop turn centroids");
+}
+
+int bps_load_op1_per_flop_river_centroids(BPSReader *r, const char *path) {
+    return bps_load_op1_tcn3(r, path, &r->op1_river_centroids,
+                             &r->op1_river_loaded,
+                             "OP1 per-flop river centroids");
+}
+
+/* Shared search-time bucket resolver: nearest-centroid-by-EMD against
+ * the per-flop centroid slice for this flop_hash. num_board is 4 (turn)
+ * or 5 (river). */
+static int bps_hand_to_bucket_search_impl(const BPSReader *r,
+                                            const float *centroids,
+                                            int centroids_loaded,
+                                            uint64_t flop_hash,
+                                            const int *board, int num_board,
+                                            int c0, int c1) {
+    if (!r || !board) return -1;
+    if (!centroids || !centroids_loaded) return -1;
+    if (r->op1_num_textures <= 0 || r->op1_k <= 0 || r->op1_n_bins <= 0)
+        return -1;
+    if (!r->textures.loaded) return -1;
+
+    /* Strict: no flop-global fallback (plan §8 R4). flop_hash=0 means
+     * caller didn't pass one; we refuse rather than silently use a stale
+     * centroid slice. */
+    if (flop_hash == 0ULL) return -1;
+
+    /* Hand must not collide with the board. */
+    for (int i = 0; i < num_board; i++) {
+        if (board[i] == c0 || board[i] == c1) return -1;
+    }
+
+    int tex_idx = tex_index_lookup(&r->textures, flop_hash);
+    if (tex_idx < 0) return -1;
+    if (tex_idx >= r->op1_num_textures) return -1;
+
+    const float *slice = centroids
+        + (size_t)tex_idx * (size_t)r->op1_k * (size_t)r->op1_n_bins;
+
+    /* If this flop's slice was never populated (sharded precompute didn't
+     * reach it), reject loudly rather than pick the 0-th centroid by
+     * default (which is a hist of zeros). Detect via total mass: a valid
+     * slice has ≥ one histogram summing to 1.0. */
+    int any_nonzero = 0;
+    for (int i = 0; i < r->op1_k && !any_nonzero; i++) {
+        float s = 0.0f;
+        for (int b = 0; b < r->op1_n_bins; b++) {
+            s += slice[i * r->op1_n_bins + b];
+            if (s > 1e-6f) { any_nonzero = 1; break; }
+        }
+    }
+    if (!any_nonzero) return -1;
+
+    int hand[2] = {c0, c1};
+    int n_bins = r->op1_n_bins;
+    float *hist = (float*)malloc((size_t)n_bins * sizeof(float));
+    if (!hist) return -1;
+    ca_compute_ehs_distribution(board, num_board, hand, 1000, hist, n_bins);
+    int bucket = ca_nearest_centroid_emd(hist, slice, r->op1_k, n_bins);
+    free(hist);
+    return bucket;
+}
+
+int bps_hand_to_bucket_turn_search(const BPSReader *r,
+                                     uint64_t flop_hash,
+                                     const int *board4,
+                                     int c0, int c1) {
+    return bps_hand_to_bucket_search_impl(
+        r, r->op1_turn_centroids, r->op1_turn_loaded,
+        flop_hash, board4, 4, c0, c1);
+}
+
+int bps_hand_to_bucket_river_search(const BPSReader *r,
+                                      uint64_t flop_hash,
+                                      const int *board5,
+                                      int c0, int c1) {
+    return bps_hand_to_bucket_search_impl(
+        r, r->op1_river_centroids, r->op1_river_loaded,
+        flop_hash, board5, 5, c0, c1);
+}
+
 /* ── Cache serialization ─────────────────────────────────────────────── */
 
 /*
@@ -1413,6 +1605,25 @@ void bps_reader_free(BPSReader *r) {
     r->textures.bucket_cache = NULL;
     r->textures.loaded = 0;
     r->textures.num_textures = 0;
+    if (r->pa_emd_turn_centroids) {
+        free(r->pa_emd_turn_centroids);
+        r->pa_emd_turn_centroids = NULL;
+        r->pa_emd_turn_k = 0;
+        r->pa_emd_turn_bins = 0;
+    }
+    if (r->op1_turn_centroids) {
+        free(r->op1_turn_centroids);
+        r->op1_turn_centroids = NULL;
+    }
+    if (r->op1_river_centroids) {
+        free(r->op1_river_centroids);
+        r->op1_river_centroids = NULL;
+    }
+    r->op1_turn_loaded = 0;
+    r->op1_river_loaded = 0;
+    r->op1_num_textures = 0;
+    r->op1_k = 0;
+    r->op1_n_bins = 0;
     r->strategies_loaded = 0;
     r->evs_loaded = 0;
 }

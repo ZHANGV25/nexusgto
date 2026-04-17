@@ -132,6 +132,26 @@ typedef struct {
      * bps_load_pa_emd_flop_cache). When pa_emd_flop_loaded=1,
      * the texture cache was populated from the PAEB file. */
     int      pa_emd_flop_loaded;
+
+    /* OP1 per-flop 500-bucket PA-EMD centroids (TCN3 format, loaded via
+     * bps_load_op1_per_flop_turn_centroids / _river_). Used ONLY by the
+     * search-time future-round bucket lookup
+     * (bps_hand_to_bucket_turn_search / _river_search) — distinct from the
+     * 200-bucket blueprint pa_emd_turn_centroids which serves rollout sigma
+     * lookups. See docs/OP3_OP1_MULTI_STREET_PLAN.md §2,§5.
+     *
+     * Shape (flat row-major): [num_textures * op1_k * op1_n_bins].
+     * Texture slice for texture_idx tx: &op1_turn_centroids[tx * op1_k * op1_n_bins].
+     * num_textures MUST match the BPSTextureCache's num_textures once loaded
+     * (the TCN3 file is written in `generate_all_textures()` order and
+     * indexed by `tex_index_lookup(flop_hash)` at query time). */
+    float   *op1_turn_centroids;   /* [num_textures * op1_k * op1_n_bins] */
+    float   *op1_river_centroids;  /* [num_textures * op1_k * op1_n_bins] */
+    int      op1_num_textures;     /* 1755 at ship-time */
+    int      op1_k;                /* 500 at ship-time */
+    int      op1_n_bins;           /* 50 at ship-time */
+    int      op1_turn_loaded;      /* 1 after bps_load_op1_per_flop_turn_centroids */
+    int      op1_river_loaded;     /* 1 after bps_load_op1_per_flop_river_centroids */
 } BPSReader;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -371,6 +391,88 @@ BPS_EXPORT int bps_load_pa_emd_flop_cache(BPSReader *r, const char *path);
  * Returns k on success, -1 on error.
  */
 BPS_EXPORT int bps_load_pa_emd_turn_centroids(BPSReader *r, const char *path);
+
+/* ── OP1 per-flop search-time bucket lookups ─────────────────────────── */
+
+/**
+ * Compute the canonical flop hash used to key the BPSTextureCache and the
+ * OP1 per-flop centroid tables. Mirrors the internal `compute_board_hash`
+ * function with the reader's loaded mixer (boost vs splitmix64 — set by
+ * whichever load function populated the texture cache).
+ *
+ * Pluribus §2 notes the flop abstraction is suit-isomorphic: the hash
+ * canonicalizes the 3-card flop first so suit-equivalent flops collapse
+ * to the same hash.
+ *
+ * Args:
+ *   r: reader with texture cache loaded (mixer mode is inherited from there).
+ *   flop: 3 cards (any order; canonicalized internally).
+ *
+ * Returns the 64-bit canonical flop hash, or 0 on error (uninitialized
+ * reader or bad flop; note that real hashes are essentially never 0 in
+ * practice, so 0 is a sentinel).
+ */
+BPS_EXPORT uint64_t bps_compute_flop_hash(const BPSReader *r, const int *flop);
+
+/**
+ * Load OP1 per-flop 500-bucket PA-EMD turn centroids (TCN3 format).
+ *
+ * Produced by tools/precompute_op1_per_flop_centroids.py. Feeds the
+ * solver-time future-round bucket lookup at turn (one set of 500
+ * centroids per canonical flop texture, keyed by flop_hash → tex_idx via
+ * the already-loaded BPSTextureCache).
+ *
+ * Format: "TCN3" magic + int32 version + int32 num_textures + int32 k
+ *       + int32 n_bins + float32[num_textures * k * n_bins] centroids.
+ *
+ * Prereq: bps_load_texture_cache or bps_load_pa_emd_flop_cache must have
+ * been called first (the flop_hash → tex_idx map is in BPSTextureCache).
+ * The TCN3 num_textures must equal the texture cache's num_textures.
+ *
+ * Returns k on success, -1 on error.
+ */
+BPS_EXPORT int bps_load_op1_per_flop_turn_centroids(BPSReader *r, const char *path);
+
+/**
+ * Load OP1 per-flop 500-bucket PA-EMD river centroids (TCN3 format).
+ * Parallel to the turn loader; same constraints. */
+BPS_EXPORT int bps_load_op1_per_flop_river_centroids(BPSReader *r, const char *path);
+
+/**
+ * Search-time turn bucket lookup for a hand on a 4-card turn board.
+ *
+ * Resolves (flop_hash → tex_idx) via the texture cache, slices
+ * op1_turn_centroids for that flop's 500-bucket table, computes the
+ * hand's equity distribution on the full 4-card board, and finds the
+ * nearest centroid by EMD.
+ *
+ * Args:
+ *   r:        reader with OP1 turn centroids + texture cache loaded.
+ *   flop_hash: hash of the subgame-root flop (3 cards), produced by
+ *              `compute_board_hash(flop, 3, use_legacy_mixer)`. Pass 0 to
+ *              hard-fail (no flop-global fallback; see plan §8 R4).
+ *   board4:   4 cards (flop + turn).
+ *   c0, c1:   hero hole cards.
+ *
+ * Returns bucket index in [0, k-1], or -1 on error:
+ *   - OP1 turn centroids not loaded
+ *   - texture cache not loaded
+ *   - flop_hash not found in texture cache
+ *   - hand conflicts with board
+ *   - centroid slice is empty (flop never ran through precompute)
+ */
+BPS_EXPORT int bps_hand_to_bucket_turn_search(const BPSReader *r,
+                                                uint64_t flop_hash,
+                                                const int *board4,
+                                                int c0, int c1);
+
+/**
+ * Search-time river bucket lookup for a hand on a 5-card river board.
+ * Parallel to the turn search-time lookup. */
+BPS_EXPORT int bps_hand_to_bucket_river_search(const BPSReader *r,
+                                                 uint64_t flop_hash,
+                                                 const int *board5,
+                                                 int c0, int c1);
 
 /**
  * Save the loaded hash table state to a binary cache file.
