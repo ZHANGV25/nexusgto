@@ -58,7 +58,7 @@ $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_re
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
 $(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
 

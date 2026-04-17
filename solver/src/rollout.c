@@ -1070,16 +1070,52 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
 
     memset(out, 0, (size_t)floats_needed * sizeof(float));
 
-    /* bias combo decoding: bias[p] = (combo / NUM_BIAS_PROFILES^p) % NUM_BIAS_PROFILES */
-    for (int32_t li_idx = 0; li_idx < n_leaves; li_idx++) {
-        const RolloutLeafInfo *li = &leaf_infos[li_idx];
-        int32_t stacks[ROLLOUT_MAX_PLAYERS];
-        for (int32_t p = 0; p < num_players; p++) {
-            int32_t s = stack_chips - li->bets[p];
-            stacks[p] = s < 0 ? 0 : s;
-        }
+    /* OpenMP parallelization over (leaf × combo). The RNG is per-tuple
+     * splitmix64 with no shared state; `out` is written to disjoint
+     * per-(leaf_idx, combo) regions by construction (flat indexing in
+     * rollout_compute_leaf_values_all_hands_c).
+     *
+     * Error handling: rollout_set_error writes to thread-local storage
+     * inside worker threads, so we cannot surface the reason through the
+     * caller's TLS slot. First-failure capture pattern:
+     *   - `g_fail` is set atomically on the first rc != 0.
+     *   - Remaining iterations short-circuit via the flag check.
+     *   - The worker that captured the first failure copies its TLS error
+     *     into a shared buffer before exiting, so the caller's
+     *     rollout_get_last_error sees a meaningful reason.
+     */
+    volatile int g_fail = 0;
+    /* Error-capture buffer, protected by a critical section. */
+    char cap_reason[512] = {0};
+    int32_t cap_street = street;
+    int32_t cap_num_players = num_players;
 
+    /* Parallelize across the full (leaf × combo) cartesian product.
+     * collapse(2) requires perfectly-nested loops, so stack computation
+     * moves inside. `g_fail` guards short-circuit; break is illegal in
+     * OpenMP `for` body so we use continue.
+     *
+     * Typical workloads at 2p have n_leaves small (1-few) but
+     * cont_per_leaf = 16; at 3p cont_per_leaf = 64; at 6p it's 4096.
+     * Inner combo loop carries the real fanout — collapse is essential. */
+    #pragma omp parallel for collapse(2) schedule(dynamic, 1) default(none) \
+        shared(out, leaf_infos, n_leaves, cont_per_leaf, stack_chips, \
+                num_players, max_hands, num_rollouts, master_seed, \
+                r, board, n_board_cards, street, active, player_hands, \
+                acting_order, acting_order_len, player_seats, \
+                game_action_history, gah_len, g_fail, \
+                cap_reason, cap_street, cap_num_players)
+    for (int32_t li_idx = 0; li_idx < n_leaves; li_idx++) {
         for (int64_t combo = 0; combo < cont_per_leaf; combo++) {
+            if (g_fail) continue;
+
+            const RolloutLeafInfo *li = &leaf_infos[li_idx];
+            int32_t stacks[ROLLOUT_MAX_PLAYERS];
+            for (int32_t p = 0; p < num_players; p++) {
+                int32_t s = stack_chips - li->bets[p];
+                stacks[p] = s < 0 ? 0 : s;
+            }
+
             int32_t bias_profile[ROLLOUT_MAX_PLAYERS];
             int64_t c = combo;
             for (int32_t p = 0; p < num_players; p++) {
@@ -1097,8 +1133,34 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
                 player_seats, game_action_history, gah_len,
                 bias_profile, max_hands, num_rollouts, master_seed,
                 li->leaf_idx, (int32_t)combo, slot);
-            if (rc != 0) return -1;
+            if (rc != 0) {
+                #pragma omp critical(rollout_parallel_fail)
+                {
+                    if (!g_fail) {
+                        const char *reason = NULL;
+                        int32_t s_st = 0, s_np = 0;
+                        rollout_get_last_error(&reason, &s_st, &s_np);
+                        if (reason) {
+                            strncpy(cap_reason, reason,
+                                    sizeof(cap_reason) - 1);
+                            cap_reason[sizeof(cap_reason) - 1] = '\0';
+                            cap_street = s_st;
+                            cap_num_players = s_np;
+                        }
+                        g_fail = 1;
+                    }
+                }
+            }
         }
+    }
+
+    if (g_fail) {
+        /* Re-raise into the caller's TLS slot so rollout_get_last_error
+         * continues to work on the main thread. */
+        rollout_set_error(cap_street, cap_num_players, "%s",
+                          cap_reason[0] ? cap_reason
+                                        : "rollout worker failed");
+        return -1;
     }
     return 0;
 }
