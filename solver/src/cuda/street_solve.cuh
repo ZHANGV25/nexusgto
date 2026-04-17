@@ -40,6 +40,13 @@
 #define SS_MAX_LEAVES     64      /* max depth-limit leaves before cont expansion */
 #define SS_NUM_CONT_STRATS 4      /* unmodified, fold-biased, call-biased, raise-biased */
 #define SS_MAX_RAISES     3       /* max raises per street (2p or river) */
+/* OP1: per-flop PA-EMD bucket count at future rounds. Pluribus §2 spec:
+ * "500 buckets per round, per flop, for the search-time future-round
+ * abstraction." The dimension is pre-allocated in d_regrets_fut even in
+ * commit 5 (where bucket lookup is stubbed at 0) so commit 7 can wire
+ * the per-flop centroid tables without reallocating device memory.
+ * See docs/OP3_OP1_MULTI_STREET_PLAN.md §"Bucket-keyed regret storage". */
+#define SS_OP1_BUCKETS    500
 /* Pluribus Science 2019 supplement §4: multi-way non-river subgames cap at
  * 2 raises ahead to keep the tree tractable. Override via compile-time
  * -DSS_MULTIWAY_MAX_RAISES=<n> if needed for experimentation. */
