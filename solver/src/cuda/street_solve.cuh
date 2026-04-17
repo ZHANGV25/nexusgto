@@ -47,6 +47,23 @@
 #define SS_MULTIWAY_MAX_RAISES 2
 #endif
 
+/* Cont-strat tree mode. See docs/OP4_CONT_STRAT_MARGINAL_PLAN.md.
+ *   JOINT  — chain of N decision nodes + 4^N terminals per betting leaf.
+ *            Legacy path, retained for regression diff. Has a sequential-
+ *            observation deviation from Pluribus §4 AND blows up at 5-6p.
+ *   SAMPLED — one terminal per betting leaf; leaf-value integrator samples
+ *             one joint cont-strat assignment per CFR iteration (MCCFR
+ *             external-sampling on the cont-strat chance step). Closes
+ *             both deviations. Shipping mode. */
+#define SS_CONT_STRAT_MODE_JOINT   0
+#define SS_CONT_STRAT_MODE_SAMPLED 1
+/* Default remains JOINT until the sampled leaf-value integrator lands
+ * (OP4 commits 3-5). Flipped to SAMPLED in OP4 commit 10 after all
+ * regressions are green and the API wire-in is tested. */
+#ifndef SS_CONT_STRAT_MODE
+#define SS_CONT_STRAT_MODE SS_CONT_STRAT_MODE_JOINT
+#endif
+
 /* Node types */
 #define SS_NODE_DECISION  0
 #define SS_NODE_FOLD      1       /* a player folded; node stores who folded */
