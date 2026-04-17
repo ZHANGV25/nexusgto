@@ -151,6 +151,32 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.rollout_compute_subgame_leaf_values_c.restype = ctypes.c_int32
 
+    # Sampled-cont-strat variant (OP4 / Option c)
+    lib.rollout_compute_subgame_leaf_values_sampled_c.argtypes = [
+        ctypes.c_void_p,                    # BPSReader *
+        ctypes.POINTER(ctypes.c_int),       # board
+        ctypes.c_int32,                     # n_board_cards
+        ctypes.c_int32,                     # street
+        ctypes.POINTER(_RolloutLeafInfo),   # leaf_infos
+        ctypes.c_int32,                     # n_leaves
+        ctypes.POINTER(ctypes.c_int32),     # active
+        ctypes.c_int32,                     # num_players
+        ctypes.POINTER(_RolloutHandList),   # player_hands
+        ctypes.POINTER(ctypes.c_int32),     # acting_order
+        ctypes.c_int32,                     # acting_order_len
+        ctypes.POINTER(ctypes.c_int32),     # player_seats
+        ctypes.POINTER(ctypes.c_int32),     # game_action_history
+        ctypes.c_int32,                     # gah_len
+        ctypes.c_int32,                     # stack_chips
+        ctypes.c_int32,                     # max_hands
+        ctypes.c_int32,                     # num_rollouts
+        ctypes.c_int32,                     # num_samples_k
+        ctypes.c_uint64,                    # master_seed
+        ctypes.POINTER(ctypes.c_float),     # out
+        ctypes.c_int32,                     # out_size
+    ]
+    lib.rollout_compute_subgame_leaf_values_sampled_c.restype = ctypes.c_int32
+
     lib.rollout_compute_leaf_value_c.argtypes = [
         ctypes.c_void_p,                    # BPSReader *
         ctypes.POINTER(ctypes.c_int),       # board
@@ -424,5 +450,118 @@ def compute_subgame_leaf_values_c(
         raise LeafValueUnavailable(
             street=street, num_players=num_players,
             reason=f"[rollout.c] {msg}",
+        )
+    return out
+
+
+def compute_subgame_leaf_values_sampled_c(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    starting_pot_chips: int,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int = 3,
+    num_samples_k: int = 1,
+    rng=None,
+    master_seed: int = 0x5a17_e8c0_feed_beef,
+) -> np.ndarray:
+    """Drop-in replacement for python/rollout.py::compute_subgame_leaf_values_sampled.
+
+    Returns float32 numpy array of shape [total, num_players, max_hands]
+    where total = max leaf_idx + 1 (no cont-strat axis — SAMPLED mode).
+
+    Pairs with the SAMPLED tree builder (SS_CONT_STRAT_MODE==SAMPLED in
+    street_solve.cuh). See docs/OP4_CONT_STRAT_MARGINAL_PLAN.md.
+
+    Raises LeafValueUnavailable on any blueprint coverage miss.
+    """
+    if street not in _STREET_NUM:
+        raise ValueError(f"bad street {street!r}")
+    if num_samples_k < 1:
+        raise ValueError(f"num_samples_k must be >= 1, got {num_samples_k}")
+
+    if rng is not None:
+        try:
+            master_seed = int(rng.integers(0, 2**64 - 1, dtype=np.uint64))
+        except Exception:
+            pass
+    lib = _lib()
+
+    if not hasattr(blueprint, "_reader"):
+        raise TypeError(
+            "C rollout requires a BPSReaderC blueprint (has ._reader handle); "
+            f"got {type(blueprint).__name__}. Fall back to python/rollout.py "
+            f"for other blueprint types."
+        )
+    bp_ptr = blueprint._reader
+
+    num_players = len(player_hands)
+    if num_players <= 0 or num_players > _ROLLOUT_MAX_PLAYERS:
+        raise ValueError(f"num_players {num_players} out of range [1, 6]")
+
+    max_leaf_idx = max((li.leaf_idx for li in leaf_infos), default=-1)
+    total = max_leaf_idx + 1
+    floats_needed = total * num_players * max_hands
+
+    out = np.zeros((total, num_players, max_hands), dtype=np.float32)
+
+    board_arr = (ctypes.c_int * len(board))(*board) if board else None
+    board_ptr = board_arr if board_arr is not None else ctypes.POINTER(ctypes.c_int)()
+
+    n_leaves = len(leaf_infos)
+    li_arr = (_RolloutLeafInfo * n_leaves)()
+    for i, li in enumerate(leaf_infos):
+        li_arr[i].leaf_idx = int(li.leaf_idx)
+        li_arr[i].pot_chips = int(li.pot)
+        bets_src = list(li.bets) if hasattr(li, "bets") else [0] * num_players
+        for p in range(_ROLLOUT_MAX_PLAYERS):
+            li_arr[i].bets[p] = int(bets_src[p]) if p < num_players else 0
+
+    active_arr = (ctypes.c_int32 * num_players)(
+        *[1 if a else 0 for a in active]
+    )
+
+    stash: list = []
+    hl_arr = (_RolloutHandList * num_players)()
+    for p in range(num_players):
+        hl = _hand_list_struct(player_hands[p], stash)
+        hl_arr[p] = hl
+
+    acting_order_arr = (ctypes.c_int32 * len(acting_order))(*acting_order)
+    player_seats_arr = (ctypes.c_int32 * len(player_seats))(*player_seats)
+    gah_arr = (ctypes.c_int32 * len(game_action_history))(*game_action_history) \
+        if game_action_history else (ctypes.c_int32 * 0)()
+
+    out_ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+    rc = lib.rollout_compute_subgame_leaf_values_sampled_c(
+        bp_ptr,
+        board_ptr, ctypes.c_int32(len(board)),
+        ctypes.c_int32(_STREET_NUM[street]),
+        li_arr, ctypes.c_int32(n_leaves),
+        active_arr, ctypes.c_int32(num_players),
+        hl_arr,
+        acting_order_arr, ctypes.c_int32(len(acting_order)),
+        player_seats_arr,
+        gah_arr, ctypes.c_int32(len(game_action_history)),
+        ctypes.c_int32(int(stack_chips)),
+        ctypes.c_int32(int(max_hands)),
+        ctypes.c_int32(int(num_rollouts)),
+        ctypes.c_int32(int(num_samples_k)),
+        ctypes.c_uint64(int(master_seed) & 0xFFFFFFFFFFFFFFFF),
+        out_ptr, ctypes.c_int32(int(floats_needed)),
+    )
+    if rc != 0:
+        msg, street_n, np_n = _last_error()
+        raise LeafValueUnavailable(
+            street=street, num_players=num_players,
+            reason=f"[rollout.c sampled] {msg}",
         )
     return out
