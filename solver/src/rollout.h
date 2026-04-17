@@ -206,6 +206,36 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
     float *out, int32_t out_size
 );
 
+/* Sampled-cont-strat variant (OP4 / Option c). For each betting leaf,
+ * draws num_samples_k joint bias profiles uniformly from {0,1,2,3}^N
+ * and averages leaf values across samples. Output shape is
+ * float32[(max leaf_idx + 1) * num_players * max_hands] — NO
+ * cont-strat axis. Pairs with the SAMPLED tree builder
+ * (SS_CONT_STRAT_MODE == SAMPLED) where each betting leaf is a single
+ * terminal.
+ *
+ * Flat index: out[li->leaf_idx * num_players * max_hands
+ *                 + p * max_hands + h].
+ *
+ * See docs/OP4_CONT_STRAT_MARGINAL_PLAN.md. */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_samples_k,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+);
+
 /* ── Error surface ───────────────────────────────────────────────────── */
 
 BPS_EXPORT void rollout_get_last_error(
