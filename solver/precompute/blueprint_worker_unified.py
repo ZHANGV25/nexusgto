@@ -625,7 +625,6 @@ def main():
                 # Upload .bps.cache to S3 (.bps already uploaded by _export_checkpoint)
                 s3_bucket = os.environ.get("S3_BUCKET")
                 if s3_bucket:
-                    import subprocess
                     fname = os.path.basename(ev_cache_path)
                     print(f"Uploading {fname} to {s3_dest}...", flush=True)
                     subprocess.run(
