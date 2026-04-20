@@ -622,17 +622,16 @@ def main():
                 print(f"Saving EV cache to {ev_cache_path}...", flush=True)
                 reader.save_cache(ev_cache_path)
 
-                # Upload EV-enriched files to S3 (if S3 bucket is set)
+                # Upload .bps.cache to S3 (.bps already uploaded by _export_checkpoint)
                 s3_bucket = os.environ.get("S3_BUCKET")
                 if s3_bucket:
                     import subprocess
-                    for fpath in [ev_cache_path, bps_path]:
-                        fname = os.path.basename(fpath)
-                        print(f"Uploading {fname} to {s3_dest}...", flush=True)
-                        subprocess.run(
-                            ["aws", "s3", "cp", fpath, s3_dest],
-                            check=True
-                        )
+                    fname = os.path.basename(ev_cache_path)
+                    print(f"Uploading {fname} to {s3_dest}...", flush=True)
+                    subprocess.run(
+                        ["aws", "s3", "cp", ev_cache_path, s3_dest],
+                        check=True
+                    )
                 print("EV walk + upload done.")
             except Exception as e:
                 print(f"[WARN] Auto EV walk failed: {e}", flush=True)
