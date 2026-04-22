@@ -656,7 +656,7 @@ def _probe_preflop(bp_lib, solver):
     'pruned=3/8' means 3 of 8 raise actions are below -300M threshold.
     This directly measures whether the pruning fix is working."""
     try:
-        PRUNE_THRESH = -300_000_000
+        PRUNE_THRESH = -10_000_000
 
         # Pocket pairs + key broadway/suited connectors that showed
         # convergence issues (AKo uniform stuck, A5s/K9s/87s/98s fold locked)
@@ -668,7 +668,7 @@ def _probe_preflop(bp_lib, solver):
             ("98s", 106), ("87s", 121),
         ]
         # Diagnostic hands: raw regrets for call trap / fold lock-in / uniform stuck
-        diag_hands = [("TT", 88), ("99", 105), ("44", 160), ("AKo", 2), ("87s", 121)]
+        diag_hands = [("AA", 0), ("KK", 25), ("TT", 88), ("99", 105), ("44", 160), ("AKo", 2), ("87s", 121)]
 
         # Positions with their "folds to me" action sequences.
         # Preflop order: UTG(2), MP(3), CO(4), BTN(5), SB(0), BB(1).
