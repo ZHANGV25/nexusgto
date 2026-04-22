@@ -656,7 +656,7 @@ def _probe_preflop(bp_lib, solver):
     'pruned=3/8' means 3 of 8 raise actions are below -300M threshold.
     This directly measures whether the pruning fix is working."""
     try:
-        PRUNE_THRESH = -10_000_000
+        PRUNE_THRESH = -50_000_000
 
         # Pocket pairs + key broadway/suited connectors that showed
         # convergence issues (AKo uniform stuck, A5s/K9s/87s/98s fold locked)
@@ -667,8 +667,14 @@ def _probe_preflop(bp_lib, solver):
             ("AKo", 2), ("AQs", 3), ("A5s", 17), ("K9s", 32),
             ("98s", 106), ("87s", 121),
         ]
-        # Diagnostic hands: raw regrets for call trap / fold lock-in / uniform stuck
-        diag_hands = [("AA", 0), ("KK", 25), ("TT", 88), ("99", 105), ("44", 160), ("AKo", 2), ("87s", 121)]
+        # Diagnostic hands: raw regrets for all pairs + key hands
+        diag_hands = [
+            ("AA", 0), ("KK", 25), ("QQ", 48), ("JJ", 69), ("TT", 88),
+            ("99", 105), ("88", 120), ("77", 133), ("66", 144), ("55", 153),
+            ("44", 160), ("33", 165), ("22", 168),
+            ("AKo", 2), ("AQs", 3), ("A5s", 17), ("K9s", 32),
+            ("98s", 106), ("87s", 121),
+        ]
 
         # Positions with their "folds to me" action sequences.
         # Preflop order: UTG(2), MP(3), CO(4), BTN(5), SB(0), BB(1).
@@ -705,24 +711,31 @@ def _probe_preflop(bp_lib, solver):
                     parts.append(f"{name}:?")
             lines.append(f"{pos_name}: {' '.join(parts)}")
 
-        # Raw regret lines for diagnostic hands (UTG only)
-        utg_regret_seq = (ctypes.c_int * 1)(0)
-        for name, bucket in diag_hands:
-            na = bp_lib.bp_get_regrets(solver, 2, empty_board, 0,
-                                        utg_regret_seq, 0, regret_buf, bucket)
-            if na >= 3:
-                fold_r = regret_buf[0]
-                call_r = regret_buf[1]
-                raise_regrets = [regret_buf[a] for a in range(2, na)]
-                best_raise = max(raise_regrets)
-                n_pruned = sum(1 for r in raise_regrets if r < PRUNE_THRESH)
-                n_raises = len(raise_regrets)
-                lines.append(
-                    f"REGRETS UTG {name}: fold={fold_r:+d} call={call_r:+d} "
-                    f"best_raise={best_raise:+d} pruned={n_pruned}/{n_raises}"
-                )
+        # Raw regret lines for diagnostic hands (UTG + BTN)
+        for pos_name, player, action_seq in positions:
+            if action_seq:
+                reg_seq = (ctypes.c_int * len(action_seq))(*action_seq)
+                reg_seq_len = len(action_seq)
             else:
-                lines.append(f"REGRETS UTG {name}: not_found")
+                reg_seq = (ctypes.c_int * 1)(0)
+                reg_seq_len = 0
+            for name, bucket in diag_hands:
+                na = bp_lib.bp_get_regrets(solver, player, empty_board, 0,
+                                            reg_seq, reg_seq_len, regret_buf, bucket)
+                if na >= 3:
+                    fold_r = regret_buf[0]
+                    call_r = regret_buf[1]
+                    raise_regrets = [regret_buf[a] for a in range(2, na)]
+                    best_raise = max(raise_regrets)
+                    all_raises = "/".join(f"{r:+d}" for r in raise_regrets)
+                    n_pruned = sum(1 for r in raise_regrets if r < PRUNE_THRESH)
+                    n_raises = len(raise_regrets)
+                    lines.append(
+                        f"REGRETS {pos_name} {name}: fold={fold_r:+d} call={call_r:+d} "
+                        f"raises=[{all_raises}] pruned={n_pruned}/{n_raises}"
+                    )
+                else:
+                    lines.append(f"REGRETS {pos_name} {name}: not_found")
 
         return "\n".join(lines)
     except Exception as e:

@@ -49,7 +49,7 @@
                                             * dominant actions to saturate 7x too early, losing
                                             * ordering information when multiple actions competed.
                                             * int64 intermediate arithmetic prevents overflow. */
-#define BP_PRUNE_THRESHOLD   (-10000000)    /* DCFR β=0: regrets accumulate slowly, -10M is 10x oscillation margin */
+#define BP_PRUNE_THRESHOLD   (-50000000)    /* DCFR β=0: -50M balances speed vs convergence for marginal actions */
 #define BP_PRUNE_PROB        0.95f          /* fraction of iters that prune */
 
 /* ── Data structures ─────────────────────────────────────────────────── */
