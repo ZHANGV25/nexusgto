@@ -52,18 +52,18 @@ POSTFLOP_BET_SIZES = [0.5, 1.0]
 # Tiered preflop sizing (Pluribus uses up to 14 sizes per decision; we ship a
 # coarser tier but cover the bands humans actually open/3-bet/4-bet at).
 #
-# Enumerated tree (6p, 100BB): 1.17M preflop decision nodes × 169 buckets
-# = 197M preflop info sets. Total ~830M IS at saturation.
-# Tree count is from tests/count_preflop_tiered.py.
-# 2B hash table at 830M entries = 41.5% load (safe).
-# Pluribus opened to ~2.0-2.25 BB; r0.7x (2.05 BB) matches exactly.
+# Enumerated tree (6p, 100BB): 380K preflop decision nodes × 169 buckets
+# = 64M preflop IS, 381K flop lines. Est ~350M total IS, ~220M encountered
+# with -300M pruning. 750M hash at 44% load = 42 GB metadata.
+# Hand-picked from 2B checkpoint regret analysis: r0.7x had highest
+# positive rate (29%), all 3 open sizes within 25-29%. 5-bet shove
+# dropped (0-6% positive = dead weight).
 PREFLOP_TIERS = {
-    0: [0.5, 0.7, 1.0],              # open raise: 3 sizes
+    0: [0.5, 0.7, 1.0],              # open raise: 3 sizes (all viable per regret data)
     1: [0.7, 1.0],                   # 3-bet: 2 sizes
-    2: [1.0],                        # 4-bet: 1 size
-    3: [8.0],                        # 5-bet: shove only
+    2: [1.0],                        # 4-bet: 1 size (all-in auto-added)
 }
-PREFLOP_MAX_RAISES = 4
+PREFLOP_MAX_RAISES = 3
 
 # ── Config hash (stale-checkpoint guard) ──────────────────────────
 # Prior incident: a new tiered-sizing run loaded an OLD flat-8 checkpoint
