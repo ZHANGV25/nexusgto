@@ -99,9 +99,9 @@ def _compute_config_hash():
         # vice versa) without producing garbage.
         "river_ochs": os.environ.get("BPS_RIVER_OCHS", "0"),
         "river_ochs_clusters": os.environ.get("BPS_RIVER_OCHS_CLUSTERS", ""),
-        # Hash table size determines slot layout — a checkpoint trained on
-        # 3B slots cannot resume on 3.5B (probe sequences differ).
-        "hash_table_size": os.environ.get("BPS_HASH_SIZE", "3500000000"),
+        # Hash table size is NOT included: bp_load_regrets rehashes each
+        # entry via info_table_find_or_create into the current table_size,
+        # so checkpoints are portable across hash table sizes.
     }
     canon = json.dumps(payload, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canon.encode('utf-8')).hexdigest()
@@ -375,12 +375,41 @@ def main():
                         ckpt_hash = cmeta.get("config_hash")
                         cur_hash = _compute_config_hash()
                         if ckpt_hash and ckpt_hash != cur_hash:
-                            print(f"[FATAL] Config hash mismatch.\n"
-                                  f"  checkpoint: {ckpt_hash}\n"
-                                  f"  current:    {cur_hash}\n"
-                                  f"Refusing to resume — action/bucket layout "
-                                  f"may be incompatible.")
-                            sys.exit(2)
+                            # The config hash no longer includes hash_table_size,
+                            # but old checkpoints were saved with it. Try matching
+                            # with the old hash_table_size value to distinguish
+                            # a benign resize from a real config incompatibility.
+                            import hashlib as _hl
+                            old_ht = os.environ.get("BPS_OLD_HASH_SIZE", "750000000")
+                            _p = json.loads(json.dumps({
+                                "num_players": NUM_PLAYERS,
+                                "blinds": [SMALL_BLIND, BIG_BLIND],
+                                "initial_stack": INITIAL_STACK,
+                                "preflop_tiers": {str(k): v for k, v in sorted(PREFLOP_TIERS.items())},
+                                "preflop_max_raises": PREFLOP_MAX_RAISES,
+                                "postflop_bet_sizes": POSTFLOP_BET_SIZES,
+                                "preflop_buckets": 169,
+                                "postflop_buckets": 200,
+                                "dcfr_alpha": os.environ.get("BPS_DCFR_ALPHA", ""),
+                                "dcfr_beta": os.environ.get("BPS_DCFR_BETA", ""),
+                                "dcfr_gamma": os.environ.get("BPS_DCFR_GAMMA", ""),
+                                "river_ochs": os.environ.get("BPS_RIVER_OCHS", "0"),
+                                "river_ochs_clusters": os.environ.get("BPS_RIVER_OCHS_CLUSTERS", ""),
+                                "hash_table_size": old_ht,
+                            }))
+                            _c = json.dumps(_p, sort_keys=True, separators=(',', ':'))
+                            legacy_hash = _hl.sha256(_c.encode()).hexdigest()
+                            if ckpt_hash == legacy_hash:
+                                print(f"[INFO] Config hash matched via legacy "
+                                      f"format (hash_table_size resize). "
+                                      f"Resuming.")
+                            else:
+                                print(f"[FATAL] Config hash mismatch.\n"
+                                      f"  checkpoint: {ckpt_hash}\n"
+                                      f"  current:    {cur_hash}\n"
+                                      f"Refusing to resume — action/bucket "
+                                      f"layout may be incompatible.")
+                                sys.exit(2)
                         if not ckpt_hash:
                             print("[WARN] Checkpoint has no config_hash "
                                   "(pre-v3 format). Resuming at your risk.")
