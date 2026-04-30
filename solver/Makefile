@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout
+.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -59,6 +59,19 @@ rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
 $(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+
+# ── Street solve (CUDA — N-player single-street GPU solver) ──
+# Builds with nvcc; requires CUDA toolkit on PATH. Targets sm_75 (T4 on
+# g4dn) by default; override SS_GPU_ARCH=sm_86 for A10, sm_70 for V100.
+# Skip on Mac dev machines (nvcc not present); the .so is consumed by
+# python/street_solver_gpu.py at runtime via ctypes on Linux.
+NVCC ?= nvcc
+SS_GPU_ARCH ?= sm_75
+street_solve: $(BUILD_DIR)/street_solve$(SHLIB_EXT)
+
+$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) \
+	    $(SRC_DIR)/cuda/street_solve.cu -o $@
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
