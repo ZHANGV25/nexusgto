@@ -128,7 +128,11 @@ BPS_EXPORT float rollout_compute_showdown_payoff_c(
 
 /* Single (leaf, bias_profile, hero, hero_hand) rollout mean.
  * out_value receives the mean payoff.
- * Returns 0 on success, -1 on LeafValueUnavailable (set last-error). */
+ * Returns 0 on success, -1 on genuine error (deck exhausted, board
+ * overflow, bucket lookup failure, etc.) — see rollout_get_last_error.
+ * Blueprint coverage misses are handled inline via uniform-on-legal-
+ * actions (Pluribus Algorithm 1); call rollout_get_observability to
+ * count substitutions. */
 BPS_EXPORT int32_t rollout_compute_leaf_value_c(
     const BPSReader *r,
     /* leaf state */
@@ -155,8 +159,8 @@ BPS_EXPORT int32_t rollout_compute_leaf_value_c(
 );
 
 /* Multi-hand wrapper. out is float32[num_players * max_hands] row-major.
- * Returns 0 on success; -1 on LeafValueUnavailable propagated from any
- * hand (same G2 fail-loud semantics as Python). */
+ * Returns 0 on success; -1 on genuine error (see single-hand entry).
+ * Blueprint coverage misses are absorbed by uniform substitution. */
 BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
     const BPSReader *r,
     const int *board, int32_t n_board_cards,
@@ -240,6 +244,23 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
 
 BPS_EXPORT void rollout_get_last_error(
     const char **reason, int32_t *street, int32_t *num_players
+);
+
+/* ── Observability counters (per-thread) ─────────────────────────────── */
+
+/* Reset both counters to zero. Call before each subgame solve to scope
+ * the counter readout. */
+BPS_EXPORT void rollout_reset_observability(void);
+
+/* Read counters. Pass NULL for either pointer to skip. Pluribus Algorithm
+ * 1 supplementary substitutes uniform-on-legal-actions for missing or
+ * zero-sum σ̄; the counters keep that substitution observable.
+ *   *out_miss    — σ̄ entry not in blueprint (coverage gap; expected
+ *                  outside the trained tree).
+ *   *out_zerosum — σ̄ entry present but the truncated strategy summed
+ *                  to zero (data integrity issue; should be rare). */
+BPS_EXPORT void rollout_get_observability(
+    uint64_t *out_miss, uint64_t *out_zerosum
 );
 
 #ifdef __cplusplus

@@ -292,7 +292,7 @@ def action_amount_chips(
     return ("bet", min(max(bet_amount, 1), stack))
 
 
-# ─── Blueprint lookup (fail-loud) ────────────────────────────────────────
+# ─── Blueprint lookup ────────────────────────────────────────────────────
 
 
 def _lookup_strategy(
@@ -302,11 +302,17 @@ def _lookup_strategy(
     player: int,
     bucket: int,
     street: int,
-) -> np.ndarray:
+) -> Optional[np.ndarray]:
     """Look up σ̄(bucket) at a postflop decision node.
 
-    Raises LeafValueUnavailable on miss. Records coverage hit/miss
-    via leaf_coverage.record() if a CoverageScope is active.
+    Returns the normalized strategy on hit, or None on miss / zero-sum.
+    Records coverage hit/miss via leaf_coverage.record() if a
+    CoverageScope is active.
+
+    Pluribus Algorithm 1 supplementary: when σ̄ is unavailable or sums
+    to zero, the caller substitutes uniform-on-legal-actions. This
+    function communicates the substitution-needed signal as None;
+    callers MUST handle it.
     """
     try:
         from leaf_coverage import record as _rec
@@ -318,28 +324,13 @@ def _lookup_strategy(
     )
     if strat is None:
         _rec("rollout_sigma", hit=False,
-             detail=f"street={street}_p={player}_ah={len(action_history)}")
-        raise LeafValueUnavailable(
-            street={1: "flop", 2: "turn", 3: "river"}.get(street, f"s{street}"),
-            reason=(
-                f"blueprint σ̄ missing at player={player} bucket={bucket} "
-                f"action_history={action_history} — spot is outside the "
-                f"trained/walked coverage region. Rollout cannot continue."
-            ),
-            num_players=-1,
-        )
+             detail=f"miss_street={street}_p={player}_ah={len(action_history)}")
+        return None
     arr = np.asarray(strat, dtype=np.float64)
     if arr.sum() <= 1e-10:
         _rec("rollout_sigma", hit=False,
              detail=f"zerosum_street={street}_p={player}")
-        raise LeafValueUnavailable(
-            street={1: "flop", 2: "turn", 3: "river"}.get(street, f"s{street}"),
-            reason=(
-                f"blueprint σ̄ is all-zero at player={player} bucket={bucket} "
-                f"action_history={action_history}"
-            ),
-            num_players=-1,
-        )
+        return None
     _rec("rollout_sigma", hit=True)
     return arr / arr.sum()
 
@@ -498,8 +489,13 @@ def _simulate_one(
                 bucket=bucket,
                 street=_street_num(street),
             )
-            # Truncate/pad to the rollout tree's action count.
-            if len(strat_full) >= n_actions:
+            if strat_full is None:
+                # Pluribus Algorithm 1 supplementary: σ̄ unavailable →
+                # uniform over the rollout tree's legal action set. The
+                # leaf_coverage record from _lookup_strategy keeps the
+                # substitution observable.
+                strat = np.full(n_actions, 1.0 / n_actions, dtype=np.float64)
+            elif len(strat_full) >= n_actions:
                 strat = strat_full[:n_actions]
             else:
                 # Blueprint has fewer actions than our tree says; this
@@ -509,15 +505,17 @@ def _simulate_one(
                 strat[:len(strat_full)] = strat_full
                 cats = cats[:max(len(strat_full), 1)]
                 if strat.sum() <= 0.0:
-                    # Degenerate — treat as unavailable.
-                    raise LeafValueUnavailable(
-                        street=street,
-                        reason=(
-                            f"blueprint returned empty strategy slice for "
-                            f"player={p} bucket={bucket}"
-                        ),
-                        num_players=num_players,
-                    )
+                    # Post-truncate degenerate (blueprint mass was
+                    # entirely outside our action range). Same Pluribus
+                    # Algorithm 1 fallback: uniform-on-legal.
+                    try:
+                        from leaf_coverage import record as _rec
+                    except ImportError:
+                        from python.leaf_coverage import record as _rec  # type: ignore
+                    _rec("rollout_sigma", hit=False,
+                         detail=f"post_truncate_zerosum_p={p}_bucket={bucket}")
+                    strat = np.full(n_actions, 1.0 / n_actions, dtype=np.float64)
+                    cats = classify_postflop_actions(facing_bet, raises_this_street)
 
             biased = apply_bias(strat, int(bias_profile[p]), cats)
             # Re-normalize defensively
@@ -684,9 +682,10 @@ def compute_leaf_value(
       3. Accumulate hero's payoff.
     Return the mean.
 
-    Raises LeafValueUnavailable if ANY rollout hits a blueprint
-    coverage miss. This is deliberate — G2 fail-loud semantics,
-    consistent across the rollout tree.
+    Blueprint coverage misses are absorbed inline via uniform-on-legal-
+    actions (Pluribus Algorithm 1 supplementary); leaf_coverage records
+    the substitutions. Raises LeafValueUnavailable on genuine errors
+    (bucket lookup failure at site 479).
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -870,15 +869,11 @@ def compute_subgame_leaf_values(
             flat = li.leaf_idx * cont_per_leaf + combo
             if flat >= total:
                 continue
-            try:
-                arr = compute_leaf_values_all_hands(
-                    leaf=leaf, bias_profile=bias,
-                    blueprint=blueprint, max_hands=max_hands,
-                    num_rollouts=num_rollouts, rng=rng,
-                )
-            except LeafValueUnavailable:
-                # Propagate — the whole subgame is uncovered.
-                raise
+            arr = compute_leaf_values_all_hands(
+                leaf=leaf, bias_profile=bias,
+                blueprint=blueprint, max_hands=max_hands,
+                num_rollouts=num_rollouts, rng=rng,
+            )
             out[flat] = arr
     return out
 
@@ -975,14 +970,11 @@ def compute_subgame_leaf_values_sampled(
         sample_sum = np.zeros((num_players, max_hands), dtype=np.float64)
         for sample_idx in range(num_samples_k):
             bias = rng.integers(0, NUM_BIAS_PROFILES, size=num_players).tolist()
-            try:
-                arr = compute_leaf_values_all_hands(
-                    leaf=leaf, bias_profile=bias,
-                    blueprint=blueprint, max_hands=max_hands,
-                    num_rollouts=num_rollouts, rng=rng,
-                )
-            except LeafValueUnavailable:
-                raise
+            arr = compute_leaf_values_all_hands(
+                leaf=leaf, bias_profile=bias,
+                blueprint=blueprint, max_hands=max_hands,
+                num_rollouts=num_rollouts, rng=rng,
+            )
             sample_sum += arr.astype(np.float64)
 
         out[li.leaf_idx] = (sample_sum / float(num_samples_k)).astype(np.float32)

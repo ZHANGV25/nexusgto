@@ -211,6 +211,16 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.rollout_get_last_error.restype = None
 
+    # Observability counters (uniform-on-zero substitution).
+    lib.rollout_reset_observability.argtypes = []
+    lib.rollout_reset_observability.restype = None
+
+    lib.rollout_get_observability.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.rollout_get_observability.restype = None
+
 
 _LIB: Optional[ctypes.CDLL] = None
 
@@ -233,6 +243,31 @@ def _last_error() -> Tuple[str, int, int]:
     )
     msg = reason.value.decode("utf-8", "replace") if reason.value else ""
     return msg, int(street.value), int(num_players.value)
+
+
+def reset_rollout_observability() -> None:
+    """Zero the per-thread σ̄-substitution counters before a solve."""
+    _lib().rollout_reset_observability()
+
+
+def get_rollout_observability() -> Tuple[int, int]:
+    """Read the per-thread σ̄-substitution counters.
+
+    Returns (blueprint_miss_count, zerosum_count) where:
+      - blueprint_miss_count: σ̄ entry not found (coverage gap; expected
+        outside the trained tree). Substituted with uniform-on-legal-
+        actions per Pluribus Algorithm 1 supplementary.
+      - zerosum_count: σ̄ entry present but truncated strategy summed
+        to zero (data integrity issue; should be rare).
+
+    Callers that care about coverage should reset before each solve and
+    read after to scope counts to that solve.
+    """
+    lib = _lib()
+    miss = ctypes.c_uint64(0)
+    zerosum = ctypes.c_uint64(0)
+    lib.rollout_get_observability(ctypes.byref(miss), ctypes.byref(zerosum))
+    return (int(miss.value), int(zerosum.value))
 
 
 # ─── Pure-math thin wrappers (used by parity tests) ──────────────────────
@@ -361,7 +396,11 @@ def compute_subgame_leaf_values_c(
     Returns float32 numpy array of shape [total, num_players, max_hands]
     where total = (max leaf_idx + 1) * (4 ** num_players).
 
-    Raises LeafValueUnavailable on any blueprint coverage miss (G2 fail-loud).
+    Blueprint coverage misses are absorbed inline via uniform-on-legal-
+    actions (Pluribus Algorithm 1 supplementary); call
+    get_rollout_observability() to count substitutions. Raises
+    LeafValueUnavailable on genuine errors (deck exhausted, board
+    overflow, bucket lookup failure).
     """
     if street not in _STREET_NUM:
         raise ValueError(f"bad street {street!r}")
@@ -480,7 +519,10 @@ def compute_subgame_leaf_values_sampled_c(
     Pairs with the SAMPLED tree builder (SS_CONT_STRAT_MODE==SAMPLED in
     street_solve.cuh). See docs/OP4_CONT_STRAT_MARGINAL_PLAN.md.
 
-    Raises LeafValueUnavailable on any blueprint coverage miss.
+    Blueprint coverage misses are absorbed inline via uniform-on-legal-
+    actions (Pluribus Algorithm 1 supplementary); call
+    get_rollout_observability() to count substitutions. Raises
+    LeafValueUnavailable on genuine errors only.
     """
     if street not in _STREET_NUM:
         raise ValueError(f"bad street {street!r}")

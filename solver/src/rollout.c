@@ -102,6 +102,38 @@ BPS_EXPORT void rollout_get_last_error(
     if (num_players) *num_players = g_rollout_last_error.num_players;
 }
 
+/* ── Observability counters ──────────────────────────────────────────── */
+
+/* Pluribus Algorithm 1 supplementary substitutes uniform-on-legal-actions
+ * for missing or zero-sum blueprint σ̄. The two cases mean different
+ * things and are counted separately:
+ *   blueprint_miss_count: σ̄ entry not in blueprint (coverage gap; expected
+ *                         outside the trained tree).
+ *   zerosum_count:        σ̄ entry present but the truncated strategy sums
+ *                         to zero (data integrity issue; should be rare). */
+typedef struct {
+    uint64_t blueprint_miss_count;
+    uint64_t zerosum_count;
+} RolloutObservability;
+
+#if defined(_MSC_VER)
+static __declspec(thread) RolloutObservability g_rollout_obs;
+#else
+static _Thread_local RolloutObservability g_rollout_obs;
+#endif
+
+BPS_EXPORT void rollout_reset_observability(void) {
+    g_rollout_obs.blueprint_miss_count = 0;
+    g_rollout_obs.zerosum_count = 0;
+}
+
+BPS_EXPORT void rollout_get_observability(
+    uint64_t *out_miss, uint64_t *out_zerosum
+) {
+    if (out_miss)    *out_miss    = g_rollout_obs.blueprint_miss_count;
+    if (out_zerosum) *out_zerosum = g_rollout_obs.zerosum_count;
+}
+
 /* ── apply_bias ──────────────────────────────────────────────────────── */
 
 /* Matches python/rollout.py::apply_bias.
@@ -381,18 +413,15 @@ BPS_EXPORT float rollout_compute_showdown_payoff_c(
     return (float)(hero_share - (double)bets[hero_player]);
 }
 
-/* ── Blueprint lookup (fail-loud) ────────────────────────────────────── */
+/* ── Blueprint lookup ────────────────────────────────────────────────── */
 
 /* Returns num_actions written to out_strat (normalized), or 0 on miss.
- * Matches python/rollout.py::_lookup_strategy except Python-level
- * coverage recording (handled at the reference path).
+ * Matches python/rollout.py::_lookup_strategy.
  *
  * Note: bps_query_strategy already normalizes; zero-sum inputs are
- * turned into uniform by C. To match Python's fail-loud-on-zero-sum we
- * would need the raw bucket counts, which aren't exposed. This matches
- * the observable behavior of Python-over-BPSReaderC: never raises on
- * zero-sum because the C side already smoothed to uniform. Flagged in
- * docs/C2_CPU_ROLLOUT_PLAN.md "Known parity-with-Python limitations". */
+ * turned into uniform by C. Caller substitutes uniform-on-legal-actions
+ * on miss (return value 0) per Pluribus Algorithm 1 supplementary; the
+ * substitution count is exposed via rollout_get_observability. */
 static int rollout_lookup_strategy(
     const BPSReader *r,
     const int32_t *action_history, int32_t ah_len,
@@ -613,19 +642,15 @@ static int rollout_simulate_one(
                 full_seat, bucket, street,
                 strat_full, BPS_MAX_ACTIONS);
             if (bp_na <= 0) {
-                /* Dump action history for debugging — which sequence of
-                 * actions did the rollout produce to land at this miss? */
-                char ah_desc[256] = {0};
-                int ah_off = 0;
-                for (int32_t j = 0; j < gah_len && ah_off < 250; j++) {
-                    ah_off += snprintf(ah_desc + ah_off, 256 - ah_off,
-                                       "%d%s", game_history[j],
-                                       j + 1 < gah_len ? "," : "");
-                }
-                rollout_set_error(street, num_players,
-                    "blueprint sigma missing: player=%d(seat=%d) bucket=%d "
-                    "street=%d ah=[%s]", p, full_seat, bucket, street, ah_desc);
-                return -1;
+                /* Pluribus Algorithm 1 supplementary: σ̄ unavailable →
+                 * uniform over the rollout tree's legal action set. The
+                 * counter is exposed via rollout_get_observability so the
+                 * substitution remains visible to callers (e.g., API
+                 * logs an alert if miss-rate exceeds a threshold). */
+                g_rollout_obs.blueprint_miss_count++;
+                bp_na = n_actions;
+                float u = 1.0f / (float)n_actions;
+                for (int32_t i = 0; i < n_actions; i++) strat_full[i] = u;
             }
 
             /* Truncate/pad to rollout tree's action count — matches
@@ -642,15 +667,23 @@ static int rollout_simulate_one(
                 /* Python: cats = cats[:max(len(strat_full), 1)] */
                 cats_active_n = bp_na > 0 ? bp_na : 1;
                 if (cats_active_n > n_actions) cats_active_n = n_actions;
-                /* Degenerate: all zero — fail loud */
-                double sum = 0.0;
-                for (int32_t i = 0; i < n_actions; i++) sum += strat[i];
-                if (sum <= 0.0) {
-                    rollout_set_error(street, num_players,
-                        "blueprint empty strategy slice: player=%d bucket=%d",
-                        p, bucket);
-                    return -1;
-                }
+            }
+
+            /* Pluribus Algorithm 1 supplementary: post-truncate zero-sum
+             * → uniform. This catches both bp_na < n_actions degenerates
+             * (blueprint had values outside the rollout tree's action
+             * range) and bp_na >= n_actions cases where the first
+             * n_actions slots are zero (probability mass was entirely in
+             * the truncated tail). bps_query_strategy already smooths
+             * raw zero-regret entries to uniform, so this counter
+             * primarily catches truncation edge cases. */
+            double strat_sum = 0.0;
+            for (int32_t i = 0; i < n_actions; i++) strat_sum += strat[i];
+            if (strat_sum <= 0.0) {
+                g_rollout_obs.zerosum_count++;
+                double u = 1.0 / (double)n_actions;
+                for (int32_t i = 0; i < n_actions; i++) strat[i] = u;
+                cats_active_n = n_actions;
             }
 
             /* apply_bias — note Python passes `cats` (possibly truncated)

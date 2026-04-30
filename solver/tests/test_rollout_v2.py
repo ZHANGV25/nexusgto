@@ -412,39 +412,74 @@ def test_uses_blueprint_hand_to_bucket() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# E. Fail-loud on coverage miss
+# E. Uniform-on-zero substitution (Pluribus Algorithm 1 supplementary)
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def test_coverage_miss_raises() -> None:
-    """If the blueprint returns None (info set not in coverage), the
-    rollout must raise LeafValueUnavailable — not fall back to uniform.
+def test_coverage_miss_substitutes_uniform() -> None:
+    """When the blueprint returns None (info set not in coverage), the
+    rollout substitutes uniform-on-legal-actions per Pluribus Algorithm
+    1 supplementary. The leaf_coverage record makes the substitution
+    observable; the rollout must NOT raise LeafValueUnavailable.
     """
     from rollout import compute_leaf_value
     from leaf_values import LeafValueUnavailable
+    import leaf_coverage
     bp = NoneBlueprint()
     rec_leaf = _build_hu_flop_leaf(RecorderBlueprint())  # reuse shape
-    raised = False
-    try:
-        _ = compute_leaf_value(
-            leaf=rec_leaf,
-            bias_profile=[0, 0],
-            blueprint=bp,
-            hero_player=0,
-            hero_hand_idx=0,
-            num_rollouts=1,
-            rng=np.random.default_rng(42),
-        )
-    except LeafValueUnavailable:
-        raised = True
-    except Exception as e:
-        check("coverage miss raises LeafValueUnavailable",
-              False, f"got {type(e).__name__}: {e}")
-        return
+    with leaf_coverage.CoverageScope() as scope:
+        try:
+            value = compute_leaf_value(
+                leaf=rec_leaf,
+                bias_profile=[0, 0],
+                blueprint=bp,
+                hero_player=0,
+                hero_hand_idx=0,
+                num_rollouts=1,
+                rng=np.random.default_rng(42),
+            )
+        except LeafValueUnavailable as e:
+            check("coverage miss returns valid value (no LeafValueUnavailable)",
+                  False, f"raised: {e}")
+            return
+        except Exception as e:
+            check("coverage miss returns valid value",
+                  False, f"got {type(e).__name__}: {e}")
+            return
     check(
-        "coverage miss raises LeafValueUnavailable",
-        raised,
-        "no exception raised; rollout silently succeeded",
+        "coverage miss returns finite value",
+        np.isfinite(value),
+        f"value={value}",
+    )
+    # Coverage scope must record the misses (substitution is observable).
+    miss_count = scope.miss_categories.get("rollout_sigma", 0)
+    check(
+        "coverage misses recorded in leaf_coverage scope",
+        miss_count > 0,
+        f"miss_count={miss_count}",
+    )
+
+
+def test_coverage_hit_returns_blueprint_strategy() -> None:
+    """Positive guard: when the blueprint has coverage, the rollout
+    uses its strategy, NOT uniform. Without this, every "expect uniform
+    on miss" test could pass by always returning uniform.
+    """
+    from rollout import _lookup_strategy
+    bp = FixedStrategyBlueprint(np.array([0.7, 0.2, 0.1], dtype=np.float32))
+    result = _lookup_strategy(
+        blueprint=bp, board=[0, 1, 2], action_history=[],
+        player=0, bucket=0, street=1,
+    )
+    check(
+        "covered lookup returns blueprint strategy",
+        result is not None and abs(result[0] - 0.7) < 1e-6,
+        f"result={result}",
+    )
+    check(
+        "covered lookup is NOT uniform",
+        result is not None and abs(result[0] - 1.0 / 3) > 0.01,
+        f"result={result} — looks uniform; means hit path is broken",
     )
 
 
@@ -612,8 +647,9 @@ def main() -> int:
         test_acting_order_respects_active_mask,
         # D. Bucket
         test_uses_blueprint_hand_to_bucket,
-        # E. Fail-loud
-        test_coverage_miss_raises,
+        # E. Uniform-on-zero substitution
+        test_coverage_miss_substitutes_uniform,
+        test_coverage_hit_returns_blueprint_strategy,
         # F. Showdown
         test_showdown_hero_wins,
         test_showdown_chop,

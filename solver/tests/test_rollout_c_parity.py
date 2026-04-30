@@ -203,9 +203,9 @@ def test_showdown_bit_exact() -> None:
 
 def test_leaf_idx_indexing() -> None:
     """C must place values at out[leaf_idx * cont_per_leaf + combo], not
-    at i * cont_per_leaf + combo — the handoff caveat. Uses a mock
-    blueprint that covers zero info sets (every rollout hits
-    LeafValueUnavailable), so we only test the allocation shape."""
+    at i * cont_per_leaf + combo — the handoff caveat. We only test the
+    allocation shape; the C path absorbs blueprint coverage misses via
+    uniform-on-legal-actions (Pluribus Algorithm 1 supplementary)."""
     # Build a trivial subgame with out-of-order leaf_idx values
     from collections import namedtuple
     LI = namedtuple("LI", "leaf_idx pot bets")
