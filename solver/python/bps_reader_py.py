@@ -58,8 +58,44 @@ def _stream_lzma_to_tempfile(src_file, compressed_size: int, label: str) -> str:
     blueprint), which is what the old `lzma.decompress(buf)` round-trip
     cost.
     """
+    # IMPORTANT: the tempfile MUST be on a disk-backed filesystem. On
+    # AL2023 (and many other modern Linux distros) /tmp is tmpfs (RAM),
+    # which defeats the streaming refactor — the decompressed blob ends
+    # up in RAM via tmpfs and OOMs around 28 GB on a 32 GB host.
+    # Honor BPS_TMPDIR explicitly when set; otherwise fall back to
+    # tempfile's resolution (TMPDIR / /tmp), with a loud warning if
+    # the resolved path looks like tmpfs.
+    tmpdir = os.environ.get("BPS_TMPDIR") or tempfile.gettempdir()
+    if not os.path.isdir(tmpdir):
+        os.makedirs(tmpdir, exist_ok=True)
+    # Loud warning if tmpdir is tmpfs (RAM-backed). Best-effort check —
+    # `findmnt` is the canonical answer but isn't always available; fall
+    # back to checking /proc/mounts. On Windows there's no equivalent
+    # concern (tempfile resolves to %TEMP% which is on the user profile
+    # disk), so skip the warning there.
+    if sys.platform != "win32":
+        try:
+            with open("/proc/mounts", "r") as _mf:
+                for _line in _mf:
+                    parts = _line.split()
+                    if len(parts) >= 3 and parts[2] == "tmpfs":
+                        # Check whether tmpdir is mounted at this point.
+                        mount_point = parts[1]
+                        if (os.path.realpath(tmpdir).startswith(mount_point + "/")
+                            or os.path.realpath(tmpdir) == mount_point):
+                            print(
+                                f"[BPSReaderC] WARNING: tempfile dir {tmpdir} is tmpfs "
+                                f"(RAM-backed, mounted from {mount_point}). The "
+                                f"streaming decompress will fill RAM, defeating its "
+                                f"purpose. Set BPS_TMPDIR or TMPDIR to a disk-backed "
+                                f"path (e.g. /var/cache/bps-tmp).",
+                                flush=True,
+                            )
+                            break
+        except Exception:
+            pass
     tf = tempfile.NamedTemporaryFile(prefix="bps_decompressed_", suffix=".bin",
-                                     delete=False)
+                                     delete=False, dir=tmpdir)
     tf_path = tf.name
     written = 0
     decompressor = lzma.LZMADecompressor()
