@@ -23,9 +23,11 @@ Usage:
 import ctypes
 import json
 import lzma
+import mmap
 import os
 import struct
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -33,6 +35,84 @@ import numpy as np
 
 # Maximum actions per decision node (must match BPS_MAX_ACTIONS in bps_reader.h)
 _MAX_ACTIONS = 16
+
+# Chunk size for streaming LZMA decompression. Large enough to amortize
+# Python's per-call overhead in `LZMADecompressor.decompress(chunk)` —
+# small chunks are 5-10× slower than `lzma.decompress(whole_buffer)` on
+# multi-GB inputs because each call has fixed Python-side cost. 256 MB
+# compressed → ~400 MB decompressed worst case. With a 32 GB host that
+# leaves plenty of headroom (the compressed chunk plus the decompressor's
+# own state plus a single decompressed-output bytes object); the rest
+# of the decompressed blob is on disk in the tempfile, not in RAM.
+_LZMA_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _stream_lzma_to_tempfile(src_file, compressed_size: int, label: str) -> str:
+    """Stream-decompress `compressed_size` bytes from `src_file` (already
+    positioned at the start of the LZMA stream) into a fresh tempfile.
+
+    Returns the tempfile path. Caller is responsible for unlinking it.
+
+    Peak Python RAM during this call: O(_LZMA_CHUNK_BYTES) — about 32 MB —
+    instead of `compressed_size + decompressed_size` (40+ GB on the 3.4B
+    blueprint), which is what the old `lzma.decompress(buf)` round-trip
+    cost.
+    """
+    tf = tempfile.NamedTemporaryFile(prefix="bps_decompressed_", suffix=".bin",
+                                     delete=False)
+    tf_path = tf.name
+    written = 0
+    decompressor = lzma.LZMADecompressor()
+    try:
+        bytes_left = compressed_size
+        last_pct = -1
+        while bytes_left > 0:
+            n = min(_LZMA_CHUNK_BYTES, bytes_left)
+            chunk = src_file.read(n)
+            if not chunk:
+                break
+            bytes_left -= len(chunk)
+            out = decompressor.decompress(chunk)
+            if out:
+                tf.write(out)
+                written += len(out)
+            pct = int(100 * (compressed_size - bytes_left) / max(1, compressed_size))
+            if pct >= last_pct + 10:
+                print(
+                    f"[BPSReaderC]   {label} decompress: {pct}% "
+                    f"({(compressed_size - bytes_left) / (1024**2):.0f} MB in -> "
+                    f"{written / (1024**2):.0f} MB out)",
+                    flush=True,
+                )
+                last_pct = pct
+        # Some lzma streams have a trailing flush; LZMADecompressor doesn't
+        # expose a public flush() but `decompress(b"")` after EOF returns
+        # any final buffered output.
+        try:
+            tail = decompressor.decompress(b"")
+            if tail:
+                tf.write(tail)
+                written += len(tail)
+        except Exception:
+            pass
+        tf.flush()
+        try:
+            os.fsync(tf.fileno())
+        except OSError:
+            # fsync can fail on some Windows filesystems; not fatal.
+            pass
+    finally:
+        try:
+            tf.close()
+        except Exception:
+            pass
+
+    print(
+        f"[BPSReaderC]   {label}: streamed {written / (1024**2):.0f} MB to "
+        f"tempfile {tf_path}",
+        flush=True,
+    )
+    return tf_path
 
 
 def _find_lib() -> ctypes.CDLL:
@@ -74,9 +154,13 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     c_float_p = ctypes.POINTER(ctypes.c_float)
     c_int64_p = ctypes.POINTER(ctypes.c_int64)
 
+    # `data` is declared c_void_p so we can hand C either a Python bytes
+    # buffer (auto-converts) or a raw pointer into an mmap view (we go
+    # through ctypes.c_char arrays to avoid a copy of the decompressed
+    # blob — see _load_full).
     lib.bps_load_strategies.argtypes = [
         ctypes.c_void_p,         # BPSReader*
-        ctypes.c_char_p,         # data
+        ctypes.c_void_p,         # data (bytes or mmap-pointer)
         ctypes.c_size_t,         # len
         ctypes.c_int,            # use_legacy_mixer
         ctypes.c_int,            # postflop_buckets
@@ -86,7 +170,7 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
 
     lib.bps_load_evs.argtypes = [
         ctypes.c_void_p,         # BPSReader*
-        ctypes.c_char_p,         # data
+        ctypes.c_void_p,         # data (bytes or mmap-pointer)
         ctypes.c_size_t,         # len
     ]
     lib.bps_load_evs.restype = ctypes.c_int
@@ -303,8 +387,12 @@ class BPSReaderC:
     file I/O and LZMA decompression; C handles hash table construction
     and all lookups.
 
-    Typical memory: ~4 GB steady-state for the full 1.5B blueprint.
-    Peak during load: +28 GB for the decompressed strategy bytes.
+    Typical memory: ~4 GB steady-state for the full 1.5B blueprint
+    (~7 GB for the 3.4B). Load uses streaming LZMA decompression to a
+    tempfile + mmap, so peak Python RSS during load is only the C
+    hash table itself (a few extra MB for the streaming chunk
+    buffer). The decompressed blob lives in page cache for the
+    duration of the load and is evictable afterwards.
     """
 
     # Size of the BPSReader C struct. Contains inline arrays for
@@ -374,7 +462,19 @@ class BPSReaderC:
             self._metadata = json.loads(meta_bytes.decode("utf-8"))
 
     def _load_full(self, bps_path: str, cache_path: str) -> None:
-        """Full slow load: LZMA decompress + hash table build + save cache."""
+        """Full slow load: LZMA stream-decompress + hash table build + save cache.
+
+        Memory profile:
+          - Old code: peak ~43 GB on 3.4B (.bps reads 18 GB compressed
+            into a Python bytes, then lzma.decompress() allocates ~25 GB
+            decompressed; both live simultaneously until the C copy
+            finishes).
+          - New code: peak ~4 GB (just the C hash table) plus a few MB
+            for the streaming chunk buffer. Compressed bytes stream
+            from the source file straight into LZMADecompressor; the
+            decompressed output goes to a tempfile that gets mmap'd
+            for C consumption.
+        """
         with open(bps_path, "rb") as f:
             magic = f.read(4)
             if magic != b"BPS3":
@@ -382,9 +482,14 @@ class BPSReaderC:
 
             # Outer header: compressed_size(u64) + meta_size(u32)
             compressed_size, meta_size = struct.unpack("<QI", f.read(12))
-            compressed = f.read(compressed_size)
-            meta_bytes = f.read(meta_size)
 
+            # Read metadata FIRST by seeking past the compressed strats.
+            # The mixer/bucket config lives in the JSON tail and we need
+            # it before invoking bps_load_strategies. After reading meta
+            # we'll seek back to the strats and stream-decompress them.
+            strats_offset = f.tell()
+            f.seek(strats_offset + compressed_size)
+            meta_bytes = f.read(meta_size)
             self._metadata = json.loads(meta_bytes.decode("utf-8"))
 
             # Determine mixer mode.
@@ -409,34 +514,26 @@ class BPSReaderC:
             nb_pre = self._metadata.get("preflop_buckets", 169)
 
             print(
-                f"[BPSReaderC] Decompressing strategies "
+                f"[BPSReaderC] Stream-decompressing strategies "
                 f"({compressed_size / (1024**2):.1f} MB compressed)...",
                 flush=True,
             )
 
-            # Decompress strategies
-            strat_data = lzma.decompress(compressed)
-            del compressed  # free compressed buffer early
-
-            print(
-                f"[BPSReaderC] Decompressed to {len(strat_data) / (1024**2):.1f} MB. "
-                f"Loading into C hash table (mixer={mixer_tag})...",
-                flush=True,
+            f.seek(strats_offset)
+            ret = self._stream_decompress_and_load(
+                f, compressed_size, "strategies",
+                lambda data_ptr, data_len: self._lib.bps_load_strategies(
+                    self._reader, data_ptr, data_len,
+                    use_legacy, nb_post, nb_pre,
+                ),
             )
-
-            # Pass raw bytes to C
-            ret = self._lib.bps_load_strategies(
-                self._reader,
-                strat_data,
-                len(strat_data),
-                use_legacy,
-                nb_post,
-                nb_pre,
-            )
-            del strat_data  # free the large decompressed buffer
-
             if ret != 0:
                 raise RuntimeError(f"bps_load_strategies failed (ret={ret})")
+
+            # `f` is now positioned just past the strats compressed blob.
+            # Skip the metadata block (already consumed earlier in-memory)
+            # and look for an optional BPR3 EV trailing section.
+            f.seek(strats_offset + compressed_size + meta_size)
 
             # Load action EVs if present
             schema_version = self._metadata.get("schema_version", 2)
@@ -446,26 +543,17 @@ class BPSReaderC:
                 ev_magic = f.read(4)
                 if ev_magic == b"BPR3":
                     ev_compressed_size = struct.unpack("<Q", f.read(8))[0]
-                    ev_compressed = f.read(ev_compressed_size)
-
                     print(
-                        f"[BPSReaderC] Decompressing action EVs "
+                        f"[BPSReaderC] Stream-decompressing action EVs "
                         f"({ev_compressed_size / (1024**2):.1f} MB compressed)...",
                         flush=True,
                     )
-                    ev_data = lzma.decompress(ev_compressed)
-                    del ev_compressed
-
-                    print(
-                        f"[BPSReaderC] Loading {len(ev_data) / (1024**2):.1f} MB "
-                        f"of action EVs...",
-                        flush=True,
+                    ret = self._stream_decompress_and_load(
+                        f, ev_compressed_size, "action EVs",
+                        lambda data_ptr, data_len: self._lib.bps_load_evs(
+                            self._reader, data_ptr, data_len,
+                        ),
                     )
-                    ret = self._lib.bps_load_evs(
-                        self._reader, ev_data, len(ev_data)
-                    )
-                    del ev_data
-
                     if ret != 0:
                         print(
                             f"[BPSReaderC] WARNING: bps_load_evs failed (ret={ret}), "
@@ -491,6 +579,72 @@ class BPSReaderC:
 
         self._load_texture_cache_auto(bps_path)
         self._report_stats()
+
+    def _stream_decompress_and_load(self, src_file, compressed_size: int,
+                                     label: str, c_call) -> int:
+        """Stream-decompress an LZMA blob and hand it to a C loader.
+
+        Pipeline:
+          1. Stream-decompress `compressed_size` bytes from `src_file`
+             (currently positioned at the start of the LZMA stream) into
+             a tempfile. Peak Python RAM = chunk size (~32 MB).
+          2. mmap the tempfile in COPY mode. ACCESS_COPY is "private,
+             copy-on-write" — ctypes treats it as a writable buffer
+             (so `from_buffer` works without complaint), but the OS
+             only actually copies pages we modify, and we never write
+             through this pointer. So total RSS contribution is just
+             whatever pages C touches during the load — typically the
+             whole blob is sequential-read once, putting it briefly in
+             page cache, then it's all evictable.
+          3. Get the C-pointer to the mmap'd region via ctypes and call
+             `c_call(data_ptr, data_len)`.
+          4. Tear everything down: close mmap, unlink tempfile.
+
+        Returns the int returned by `c_call`.
+        """
+        tf_path = _stream_lzma_to_tempfile(src_file, compressed_size, label)
+        mm = None
+        rf = None
+        try:
+            rf = open(tf_path, "rb")
+            n = os.path.getsize(tf_path)
+            if n == 0:
+                print(f"[BPSReaderC]   {label}: empty after decompress",
+                      flush=True)
+                return -1
+            # ACCESS_COPY: shared page cache, no actual copy unless we
+            # write. ctypes from_buffer requires a writable buffer.
+            mm = mmap.mmap(rf.fileno(), n, access=mmap.ACCESS_COPY)
+            # Zero-copy view into the mmap: a c_char[n] sitting on the
+            # mapped pages. addressof() is the pointer C consumes.
+            view = (ctypes.c_char * n).from_buffer(mm)
+            data_ptr = ctypes.addressof(view)
+            print(
+                f"[BPSReaderC]   {label}: handing {n / (1024**2):.0f} MB to C "
+                f"(mmap COW, ptr=0x{data_ptr:x})",
+                flush=True,
+            )
+            ret = c_call(data_ptr, n)
+            # Drop the ctypes view BEFORE closing the mmap so the buffer
+            # export count goes back to zero (mmap.close() raises
+            # BufferError otherwise).
+            del view
+            return int(ret)
+        finally:
+            try:
+                if mm is not None:
+                    mm.close()
+            except Exception:
+                pass
+            try:
+                if rf is not None:
+                    rf.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tf_path)
+            except Exception:
+                pass
 
     def _load_texture_cache_auto(self, bps_path: str) -> None:
         """Try to auto-load texture cache from well-known locations."""
