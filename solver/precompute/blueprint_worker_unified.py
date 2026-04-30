@@ -1068,7 +1068,43 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
     # ── Save regret table (for resume) — atomic write ──
     regret_path = os.path.join(args.output_dir, "regrets_latest.bin")
     regret_tmp = regret_path + ".tmp"
-    bp_lib.bp_save_regrets(solver, regret_tmp.encode('utf-8'))
+    # Pre-flight disk space check. The save needs ~80 GB on a 1.5B-IS run;
+    # at 5B target with 2.4B IS, peak is ~120 GB. Require 1.5x headroom
+    # to leave room for the in-progress .tmp + the existing regrets_latest.bin
+    # that won't be replaced until os.replace below. 2026-04-29 incident:
+    # /opt filled silently from accidental aws s3 sync of blueprint_data_v3,
+    # bp_save_regrets hit ENOSPC and produced a truncated 3.3B snapshot.
+    try:
+        import shutil
+        free_bytes = shutil.disk_usage(args.output_dir).free
+        free_gb = free_bytes / 1024**3
+        # Estimate current save size: ~50 bytes/entry × num info sets
+        est_save_gb = (n_is * 50) / 1024**3
+        needed_gb = est_save_gb * 2.0  # 2x for old + new file during atomic swap
+        if free_gb < needed_gb:
+            raise RuntimeError(
+                f"Pre-save disk-space check failed: need ~{needed_gb:.1f} GB "
+                f"free in {args.output_dir} (estimated save {est_save_gb:.1f} "
+                f"GB × 2 for atomic-swap headroom), have {free_gb:.1f} GB. "
+                f"Aborting save to prevent silent ENOSPC truncation. "
+                f"Free disk space and retry on next checkpoint.")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"  [WARN] disk-space pre-flight check failed: {e} — proceeding "
+              f"anyway (C code now has fwrite checks as safety net)",
+              flush=True)
+
+    save_rc = bp_lib.bp_save_regrets(solver, regret_tmp.encode('utf-8'))
+    if save_rc != 0:
+        # The C code now signals -2 on short fwrite (ENOSPC). The .tmp is
+        # already deleted by the C code. Don't os.replace; retain prior
+        # regrets_latest.bin so resume still has a valid recovery point.
+        raise RuntimeError(
+            f"bp_save_regrets returned {save_rc} — likely ENOSPC. "
+            f"Prior regrets_latest.bin retained. "
+            f"Free disk space ({shutil.disk_usage(args.output_dir).free/1024**3:.1f} "
+            f"GB available) before next checkpoint.")
     os.replace(regret_tmp, regret_path)
 
     # Save checkpoint metadata — atomic write
@@ -1279,21 +1315,23 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
             _s3_upload_with_retry(regret_path, versioned_s3, verify=True)
             print(f"  Regrets versioned snapshot uploaded ({iter_tag}) "
                   f"— size verified", flush=True)
-            # Server-side copy is atomic in S3 (single PUT-COPY operation),
-            # so it can't truncate. Still verify size after.
-            subprocess.run(
-                ["aws", "s3", "cp", versioned_s3, latest_s3, "--quiet"],
-                check=True, capture_output=True, timeout=120,
-            )
+            # Update regrets_latest by uploading the local file a second
+            # time. We previously used `aws s3 cp` for s3-to-s3 copy, but
+            # AWS CLI requires --expected-size for objects > 5 GB and
+            # silently fails the simple form. Re-uploading the local file
+            # uses the same multipart machinery (auto-triggered at 64 MB
+            # via the AWS_CLI configure call earlier) and has identical
+            # cost since the egress is from the same EC2-S3 region pair
+            # (free intra-region bandwidth). The file is already on disk
+            # from the versioned upload moments earlier — no extra I/O.
+            _s3_upload_with_retry(regret_path, latest_s3, verify=True)
             ls = _s3_head_size(latest_s3)
-            vs = _s3_head_size(versioned_s3)
             local_size = os.path.getsize(regret_path)
-            if ls != vs or ls != local_size:
-                print(f"  [ERROR] regrets_latest size mismatch after "
-                      f"server-side copy: latest={ls}, versioned={vs}, "
-                      f"local={local_size}. Continuing — versioned "
-                      f"snapshot is intact, next checkpoint will retry.",
-                      flush=True)
+            if ls != local_size:
+                print(f"  [ERROR] regrets_latest size mismatch: "
+                      f"latest={ls}, local={local_size}. Continuing — "
+                      f"versioned snapshot is intact, next checkpoint "
+                      f"will retry.", flush=True)
             else:
                 print(f"  regrets_latest updated ({iter_tag}, "
                       f"{ls / 1024 / 1024 / 1024:.1f} GiB verified)",

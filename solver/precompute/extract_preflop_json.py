@@ -46,12 +46,11 @@ PLAYER_TO_POS = {v: k for k, v in POS_TO_PLAYER.items()}
 #
 # Level n = num_raises at that node. Level 0 = unraised (UTG opens).
 PREFLOP_TIERS = {
-    0: [0.5, 0.7, 1.0, 1.5, 2.0],   # open raise: 5 sizes
-    1: [0.5, 0.7, 1.0, 1.5],         # 3-bet: 4 sizes
-    2: [0.7, 1.0, 1.5],              # 4-bet: 3 sizes
-    3: [8.0],                        # 5-bet: shove (8x pot ≫ stack → coerced to allin)
+    0: [0.5, 0.7, 1.0],              # open raise: 3 sizes
+    1: [0.7, 1.0],                   # 3-bet: 2 sizes
+    2: [1.0],                        # 4-bet: 1 size (all-in auto-added)
 }
-PREFLOP_MAX_RAISES = 4
+PREFLOP_MAX_RAISES = 3
 
 # Integer chip representation — the C solver uses int chips, not floats.
 # We replicate its exact arithmetic so action counts match byte-for-byte.
@@ -425,6 +424,99 @@ def load_bps3_preflop_direct(bps_path):
     return by_node, by_node_evs, meta
 
 
+def load_preflop_from_bpr4(bpr4_path):
+    """Read BPR4 regret checkpoint, extract only street==0 entries.
+
+    Returns same format as load_bps3_preflop_direct:
+        (by_node, by_node_evs, meta)
+    where by_node = dict[(action_hash, player)] -> {bucket: np.ndarray[na] uint8}
+    """
+    by_node = {}
+    by_node_evs = {}
+
+    with open(bpr4_path, 'rb') as f:
+        magic = f.read(4)
+        if magic not in (b'BPR4', b'BPRG'):
+            raise ValueError(f"Expected BPR4/BPRG, got {magic!r}")
+        table_size = struct.unpack('<q', f.read(8))[0]
+        num_entries = struct.unpack('<q', f.read(8))[0]
+        iterations = struct.unpack('<q', f.read(8))[0]
+
+    print(f"  BPR4: {num_entries:,} entries, {iterations:,} iterations", flush=True)
+
+    kept = 0
+    skipped = 0
+    with open(bpr4_path, 'rb') as f:
+        f.seek(28)
+        for _ in range(num_entries):
+            raw_key = f.read(32)
+            if len(raw_key) < 32:
+                break
+            player = struct.unpack_from('<i', raw_key, 0)[0]
+            street = struct.unpack_from('<i', raw_key, 4)[0]
+            bucket = struct.unpack_from('<i', raw_key, 8)[0]
+            action_hash = struct.unpack_from('<Q', raw_key, 20)[0]
+            na = struct.unpack_from('<i', raw_key, 28)[0]
+            if na < 1 or na > 16:
+                break
+            regrets_raw = f.read(4 * na)
+            if len(regrets_raw) < 4 * na:
+                break
+            regrets = list(struct.unpack(f'<{na}i', regrets_raw))
+            has_ss_bytes = f.read(4)
+            if len(has_ss_bytes) < 4:
+                break
+            has_ss = struct.unpack('<i', has_ss_bytes)[0]
+            strategy_sum = None
+            if has_ss:
+                ss_raw = f.read(4 * na)
+                if len(ss_raw) < 4 * na:
+                    break
+                strategy_sum = list(struct.unpack(f'<{na}f', ss_raw))
+
+            if street == 0:
+                if strategy_sum is not None:
+                    clamped = [max(0.0, v) for v in strategy_sum]
+                    total = sum(clamped)
+                    if total > 0:
+                        strategy = [v / total for v in clamped]
+                    else:
+                        positive = [max(0.0, float(r)) for r in regrets]
+                        t = sum(positive)
+                        strategy = [p / t for p in positive] if t > 0 else [1.0/na]*na
+                else:
+                    positive = [max(0.0, float(r)) for r in regrets]
+                    t = sum(positive)
+                    strategy = [p / t for p in positive] if t > 0 else [1.0/na]*na
+
+                quant = np.array(
+                    [max(0, min(255, int(p * 255.0 + 0.5))) for p in strategy],
+                    dtype=np.uint8,
+                )
+                key = (action_hash, player)
+                d = by_node.get(key)
+                if d is None:
+                    by_node[key] = {bucket: quant}
+                else:
+                    d[bucket] = quant
+                kept += 1
+            else:
+                skipped += 1
+
+            total_done = kept + skipped
+            if total_done % 50_000_000 == 0:
+                print(f"  scanned {total_done:,} (kept {kept:,} preflop)", flush=True)
+
+    print(f"  Done: kept {kept:,} preflop, skipped {skipped:,} postflop", flush=True)
+
+    meta = {
+        "iterations": iterations,
+        "num_info_sets": num_entries,
+        "hash_mixer": "splitmix64",
+    }
+    return by_node, by_node_evs, meta
+
+
 def get_or_build_cached_table(bps_path):
     """Load (action_hash, player) -> packed strategies + per-action EVs.
 
@@ -501,7 +593,10 @@ def get_or_build_cached_table(bps_path):
             print(f"Cache load failed ({e}), rebuilding...", flush=True)
 
     # Build from scratch
-    by_node, by_node_evs, meta = load_bps3_preflop_direct(bps_path)
+    if bps_path.endswith('.bin'):
+        by_node, by_node_evs, meta = load_preflop_from_bpr4(bps_path)
+    else:
+        by_node, by_node_evs, meta = load_bps3_preflop_direct(bps_path)
 
     # Convert sparse {bucket: row} dicts into dense [169, na] uint8 matrices.
     # Unvisited buckets stay 0 (vs the old code's uniform default — we'll

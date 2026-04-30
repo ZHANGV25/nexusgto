@@ -538,11 +538,53 @@ static uint64_t compute_action_hash(const int *actions, int num_actions) {
     return h;
 }
 
+/* Round n up to the next prime. Used by info_table_init to ensure the
+ * modulo operation in slot derivation produces uniform distribution.
+ *
+ * 2026-04-29 incident: training run with table_size=2_000_000_000 (= 2^10
+ * × 5^9) hit max_probe=4095 at only 67% load, with insertion_failures > 0.
+ * Empirical analysis (scripts/analyze_hash_distribution.c) showed that
+ * non-prime table sizes whose factors align with hash output structure
+ * cause catastrophic clustering on this key set. Switching to a nearby
+ * prime (2_000_000_011) at the SAME load dropped max_probe to 184 with
+ * 0 insertion failures — textbook behavior.
+ *
+ * Trial-division is fine: caller passes O(1B)-sized values, so the cost
+ * of factoring is negligible compared to the calloc that follows.
+ */
+static int is_prime_i64(int64_t n) {
+    if (n < 2) return 0;
+    if (n == 2) return 1;
+    if ((n & 1) == 0) return 0;
+    for (int64_t d = 3; d * d <= n; d += 2) {
+        if (n % d == 0) return 0;
+    }
+    return 1;
+}
+
+static int64_t next_prime_i64(int64_t n) {
+    if (n <= 2) return 2;
+    if ((n & 1) == 0) n++;
+    while (!is_prime_i64(n)) n += 2;
+    return n;
+}
+
 static void info_table_init(BPInfoTable *t, int64_t table_size) {
-    t->table_size = table_size;
-    t->keys = (BPInfoKey*)calloc((size_t)table_size, sizeof(BPInfoKey));
-    t->sets = (BPInfoSet*)calloc((size_t)table_size, sizeof(BPInfoSet));
-    t->occupied = (int*)calloc((size_t)table_size, sizeof(int));
+    /* Promote table_size to the next prime to eliminate modular collision
+     * patterns. The size grows by at most a few hundred slots — negligible
+     * memory cost, ~30x reduction in observed max_probe at high load. */
+    int64_t prime_size = next_prime_i64(table_size);
+    if (prime_size != table_size) {
+        printf("[BP] Hash table size promoted to next prime: %lld -> %lld "
+               "(+%lld slots, eliminates modular clustering)\n",
+               (long long)table_size, (long long)prime_size,
+               (long long)(prime_size - table_size));
+        fflush(stdout);
+    }
+    t->table_size = prime_size;
+    t->keys = (BPInfoKey*)calloc((size_t)prime_size, sizeof(BPInfoKey));
+    t->sets = (BPInfoSet*)calloc((size_t)prime_size, sizeof(BPInfoSet));
+    t->occupied = (int*)calloc((size_t)prime_size, sizeof(int));
     t->num_entries = 0;
     t->insertion_failures = 0;
     t->max_probe_observed = 0;
@@ -3558,6 +3600,23 @@ void bp_get_table_stats(const BPSolver *s,
         *out_max_probe_observed = __atomic_load_n(&s->info_table.max_probe_observed, __ATOMIC_RELAXED);
 }
 
+/* CHK_FW: write `count` items of `size` bytes from `ptr` to `f`. If the
+ * write is short (disk full, etc.), goto write_failed which closes the
+ * file and returns -2. The 2026-04-29 incident: bp_save_regrets returned
+ * 0 ("success") even though the C runtime's fwrite had hit ENOSPC and
+ * dropped 200M entries silently. Header counter said 1.466B entries,
+ * actual file contained 1.265B. Now any short write aborts the save
+ * immediately so the caller knows to retry/cleanup. */
+#define CHK_FW(ptr, size, count, f) do {                                   \
+    size_t _n = fwrite((ptr), (size), (count), (f));                       \
+    if (_n != (size_t)(count)) {                                           \
+        fprintf(stderr,                                                    \
+                "[BP] bp_save_regrets: short fwrite (%zu/%zu items) — "    \
+                "likely ENOSPC. Aborting save.\n", _n, (size_t)(count));   \
+        goto write_failed;                                                 \
+    }                                                                      \
+} while(0)
+
 int bp_save_regrets(const BPSolver *s, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -3565,11 +3624,11 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
     const BPInfoTable *t = &s->info_table;
 
     /* Header: "BPR4" = bucket-in-key format v4 (int64 table_size, int64 iterations) */
-    fwrite("BPR4", 1, 4, f);
-    fwrite(&t->table_size, sizeof(int64_t), 1, f);
-    fwrite(&t->num_entries, sizeof(int64_t), 1, f);
+    CHK_FW("BPR4", 1, 4, f);
+    CHK_FW(&t->table_size, sizeof(int64_t), 1, f);
+    CHK_FW(&t->num_entries, sizeof(int64_t), 1, f);
     int64_t iters64 = s->iterations_run;
-    fwrite(&iters64, sizeof(int64_t), 1, f);
+    CHK_FW(&iters64, sizeof(int64_t), 1, f);
 
     /* Entries — each info set has bucket in key, regrets[num_actions] only */
     int64_t written = 0;
@@ -3578,26 +3637,41 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
         BPInfoKey *key = &t->keys[i];
         BPInfoSet *is = &t->sets[i];
 
-        fwrite(&key->player, sizeof(int), 1, f);
-        fwrite(&key->street, sizeof(int), 1, f);
-        fwrite(&key->bucket, sizeof(int), 1, f);
-        fwrite(&key->board_hash, sizeof(uint64_t), 1, f);
-        fwrite(&key->action_hash, sizeof(uint64_t), 1, f);
-        fwrite(&is->num_actions, sizeof(int), 1, f);
+        CHK_FW(&key->player, sizeof(int), 1, f);
+        CHK_FW(&key->street, sizeof(int), 1, f);
+        CHK_FW(&key->bucket, sizeof(int), 1, f);
+        CHK_FW(&key->board_hash, sizeof(uint64_t), 1, f);
+        CHK_FW(&key->action_hash, sizeof(uint64_t), 1, f);
+        CHK_FW(&is->num_actions, sizeof(int), 1, f);
 
-        fwrite(is->regrets, sizeof(int), is->num_actions, f);
+        CHK_FW(is->regrets, sizeof(int), is->num_actions, f);
 
         int has_ss = (is->strategy_sum != NULL) ? 1 : 0;
-        fwrite(&has_ss, sizeof(int), 1, f);
+        CHK_FW(&has_ss, sizeof(int), 1, f);
         if (has_ss) {
-            fwrite(is->strategy_sum, sizeof(float), is->num_actions, f);
+            CHK_FW(is->strategy_sum, sizeof(float), is->num_actions, f);
         }
         written++;
     }
 
-    fclose(f);
+    /* Final flush — fclose may also report errors that prior fwrite missed
+     * because of buffering. Treat fclose failure as ENOSPC too. */
+    if (fflush(f) != 0) {
+        fprintf(stderr, "[BP] bp_save_regrets: fflush failed\n");
+        goto write_failed;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "[BP] bp_save_regrets: fclose failed\n");
+        return -2;
+    }
     printf("[BP] Saved %lld info sets to %s\n", (long long)written, path);
     return 0;
+
+write_failed:
+    fclose(f);
+    /* Best-effort delete the partial file so callers don't accidentally use it. */
+    unlink(path);
+    return -2;
 }
 
 /* ── Regret loader ────────────────────────────────────────────────
