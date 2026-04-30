@@ -65,6 +65,50 @@ PREFLOP_TIERS = {
 }
 PREFLOP_MAX_RAISES = 3
 
+# ── Canonical 169-class preflop bucket map (matches mccfr_blueprint.c) ──
+# Built programmatically so probes display the right hand under each
+# bucket index. Probe code uses this map; hardcoded indices have been
+# wrong twice in the past (Bug A in EXTRACTOR_BUGS.md). Single source.
+_RANKS = "AKQJT98765432"
+
+
+def _build_c_bucket_map():
+    """Replicate mccfr_blueprint.c init_unified() class_map iteration.
+    The C code:
+        for r0 = 12 down to 0:
+            for r1 = r0 down to 0:
+                if r0 == r1: pair → 1 class
+                else:        suited then offsuit → 2 classes
+    Yields AA=0, AKs=1, AKo=2, ..., 22=168.
+    """
+    bm = {}
+    n = 0
+    for r0 in range(12, -1, -1):
+        for r1 in range(r0, -1, -1):
+            r0c = _RANKS[12 - r0]
+            r1c = _RANKS[12 - r1]
+            if r0 == r1:
+                bm[r0c + r1c] = n
+                n += 1
+            else:
+                bm[r0c + r1c + "s"] = n
+                n += 1
+                bm[r0c + r1c + "o"] = n
+                n += 1
+    assert n == 169, f"Expected 169, got {n}"
+    # Spot-check sentinels — fail loud at module load if any drift.
+    assert bm["AA"] == 0
+    assert bm["AKs"] == 1
+    assert bm["AKo"] == 2
+    assert bm["KK"] == 25
+    assert bm["JJ"] == 69
+    assert bm["TT"] == 88
+    assert bm["22"] == 168
+    return bm
+
+
+_C_BUCKET_MAP = _build_c_bucket_map()
+
 # ── Config hash (stale-checkpoint guard) ──────────────────────────
 # Prior incident: a new tiered-sizing run loaded an OLD flat-8 checkpoint
 # and produced garbage for hours before detection. Embedding a SHA256 of
@@ -473,15 +517,16 @@ def main():
         except (OSError, ValueError):
             pass
 
-    # Checkpoint schedule: dense early, then every 300M for spot safety.
-    # Target: 8B iterations. Every checkpoint uploaded to S3 so any restart
-    # loses at most one checkpoint's worth of iterations.
+    # Checkpoint cadence: every 100M iters. At ~110K iter/s on c6a.metal,
+    # 100M = ~15min wall-clock. Spot reclaim loses at most ~15min of work.
+    # Each checkpoint = 76 GB regret file + ~50 KB meta. Save+upload takes
+    # ~3 min on gp3 1GB/s throughput. Overhead: ~20% of wall time.
     #
-    # v3 cadence: checkpoint every 250M iters. At ~35K iter/s on
-    # c7a.metal-48xl, 250M = ~2h wall-clock, so a spot reclaim loses
-    # at most ~2h of work. 32 checkpoints over 8B iters. Checkpoint
-    # write (~27 GB) takes ~1-2 min = ~1.5% overhead.
-    checkpoint_interval_iters = 250_000_000
+    # Versioned snapshots: every checkpoint also creates a versioned
+    # `regrets_NNNM.bin` copy in S3 so a truncated upload of regrets_latest
+    # never destroys a known-good prior checkpoint. Lifecycle policy on
+    # the bucket prunes old versioned snapshots after retention window.
+    checkpoint_interval_iters = 100_000_000
     checkpoint_milestones = [
         (i + 1) * checkpoint_interval_iters
         for i in range(max(1, int(total_iters // checkpoint_interval_iters)))
@@ -672,45 +717,96 @@ def main():
 
 
 def _probe_preflop(bp_lib, solver):
-    """Extract preflop strategies and raw regrets for key hands.
+    """Extract richer preflop convergence diagnostics.
 
-    Output format (multi-line):
-      UTG: AA:F0/C2/R98 KK:F0/C5/R95 ... 22:F85/C10/R5
-      BTN: AA:F0/C1/R99 KK:F0/C2/R98 ... 22:F60/C20/R20
-      REGRETS UTG TT: fold=+1234 call=+56789 best_raise=+12345 pruned=3/8
-      REGRETS UTG 99: fold=+5678 call=+45678 best_raise=-1234 pruned=5/8
-      REGRETS UTG 44: fold=+9012 call=-3456 best_raise=-78901 pruned=6/8
+    Three sections:
 
-    The REGRETS lines show raw int regrets for the 3 diagnostic hands.
-    'pruned=3/8' means 3 of 8 raise actions are below -300M threshold.
-    This directly measures whether the pruning fix is working."""
+      OPEN — open-raise strategy at every position (UTG, MP, CO, BTN, SB, BB).
+        Per-raise-size frequencies (not aggregated R%) so we can see if
+        r0.5x / r0.7x / r1.0x are converging differentially. UTG = no
+        prior action; MP = UTG folded; CO = UTG+MP folded; BTN = UTG+MP+CO
+        folded; SB = UTG+MP+CO+BTN folded; BB = UTG+MP+CO+BTN+SB called
+        (BB defends). Format:
+          OPEN UTG AA: F0 C5 R0.5x:30 R0.7x:35 R1.0x:30
+          OPEN BTN 22: F60 C20 R0.5x:5 R0.7x:5 R1.0x:10
+
+      VS_OPEN — defending strategy when villain (UTG) opens to 3bb.
+        BB and BTN as defenders. Lets us see fold/call/3bet ranges.
+        Format:
+          VS_OPEN BB AA: F2 C20 R3bet=78
+          VS_OPEN BTN AKs: F0 C40 R3bet=60
+
+      VS_3BET — 4bet response when villain (BB) 3bets us (UTG opener).
+        Detects whether 5-bet jam line is live. Format:
+          VS_3BET UTG AA: F2 C5 R4bet=93
+          VS_3BET UTG TT: F30 C50 R4bet=20
+
+      REGRETS — raw int regrets for diagnostic hands at all 6 positions.
+        Per-raise-size regrets so we can see which sizes are saturated
+        vs growing. Pruning indicator (`pruned=N/M`) shows how many
+        raise actions are below the prune threshold (-300M).
+
+      TABLE — hash table health: entries, load factor, insertion failures,
+        max probe distance. Critical for catching saturation early.
+    """
     try:
-        PRUNE_THRESH = -50_000_000
+        # PRUNE_THRESHOLD in C is -300M; mirror here for "is this raise
+        # currently pruned?" reporting. Don't conflate with REGRET_FLOOR.
+        PRUNE_THRESH = -300_000_000
 
-        # Pocket pairs + key broadway/suited connectors that showed
-        # convergence issues (AKo uniform stuck, A5s/K9s/87s/98s fold locked)
-        pairs = [
-            ("AA", 0), ("KK", 25), ("QQ", 48), ("JJ", 69), ("TT", 88),
-            ("99", 105), ("88", 120), ("77", 133), ("66", 144), ("55", 153),
-            ("44", 160), ("33", 165), ("22", 168),
-            ("AKo", 2), ("AQs", 3), ("A5s", 17), ("K9s", 32),
-            ("98s", 106), ("87s", 121),
+        # Strategically diverse hand spread (37 hands).
+        #
+        # Bucket indices come from _C_BUCKET_MAP — built programmatically
+        # from the C class_map iteration in mccfr_blueprint.c:init_unified.
+        # Verified at module load time; if this assertion ever fires the
+        # C side has changed and probes will mislabel.
+        diag_hand_names = [
+            # Premium pairs + big aces
+            "AA", "AKs", "AKo", "AQs", "AQo", "AJs", "ATs", "A5s", "A2s",
+            # K-range
+            "KK", "KQs", "KQo", "KJs", "KTs", "K9s",
+            # Q-range
+            "QQ", "QJs", "QTs",
+            # J-range
+            "JJ", "JTs",
+            # T+ pairs
+            "TT", "99", "88", "77", "66", "55", "44", "33", "22",
+            # Suited connectors
+            "T9s", "98s", "87s", "76s", "65s", "54s",
+            # Trash benchmarks
+            "T2o", "72o", "32o",
         ]
-        # Diagnostic hands: raw regrets for all pairs + key hands
-        diag_hands = [
-            ("AA", 0), ("KK", 25), ("QQ", 48), ("JJ", 69), ("TT", 88),
-            ("99", 105), ("88", 120), ("77", 133), ("66", 144), ("55", 153),
-            ("44", 160), ("33", 165), ("22", 168),
-            ("AKo", 2), ("AQs", 3), ("A5s", 17), ("K9s", 32),
-            ("98s", 106), ("87s", 121),
+        diag_hands = [(n, _C_BUCKET_MAP[n]) for n in diag_hand_names]
+
+        # All 6 preflop positions with prefix action sequences. The C tree
+        # uses traversal order (UTG, MP, CO, BTN, SB, BB) with action
+        # indices: 0=fold, 1=call/check, 2..=raise sizes.
+        # "Open" position: every prior actor folded (action 0 each).
+        open_positions = [
+            ("UTG", 2, []),                  # first to act
+            ("MP",  3, [0]),                 # UTG folded
+            ("CO",  4, [0, 0]),              # UTG, MP folded
+            ("BTN", 5, [0, 0, 0]),           # UTG, MP, CO folded
+            ("SB",  0, [0, 0, 0, 0]),        # all folded to SB
+            ("BB",  1, [0, 0, 0, 0, 1]),     # UTG-SB folded (1=SB call)
         ]
 
-        # Positions with their "folds to me" action sequences.
-        # Preflop order: UTG(2), MP(3), CO(4), BTN(5), SB(0), BB(1).
-        # Action index 0 = fold. Each position's root = all prior players folded.
-        positions = [
-            ("UTG", 2, []),              # first to act
-            ("BTN", 5, [0, 0, 0]),       # UTG, MP, CO folded
+        # UTG's preflop actions at the open (na=5):
+        #   0=fold, 1=call, 2=r0.5x, 3=r0.7x, 4=r1.0x   (tier-0 sizes)
+        #   plus auto-allin only if r1.0x doesn't already make UTG allin.
+        # vs-open: UTG opens r0.7x (action 3), then 0/0/0 fold across MP/CO.
+        vs_open_positions = [
+            ("BB",  1, [3, 0, 0, 0, 0]),     # UTG r0.7x; MP/CO/BTN/SB fold
+            ("BTN", 5, [3, 0, 0]),           # UTG r0.7x; MP/CO fold
+        ]
+
+        # BB's response to UTG's r0.7x has na ≈ 5:
+        #   0=fold, 1=call, 2=r0.7x (3bet), 3=r1.0x (3bet),
+        #   4=allin (auto-added when r1.0x doesn't already shove)
+        # vs-3bet: UTG opens r0.7x, MP/CO/BTN/SB fold, BB 3bets r1.0x.
+        # BB action 3 = r1.0x 3bet (NOT 4 — that would be BB shove).
+        vs_3bet_positions = [
+            ("UTG", 2, [3, 0, 0, 0, 0, 3]),  # last 3 = BB r1.0x 3bet
         ]
 
         strat_buf = (ctypes.c_float * 16)()
@@ -719,77 +815,238 @@ def _probe_preflop(bp_lib, solver):
 
         lines = []
 
-        # Strategy lines for each position
-        for pos_name, player, action_seq in positions:
+        def probe_strat(player, action_seq, bucket):
+            """Return (na, [strategy_freqs])  or (0, None) if not found."""
             if action_seq:
                 c_seq = (ctypes.c_int * len(action_seq))(*action_seq)
                 seq_len = len(action_seq)
             else:
                 c_seq = (ctypes.c_int * 1)(0)
                 seq_len = 0
-            parts = []
-            for name, bucket in pairs:
-                na = bp_lib.bp_get_strategy(solver, player, empty_board, 0,
-                                             c_seq, seq_len, strat_buf, bucket)
-                if na >= 3:
-                    f_p = strat_buf[0] * 100
-                    c_p = strat_buf[1] * 100
-                    r_p = sum(strat_buf[a] for a in range(2, na)) * 100
-                    parts.append(f"{name}:F{f_p:.0f}/C{c_p:.0f}/R{r_p:.0f}")
-                else:
-                    parts.append(f"{name}:?")
-            lines.append(f"{pos_name}: {' '.join(parts)}")
+            na = bp_lib.bp_get_strategy(solver, player, empty_board, 0,
+                                         c_seq, seq_len, strat_buf, bucket)
+            if na <= 0:
+                return 0, None
+            return na, [strat_buf[a] for a in range(na)]
 
-        # Raw regret lines for diagnostic hands (UTG + BTN)
-        for pos_name, player, action_seq in positions:
+        def probe_regrets(player, action_seq, bucket):
+            """Return (na, [regret_ints]) or (0, None) if not found."""
             if action_seq:
-                reg_seq = (ctypes.c_int * len(action_seq))(*action_seq)
-                reg_seq_len = len(action_seq)
+                c_seq = (ctypes.c_int * len(action_seq))(*action_seq)
+                seq_len = len(action_seq)
             else:
-                reg_seq = (ctypes.c_int * 1)(0)
-                reg_seq_len = 0
-            for name, bucket in diag_hands:
-                na = bp_lib.bp_get_regrets(solver, player, empty_board, 0,
-                                            reg_seq, reg_seq_len, regret_buf, bucket)
-                if na >= 3:
-                    fold_r = regret_buf[0]
-                    call_r = regret_buf[1]
-                    raise_regrets = [regret_buf[a] for a in range(2, na)]
-                    best_raise = max(raise_regrets)
-                    all_raises = "/".join(f"{r:+d}" for r in raise_regrets)
-                    n_pruned = sum(1 for r in raise_regrets if r < PRUNE_THRESH)
-                    n_raises = len(raise_regrets)
-                    lines.append(
-                        f"REGRETS {pos_name} {name}: fold={fold_r:+d} call={call_r:+d} "
-                        f"raises=[{all_raises}] pruned={n_pruned}/{n_raises}"
-                    )
-                else:
-                    lines.append(f"REGRETS {pos_name} {name}: not_found")
+                c_seq = (ctypes.c_int * 1)(0)
+                seq_len = 0
+            na = bp_lib.bp_get_regrets(solver, player, empty_board, 0,
+                                        c_seq, seq_len, regret_buf, bucket)
+            if na <= 0:
+                return 0, None
+            return na, [regret_buf[a] for a in range(na)]
+
+        # ── OPEN strategies — per-raise-size frequencies ──
+        # Tier 0 sizes: [0.5, 0.7, 1.0]  → raise actions at index 2,3,4.
+        # Some positions have a fold action (0) only when there's
+        # something to fold to — UTG has no fold (open spot), so na may
+        # be 4 (check, r0.5, r0.7, r1.0). BB has fold + check + raises.
+        # We detect na and label by index dynamically.
+        for pos_name, player, action_seq in open_positions:
+            for hand_name, bucket in diag_hands:
+                na, strat = probe_strat(player, action_seq, bucket)
+                if not strat:
+                    lines.append(f"OPEN {pos_name} {hand_name}: not_found")
+                    continue
+                # Pretty-print: pct for each action
+                # First decide which actions exist:
+                #   UTG/MP/CO/BTN: na=4 (check, r0.5, r0.7, r1.0) typically
+                #   BB: na=5 (fold, check, r0.5, r0.7, r1.0)
+                #   SB: na=5 (fold, call, r0.5, r0.7, r1.0)
+                # We don't know labels from the C side; use heuristic:
+                # if to_call > 0 there's fold + call, otherwise check.
+                # Record raw (action_idx, freq) pairs.
+                pcts = [int(round(p * 100)) for p in strat]
+                # Skip near-zero entries to keep the line compact.
+                tail = " ".join(
+                    f"a{i}={pcts[i]}" for i in range(len(pcts))
+                    if pcts[i] >= 1
+                )
+                lines.append(
+                    f"OPEN {pos_name} {hand_name} "
+                    f"(na={na}): {tail}"
+                )
+
+        # ── VS_OPEN — defender strategies after UTG opens r0.7x ──
+        for pos_name, player, action_seq in vs_open_positions:
+            for hand_name, bucket in diag_hands:
+                na, strat = probe_strat(player, action_seq, bucket)
+                if not strat:
+                    lines.append(f"VS_OPEN {pos_name} {hand_name}: not_found")
+                    continue
+                pcts = [int(round(p * 100)) for p in strat]
+                tail = " ".join(
+                    f"a{i}={pcts[i]}" for i in range(len(pcts))
+                    if pcts[i] >= 1
+                )
+                lines.append(
+                    f"VS_OPEN {pos_name} {hand_name} "
+                    f"(na={na}): {tail}"
+                )
+
+        # ── VS_3BET — UTG facing BB's 3bet ──
+        for pos_name, player, action_seq in vs_3bet_positions:
+            for hand_name, bucket in diag_hands:
+                na, strat = probe_strat(player, action_seq, bucket)
+                if not strat:
+                    lines.append(f"VS_3BET {pos_name} {hand_name}: not_found")
+                    continue
+                pcts = [int(round(p * 100)) for p in strat]
+                tail = " ".join(
+                    f"a{i}={pcts[i]}" for i in range(len(pcts))
+                    if pcts[i] >= 1
+                )
+                lines.append(
+                    f"VS_3BET {pos_name} {hand_name} "
+                    f"(na={na}): {tail}"
+                )
+
+        # ── REGRETS — raw int regrets at OPEN positions for all hands ──
+        # Per-raise-size regrets shows which sizes are pruned vs growing.
+        for pos_name, player, action_seq in open_positions:
+            for hand_name, bucket in diag_hands:
+                na, regrets = probe_regrets(player, action_seq, bucket)
+                if not regrets:
+                    lines.append(f"REGRETS {pos_name} {hand_name}: not_found")
+                    continue
+                # Show all action regrets so we can see fold vs call vs each
+                # raise size individually (per-size visibility was the gap
+                # in the prior probe).
+                regret_str = "/".join(f"{r:+d}" for r in regrets)
+                n_pruned = sum(1 for r in regrets if r < PRUNE_THRESH)
+                lines.append(
+                    f"REGRETS {pos_name} {hand_name} "
+                    f"(na={na}): [{regret_str}] pruned={n_pruned}/{na}"
+                )
+
+        # ── TABLE — hash health stats ──
+        if getattr(bp_lib, 'bp_get_table_stats', None) is not None:
+            ht_entries = ctypes.c_int64(0)
+            ht_size = ctypes.c_int64(0)
+            ht_fails = ctypes.c_int64(0)
+            ht_max_probe = ctypes.c_int64(0)
+            bp_lib.bp_get_table_stats(
+                solver,
+                ctypes.byref(ht_entries),
+                ctypes.byref(ht_size),
+                ctypes.byref(ht_fails),
+                ctypes.byref(ht_max_probe),
+            )
+            if ht_size.value > 0:
+                load = 100.0 * ht_entries.value / ht_size.value
+                lines.append(
+                    f"TABLE entries={ht_entries.value} size={ht_size.value} "
+                    f"load={load:.2f}% ins_fails={ht_fails.value} "
+                    f"max_probe={ht_max_probe.value}"
+                )
 
         return "\n".join(lines)
     except Exception as e:
         return f"probe_error:{e}"
 
 
-def _s3_upload_with_retry(local_path, s3_uri, max_attempts=3, delay=5):
-    """Upload a file to S3 with retry logic."""
+def _s3_head_size(s3_uri):
+    """Return ContentLength of an S3 object, or None if not found / error.
+
+    Uses `aws s3api head-object` because `aws s3 ls` returns sizes only as
+    a count of bytes via parsing — head-object returns a structured JSON
+    that's safer to parse and includes an ETag we can also cross-check.
+    """
+        return None
+    rest = s3_uri[5:]
+    if "/" not in rest:
+        return None
+    bucket, key = rest.split("/", 1)
+    try:
+        out = subprocess.run(
+            ["aws", "s3api", "head-object",
+             "--bucket", bucket, "--key", key,
+             "--output", "json"],
+            check=True, capture_output=True, timeout=30,
+        )
+        meta = json.loads(out.stdout.decode())
+        return int(meta.get("ContentLength", 0))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            ValueError, KeyError):
+        return None
+
+
+def _s3_upload_with_retry(local_path, s3_uri, max_attempts=3, delay=5,
+                          verify=True):
+    """Upload a file to S3 with retry + size-verification on each attempt.
+
+    The 3B run on 2026-04-27 silently truncated a 76 GB regret upload to
+    57 GB on a multipart cancellation. The aws CLI returned 0 (or 1, the
+    log line was suppressed by `--quiet`), and the S3 head_object size
+    came back smaller than the local file — but nothing checked that.
+
+    This function:
+      1. Uploads via `aws s3 cp`
+      2. Calls `head-object` to confirm bytes-on-S3 == bytes-on-disk
+      3. Treats a size mismatch as a failed attempt (retries)
+
+    Set verify=False ONLY for files where mid-stream interruption is
+    survivable (e.g. periodic log uploads). For checkpoint regrets and
+    .bps files, ALWAYS verify.
+    """
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(local_path)
+    expected_size = os.path.getsize(local_path)
+
     for attempt in range(1, max_attempts + 1):
         try:
+            # Note: `--expected-size` is for stdin streams only, doesn't
+            # apply here. The size check via head-object after upload
+            # is the actual integrity guarantee.
             subprocess.run(
                 ["aws", "s3", "cp", local_path, s3_uri, "--quiet"],
                 check=True,
                 capture_output=True,
             )
-            return  # success
         except subprocess.CalledProcessError as e:
             if attempt < max_attempts:
-                print(f"  [WARN] S3 upload failed (attempt {attempt}/{max_attempts}): "
-                      f"{e.stderr.decode().strip()}, retrying in {delay}s...")
+                stderr = e.stderr.decode().strip() if e.stderr else ""
+                print(f"  [WARN] S3 upload failed "
+                      f"(attempt {attempt}/{max_attempts}): {stderr}, "
+                      f"retrying in {delay}s...", flush=True)
                 time.sleep(delay)
-            else:
-                print(f"  [ERROR] S3 upload failed after {max_attempts} attempts: "
-                      f"{local_path} -> {s3_uri}: {e.stderr.decode().strip()}")
-                raise
+                continue
+            stderr = e.stderr.decode().strip() if e.stderr else ""
+            print(f"  [ERROR] S3 upload failed after {max_attempts} "
+                  f"attempts: {local_path} -> {s3_uri}: {stderr}",
+                  flush=True)
+            raise
+
+        if not verify:
+            return  # success, no integrity check
+
+        actual_size = _s3_head_size(s3_uri)
+        if actual_size == expected_size:
+            return  # success and verified
+
+        # Size mismatch — uploaded data is corrupted/truncated.
+        if attempt < max_attempts:
+            print(f"  [WARN] S3 size mismatch "
+                  f"(attempt {attempt}/{max_attempts}): "
+                  f"local={expected_size}, s3={actual_size} "
+                  f"({s3_uri}), retrying...", flush=True)
+            time.sleep(delay)
+        else:
+            print(f"  [ERROR] S3 upload size mismatch after "
+                  f"{max_attempts} attempts: local={expected_size}, "
+                  f"s3={actual_size} ({s3_uri})", flush=True)
+            raise RuntimeError(
+                f"S3 upload integrity check failed: "
+                f"{s3_uri} expected {expected_size} bytes, "
+                f"got {actual_size}"
+            )
 
 
 def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
@@ -854,29 +1111,91 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
     regret_mb = os.path.getsize(regret_path) / 1024 / 1024
 
     if label == "final":
+        # OOM-safe streaming export.
+        #
+        # Prior pattern materialized the entire raw strat (~23 GB) AND a
+        # `bytes()` copy of it AND the full LZMA output in Python memory
+        # simultaneously. With the regret hash table still alive (~75 GB
+        # table arrays + ~25 GB arena) plus OS write buffers, peak crossed
+        # the c6a.metal 384 GB ceiling under load and got OOM-killed mid
+        # multipart upload — the truncation that cost the 3B run.
+        #
+        # New pattern:
+        #   1. Single `bp_export_strategies` call into one C-side buffer
+        #      (Python sees it via ctypes; no `bytes()` copy).
+        #   2. Compress the buffer slice-by-slice with `LZMACompressor`,
+        #      streaming each chunk straight into the output file. Only
+        #      a small (~1 MB) compressor working set lives in RAM.
+        #   3. Outer .bps wrapper is written with a placeholder header,
+        #      then we patch in the real compressed_size after streaming.
         needed = ctypes.c_size_t(0)
         bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
         strat_size = needed.value
 
         if strat_size > 0:
+            print(f"  Streaming strat export: {strat_size / 1024 / 1024 / 1024:.2f} GiB raw",
+                  flush=True)
             strat_buf = (ctypes.c_char * strat_size)()
             written = ctypes.c_size_t(0)
             bp_lib.bp_export_strategies(solver, strat_buf, strat_size,
                                         ctypes.byref(written))
-            strat_data = bytes(strat_buf[:written.value])
-            compressed = lzma.compress(strat_data, preset=1)
+            written_bytes = written.value
             meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
 
+            # Stream LZMA directly to file. Use `memoryview` over strat_buf
+            # so we don't allocate a Python `bytes` copy of the whole buffer.
+            CHUNK = 64 * 1024 * 1024  # 64 MB compress chunks
             out_tmp = bps_path + ".tmp"
+
+            # Strategy: write header with placeholder compressed_size = 0,
+            # stream-compress to disk past the header, fseek back and patch
+            # the header. Atomically rename at the end.
+            compressor = lzma.LZMACompressor(preset=1)
+            compressed_size = 0
+
             with open(out_tmp, 'wb') as f:
-                f.write(b'BPS3')  # v3: uint64 size field for >4GB strategies
-                f.write(struct.pack('<QI', len(compressed), len(meta_bytes)))
-                f.write(compressed)
+                # Header placeholder. compressed_size=0 will be patched.
+                f.write(b'BPS3')
+                header_compressed_size_offset = f.tell()
+                f.write(struct.pack('<QI', 0, len(meta_bytes)))
+
+                # Stream raw strat_buf in 64 MB chunks through the compressor.
+                mv = memoryview(strat_buf)[:written_bytes]
+                pos = 0
+                last_pct_logged = -1
+                while pos < written_bytes:
+                    chunk_end = min(pos + CHUNK, written_bytes)
+                    # memoryview slice avoids the per-chunk bytes() copy
+                    # (lzma.compress accepts buffer-protocol objects directly).
+                    out_chunk = compressor.compress(mv[pos:chunk_end])
+                    if out_chunk:
+                        f.write(out_chunk)
+                        compressed_size += len(out_chunk)
+                    pos = chunk_end
+                    pct = int(100 * pos / written_bytes)
+                    if pct >= last_pct_logged + 10:
+                        print(f"    compress {pct}% "
+                              f"(in={pos / 1024 / 1024 / 1024:.1f} GiB, "
+                              f"out={compressed_size / 1024 / 1024 / 1024:.2f} GiB)",
+                              flush=True)
+                        last_pct_logged = pct
+                tail = compressor.flush()
+                if tail:
+                    f.write(tail)
+                    compressed_size += len(tail)
+
+                # Now write meta footer.
                 f.write(meta_bytes)
+
+                # Patch the compressed_size field in the header.
+                f.seek(header_compressed_size_offset)
+                f.write(struct.pack('<Q', compressed_size))
+
             os.replace(out_tmp, bps_path)
 
-            comp_mb = len(compressed) / 1024 / 1024
-            print(f"  Final checkpoint: strategy={comp_mb:.0f}MB, regrets={regret_mb:.0f}MB")
+            comp_mb = compressed_size / 1024 / 1024
+            print(f"  Final checkpoint: strategy={comp_mb:.0f}MB compressed, "
+                  f"regrets={regret_mb:.0f}MB", flush=True)
         else:
             print("  [WARN] No strategies to export")
     else:
@@ -938,21 +1257,51 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
                 except subprocess.CalledProcessError:
                     pass
 
-        # Upload regret file as latest (always). Only keep a timestamped
-        # copy every 1B iters to limit S3 storage (~8 snapshots instead of
-        # 80 at ~100 GB each = ~800 GB vs ~8 TB).
+        # Upload regret file with integrity verification. Two-step pattern:
+        #   1. Upload to checkpoints/regrets_NNNM.bin (versioned snapshot)
+        #      VERIFIED first — this is the durable artifact.
+        #   2. Server-side copy to regrets_latest.bin (resume entry point).
+        #
+        # Why versioned-first: if step 1 truncates, regrets_latest stays as
+        # the previous good copy. The 3B-run failure mode (truncated upload
+        # overwrote regrets_latest, destroying the prior good 2.75B copy)
+        # is impossible under this order. Lifecycle policy on the bucket
+        # prunes old versioned snapshots after retention window.
+        versioned_s3 = (
+        )
+        # Soft-fail policy: log loud on upload errors, but don't raise.
+        # A transient S3 hiccup shouldn't kill a 5-day run. The next
+        # checkpoint (in 100M iters / ~15 min) will retry with fresher
+        # regrets, and any prior versioned snapshot is still safe on S3.
+        # If something is structurally broken (creds, bucket policy),
+        # multiple consecutive failures will surface in the log.
         try:
-            _s3_upload_with_retry(
-            if iters_done % 1_000_000_000 == 0 or label == "final":
-                subprocess.run(
-                    ["aws", "s3", "cp",
-                     "--quiet"],
-                    check=True, capture_output=True)
-                print(f"  Regrets uploaded + snapshot preserved ({iter_tag})")
+            _s3_upload_with_retry(regret_path, versioned_s3, verify=True)
+            print(f"  Regrets versioned snapshot uploaded ({iter_tag}) "
+                  f"— size verified", flush=True)
+            # Server-side copy is atomic in S3 (single PUT-COPY operation),
+            # so it can't truncate. Still verify size after.
+            subprocess.run(
+                ["aws", "s3", "cp", versioned_s3, latest_s3, "--quiet"],
+                check=True, capture_output=True, timeout=120,
+            )
+            ls = _s3_head_size(latest_s3)
+            vs = _s3_head_size(versioned_s3)
+            local_size = os.path.getsize(regret_path)
+            if ls != vs or ls != local_size:
+                print(f"  [ERROR] regrets_latest size mismatch after "
+                      f"server-side copy: latest={ls}, versioned={vs}, "
+                      f"local={local_size}. Continuing — versioned "
+                      f"snapshot is intact, next checkpoint will retry.",
+                      flush=True)
             else:
-                print(f"  Regrets uploaded as latest ({iter_tag}, no snapshot)")
-        except subprocess.CalledProcessError as e:
-            print(f"  [WARN] regret upload/copy failed: {e}")
+                print(f"  regrets_latest updated ({iter_tag}, "
+                      f"{ls / 1024 / 1024 / 1024:.1f} GiB verified)",
+                      flush=True)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                RuntimeError) as e:
+            print(f"  [ERROR] regret upload/copy failed: {e}. "
+                  f"Continuing — next checkpoint will retry.", flush=True)
 
 
 if __name__ == "__main__":
