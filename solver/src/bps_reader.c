@@ -160,6 +160,118 @@ static inline float read_f32(const unsigned char *p) {
     return v;
 }
 
+/* ── Count-pass helper for two-pass build ────────────────────────────── */
+
+/* Compact temp slot used only during the count pass: composite hash +
+ * na (so we can size strat_data exactly without re-parsing entries). */
+typedef struct {
+    uint64_t key;       /* hash_combine(action_hash, hash(player, street)) */
+    uint8_t  na;        /* num_actions for this node (constant across buckets) */
+    uint8_t  occupied;
+    uint16_t _pad;
+} BPSCountSlot;
+
+/* Walk the BPS3 stream once to compute exact unique-node count and
+ * exact total strat_data byte requirement. The temp set is freed before
+ * the real allocations, so this only adds transient memory equal to the
+ * temp set itself (~16B per slot at the same load factor as the real
+ * table). The win is twofold: (a) exact sizing of the real hash table
+ * eliminates ~50% over-allocation slack, (b) exact strat_data sizing
+ * avoids the 2× realloc spike that previously peaked transient memory
+ * at ~old+new during memcpy.
+ *
+ * Returns 0 on success, -1 on parse error. *out_nodes and
+ * *out_strat_bytes are populated on success. */
+static int bps_count_strategy_nodes(
+    const unsigned char *data, size_t len,
+    int postflop_buckets, int preflop_buckets,
+    int64_t est_nodes,
+    int64_t *out_nodes, size_t *out_strat_bytes
+) {
+    const unsigned char *p = data;
+    if (memcmp(p, "BPS3", 4) != 0) return -1;
+    p += 4;
+    uint32_t num_entries = read_u32(p); p += 4;
+    /* uint32_t num_players = */ read_u32(p); p += 4;
+
+    int64_t temp_size = next_pow2((int64_t)(est_nodes / 0.60) + 1);
+    if (temp_size < 1024) temp_size = 1024;
+    BPSCountSlot *temp = (BPSCountSlot *)calloc(
+        (size_t)temp_size, sizeof(BPSCountSlot));
+    if (!temp) {
+        fprintf(stderr,
+            "[bps_reader] OOM allocating count-pass temp (%lld slots)\n",
+            (long long)temp_size);
+        return -1;
+    }
+
+    int64_t unique_nodes = 0;
+    size_t total_strat_bytes = 0;
+    const unsigned char *end = data + len;
+
+    for (uint32_t e = 0; e < num_entries; e++) {
+        if (p + 21 > end) break;
+        uint8_t player = read_u8(p); p += 1;
+        uint8_t street = read_u8(p); p += 1;
+        uint16_t bucket = read_u16(p); p += 2;
+        /* uint64_t board_hash = */ read_u64(p); p += 8;
+        uint64_t action_hash = read_u64(p); p += 8;
+        uint8_t na = read_u8(p); p += 1;
+
+        if (na > BPS_MAX_ACTIONS) na = BPS_MAX_ACTIONS;
+        if (p + na > end) break;
+
+        int nb = (street == 0) ? preflop_buckets : postflop_buckets;
+        if (bucket >= nb) {
+            p += na;
+            continue;
+        }
+
+        /* Find or create in temp set. Composite key matches node_slot's
+         * derivation so collisions in the temp pass mirror the final
+         * table's collisions, keeping the count parity-clean. */
+        uint64_t composite = bp_mix64(
+            action_hash ^ bp_mix64((uint64_t)player * 31 + street));
+        int64_t slot = (int64_t)(composite % (uint64_t)temp_size);
+        int found = 0;
+        for (int probe = 0; probe < BPS_PROBE_LIMIT; probe++) {
+            int64_t idx = (slot + probe) % temp_size;
+            if (!temp[idx].occupied) {
+                temp[idx].occupied = 1;
+                temp[idx].key = composite;
+                temp[idx].na = na;
+                total_strat_bytes += (size_t)nb * na;
+                unique_nodes++;
+                found = 1;
+                break;
+            }
+            if (temp[idx].key == composite) {
+                /* Already counted */
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            /* Probe limit hit — temp set was undersized. The real
+             * table will be no better; bail and let single-pass
+             * fallback handle it (caller frees temp on error path). */
+            free(temp);
+            fprintf(stderr,
+                "[bps_reader] count pass: probe limit at entry %u "
+                "(temp_size=%lld); falling back\n",
+                e, (long long)temp_size);
+            return -1;
+        }
+
+        p += na;
+    }
+
+    free(temp);
+    *out_nodes = unique_nodes;
+    *out_strat_bytes = total_strat_bytes;
+    return 0;
+}
+
 /* ── Strategy loader ─────────────────────────────────────────────────── */
 
 int bps_load_strategies(BPSReader *r,
@@ -188,18 +300,42 @@ int bps_load_strategies(BPSReader *r,
     printf("[bps_reader] BPS3: %u entries\n", num_entries);
     fflush(stdout);
 
-    /* Estimate unique nodes: entries / avg_buckets_per_node.
-     *
-     * Each BPS3 entry is one (player, street, bucket, action_hash) tuple.
-     * Unique nodes are (action_hash, player, street) triples. In practice
-     * many nodes are sparse (visited by only a few buckets, not all 200),
-     * so entries_per_node averages ~8-10, not 200. Using /8 as a
-     * conservative divisor ensures the table is large enough. */
+    /* Conservative upper-bound estimate for the count pass; matches the
+     * old single-pass divisor so we never undersize the count temp set. */
     int64_t est_nodes = (int64_t)num_entries / 8 + 10000;
 
-    /* Table size: next power of 2 above est_nodes / 0.60 load factor */
-    int64_t table_size = next_pow2((int64_t)(est_nodes / 0.60) + 1);
+    /* Two-pass build: count exact unique nodes and exact total strat
+     * bytes, then size the real allocations exactly. Falls back to the
+     * single-pass behavior on count-pass failure (mostly probe limit;
+     * shouldn't fire with conservative est_nodes). */
+    int64_t actual_nodes = 0;
+    size_t exact_strat_bytes = 0;
+    int two_pass_ok = (bps_count_strategy_nodes(
+        data, len, postflop_buckets, preflop_buckets,
+        est_nodes, &actual_nodes, &exact_strat_bytes) == 0);
+
+    int64_t table_size;
+    size_t strat_cap;
+    if (two_pass_ok) {
+        /* Size the real table for the EXACT number of unique nodes,
+         * still keeping the 0.60 load factor for hash-collision
+         * headroom. Saves ~50–60% vs the upper-bound estimate. */
+        table_size = next_pow2((int64_t)(actual_nodes / 0.60) + 1);
+        strat_cap = exact_strat_bytes;  /* exact — no realloc */
+        printf("[bps_reader] Count pass: %lld unique nodes, "
+               "%zu strat bytes (table_size=%lld, was %lld)\n",
+               (long long)actual_nodes, exact_strat_bytes,
+               (long long)table_size,
+               (long long)next_pow2((int64_t)(est_nodes / 0.60) + 1));
+        fflush(stdout);
+    } else {
+        /* Fallback: original conservative sizing + 4 bytes/entry strat
+         * estimate that grows via realloc. */
+        table_size = next_pow2((int64_t)(est_nodes / 0.60) + 1);
+        strat_cap = (size_t)num_entries * 4;
+    }
     if (table_size < 1024) table_size = 1024;
+    if (strat_cap < 4096) strat_cap = 4096;
 
     BPSTable *t = &r->table;
     t->table_size = table_size;
@@ -217,11 +353,6 @@ int bps_load_strategies(BPSReader *r,
         return -1;
     }
 
-    /* Pre-allocate strategy data buffer.
-     * Each entry contributes ~3-5 strategy bytes. Use 4 bytes/entry as estimate.
-     * But entries sharing a node overlap, so actual usage is less. */
-    size_t strat_cap = (size_t)num_entries * 4;
-    if (strat_cap < 4096) strat_cap = 4096;
     t->strat_data = (uint8_t *)malloc(strat_cap);
     if (!t->strat_data) {
         fprintf(stderr, "[bps_reader] OOM allocating strat_data (%zu bytes)\n", strat_cap);
@@ -336,11 +467,102 @@ int bps_load_strategies(BPSReader *r,
            100.0 * nodes_created / t->table_size);
     fflush(stdout);
 
+    /* Parity guard: the count pass must agree with the populate pass
+     * on both the unique-node count and the strat_data byte total.
+     * If it disagrees, the count-pass logic has drifted from the
+     * populate logic — fail loud, don't degrade silently. */
+    if (two_pass_ok) {
+        if ((int64_t)nodes_created != actual_nodes ||
+            t->strat_data_used != exact_strat_bytes) {
+            fprintf(stderr,
+                "[bps_reader] count/populate parity drift: "
+                "nodes=%lld vs %lld, strat=%zu vs %zu\n",
+                (long long)nodes_created, (long long)actual_nodes,
+                t->strat_data_used, exact_strat_bytes);
+            bps_reader_free(r);
+            return -1;
+        }
+    }
+
     r->strategies_loaded = 1;
     return 0;
 }
 
 /* ── EV loader ───────────────────────────────────────────────────────── */
+
+/* Count-pass for EV blocks: walk BPR3 entries, dedupe unique
+ * (action_hash, player, street) triples, accumulate exact ev_data
+ * float count using each node's (nb, na). Mirrors
+ * bps_count_strategy_nodes; same trade-off (transient temp set,
+ * exact final allocation). */
+static int bps_count_ev_floats(
+    const unsigned char *data, size_t len,
+    int postflop_buckets, int preflop_buckets,
+    int64_t est_nodes,
+    size_t *out_ev_floats
+) {
+    const unsigned char *p = data;
+    if (memcmp(p, "BPR3", 4) != 0) return -1;
+    p += 4;
+    uint32_t num_entries = read_u32(p); p += 4;
+
+    int64_t temp_size = next_pow2((int64_t)(est_nodes / 0.60) + 1);
+    if (temp_size < 1024) temp_size = 1024;
+    BPSCountSlot *temp = (BPSCountSlot *)calloc(
+        (size_t)temp_size, sizeof(BPSCountSlot));
+    if (!temp) return -1;
+
+    size_t total_floats = 0;
+    const unsigned char *end = data + len;
+
+    for (uint32_t e = 0; e < num_entries; e++) {
+        if (p + 13 > end) break;
+        uint8_t player = read_u8(p); p += 1;
+        uint8_t street = read_u8(p); p += 1;
+        uint16_t bucket = read_u16(p); p += 2;
+        uint64_t action_hash = read_u64(p); p += 8;
+        uint8_t na = read_u8(p); p += 1;
+
+        if (na > BPS_MAX_ACTIONS) na = BPS_MAX_ACTIONS;
+        if (p + (size_t)na * 4 > end) break;
+
+        int nb = (street == 0) ? preflop_buckets : postflop_buckets;
+        if (bucket >= nb) {
+            p += (size_t)na * 4;
+            continue;
+        }
+
+        uint64_t composite = bp_mix64(
+            action_hash ^ bp_mix64((uint64_t)player * 31 + street));
+        int64_t slot = (int64_t)(composite % (uint64_t)temp_size);
+        int found = 0;
+        for (int probe = 0; probe < BPS_PROBE_LIMIT; probe++) {
+            int64_t idx = (slot + probe) % temp_size;
+            if (!temp[idx].occupied) {
+                temp[idx].occupied = 1;
+                temp[idx].key = composite;
+                temp[idx].na = na;
+                total_floats += (size_t)nb * na;
+                found = 1;
+                break;
+            }
+            if (temp[idx].key == composite) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            free(temp);
+            return -1;
+        }
+
+        p += (size_t)na * 4;
+    }
+
+    free(temp);
+    *out_ev_floats = total_floats;
+    return 0;
+}
 
 int bps_load_evs(BPSReader *r,
                    const unsigned char *data, size_t len) {
@@ -364,10 +586,24 @@ int bps_load_evs(BPSReader *r,
     printf("[bps_reader] BPR3: %u entries\n", num_entries);
     fflush(stdout);
 
-    /* Pre-allocate EV data buffer.
-     * Each entry: ~4 actions x 4 bytes = 16 bytes, but we store per-node blocks
-     * of [nb][na] floats. Conservative: num_entries * 4 floats. */
-    size_t ev_cap = (size_t)num_entries * 4;
+    /* Try to size ev_data exactly via a count pass (avoids realloc
+     * spikes during populate). Falls back to the conservative
+     * num_entries * 4 estimate that grows via 2× realloc. */
+    int64_t est_nodes = (int64_t)num_entries / 8 + 10000;
+    size_t exact_floats = 0;
+    int two_pass_ok = (bps_count_ev_floats(
+        data, len, r->num_postflop_buckets, r->num_preflop_buckets,
+        est_nodes, &exact_floats) == 0);
+
+    size_t ev_cap;
+    if (two_pass_ok) {
+        ev_cap = exact_floats;
+        printf("[bps_reader] EV count pass: %zu floats (exact)\n",
+               exact_floats);
+        fflush(stdout);
+    } else {
+        ev_cap = (size_t)num_entries * 4;
+    }
     if (ev_cap < 4096) ev_cap = 4096;
     t->ev_data = (float *)calloc(ev_cap, sizeof(float));
     if (!t->ev_data) {
@@ -469,6 +705,17 @@ int bps_load_evs(BPSReader *r,
     printf("[bps_reader] Loaded %lld EV entries into %lld nodes\n",
            (long long)loaded, (long long)ev_nodes_created);
     fflush(stdout);
+
+    /* Parity guard: count-pass must agree with populate-pass on the
+     * total ev_data float count. Drift indicates the count and
+     * populate logic have diverged — fail loud. */
+    if (two_pass_ok && t->ev_data_used != exact_floats) {
+        fprintf(stderr,
+            "[bps_reader] EV count/populate parity drift: "
+            "floats=%zu vs %zu\n",
+            t->ev_data_used, exact_floats);
+        return -1;
+    }
 
     r->evs_loaded = 1;
     return 0;
