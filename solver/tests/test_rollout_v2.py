@@ -483,6 +483,54 @@ def test_coverage_hit_returns_blueprint_strategy() -> None:
     )
 
 
+def test_post_truncate_zerosum_records_miss() -> None:
+    """When the blueprint returns a strategy with all mass in indices
+    beyond the rollout tree's action count, the truncated slice is
+    zero. The post-truncate substitution must record a miss (otherwise
+    the C and Python counters diverge). Mirrors src/rollout.c's
+    post-truncate zero-sum check.
+    """
+    from rollout import compute_leaf_value
+    import leaf_coverage
+    # Blueprint returns BPS_MAX_ACTIONS (16) actions with all mass at
+    # the last index. Rollout tree's n_actions is always < 16 at
+    # postflop nodes, so strat_full[:n_actions] is always all-zero —
+    # the post-truncate substitution must fire on every decision.
+    tail_strat = np.zeros(16, dtype=np.float32)
+    tail_strat[15] = 1.0
+    bp = FixedStrategyBlueprint(tail_strat)
+    rec_leaf = _build_hu_flop_leaf(RecorderBlueprint())
+    with leaf_coverage.CoverageScope() as scope:
+        try:
+            value = compute_leaf_value(
+                leaf=rec_leaf,
+                bias_profile=[0, 0],
+                blueprint=bp,
+                hero_player=0,
+                hero_hand_idx=0,
+                num_rollouts=1,
+                rng=np.random.default_rng(42),
+            )
+        except Exception as e:
+            check("post-truncate zerosum returns finite value",
+                  False, f"raised: {type(e).__name__}: {e}")
+            return
+    check(
+        "post-truncate zerosum returns finite value",
+        np.isfinite(value),
+        f"value={value}",
+    )
+    detail_keys = list(scope.miss_details.keys())
+    has_post_truncate_record = any(
+        "post_truncate_zerosum" in k for k in detail_keys
+    )
+    check(
+        "post-truncate zerosum recorded in coverage scope",
+        has_post_truncate_record,
+        f"miss_details keys: {detail_keys}",
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # F. Showdown payoffs
 # ──────────────────────────────────────────────────────────────────────────
@@ -650,6 +698,7 @@ def main() -> int:
         # E. Uniform-on-zero substitution
         test_coverage_miss_substitutes_uniform,
         test_coverage_hit_returns_blueprint_strategy,
+        test_post_truncate_zerosum_records_miss,
         # F. Showdown
         test_showdown_hero_wins,
         test_showdown_chop,

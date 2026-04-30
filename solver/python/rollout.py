@@ -504,18 +504,22 @@ def _simulate_one(
                 strat = np.zeros(n_actions, dtype=np.float64)
                 strat[:len(strat_full)] = strat_full
                 cats = cats[:max(len(strat_full), 1)]
-                if strat.sum() <= 0.0:
-                    # Post-truncate degenerate (blueprint mass was
-                    # entirely outside our action range). Same Pluribus
-                    # Algorithm 1 fallback: uniform-on-legal.
-                    try:
-                        from leaf_coverage import record as _rec
-                    except ImportError:
-                        from python.leaf_coverage import record as _rec  # type: ignore
-                    _rec("rollout_sigma", hit=False,
-                         detail=f"post_truncate_zerosum_p={p}_bucket={bucket}")
-                    strat = np.full(n_actions, 1.0 / n_actions, dtype=np.float64)
-                    cats = classify_postflop_actions(facing_bet, raises_this_street)
+
+            # Post-truncate zero-sum → uniform. Mirrors src/rollout.c:
+            # both branches above can produce zero strat (bp_na < n
+            # padded with zeros, OR bp_na >= n with all mass in the
+            # truncated tail). apply_bias's downstream defensive renorm
+            # would silently absorb this; the explicit substitution
+            # here keeps the leaf_coverage record visible.
+            if strat_full is not None and strat.sum() <= 0.0:
+                try:
+                    from leaf_coverage import record as _rec
+                except ImportError:
+                    from python.leaf_coverage import record as _rec  # type: ignore
+                _rec("rollout_sigma", hit=False,
+                     detail=f"post_truncate_zerosum_p={p}_bucket={bucket}")
+                strat = np.full(n_actions, 1.0 / n_actions, dtype=np.float64)
+                cats = classify_postflop_actions(facing_bet, raises_this_street)
 
             biased = apply_bias(strat, int(bias_profile[p]), cats)
             # Re-normalize defensively
