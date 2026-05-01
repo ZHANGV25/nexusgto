@@ -687,6 +687,12 @@ class BPSReaderC:
         mixer_tag = self._metadata.get("hash_mixer", "boost")
         force_boost = os.environ.get("BPS_FORCE_BOOST_MIXER", "0") == "1"
         use_legacy = 1 if (mixer_tag == "boost" or force_boost) else 0
+        print(
+            f"[BPSReaderC] texture cache mixer: metadata.hash_mixer={mixer_tag!r}, "
+            f"BPS_FORCE_BOOST_MIXER={os.environ.get('BPS_FORCE_BOOST_MIXER', '0')!r}, "
+            f"→ use_legacy={use_legacy} ({'boost' if use_legacy else 'splitmix64'})",
+            flush=True,
+        )
 
         bps_dir = Path(bps_path).parent
         repo_root = Path(__file__).resolve().parent.parent
