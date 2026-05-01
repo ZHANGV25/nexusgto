@@ -66,6 +66,14 @@ extern "C" {
  * tier widening. */
 #define ROLLOUT_MAX_ACTIONS_PER_NODE 9
 
+/* Upper bound on the action history a per-leaf rollout receives. Used
+ * by the rollout's internal game_history buffer (private to .c) and by
+ * the per-leaf flop_history field on RolloutLeafInfo (public — must
+ * match the ctypes mirror in python/rollout_c.py). 256 is more than
+ * any 6-player postflop tree can produce (postflop max raises is 3 per
+ * street, 6 players × 3 streets ≈ 24 actions). */
+#define ROLLOUT_MAX_ACTION_HISTORY 256
+
 /* ── Public structs ──────────────────────────────────────────────────── */
 
 typedef struct {
@@ -83,6 +91,15 @@ typedef struct {
     int32_t leaf_idx;                               /* canonical leaf index */
     int32_t pot_chips;
     int32_t bets[ROLLOUT_MAX_PLAYERS];              /* per compact slot */
+    /* Per-leaf flop-action history (training-encoded indices, see
+     * python/leaf_values.py::_train_action_idx). The rollout
+     * concatenates [passed_in_preflop, leaf->flop_history] when
+     * launching each per-leaf rollout so blueprint queries during the
+     * subsequent street (turn/river) hash to the keys training stored.
+     * Without this, the prefix is [preflop_only] → 100% miss → uniform
+     * leaf values across hands → CFR converges to uniform 1/n. */
+    int32_t flop_history[ROLLOUT_MAX_ACTION_HISTORY];
+    int32_t flop_history_len;
 } RolloutLeafInfo;
 
 /* ── Pure-math exports (no RNG, no blueprint; for bit-exact unit tests) ── */
@@ -245,6 +262,13 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
 BPS_EXPORT void rollout_get_last_error(
     const char **reason, int32_t *street, int32_t *num_players
 );
+
+/* Returns sizeof(RolloutLeafInfo). Used by the ctypes mirror in
+ * python/rollout_c.py to assert layout parity at module load — if the C
+ * struct grows or its field order shifts and the Python mirror isn't
+ * updated, the per-leaf flop_history lands at the wrong offset and the
+ * rollout silently misbehaves. */
+BPS_EXPORT int32_t rollout_leaf_info_sizeof(void);
 
 /* ── Observability counters (per-thread) ─────────────────────────────── */
 

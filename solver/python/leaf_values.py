@@ -206,11 +206,100 @@ def bias_strategy(strategy: np.ndarray, bias_type: int,
 
 # ── Leaf info extraction from tree ───────────────────────────────────────
 
-LeafInfo = namedtuple('LeafInfo', ['leaf_idx', 'pot', 'bets'])
+# Pluribus training postflop action enumeration. Mirrors
+# precompute/blueprint_worker_unified.py:51 (POSTFLOP_BET_SIZES = [0.5, 1.0])
+# and src/rollout.h's ROLLOUT_FIRST_RAISE_N=2 / ROLLOUT_SUBSEQUENT_RAISE_N=1.
+# Subgame trees may use richer sizes (off-tree extras from Pluribus
+# Algorithm 2 nested re-solve); _train_action_idx fuzzy-maps subgame
+# sizes back to these training-time slots so the per-leaf flop_history
+# fed into the rollout's blueprint queries hashes to the keys training
+# stored.
+_POSTFLOP_FIRST_RAISE_FRACS = (0.5, 1.0)
+_POSTFLOP_SUBSEQUENT_RAISE_FRACS = (1.0,)
+_POSTFLOP_MAX_RAISES = 3
+
+# Default — most code paths supply a richer struct via the new positional
+# field. The hasattr() guard in rollout_c.py handles the absent-field case
+# for legacy callers (LeafInfo without flop_history_train works as before;
+# the rollout falls back to the dropped-history behavior).
+LeafInfo = namedtuple(
+    'LeafInfo',
+    ['leaf_idx', 'pot', 'bets', 'flop_history_train'],
+    defaults=((),),
+)
+
+
+def _train_action_idx(facing_bet, raises_so_far, kind, size_frac):
+    """Map a (kind, size_frac) action back to its training-time action index.
+
+    Mirrors src/rollout.c:218 (rollout_classify_postflop_actions_c)'s
+    enumeration so the per-leaf flop history hashes to the same
+    action_hash training stored. Subgame trees may have richer raise
+    sizes; closest-fraction match maps them to training's discrete
+    enumeration. This is lossy at subsequent-raise nodes (training only
+    stored 1.0×pot there) but the only correct option — the blueprint
+    has nothing to return for sizes it never trained on.
+
+    Enumerations:
+        tree_closed (raises_so_far >= 3) + facing: [fold(0), call(1)]
+        tree_closed + !facing:                     [check(0)]
+        facing + first raise:    [fold(0), call(1), 0.5(2), 1.0(3), allin(4)]
+        facing + subsequent:     [fold(0), call(1), 1.0(2), allin(3)]
+        !facing:                 [check(0), 0.5(1), 1.0(2), allin(3)]
+
+    Args:
+        facing_bet: True if to_call > 0 at the parent node.
+        raises_so_far: number of raises already made this street.
+        kind: 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allin'.
+        size_frac: pot fraction for bet/raise; ignored otherwise.
+    """
+    tree_closed = raises_so_far >= _POSTFLOP_MAX_RAISES
+
+    if tree_closed:
+        if facing_bet:
+            return 0 if kind == 'fold' else 1
+        return 0
+
+    if facing_bet:
+        if kind == 'fold':
+            return 0
+        if kind in ('call', 'check'):
+            return 1
+        if raises_so_far == 0:
+            if kind == 'allin':
+                return 4
+            choices = _POSTFLOP_FIRST_RAISE_FRACS
+            best_i = min(
+                range(len(choices)),
+                key=lambda i: abs(size_frac - choices[i]),
+            )
+            return 2 + best_i
+        if kind == 'allin':
+            return 3
+        return 2
+
+    if kind == 'check':
+        return 0
+    if kind == 'allin':
+        return 3
+    choices = _POSTFLOP_FIRST_RAISE_FRACS
+    best_i = min(
+        range(len(choices)),
+        key=lambda i: abs(size_frac - choices[i]),
+    )
+    return 1 + best_i
 
 
 def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
-    """Extract pot size and bet info for each leaf in the tree.
+    """Extract pot/bets/flop_history for each subgame leaf.
+
+    DFS from the SS tree root accumulates the action sequence taken to
+    reach each cont-chain root. Each action gets re-encoded to training's
+    discrete index space via _train_action_idx; the resulting tuple is
+    stored on LeafInfo.flop_history_train and threaded into the rollout
+    so blueprint queries during turn/river include the real flop slice
+    (not the dropped [preflop_only] prefix that triggered the v3
+    sentinel battery's uniform-1/n collapse, 2026-04-30 diagnosis).
 
     Each leaf has a different pot size depending on the betting path
     that led to it. Supports N-player continuation structures:
@@ -221,63 +310,107 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
         num_players: number of active players (2-6)
 
     Returns:
-        list of LeafInfo, indexed by the leaf's original index
-        (before continuation strategy expansion)
+        list of LeafInfo, sorted by leaf_idx (matches original ordering).
     """
-    leaves = []
     cont_per_leaf = 4 ** num_players  # 16 for 2p, 64 for 3p, etc.
+    effective_stack = int(tree_data.effective_stack)
 
-    def _is_cont_chain(tree_data, node_idx, depth, num_players):
+    def _is_cont_chain(node_idx, depth):
         """Check if node_idx is the root of a N-deep continuation chain.
-        Each level has player=depth, num_children=4, depth levels total."""
+        Each level has num_children=4, depth levels total, terminals are
+        SS_NODE_LEAF (type=4) at the bottom."""
         node = tree_data.nodes[node_idx]
         if node.type != 0 or node.num_children != 4:
             return False
         if depth == num_players - 1:
-            # Last player: children should be terminals (leaf type=4)
             for c in range(4):
                 child_idx = tree_data.children[node.first_child + c]
-                if tree_data.nodes[child_idx].type != 4:  # not leaf
+                if tree_data.nodes[child_idx].type != 4:
                     return False
             return True
-        else:
-            # Intermediate: children should be continuation decision nodes
-            for c in range(4):
-                child_idx = tree_data.children[node.first_child + c]
-                if not _is_cont_chain(tree_data, child_idx, depth + 1, num_players):
-                    return False
-            return True
+        for c in range(4):
+            child_idx = tree_data.children[node.first_child + c]
+            if not _is_cont_chain(child_idx, depth + 1):
+                return False
+        return True
 
-    def _get_first_terminal(tree_data, node_idx, num_players):
+    def _get_first_terminal(node_idx):
         """Walk down the first-child chain to find the first terminal leaf."""
         cur = node_idx
         for _ in range(num_players):
             cur = tree_data.children[tree_data.nodes[cur].first_child]
         return cur
 
-    n_nodes = tree_data.num_nodes
-    for i in range(n_nodes):
-        node = tree_data.nodes[i]
-        if node.type != 0:
-            continue
-        if node.player != 0:
-            continue
-        if node.num_children != 4:
-            continue
+    leaves = []
+    # Iterative DFS — Python's default recursion limit is 1000 and SS
+    # trees at 6p with off-tree sizes can exceed that. Stack carries
+    # (node_idx, history_tuple, raises_so_far).
+    stack = [(0, (), 0)]
+    while stack:
+        node_idx, history, raises_so_far = stack.pop()
+        node = tree_data.nodes[node_idx]
 
-        if _is_cont_chain(tree_data, i, 0, num_players):
-            first_term_idx = _get_first_terminal(tree_data, i, num_players)
+        if node.type == 0 and node.num_children == 4 and \
+                _is_cont_chain(node_idx, 0):
+            first_term_idx = _get_first_terminal(node_idx)
             base_leaf_idx = tree_data.nodes[first_term_idx].leaf_idx
             orig_idx = base_leaf_idx // cont_per_leaf
-
-            # Collect bets for all players
             bets = tuple(node.bets[p] for p in range(num_players))
-
             leaves.append(LeafInfo(
                 leaf_idx=orig_idx,
                 pot=node.pot,
                 bets=bets,
+                flop_history_train=history,
             ))
+            continue
+
+        if node.type != 0:  # FOLD / SHOWDOWN / LEAF — no children to descend
+            continue
+
+        acting = node.player
+        if acting < 0:
+            continue
+
+        max_parent_bet = max(node.bets[p] for p in range(num_players))
+        parent_acting_bet = node.bets[acting]
+        to_call = max_parent_bet - parent_acting_bet
+        facing = to_call > 0
+
+        # Iterate children in REVERSE so DFS pop order matches forward
+        # order (mostly aesthetic — leaves get sorted by leaf_idx anyway).
+        for c in range(node.num_children - 1, -1, -1):
+            child_idx = tree_data.children[node.first_child + c]
+            child = tree_data.nodes[child_idx]
+
+            if child.type == 1:  # SS_NODE_FOLD
+                kind, frac = 'fold', 0.0
+                new_raises = raises_so_far
+            else:
+                bet_delta = child.bets[acting] - parent_acting_bet
+                if bet_delta == to_call:
+                    kind = 'check' if to_call == 0 else 'call'
+                    frac = 0.0
+                    new_raises = raises_so_far
+                else:
+                    # Detect all-in: acting player's CUMULATIVE this-street
+                    # bet at the child equals their effective stack. Note
+                    # bets[] is per-street in the SS tree, so this only
+                    # fires when this single street's bet maxed the stack
+                    # — which is the case the rollout's classify treats
+                    # as the trailing 'allin' index. Sized raise that does
+                    # NOT exhaust stack stays as 'bet'/'raise'.
+                    is_allin = child.bets[acting] >= effective_stack
+                    if to_call == 0:
+                        kind = 'allin' if is_allin else 'bet'
+                        frac = (bet_delta / node.pot) if node.pot > 0 else 0.0
+                    else:
+                        kind = 'allin' if is_allin else 'raise'
+                        denom = node.pot + to_call
+                        frac = ((bet_delta - to_call) / denom) if denom > 0 else 0.0
+                    new_raises = raises_so_far + 1
+
+            train_idx = _train_action_idx(facing, raises_so_far, kind, frac)
+            stack.append((child_idx, history + (train_idx,), new_raises))
 
     leaves.sort(key=lambda x: x.leaf_idx)
     return leaves

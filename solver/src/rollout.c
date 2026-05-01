@@ -21,7 +21,8 @@
 /* ── Compile-time caps ───────────────────────────────────────────────── */
 
 #define ROLLOUT_MAX_HANDS          1326
-#define ROLLOUT_MAX_ACTION_HISTORY 256
+/* ROLLOUT_MAX_ACTION_HISTORY now lives in rollout.h — it sizes a public
+ * field on RolloutLeafInfo. */
 #define ROLLOUT_DECK               52
 
 /* ── splitmix64 (matches src/bps_reader.c:18-23) ─────────────────────── */
@@ -100,6 +101,10 @@ BPS_EXPORT void rollout_get_last_error(
     if (reason)      *reason      = g_rollout_last_error.reason;
     if (street)      *street      = g_rollout_last_error.street;
     if (num_players) *num_players = g_rollout_last_error.num_players;
+}
+
+BPS_EXPORT int32_t rollout_leaf_info_sizeof(void) {
+    return (int32_t)sizeof(RolloutLeafInfo);
 }
 
 /* ── Observability counters ──────────────────────────────────────────── */
@@ -1159,11 +1164,39 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
             int64_t flat = (int64_t)li->leaf_idx * cont_per_leaf + combo;
             float *slot = out + flat * (int64_t)num_players * (int64_t)max_hands;
 
+            /* Per-leaf game history: [passed_in_preflop, leaf->flop_history].
+             * Without the leaf-specific flop slice the rollout's blueprint
+             * queries during turn/river miss 100% (training stored those
+             * nodes with [preflop, real_flop_actions, ...]) → uniform-on-
+             * zero substitution → identical leaf values across hands → CFR
+             * collapses to uniform 1/n. See PHASE0_STATUS.md (2026-04-30
+             * diagnosis). */
+            int32_t per_leaf_history[ROLLOUT_MAX_ACTION_HISTORY];
+            int32_t fh_len = li->flop_history_len;
+            if (fh_len < 0) fh_len = 0;
+            if ((int64_t)gah_len + (int64_t)fh_len > ROLLOUT_MAX_ACTION_HISTORY) {
+                #pragma omp critical(rollout_parallel_fail)
+                {
+                    if (!g_fail) {
+                        snprintf(cap_reason, sizeof(cap_reason) - 1,
+                                 "per-leaf history overflow: preflop=%d + flop=%d > %d",
+                                 gah_len, fh_len, ROLLOUT_MAX_ACTION_HISTORY);
+                        cap_street = street;
+                        cap_num_players = num_players;
+                        g_fail = 1;
+                    }
+                }
+                continue;
+            }
+            for (int32_t k = 0; k < gah_len; k++) per_leaf_history[k] = game_action_history[k];
+            for (int32_t k = 0; k < fh_len; k++) per_leaf_history[gah_len + k] = li->flop_history[k];
+            int32_t per_leaf_history_len = gah_len + fh_len;
+
             int rc = rollout_compute_leaf_values_all_hands_c(
                 r, board, n_board_cards, street, li->pot_chips,
                 active, num_players, stacks, li->bets,
                 player_hands, acting_order, acting_order_len,
-                player_seats, game_action_history, gah_len,
+                player_seats, per_leaf_history, per_leaf_history_len,
                 bias_profile, max_hands, num_rollouts, master_seed,
                 li->leaf_idx, (int32_t)combo, slot);
             if (rc != 0) {
@@ -1332,6 +1365,33 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
                 }
                 continue;
             }
+            /* Per-leaf game history: [passed_in_preflop, leaf->flop_history].
+             * Same rationale as the non-sampled path above — without the
+             * leaf-specific flop slice the rollout's blueprint queries
+             * during turn/river miss 100%. SAMPLED is the actually-called
+             * path from postflop_provider.py (K=1 default), so this
+             * branch is the load-bearing one for live solves. */
+            int32_t per_leaf_history[ROLLOUT_MAX_ACTION_HISTORY];
+            int32_t fh_len = li->flop_history_len;
+            if (fh_len < 0) fh_len = 0;
+            if ((int64_t)gah_len + (int64_t)fh_len > ROLLOUT_MAX_ACTION_HISTORY) {
+                #pragma omp critical(rollout_sampled_fail)
+                {
+                    if (!g_fail) {
+                        snprintf(cap_reason, sizeof(cap_reason) - 1,
+                                 "sampled: per-leaf history overflow: preflop=%d + flop=%d > %d",
+                                 gah_len, fh_len, ROLLOUT_MAX_ACTION_HISTORY);
+                        cap_street = street;
+                        cap_num_players = num_players;
+                        g_fail = 1;
+                    }
+                }
+                continue;
+            }
+            for (int32_t k = 0; k < gah_len; k++) per_leaf_history[k] = game_action_history[k];
+            for (int32_t k = 0; k < fh_len; k++) per_leaf_history[gah_len + k] = li->flop_history[k];
+            int32_t per_leaf_history_len = gah_len + fh_len;
+
             /* Derive a per-sample seed for the rollout's RNG chain.
              * leaf_idx slot reuses li->leaf_idx; combo slot carries
              * sample_idx so each sample's rollout stream is distinct. */
@@ -1339,7 +1399,7 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
                 r, board, n_board_cards, street, li->pot_chips,
                 active, num_players, stacks, li->bets,
                 player_hands, acting_order, acting_order_len,
-                player_seats, game_action_history, gah_len,
+                player_seats, per_leaf_history, per_leaf_history_len,
                 bias_profile, max_hands, num_rollouts, master_seed,
                 li->leaf_idx, sample_idx, scratch);
             if (rc != 0) {

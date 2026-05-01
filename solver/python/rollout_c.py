@@ -43,6 +43,8 @@ except ImportError:
 
 # Must match ROLLOUT_MAX_PLAYERS in src/rollout.h
 _ROLLOUT_MAX_PLAYERS = 6
+# Must match ROLLOUT_MAX_ACTION_HISTORY in src/rollout.h
+_ROLLOUT_MAX_ACTION_HISTORY = 256
 
 
 # ─── ctypes structs mirroring src/rollout.h ──────────────────────────────
@@ -64,10 +66,16 @@ class _RolloutHandList(ctypes.Structure):
 
 
 class _RolloutLeafInfo(ctypes.Structure):
+    # Field order MUST match RolloutLeafInfo in src/rollout.h exactly.
+    # A sizeof parity check is asserted at module load (see _lib() below)
+    # — if the C struct layout drifts, the rollout misbehaves silently
+    # because per-leaf flop_history would land at the wrong offset.
     _fields_ = [
         ("leaf_idx", ctypes.c_int32),
         ("pot_chips", ctypes.c_int32),
         ("bets", ctypes.c_int32 * _ROLLOUT_MAX_PLAYERS),
+        ("flop_history", ctypes.c_int32 * _ROLLOUT_MAX_ACTION_HISTORY),
+        ("flop_history_len", ctypes.c_int32),
     ]
 
 
@@ -221,6 +229,9 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.rollout_get_observability.restype = None
 
+    lib.rollout_leaf_info_sizeof.argtypes = []
+    lib.rollout_leaf_info_sizeof.restype = ctypes.c_int32
+
 
 _LIB: Optional[ctypes.CDLL] = None
 
@@ -230,7 +241,28 @@ def _lib() -> ctypes.CDLL:
     if _LIB is None:
         _LIB = _find_lib()
         _setup_ctypes(_LIB)
+        _assert_struct_parity(_LIB)
     return _LIB
+
+
+def _assert_struct_parity(lib: ctypes.CDLL) -> None:
+    """Hard-fail on RolloutLeafInfo layout drift between C and Python.
+
+    The per-leaf flop_history field's offset MUST match between
+    src/rollout.h's RolloutLeafInfo and the _RolloutLeafInfo ctypes
+    mirror. A silent mismatch sends junk bytes to the rollout's blueprint
+    queries — exactly the failure the sentinel battery struggled to
+    diagnose. Verify at module load instead of at first use.
+    """
+    c_size = int(lib.rollout_leaf_info_sizeof())
+    py_size = ctypes.sizeof(_RolloutLeafInfo)
+    if c_size != py_size:
+        raise RuntimeError(
+            f"RolloutLeafInfo size mismatch: C reports {c_size} bytes, "
+            f"Python ctypes mirror is {py_size} bytes. Field order or "
+            f"padding drifted — update _RolloutLeafInfo in rollout_c.py "
+            f"to match src/rollout.h."
+        )
 
 
 def _last_error() -> Tuple[str, int, int]:
@@ -440,7 +472,11 @@ def compute_subgame_leaf_values_c(
     board_arr = (ctypes.c_int * len(board))(*board) if board else None
     board_ptr = board_arr if board_arr is not None else ctypes.POINTER(ctypes.c_int)()
 
-    # leaf_infos → RolloutLeafInfo array
+    # leaf_infos → RolloutLeafInfo array. flop_history_train is a tuple
+    # of training-encoded action indices produced by
+    # python/leaf_values.py::extract_leaf_info_from_tree; missing on
+    # legacy LeafInfo objects (treated as empty → falls back to the old
+    # dropped-history behavior).
     n_leaves = len(leaf_infos)
     li_arr = (_RolloutLeafInfo * n_leaves)()
     for i, li in enumerate(leaf_infos):
@@ -449,6 +485,15 @@ def compute_subgame_leaf_values_c(
         bets_src = list(li.bets) if hasattr(li, "bets") else [0] * num_players
         for p in range(_ROLLOUT_MAX_PLAYERS):
             li_arr[i].bets[p] = int(bets_src[p]) if p < num_players else 0
+        fh = getattr(li, "flop_history_train", ()) or ()
+        if len(fh) > _ROLLOUT_MAX_ACTION_HISTORY:
+            raise ValueError(
+                f"leaf {i}: flop_history_train length {len(fh)} exceeds "
+                f"ROLLOUT_MAX_ACTION_HISTORY={_ROLLOUT_MAX_ACTION_HISTORY}"
+            )
+        for j, idx in enumerate(fh):
+            li_arr[i].flop_history[j] = int(idx)
+        li_arr[i].flop_history_len = len(fh)
 
     active_arr = (ctypes.c_int32 * num_players)(
         *[1 if a else 0 for a in active]
