@@ -1228,6 +1228,177 @@ int bps_load_turn_centroids(BPSReader *r, const char *path) {
     return -1;
 }
 
+int bps_precompute_l2_turn_centroids(BPSReader *r, const char *output_path) {
+    /* Reproduce the v3 training-time turn-centroid k-means
+     * (mccfr_blueprint.c:2710-2858) so inference can bucket turn
+     * boards consistently with how training labelled them.
+     *
+     * v3 trained with L2 3-feature centroids (EHS, PPot, NPot) over
+     * 2000 sampled turn boards × ~300 hands each, k=200 clusters,
+     * 20 k-means iterations, percentile-seeded init. Deterministic
+     * from xorshift64 seed 0xABCDEF0123456789. The same algorithm
+     * runs here so the produced centroids match training bit-for-bit
+     * (modulo OS sort order — the centroid-init step uses qsort on
+     * EHS percentile, here a portable shellsort, same comparison).
+     *
+     * Saves TCN1 (4-byte magic + int32 k + float32[k][3] centroids)
+     * to output_path and populates r->turn_centroids in-memory so
+     * inference can use them immediately. Returns k on success, -1
+     * on failure. ~5 minutes single-threaded on a g4dn.2xlarge. */
+    if (!r || !output_path) return -1;
+
+    const int k_target = 200;
+    const int n_turn_boards = 2000;
+    const int feat_samples = 200;
+    const int max_hands = BPS_MAX_HANDS;
+    const int hand_batch = 300;
+
+    int max_feat = n_turn_boards * (hand_batch + 1);
+    float (*all_feat)[3] = (float(*)[3])malloc((size_t)max_feat * 3 * sizeof(float));
+    if (!all_feat) return -1;
+    int n_feat = 0;
+
+    int (*hands)[2] = (int(*)[2])malloc((size_t)max_hands * 2 * sizeof(int));
+    float (*feats)[3] = (float(*)[3])malloc((size_t)max_hands * 3 * sizeof(float));
+    if (!hands || !feats) {
+        free(all_feat); if (hands) free(hands); if (feats) free(feats);
+        return -1;
+    }
+
+    uint64_t trng = 0xABCDEF0123456789ULL;
+    fprintf(stderr, "[bps_reader] Precomputing L2 turn centroids "
+            "(%d boards × %d hands, ~5 min)...\n",
+            n_turn_boards, hand_batch);
+
+    for (int ti = 0; ti < n_turn_boards && n_feat < max_feat - hand_batch; ti++) {
+        int deck[52];
+        for (int c = 0; c < 52; c++) deck[c] = c;
+        for (int i = 0; i < 4; i++) {
+            int j = i + (int)(bpr_rng_next(&trng) % (uint64_t)(52 - i));
+            int tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+        }
+        int board[4] = {deck[0], deck[1], deck[2], deck[3]};
+
+        int bblk[52] = {0};
+        for (int b = 0; b < 4; b++) bblk[board[b]] = 1;
+        int nh = 0;
+        for (int c0 = 0; c0 < 52 && nh < max_hands; c0++) {
+            if (bblk[c0]) continue;
+            for (int c1 = c0 + 1; c1 < 52 && nh < max_hands; c1++) {
+                if (bblk[c1]) continue;
+                hands[nh][0] = c0;
+                hands[nh][1] = c1;
+                nh++;
+            }
+        }
+
+        int batch = (nh > hand_batch) ? hand_batch : nh;
+        ca_compute_features(board, 4, (const int(*)[2])hands, batch,
+                            feat_samples, feats);
+        for (int h = 0; h < batch && n_feat < max_feat; h++) {
+            all_feat[n_feat][0] = feats[h][0];
+            all_feat[n_feat][1] = feats[h][1];
+            all_feat[n_feat][2] = feats[h][2];
+            n_feat++;
+        }
+        if ((ti + 1) % 200 == 0) {
+            fprintf(stderr, "[bps_reader]   board %d/%d, %d features collected\n",
+                    ti + 1, n_turn_boards, n_feat);
+        }
+    }
+    free(hands); free(feats);
+
+    /* Percentile-seeded k-means init: shell-sort by EHS, pick k
+     * percentile points. Same as mccfr_blueprint.c:2783-2802. */
+    typedef struct { float ehs; int idx; } EhsIdx;
+    EhsIdx *sort_buf = (EhsIdx*)malloc((size_t)n_feat * sizeof(EhsIdx));
+    if (!sort_buf) { free(all_feat); return -1; }
+    for (int f = 0; f < n_feat; f++) {
+        sort_buf[f].ehs = all_feat[f][0];
+        sort_buf[f].idx = f;
+    }
+    for (int gap = n_feat / 2; gap > 0; gap /= 2)
+        for (int i = gap; i < n_feat; i++) {
+            EhsIdx tmp = sort_buf[i];
+            int j = i;
+            while (j >= gap && sort_buf[j - gap].ehs > tmp.ehs) {
+                sort_buf[j] = sort_buf[j - gap];
+                j -= gap;
+            }
+            sort_buf[j] = tmp;
+        }
+
+    float (*centroids)[3] = (float(*)[3])malloc((size_t)k_target * 3 * sizeof(float));
+    if (!centroids) { free(sort_buf); free(all_feat); return -1; }
+    for (int c = 0; c < k_target; c++) {
+        int si = (int)((float)c / k_target * n_feat);
+        if (si >= n_feat) si = n_feat - 1;
+        int fi = sort_buf[si].idx;
+        centroids[c][0] = all_feat[fi][0];
+        centroids[c][1] = all_feat[fi][1];
+        centroids[c][2] = all_feat[fi][2];
+    }
+    free(sort_buf);
+
+    int *counts = (int*)calloc(k_target, sizeof(int));
+    float (*sums)[3] = (float(*)[3])calloc((size_t)k_target * 3, sizeof(float));
+    if (!counts || !sums) {
+        free(centroids); free(all_feat);
+        if (counts) free(counts); if (sums) free(sums);
+        return -1;
+    }
+    for (int iter = 0; iter < 20; iter++) {
+        memset(counts, 0, (size_t)k_target * sizeof(int));
+        memset(sums, 0, (size_t)k_target * 3 * sizeof(float));
+        for (int f = 0; f < n_feat; f++) {
+            int best_c = 0;
+            float best_d = 1e30f;
+            for (int c = 0; c < k_target; c++) {
+                float d0 = all_feat[f][0] - centroids[c][0];
+                float d1 = all_feat[f][1] - centroids[c][1];
+                float d2 = all_feat[f][2] - centroids[c][2];
+                float d = d0*d0 + d1*d1 + d2*d2;
+                if (d < best_d) { best_d = d; best_c = c; }
+            }
+            counts[best_c]++;
+            sums[best_c][0] += all_feat[f][0];
+            sums[best_c][1] += all_feat[f][1];
+            sums[best_c][2] += all_feat[f][2];
+        }
+        for (int c = 0; c < k_target; c++) {
+            if (counts[c] > 0) {
+                centroids[c][0] = sums[c][0] / counts[c];
+                centroids[c][1] = sums[c][1] / counts[c];
+                centroids[c][2] = sums[c][2] / counts[c];
+            }
+        }
+    }
+
+    int actual_k = 0;
+    for (int c = 0; c < k_target && actual_k < 200; c++) {
+        if (counts[c] > 0) {
+            r->turn_centroids[actual_k][0] = centroids[c][0];
+            r->turn_centroids[actual_k][1] = centroids[c][1];
+            r->turn_centroids[actual_k][2] = centroids[c][2];
+            actual_k++;
+        }
+    }
+    r->turn_centroids_k = actual_k;
+    free(counts); free(sums); free(centroids); free(all_feat);
+
+    FILE *fc = fopen(output_path, "wb");
+    if (fc) {
+        fwrite("TCN1", 1, 4, fc);
+        fwrite(&actual_k, sizeof(int), 1, fc);
+        fwrite(r->turn_centroids, sizeof(float), (size_t)actual_k * 3, fc);
+        fclose(fc);
+        fprintf(stderr, "[bps_reader] Saved %d L2 turn centroids to %s\n",
+                actual_k, output_path);
+    }
+
+    return actual_k;
+}
+
 int bps_hand_to_bucket_turn(const BPSReader *r,
                              const int *board, int c0, int c1) {
     if (!r || !board) return -1;

@@ -271,6 +271,11 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
             ctypes.c_void_p, ctypes.c_char_p,
         ]
         lib.bps_load_turn_centroids.restype = ctypes.c_int
+    if hasattr(lib, "bps_precompute_l2_turn_centroids"):
+        lib.bps_precompute_l2_turn_centroids.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+        ]
+        lib.bps_precompute_l2_turn_centroids.restype = ctypes.c_int
     if hasattr(lib, "bps_hand_to_bucket_turn"):
         lib.bps_hand_to_bucket_turn.argtypes = [
             ctypes.c_void_p, c_int_p, ctypes.c_int, ctypes.c_int,
@@ -718,7 +723,15 @@ class BPSReaderC:
         self._load_turn_centroids_auto(bps_path)
 
     def _load_turn_centroids_auto(self, bps_path: str) -> None:
-        """Auto-load TCN1 turn centroids from standard locations."""
+        """Auto-load TCN1 turn centroids from standard locations.
+
+        v3 trained with L2/TCN1 turn centroids (see
+        mccfr_blueprint.c:2662 — PA-EMD turn centroids are for the
+        next retrain's inference, not v3). If no TCN1 file is found
+        at runtime, we recompute it deterministically from xorshift64
+        seed 0xABCDEF0123456789 (matches training) and save to
+        <bps_dir>/turn_centroids.bin so the next cold-start finds it.
+        """
         if not hasattr(self._lib, "bps_load_turn_centroids"):
             return
         bps_dir = Path(bps_path).parent
@@ -740,9 +753,41 @@ class BPSReaderC:
                         return
             except (OSError, ValueError):
                 continue
-        # Pass NULL to let C search its internal candidate list too
-        # (catches /tmp paths that exist on Linux training boxes).
-        self._lib.bps_load_turn_centroids(self._reader, None)
+        # Let C search its internal candidate list too (catches
+        # paths the Python list missed, e.g. /dev/shm).
+        rc = self._lib.bps_load_turn_centroids(self._reader, None)
+        if rc and rc > 0:
+            return
+
+        # No TCN1 file anywhere — recompute. Required for v3 inference;
+        # without turn buckets the rollout's `bps_hand_to_bucket_turn`
+        # returns -1 on every turn-card lookup → LeafValueUnavailable
+        # → CFR can't compute leaf values. ~5 minute one-time cost,
+        # then cached at <bps_dir>/turn_centroids.bin for future runs.
+        if hasattr(self._lib, "bps_precompute_l2_turn_centroids"):
+            out_path = bps_dir / "turn_centroids.bin"
+            print(
+                f"[BPSReaderC] No TCN1 turn centroids found in standard "
+                f"paths. Recomputing (deterministic, ~5 min) and saving "
+                f"to {out_path}.",
+                flush=True,
+            )
+            ret = self._lib.bps_precompute_l2_turn_centroids(
+                self._reader, str(out_path).encode("utf-8"),
+            )
+            if ret <= 0:
+                print(
+                    "[BPSReaderC] WARNING: turn-centroid precompute "
+                    "failed; turn-bucket lookups will return -1.",
+                    flush=True,
+                )
+        else:
+            print(
+                "[BPSReaderC] WARNING: turn centroids missing and "
+                "bps_precompute_l2_turn_centroids not in this build of "
+                "bps_reader.so; rebuild from src.",
+                flush=True,
+            )
 
     def _report_stats(self) -> None:
         """Print loaded reader statistics."""

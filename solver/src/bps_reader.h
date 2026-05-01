@@ -324,6 +324,26 @@ BPS_EXPORT int bps_hand_to_bucket(const BPSReader *r,
 BPS_EXPORT int bps_load_turn_centroids(BPSReader *r, const char *path);
 
 /**
+ * Recompute the v3 training-time L2 turn centroids and save as TCN1.
+ *
+ * Mirrors mccfr_blueprint.c:2710-2858: deterministic xorshift64 seed
+ * 0xABCDEF0123456789, samples 2000 turn boards × up to 300 hands
+ * each, computes 3D EHS/PPot/NPot features (200 MC samples per
+ * hand), runs 20 iterations of k-means with k=200 percentile-seeded
+ * init. Saves TCN1 to output_path AND populates r->turn_centroids /
+ * r->turn_centroids_k so inference can use them immediately.
+ *
+ * Use when v3's training-time turn_centroids.bin isn't available at
+ * runtime (e.g., a fresh EC2 instance). PA-EMD turn centroids do NOT
+ * substitute — v3 was trained with L2/TCN1, not EMD.
+ *
+ * Returns k on success (~200), -1 on alloc/io failure. ~5 minutes
+ * single-threaded.
+ */
+BPS_EXPORT int bps_precompute_l2_turn_centroids(BPSReader *r,
+                                                  const char *output_path);
+
+/**
  * Map a hand on a 4-card turn board to its bucket index.
  *
  * Uses ca_compute_features (EHS, PPot, NPot) + ca_nearest_centroid
