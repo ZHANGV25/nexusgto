@@ -332,6 +332,139 @@ def test_extract_leaf_info_empty_root_is_cont_chain():
     assert li.flop_history_train == ()
 
 
+# ── SAMPLED-mode tree shape ─────────────────────────────────────────────
+#
+# Production SS trees compile with SS_CONT_STRAT_MODE_SAMPLED (default
+# since OP4 commit 10, 2026-04-17). In that mode each betting-tree
+# terminal stays as a single SS_NODE_LEAF — no cont-chain wrapping.
+# extract_leaf_info_from_tree must emit one LeafInfo per such terminal
+# (pre-fix it only matched the JOINT cont-chain pattern → returned []
+#  for SAMPLED trees → rollout fed CFR all-zero leaf values → uniform
+#  1/n at every postflop spot, sentinel run 2026-05-01 diagnosis).
+
+
+def _build_2p_sampled_tree(effective_stack=10000):
+    """3-leaf SAMPLED-mode tree:
+        root P0 acts !facing → {check, bet 0.5}
+          check → P1 acts !facing → {check (LEAF 0), bet 0.5}
+                                         bet 0.5 → P0 facing → {fold, call (LEAF 1)}
+          bet 0.5 → P1 facing → {fold, call (LEAF 2)}
+
+    Expected histories (per _train_action_idx):
+        leaf 0: (0, 0)         check, check
+        leaf 1: (0, 1, 1)      check, bet 0.5, call
+        leaf 2: (1, 1)         bet 0.5, call
+    """
+    nodes = []
+    children = []
+
+    # Index plan (built bottom-up so first_child can be patched as we go).
+    # 0: root DECISION p=0, 2 children {check_branch, bet_branch}
+    # check_branch:
+    #   1: DECISION p=1, 2 children {LEAF leaf_idx=0, bet_branch_2}
+    #   2: LEAF leaf_idx=0 (P0 check, P1 check)
+    #   3: DECISION p=0 facing (after P0 check, P1 bet 0.5), 2 children
+    #   4: FOLD
+    #   5: LEAF leaf_idx=1 (P0 check, P1 bet 0.5, P0 call)
+    # bet_branch:
+    #   6: DECISION p=1 facing (after P0 bet 0.5), 2 children
+    #   7: FOLD
+    #   8: LEAF leaf_idx=2 (P0 bet 0.5, P1 call)
+    bet_amt = int(0.5 * 200)  # 100
+
+    # 0: root
+    nodes.append(_make_node(_NODE_DECISION, 0, 2, -1, 200, (0, 0)))
+    # 1: P1 acts after P0 check
+    nodes.append(_make_node(_NODE_DECISION, 1, 2, -1, 200, (0, 0)))
+    # 2: LEAF — both check
+    nodes.append(_make_node(_NODE_LEAF, -1, 0, 0, 200, (0, 0), leaf_idx=0))
+    # 3: P0 facing after [check, bet 0.5]
+    nodes.append(_make_node(
+        _NODE_DECISION, 0, 2, -1, 200 + bet_amt, (0, bet_amt),
+    ))
+    # 4: FOLD child of 3
+    nodes.append(_make_node(
+        _NODE_FOLD, -1, 0, 0, 200 + bet_amt, (0, bet_amt),
+    ))
+    # 5: LEAF after [check, bet 0.5, call] — P0 calls bet_amt
+    nodes.append(_make_node(
+        _NODE_LEAF, -1, 0, 0, 200 + 2 * bet_amt, (bet_amt, bet_amt),
+        leaf_idx=1,
+    ))
+    # 6: P1 facing after [bet 0.5]
+    nodes.append(_make_node(
+        _NODE_DECISION, 1, 2, -1, 200 + bet_amt, (bet_amt, 0),
+    ))
+    # 7: FOLD child of 6
+    nodes.append(_make_node(
+        _NODE_FOLD, -1, 0, 0, 200 + bet_amt, (bet_amt, 0),
+    ))
+    # 8: LEAF after [bet 0.5, call]
+    nodes.append(_make_node(
+        _NODE_LEAF, -1, 0, 0, 200 + 2 * bet_amt, (bet_amt, bet_amt),
+        leaf_idx=2,
+    ))
+
+    # children[] layout — patch first_child in order:
+    # node 0 children: [1, 6]
+    nodes[0].first_child = len(children); children.extend([1, 6])
+    # node 1 children: [2, 3]
+    nodes[1].first_child = len(children); children.extend([2, 3])
+    # node 3 children: [4, 5]
+    nodes[3].first_child = len(children); children.extend([4, 5])
+    # node 6 children: [7, 8]
+    nodes[6].first_child = len(children); children.extend([7, 8])
+
+    tree = SSTreeData()
+    NodeArrayT = SSNode * len(nodes)
+    nodes_arr = NodeArrayT(*nodes)
+    tree.nodes = ctypes.cast(nodes_arr, ctypes.POINTER(SSNode))
+    tree.num_nodes = len(nodes)
+
+    ChildArrayT = ctypes.c_int * len(children)
+    cs = ChildArrayT(*children)
+    tree.children = ctypes.cast(cs, ctypes.POINTER(ctypes.c_int))
+    tree.num_children_total = len(children)
+
+    tree.num_players_field = 2
+    tree.starting_pot = 200
+    tree.effective_stack = effective_stack
+    tree.is_river = 0
+    tree._keepalive = (nodes_arr, cs)
+    return tree
+
+
+def test_extract_leaf_info_sampled_mode_emits_per_leaf():
+    """Production-shape SAMPLED tree: 3 flat SS_NODE_LEAF terminals,
+    no cont-chain wrapping. Each must yield one LeafInfo with
+    flop_history_train captured from the path."""
+    tree = _build_2p_sampled_tree()
+    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+
+    by_idx = {li.leaf_idx: li for li in leaves}
+    assert set(by_idx) == {0, 1, 2}, \
+        f"expected leaves 0,1,2 (one per SS_NODE_LEAF); got {sorted(by_idx)}"
+
+    # check-check
+    assert by_idx[0].flop_history_train == (0, 0)
+    assert by_idx[0].bets == (0, 0)
+    # check, bet 0.5, call
+    assert by_idx[1].flop_history_train == (0, 1, 1)
+    assert by_idx[1].bets == (100, 100)
+    # bet 0.5, call
+    assert by_idx[2].flop_history_train == (1, 1)
+    assert by_idx[2].bets == (100, 100)
+
+
+def test_extract_leaf_info_sampled_no_folds_no_phantom_leaves():
+    """FOLD nodes (type=1) must not produce phantom LeafInfo entries —
+    only SS_NODE_LEAF (type=4) terminals carry leaf_idx."""
+    tree = _build_2p_sampled_tree()
+    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    # Tree has 3 SS_NODE_LEAF + 2 SS_NODE_FOLD; only the 3 LEAFs emit.
+    assert len(leaves) == 3
+
+
 def test_extract_leaf_info_allin():
     # 2p flop: P0 bets allin → child.bets[0] = effective_stack (10000)
     tree = _build_2p_synthetic_tree([

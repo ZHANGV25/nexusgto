@@ -294,16 +294,27 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
     """Extract pot/bets/flop_history for each subgame leaf.
 
     DFS from the SS tree root accumulates the action sequence taken to
-    reach each cont-chain root. Each action gets re-encoded to training's
-    discrete index space via _train_action_idx; the resulting tuple is
-    stored on LeafInfo.flop_history_train and threaded into the rollout
-    so blueprint queries during turn/river include the real flop slice
-    (not the dropped [preflop_only] prefix that triggered the v3
-    sentinel battery's uniform-1/n collapse, 2026-04-30 diagnosis).
+    reach each leaf. Each action gets re-encoded to training's discrete
+    index space via _train_action_idx; the resulting tuple is stored on
+    LeafInfo.flop_history_train and threaded into the rollout so
+    blueprint queries during turn/river include the real flop slice (not
+    the dropped [preflop_only] prefix that triggered the v3 sentinel
+    battery's uniform-1/n collapse, 2026-04-30 diagnosis).
 
-    Each leaf has a different pot size depending on the betting path
-    that led to it. Supports N-player continuation structures:
-    P0 → P1 → ... → P(N-1), each with 4 children = 4^N terminals per leaf.
+    Handles both SS tree shapes (compile-time SS_CONT_STRAT_MODE):
+
+      * JOINT (legacy): each betting leaf is wrapped in a 4^N cont-chain
+        of decision nodes. Detected via `_is_cont_chain`; one LeafInfo
+        emitted per cont-chain root, leaf_idx recovered from
+        `base_leaf_idx // cont_per_leaf`.
+      * SAMPLED (default since OP4 commit 10, 2026-04-17): no tree-level
+        expansion. Each betting-tree terminal stays as SS_NODE_LEAF
+        (type=4). One LeafInfo emitted per such terminal directly,
+        leaf_idx taken from `node.leaf_idx`. Pre-fix, this function
+        searched only for the cont-chain pattern and returned empty for
+        SAMPLED trees → rollout fn returned None → CFR ran on zero leaf
+        values → uniform 1/n at every postflop spot (sentinel run
+        2026-05-01 diagnosis).
 
     Args:
         tree_data: SSTreeData ctypes struct (after ss_build_tree)
@@ -364,7 +375,17 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
             ))
             continue
 
-        if node.type != 0:  # FOLD / SHOWDOWN / LEAF — no children to descend
+        if node.type == 4:  # SS_NODE_LEAF — SAMPLED-mode betting terminal
+            bets = tuple(node.bets[p] for p in range(num_players))
+            leaves.append(LeafInfo(
+                leaf_idx=int(node.leaf_idx),
+                pot=node.pot,
+                bets=bets,
+                flop_history_train=history,
+            ))
+            continue
+
+        if node.type != 0:  # FOLD / SHOWDOWN / CHANCE — no leaf_idx
             continue
 
         acting = node.player
