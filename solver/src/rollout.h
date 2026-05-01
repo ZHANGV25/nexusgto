@@ -177,7 +177,14 @@ BPS_EXPORT int32_t rollout_compute_leaf_value_c(
 
 /* Multi-hand wrapper. out is float32[num_players * max_hands] row-major.
  * Returns 0 on success; -1 on genuine error (see single-hand entry).
- * Blueprint coverage misses are absorbed by uniform substitution. */
+ * Blueprint coverage misses are absorbed by uniform substitution.
+ *
+ * skip_first_betting: when 1, skip the betting loop on the leaf's
+ * street and advance straight to the next street's chance/deal step.
+ * Pass 1 from subgame leaf paths when the leaf's flop_history is
+ * non-empty (the leaf already represents end-of-street state and the
+ * betting we'd fictitiously redo would corrupt blueprint queries on
+ * subsequent streets). See rollout.c::rollout_simulate_one. */
 BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
     const BPSReader *r,
     const int *board, int32_t n_board_cards,
@@ -196,6 +203,7 @@ BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
     uint64_t master_seed,
     int32_t leaf_idx_for_seed,
     int32_t combo_for_seed,
+    int32_t skip_first_betting,
     float *out                                  /* [num_players * max_hands] */
 );
 

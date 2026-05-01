@@ -503,7 +503,17 @@ static int rollout_sample_opp_hand(
 /* ── _simulate_one ───────────────────────────────────────────────────── */
 
 /* Streets: 1=flop 2=turn 3=river. Returns 0 on success (payoff written
- * to *out_payoff), -1 on LeafValueUnavailable (last-error set). */
+ * to *out_payoff), -1 on LeafValueUnavailable (last-error set).
+ *
+ * skip_first_betting: when 1, skip the betting loop on leaf_street and
+ * advance straight to the next street's chance/deal step. Used by the
+ * subgame leaf paths when leaf->flop_history_len > 0 — in that case the
+ * leaf already represents end-of-street state and the betting we'd
+ * fictitiously redo here would (a) corrupt blueprint queries on the
+ * NEXT street by appending fictitious actions to game_history, and
+ * (b) miss training storage on the CURRENT street because training
+ * stored end-of-flop info sets at street=2 (turn), not street=1 (flop).
+ * See PHASE0_STATUS.md / advisor analysis 2026-04-30. */
 static int rollout_simulate_one(
     const BPSReader *r,
     /* immutable inputs */
@@ -522,6 +532,7 @@ static int rollout_simulate_one(
     const int32_t *sampled_hands_c0,
     const int32_t *sampled_hands_c1,
     const int32_t *has_sample,  /* 1 if sampled_hands[p] is set */
+    int32_t skip_first_betting,
     uint64_t *rng,
     /* out */
     float *out_payoff
@@ -551,6 +562,7 @@ static int rollout_simulate_one(
 
     int32_t pot = pot_in;
     int32_t street = leaf_street;
+    int32_t first_iter = 1;
 
     while (1) {
         /* If every live player has gone all-in (no chips left), there
@@ -565,6 +577,19 @@ static int rollout_simulate_one(
             }
             if (n_live_can_act < 2) goto street_closed;
         }
+
+        /* Skip the betting loop on the leaf's street when the leaf
+         * already represents end-of-street state (its flop_history was
+         * threaded into game_history via the subgame leaf path). The
+         * current-street betting was already accounted for by the
+         * subgame tree; redoing it here would either miss (training
+         * stored end-of-flop info sets at street=NEXT) or pollute
+         * subsequent queries with fictitious actions. */
+        if (first_iter && skip_first_betting) {
+            first_iter = 0;
+            goto street_closed;
+        }
+        first_iter = 0;
 
         /* Betting round for current street */
         int32_t street_bets[ROLLOUT_MAX_PLAYERS] = {0};
@@ -867,7 +892,8 @@ street_closed:
 
 /* ── Public entry points ─────────────────────────────────────────────── */
 
-/* Common args → compute mean payoff for one hero hand. */
+/* Common args → compute mean payoff for one hero hand. See
+ * rollout_simulate_one for the skip_first_betting semantics. */
 static int rollout_compute_leaf_value_impl(
     const BPSReader *r,
     const int *board, int32_t n_board_cards,
@@ -887,6 +913,7 @@ static int rollout_compute_leaf_value_impl(
     uint64_t master_seed,
     int32_t leaf_idx_for_seed,
     int32_t combo_for_seed,
+    int32_t skip_first_betting,
     float *out_value
 ) {
     if (num_players <= 0 || num_players > ROLLOUT_MAX_PLAYERS) {
@@ -971,6 +998,7 @@ static int rollout_compute_leaf_value_impl(
             player_seats, game_action_history, gah_len,
             bias_profile, hero_player,
             sampled_c0, sampled_c1, has_sample,
+            skip_first_betting,
             &rng, &payoff);
         if (rc != 0) {
             /* Propagate LeafValueUnavailable. */
@@ -1006,6 +1034,9 @@ BPS_EXPORT int32_t rollout_compute_leaf_value_c(
     int32_t combo_for_seed,
     float *out_value
 ) {
+    /* Public single-hand entry preserves its old signature; callers
+     * outside the subgame leaf path don't deal with skip_first_betting,
+     * so they always start the rollout with a fresh first-street round. */
     return rollout_compute_leaf_value_impl(
         r, board, n_board_cards, street, pot_chips,
         active, num_players, stacks, bets,
@@ -1013,7 +1044,9 @@ BPS_EXPORT int32_t rollout_compute_leaf_value_c(
         player_seats, game_action_history, gah_len,
         bias_profile, hero_player, hero_hand_idx,
         num_rollouts, master_seed,
-        leaf_idx_for_seed, combo_for_seed, out_value);
+        leaf_idx_for_seed, combo_for_seed,
+        /*skip_first_betting=*/0,
+        out_value);
 }
 
 BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
@@ -1034,6 +1067,7 @@ BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
     uint64_t master_seed,
     int32_t leaf_idx_for_seed,
     int32_t combo_for_seed,
+    int32_t skip_first_betting,
     float *out
 ) {
     /* Zero-init */
@@ -1059,7 +1093,8 @@ BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
                 player_hands, acting_order, acting_order_len,
                 player_seats, game_action_history, gah_len,
                 bias_profile, p, h, num_rollouts, master_seed,
-                leaf_idx_for_seed, combo_for_seed, &v);
+                leaf_idx_for_seed, combo_for_seed,
+                skip_first_betting, &v);
             if (rc != 0) return -1;
             out[p * max_hands + h] = v;
         }
@@ -1192,13 +1227,16 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
             for (int32_t k = 0; k < fh_len; k++) per_leaf_history[gah_len + k] = li->flop_history[k];
             int32_t per_leaf_history_len = gah_len + fh_len;
 
+            /* Skip the leaf's first betting round when the leaf already
+             * carries a closed flop_history — see rollout_simulate_one. */
+            int32_t skip_first = (fh_len > 0) ? 1 : 0;
             int rc = rollout_compute_leaf_values_all_hands_c(
                 r, board, n_board_cards, street, li->pot_chips,
                 active, num_players, stacks, li->bets,
                 player_hands, acting_order, acting_order_len,
                 player_seats, per_leaf_history, per_leaf_history_len,
                 bias_profile, max_hands, num_rollouts, master_seed,
-                li->leaf_idx, (int32_t)combo, slot);
+                li->leaf_idx, (int32_t)combo, skip_first, slot);
             if (rc != 0) {
                 #pragma omp critical(rollout_parallel_fail)
                 {
@@ -1392,6 +1430,9 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
             for (int32_t k = 0; k < fh_len; k++) per_leaf_history[gah_len + k] = li->flop_history[k];
             int32_t per_leaf_history_len = gah_len + fh_len;
 
+            /* Skip the leaf's first betting round when the leaf already
+             * carries a closed flop_history — see rollout_simulate_one. */
+            int32_t skip_first = (fh_len > 0) ? 1 : 0;
             /* Derive a per-sample seed for the rollout's RNG chain.
              * leaf_idx slot reuses li->leaf_idx; combo slot carries
              * sample_idx so each sample's rollout stream is distinct. */
@@ -1401,7 +1442,7 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
                 player_hands, acting_order, acting_order_len,
                 player_seats, per_leaf_history, per_leaf_history_len,
                 bias_profile, max_hands, num_rollouts, master_seed,
-                li->leaf_idx, sample_idx, scratch);
+                li->leaf_idx, sample_idx, skip_first, scratch);
             if (rc != 0) {
                 #pragma omp critical(rollout_sampled_fail)
                 {
