@@ -268,6 +268,11 @@ extern "C" {
  *                 e.g., [0,1] for heads-up OOP/IP, [0,1,2] for 3-way
  *   is_river: 1 if river (showdown terminals), 0 otherwise (leaf terminals)
  *   use_cont_strats: 1 to expand leaves with continuation strategy nodes
+ *   add_explicit_allin: 1 (default) appends an unconditional all-in
+ *     raise child whenever no bet_sizes-derived raise reached the stack;
+ *     0 omits it (use when the blueprint was trained with a fixed
+ *     bet_sizes set that doesn't include all-in — appending one would
+ *     create an off-tree branch the σ̄ rollout falls back to uniform on)
  *   tree_out: output tree data
  */
 SS_EXPORT int ss_build_tree(
@@ -276,6 +281,7 @@ SS_EXPORT int ss_build_tree(
     const float *bet_sizes, int num_bet_sizes,
     int num_players, const int *acting_order,
     int is_river, int use_cont_strats,
+    int add_explicit_allin,
     SSTreeData *tree_out
 );
 

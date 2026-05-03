@@ -157,6 +157,12 @@ def _build_labels_at_node(tree_data, node_idx):
     pot = node.pot
     acting = node.player
     acting_bet = node.bets[acting] if acting >= 0 else 0
+    # Remaining stack for the acting player. effective_stack on SSTreeData
+    # is the per-player starting stack (poker-solver/src/cuda/street_solve.cu's
+    # build_street_tree_n keeps `stack` constant down the tree), so chips
+    # left to bet = effective_stack - already-committed.
+    eff_stack = tree_data.effective_stack
+    acting_remaining = eff_stack - acting_bet if acting >= 0 else eff_stack
 
     # Max bet among all players
     mx = 0
@@ -180,6 +186,14 @@ def _build_labels_at_node(tree_data, node_idx):
 
             if bet_amount == 0:
                 labels.append("Check")
+            elif bet_amount >= acting_remaining and acting_remaining > 0:
+                # Bet/raise that consumes the rest of acting player's stack.
+                # Emits "All-in" so postflop_provider's _solver_label_to_api_action
+                # routes to ("allin", None) — without this guard a jam at
+                # 0.5×pot when 0.5×pot >= stack (or the explicit-allin
+                # branch when add_explicit_allin=True) renders as a confusing
+                # "Raise 1996%".
+                labels.append("All-in")
             elif pot > 0:
                 pct = int(round(100 * bet_amount / pot))
                 if to_call > 0:
@@ -210,7 +224,8 @@ class StreetSolverGPU:
                  acting_order=None,
                  # Common options
                  bet_sizes=None, leaf_values=None,
-                 use_cont_strats=True, leaf_value_fn=None):
+                 use_cont_strats=True, leaf_value_fn=None,
+                 add_explicit_allin=True):
         """
         Args:
             board: list of card strings or ints
@@ -223,6 +238,11 @@ class StreetSolverGPU:
             leaf_values: np.array or None
             use_cont_strats: expand leaves with continuation strategies
             leaf_value_fn: callback to compute leaf values from tree
+            add_explicit_allin: True (default) appends an unconditional all-in
+                raise child whenever no bet_sizes-derived raise reached the stack;
+                False omits it for blueprints whose training action set excluded
+                all-in (off-tree branches get uniform-on-zero σ̄ substitution
+                and CFR can pick the artifact). v3 sets this to False.
         """
         self.lib = _get_lib()
 
@@ -303,6 +323,7 @@ class StreetSolverGPU:
             self.num_players, order_arr,
             1 if self.is_river else 0,
             use_cs,
+            1 if add_explicit_allin else 0,
             ctypes.byref(self._tree))
         if err != 0:
             raise RuntimeError("ss_build_tree failed")

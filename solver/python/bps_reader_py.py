@@ -750,6 +750,11 @@ class BPSReaderC:
                         self._reader, str(tc).encode("utf-8"),
                     )
                     if ret > 0:
+                        print(
+                            f"[BPSReaderC] turn centroids loaded from {tc} "
+                            f"({ret} centroids) — S3 fast-path",
+                            flush=True,
+                        )
                         return
             except (OSError, ValueError):
                 continue
@@ -757,6 +762,11 @@ class BPSReaderC:
         # paths the Python list missed, e.g. /dev/shm).
         rc = self._lib.bps_load_turn_centroids(self._reader, None)
         if rc and rc > 0:
+            print(
+                f"[BPSReaderC] turn centroids loaded via C-side candidate "
+                f"search ({rc} centroids)",
+                flush=True,
+            )
             return
 
         # No TCN1 file anywhere — recompute. Required for v3 inference;
