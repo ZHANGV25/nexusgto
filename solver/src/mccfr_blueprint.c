@@ -651,6 +651,20 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                            !__atomic_compare_exchange_n(&t->max_probe_observed, &cur, (int64_t)probe,
                                                          1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
                 }
+                /* Phase 3 lazy shrink. When warm-restarting a legacy
+                 * (allin-included) checkpoint under --no-explicit-allin,
+                 * the saved slot has num_actions = legacy_count but the
+                 * caller's expected num_actions is smaller (legacy_count - 1
+                 * if the trailing slot was the explicit allin). On first
+                 * visit, shrink the slot to match. Indices 0..num_actions-1
+                 * stay valid; the trailing legacy slot becomes inert.
+                 * Never EXPANDS — that would be unsafe (stack-allocated
+                 * tmp arrays in callers assume the original num_actions).
+                 * See docs/PHASE3_RETRAIN_STATUS.md. */
+                if (num_actions > 0 &&
+                    num_actions < t->sets[idx].num_actions) {
+                    t->sets[idx].num_actions = num_actions;
+                }
                 return idx;
             }
             continue;
@@ -895,7 +909,8 @@ typedef struct {
 static int generate_actions(BPAction *out, int max_out,
                             int pot, int stack, int to_call,
                             int num_raises, int max_raises,
-                            const float *bet_sizes, int num_bet_sizes) {
+                            const float *bet_sizes, int num_bet_sizes,
+                            int add_explicit_allin) {
     int n = 0;
     if (to_call > 0 && n < max_out) {
         out[n].type = ACT_FOLD; out[n].bet_idx = -1; out[n].amount = 0; n++;
@@ -915,7 +930,12 @@ static int generate_actions(BPAction *out, int max_out,
             if (ba >= stack) { if (added_allin) continue; added_allin = 1; }
             out[n].type = ACT_BET; out[n].bet_idx = i; out[n].amount = ba; n++;
         }
-        if (!added_allin && stack > to_call && n < max_out) {
+        /* Phase 3: gate the implicit-allin block. v3 was trained with this
+         * always firing — see docs/PHASE3_RETRAIN_STATUS.md. With the gate
+         * off, deep-stack nodes (where stack > all bet_size raises) no
+         * longer have allin in their action set. Short-stack nodes still
+         * get allin via the in-loop clamp at line 913. */
+        if (add_explicit_allin && !added_allin && stack > to_call && n < max_out) {
             out[n].type = ACT_BET; out[n].bet_idx = num_bet_sizes;
             out[n].amount = stack; n++;
         }
@@ -1417,7 +1437,8 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     }
     int na = generate_actions(actions, BP_MAX_ACTIONS, ts->pot, remaining_stack,
                               to_call, ts->num_raises, max_raises,
-                              cur_bet_sizes, cur_num_bet_sizes);
+                              cur_bet_sizes, cur_num_bet_sizes,
+                              s->add_explicit_allin);
     if (na == 0) return 0;
 
     /* Info set lookup — bucket is part of the key (Pluribus-style).
@@ -1872,7 +1893,8 @@ static float traverse_ev(TraversalState *ts, int acting_order_idx,
     }
     int na = generate_actions(actions, BP_MAX_ACTIONS, ts->pot, remaining_stack,
                               to_call, ts->num_raises, max_raises,
-                              cur_bet_sizes, cur_num_bet_sizes);
+                              cur_bet_sizes, cur_num_bet_sizes,
+                              s->add_explicit_allin);
     if (na == 0) return 0;
 
     /* Info set lookup — read-only. We do NOT create new info sets here;
@@ -2375,6 +2397,11 @@ int bp_init_unified(BPSolver *s, int num_players,
     /* Tiered preflop: not set via bp_init_unified args, use bp_set_preflop_tiers() */
     s->num_preflop_tiers = 0;
     s->preflop_max_raises = 0;
+
+    /* Phase 3: default to legacy auto-allin behavior (preserves
+     * v3 training + every existing test). Phase 3 trainer overrides
+     * via bp_set_add_explicit_allin(). */
+    s->add_explicit_allin = 1;
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
@@ -3058,6 +3085,66 @@ int bp_set_preflop_tier(BPSolver *s, int level,
         printf("%s%.2f", i ? ", " : "", sizes[i]);
     printf("], max_raises=%d\n", s->preflop_max_raises);
     return 0;
+}
+
+/* Phase 3: gate the implicit-allin block in generate_actions().
+ * Pass 0 to disable (Phase 3 warm-restart trainer). Default = 1 (legacy). */
+int bp_set_add_explicit_allin(BPSolver *s, int enabled) {
+    s->add_explicit_allin = enabled ? 1 : 0;
+    printf("[BP] add_explicit_allin = %d (%s)\n",
+           s->add_explicit_allin,
+           s->add_explicit_allin
+               ? "legacy: implicit allin appended at deep-stack nodes"
+               : "Phase 3: deep-stack nodes have no allin in action set");
+    return 0;
+}
+
+/* Phase 3 post-load fixup: drop the trailing allin slot from infosets that
+ * were saved with the legacy action set (na = max_with_allin). Run after
+ * bp_load_regrets when the new code's add_explicit_allin=0 disagrees with
+ * the saved file's implicit-allin slot count.
+ *
+ * Drop logic, by street: see docs/PHASE3_RETRAIN_STATUS.md "Action-set
+ * fixup — invariant" table. For each (street, expected_old_max_na) where
+ * the entry's na matches, drop the trailing slot of regrets[] and
+ * strategy_sum[] (if present) and decrement num_actions.
+ *
+ *   - Preflop (street=0): if na == 1 + 1 + num_preflop_bet_sizes + 1, drop.
+ *   - Postflop (street>0): if na == 1 + 1 + num_bet_sizes + 1, drop.
+ *
+ * In our config: preflop drops na=6→5; postflop drops na=5→4. Edge cases
+ * where one bet_size already clamped to allin (added_allin=1 in
+ * generate_actions) have na = max-1 already, so the heuristic skips them
+ * correctly. */
+int64_t bp_drop_trailing_allin_slot(BPSolver *s) {
+    BPInfoTable *t = &s->info_table;
+    const int preflop_max_with_allin = 1 + 1 + s->num_preflop_bet_sizes + 1;
+    const int postflop_max_with_allin = 1 + 1 + s->num_bet_sizes + 1;
+    int64_t dropped_pf = 0, dropped_postf = 0;
+
+    for (int64_t i = 0; i < t->table_size; i++) {
+        if (t->occupied[i] != 1) continue;
+        BPInfoSet *is = &t->sets[i];
+        BPInfoKey *key = &t->keys[i];
+
+        int max_na;
+        if (key->street == 0) max_na = preflop_max_with_allin;
+        else max_na = postflop_max_with_allin;
+
+        if (is->num_actions != max_na) continue;
+
+        /* Drop trailing slot. Regrets are int*, strategy_sum is float*.
+         * Both arrays were allocated with size = old num_actions; we just
+         * decrement the count. The trailing memory is now unused but stays
+         * allocated until the arena is reset. That's fine — info_table_free
+         * frees the arena as one block. */
+        is->num_actions--;
+        if (key->street == 0) dropped_pf++; else dropped_postf++;
+    }
+    printf("[BP] bp_drop_trailing_allin_slot: dropped trailing allin from "
+           "%lld preflop and %lld postflop infosets\n",
+           (long long)dropped_pf, (long long)dropped_postf);
+    return dropped_pf + dropped_postf;
 }
 
 int bp_solve(BPSolver *s, int64_t max_iterations) {

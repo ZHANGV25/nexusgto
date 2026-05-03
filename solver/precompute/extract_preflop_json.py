@@ -601,17 +601,37 @@ def get_or_build_cached_table(bps_path):
     # Convert sparse {bucket: row} dicts into dense [169, na] uint8 matrices.
     # Unvisited buckets stay 0 (vs the old code's uniform default — we'll
     # treat 0-row as "no data" on the frontend and skip it during expansion).
+    #
+    # Phase 3 caveat: when warm-restarted from a legacy (allin-included)
+    # checkpoint with --no-explicit-allin, the lazy-shrink in
+    # info_table_find_or_create fires on first visit per infoset. Infosets
+    # that weren't visited during the post-resume window retain their
+    # legacy size (na = gated_na + 1, trailing slot is the now-obsolete
+    # allin). The result: a single (action_hash, player) bucket map can
+    # contain rows of different na — visited rows have gated_na, unvisited
+    # rows have legacy_na. Normalize to MIN (drop trailing of larger),
+    # which is the gate's intent.
     print(f"  Densifying {len(by_node):,} nodes...", flush=True)
     t0 = time.time()
     table = {}
+    n_renormalized = 0
     for key, bucket_map in by_node.items():
-        sample = next(iter(bucket_map.values()))
-        na = sample.shape[0]
-        rows = np.zeros((169, na), dtype=np.uint8)
+        # Find min na across the bucket map. Legacy entries have larger
+        # na (trailing slot = allin); shrunk entries have target na.
+        min_na = min(s.shape[0] for s in bucket_map.values())
+        max_na = max(s.shape[0] for s in bucket_map.values())
+        rows = np.zeros((169, min_na), dtype=np.uint8)
         for bucket, strat in bucket_map.items():
             if bucket < 169:
-                rows[bucket] = strat
+                if strat.shape[0] > min_na:
+                    rows[bucket] = strat[:min_na]
+                    n_renormalized += 1
+                else:
+                    rows[bucket] = strat
         table[key] = rows
+    if n_renormalized > 0:
+        print(f"  Phase 3 fixup: trimmed trailing slots in "
+              f"{n_renormalized:,} legacy-sized rows", flush=True)
     print(f"  Densified in {time.time() - t0:.1f}s", flush=True)
 
     ev_table = {}
@@ -619,12 +639,11 @@ def get_or_build_cached_table(bps_path):
         print(f"  Densifying {len(by_node_evs):,} EV nodes...", flush=True)
         t0 = time.time()
         for key, bucket_map in by_node_evs.items():
-            sample = next(iter(bucket_map.values()))
-            na = sample.shape[0]
-            evs_arr = np.zeros((169, na), dtype=np.float32)
+            min_na = min(s.shape[0] for s in bucket_map.values())
+            evs_arr = np.zeros((169, min_na), dtype=np.float32)
             for bucket, evs in bucket_map.items():
                 if bucket < 169:
-                    evs_arr[bucket, :na] = evs[:na]
+                    evs_arr[bucket] = evs[:min_na]
             ev_table[key] = evs_arr
         print(f"  EV densified in {time.time() - t0:.1f}s", flush=True)
 

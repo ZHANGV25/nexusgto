@@ -115,11 +115,15 @@ _C_BUCKET_MAP = _build_c_bucket_map()
 # the config-relevant fields in the checkpoint meta and refusing to load
 # on mismatch prevents the entire failure class.
 
-def _compute_config_hash():
+def _compute_config_hash(add_explicit_allin=None):
     """Hash of everything that shapes the regret table.
     A mismatch between current config and checkpoint meta means the
     regret table's action_hash/bucket layout is incompatible and the
     checkpoint must be rejected.
+
+    Phase 3: add_explicit_allin is part of the layout — gate=0 produces
+    one fewer slot per deep-stack infoset. Pass None to omit (legacy
+    behavior, equivalent to add_explicit_allin=1).
     """
     import hashlib
     payload = {
@@ -147,6 +151,8 @@ def _compute_config_hash():
         # entry via info_table_find_or_create into the current table_size,
         # so checkpoints are portable across hash table sizes.
     }
+    if add_explicit_allin is not None:
+        payload["add_explicit_allin"] = int(add_explicit_allin)
     canon = json.dumps(payload, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canon.encode('utf-8')).hexdigest()
 
@@ -203,6 +209,15 @@ def load_bp_dll(build_dir):
             bp.bp_save_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_load_regrets.restype = ctypes.c_int64
             bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            # Phase 3 hooks (no-op if older C lib doesn't have them).
+            if hasattr(bp, "bp_set_add_explicit_allin"):
+                bp.bp_set_add_explicit_allin.restype = ctypes.c_int
+                bp.bp_set_add_explicit_allin.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int,
+                ]
+            if hasattr(bp, "bp_drop_trailing_allin_slot"):
+                bp.bp_drop_trailing_allin_slot.restype = ctypes.c_int64
+                bp.bp_drop_trailing_allin_slot.argtypes = [ctypes.c_void_p]
             bp.bp_save_texture_cache.restype = ctypes.c_int
             bp.bp_save_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_load_texture_cache.restype = ctypes.c_int
@@ -244,6 +259,23 @@ def main():
                         help="Export checkpoint every N iterations")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest regret checkpoint on S3")
+    parser.add_argument("--resume-from", default="",
+                        help="S3 key (relative to bucket) of the regret "
+                             "file to resume from. Default: "
+                             "checkpoints/regrets_latest.bin. Used by "
+                             "Phase 3 warm-restart launcher to point at "
+                             "regrets_3400M.bin instead.")
+    parser.add_argument("--no-explicit-allin", action="store_true",
+                        default=(os.environ.get("BPS_NO_EXPLICIT_ALLIN", "0") == "1"),
+                        help="Phase 3: gate the implicit-allin block in "
+                             "generate_actions(). Default off. When on, "
+                             "deep-stack nodes have no allin in action set "
+                             "(short-stack clamp still applies). When "
+                             "combined with --resume from a legacy "
+                             "checkpoint, runs the post-load fixup that "
+                             "drops the trailing allin slot from preflop/"
+                             "postflop infosets saved at max-with-allin "
+                             "size. See docs/PHASE3_RETRAIN_STATUS.md.")
     parser.add_argument("--river-ochs", action="store_true",
                         default=(os.environ.get("BPS_RIVER_OCHS", "0") == "1"),
                         help="Enable OCHS river abstraction (Johanson 2013, "
@@ -357,6 +389,17 @@ def main():
         sys.exit(1)
     print("Solver initialized.")
 
+    # Phase 3: gate the implicit-allin block in generate_actions().
+    # See docs/PHASE3_RETRAIN_STATUS.md.
+    if args.no_explicit_allin:
+        if not hasattr(bp_lib, "bp_set_add_explicit_allin"):
+            print("FATAL: --no-explicit-allin requested but the loaded "
+                  "mccfr_blueprint.so doesn't export "
+                  "bp_set_add_explicit_allin. Rebuild with the Phase 3 "
+                  "patch.")
+            sys.exit(1)
+        bp_lib.bp_set_add_explicit_allin(solver, 0)
+
     # Set tiered preflop sizing (overrides flat sizes)
     for level, sizes in sorted(PREFLOP_TIERS.items()):
         c_sizes = (ctypes.c_float * len(sizes))(*sizes)
@@ -386,7 +429,9 @@ def main():
     # Resume from checkpoint if requested
     iters_already_done = 0
     if args.resume and args.s3_bucket:
-        regret_local = os.path.join(args.output_dir, "regrets_latest.bin")
+        resume_key = args.resume_from or "checkpoints/regrets_latest.bin"
+        regret_local = os.path.join(
+            args.output_dir, os.path.basename(resume_key))
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"Checking for checkpoint at {regret_s3}...")
         ret = subprocess.run(
@@ -396,6 +441,15 @@ def main():
         if ret.returncode == 0 and os.path.exists(regret_local):
             n_loaded = bp_lib.bp_load_regrets(
                 solver, regret_local.encode('utf-8'))
+            if n_loaded > 0 and args.no_explicit_allin:
+                # Phase 3 lazy-shrink: when --no-explicit-allin is set, the
+                # next find_or_create call for each infoset will shrink the
+                # slot's num_actions to match the new (smaller) action set.
+                # No explicit fixup needed; lazy shrink handles preflop
+                # tiers + postflop subsequent-raise cases uniformly.
+                # See mccfr_blueprint.c::info_table_find_or_create.
+                print("[Phase 3] --no-explicit-allin active. Slots will "
+                      "lazily shrink on first visit.")
             if n_loaded > 0:
                 # Read back iterations_run from the solver struct
                 # (bp_load_regrets sets s->iterations_run)
@@ -417,7 +471,37 @@ def main():
                         # config. Prevents the prior-incident class where a
                         # new tiered run loaded a flat-8 checkpoint.
                         ckpt_hash = cmeta.get("config_hash")
-                        cur_hash = _compute_config_hash()
+                        # Phase 3: the config hash now optionally includes
+                        # add_explicit_allin. Legacy v3 checkpoints were
+                        # saved BEFORE this field existed in the hash, so
+                        # their hash was computed sans field. Detect this
+                        # by absence of "add_explicit_allin" in meta and
+                        # use a sans-field comparison hash.
+                        ckpt_allin_raw = cmeta.get("add_explicit_allin")
+                        if ckpt_allin_raw is None:
+                            # Legacy meta: hash was computed without the
+                            # add_explicit_allin field. Reproduce by
+                            # passing None.
+                            ckpt_compat_hash = _compute_config_hash(
+                                add_explicit_allin=None)
+                            ckpt_allin = 1  # legacy behavior
+                        else:
+                            ckpt_allin = int(ckpt_allin_raw)
+                            ckpt_compat_hash = _compute_config_hash(
+                                add_explicit_allin=ckpt_allin)
+                        cur_allin = 0 if args.no_explicit_allin else 1
+                        cur_hash = _compute_config_hash(add_explicit_allin=cur_allin)
+                        if (args.no_explicit_allin
+                                and ckpt_allin == 1
+                                and ckpt_hash == ckpt_compat_hash
+                                and os.environ.get("BPS_PHASE3_ALLOW_LEGACY_CKPT", "0") == "1"):
+                            print(f"[Phase 3] Resuming legacy (allin=1) "
+                                  f"checkpoint under --no-explicit-allin "
+                                  f"gate. Lazy shrink will trim trailing "
+                                  f"allin slots on first visit. "
+                                  f"(ckpt_hash={ckpt_hash[:16]}..., "
+                                  f"compat={ckpt_compat_hash[:16]}...)")
+                            ckpt_hash = None  # skip mismatch path below
                         if ckpt_hash and ckpt_hash != cur_hash:
                             # The config hash no longer includes hash_table_size,
                             # but old checkpoints were saved with it. Try matching
@@ -1124,7 +1208,9 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
         "preflop_buckets": 169,
         "postflop_buckets": 200,
         "checkpoint": label or f"iter_{iters_done}",
-        "config_hash": _compute_config_hash(),
+        "config_hash": _compute_config_hash(
+            add_explicit_allin=(0 if args.no_explicit_allin else 1)),
+        "add_explicit_allin": (0 if args.no_explicit_allin else 1),
         "hash_mixer": "splitmix64",
         "dcfr": {
             "alpha": os.environ.get("BPS_DCFR_ALPHA", ""),

@@ -174,6 +174,16 @@ typedef struct {
     int num_preflop_tiers;            /* 0 = use flat preflop_bet_sizes */
     int preflop_max_raises;           /* 0 = default (4) */
 
+    /* Phase 3: gate the implicit-allin block in generate_actions().
+     * 1 = legacy behavior (always append explicit all-in raise when no
+     *     bet_size already clamped to stack). v3 trained with this = 1.
+     * 0 = no implicit all-in. Used by the Phase 3 warm-restart trainer
+     *     so allin is never an option at deep-stack nodes (where stack
+     *     >> any bet_size-derived raise). Short-stack scenarios where
+     *     a bet_size genuinely clamps to all-in (mccfr_blueprint.c:913)
+     *     are unaffected. See docs/PHASE3_RETRAIN_STATUS.md. */
+    int add_explicit_allin;
+
     /* Pot, stacks, and blinds */
     int starting_pot;       /* pot at start of postflop (when include_preflop=0) */
     int effective_stack;    /* stack at start of postflop (when include_preflop=0) */
@@ -305,6 +315,26 @@ BP_EXPORT int bp_set_buckets(BPSolver *s, int street,
 BP_EXPORT int bp_set_preflop_tier(BPSolver *s, int level,
                                    const float *sizes, int num_sizes,
                                    int max_raises);
+
+/**
+ * Phase 3: gate the implicit-allin block in generate_actions().
+ * Pass 0 to disable (Phase 3 warm-restart trainer); default is 1
+ * (legacy v3 training behavior — appended an explicit all-in raise to
+ * every betting node when no bet_size already clamped to stack).
+ *
+ * See docs/PHASE3_RETRAIN_STATUS.md.
+ */
+BP_EXPORT int bp_set_add_explicit_allin(BPSolver *s, int enabled);
+
+/**
+ * Phase 3 post-load fixup: drop the trailing allin slot from infosets
+ * saved by the legacy trainer (where the implicit-allin block fired).
+ * Call after bp_load_regrets when add_explicit_allin = 0 and resuming
+ * from a checkpoint that was trained with add_explicit_allin = 1.
+ *
+ * Returns the number of infosets dropped.
+ */
+BP_EXPORT int64_t bp_drop_trailing_allin_slot(BPSolver *s);
 
 /**
  * Run external-sampling MCCFR with Pluribus optimizations.
