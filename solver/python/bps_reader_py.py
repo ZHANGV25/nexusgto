@@ -189,6 +189,7 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     c_int_p = ctypes.POINTER(ctypes.c_int)
     c_float_p = ctypes.POINTER(ctypes.c_float)
     c_int64_p = ctypes.POINTER(ctypes.c_int64)
+    c_uint32_p = ctypes.POINTER(ctypes.c_uint32)
 
     # `data` is declared c_void_p so we can hand C either a Python bytes
     # buffer (auto-converts) or a raw pointer into an mmap view (we go
@@ -234,6 +235,18 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         c_int_p,                 # num_buckets_out
     ]
     lib.bps_query_all_evs.restype = ctypes.c_int
+
+    lib.bps_query_all_visit_counts.argtypes = [
+        ctypes.c_void_p,         # BPSReader*
+        c_int_p,                 # action_history
+        ctypes.c_int,            # action_len
+        ctypes.c_int,            # player
+        ctypes.c_int,            # street
+        c_uint32_p,              # out (uint32_t*)
+        ctypes.c_int,            # out_size
+        c_int_p,                 # num_buckets_out
+    ]
+    lib.bps_query_all_visit_counts.restype = ctypes.c_int
 
     lib.bps_query_strategy.argtypes = [
         ctypes.c_void_p,         # BPSReader*
@@ -903,6 +916,42 @@ class BPSReaderC:
         result = np.ctypeslib.as_array(buf, shape=(buf_size,))
         nb = nb_out.value
         return result[: nb * na].reshape(nb, na).copy()
+
+    def get_all_bucket_visit_counts(
+        self,
+        board: List[int],
+        action_history: List[int],
+        player: int,
+        street: int = 1,
+    ) -> Optional[np.ndarray]:
+        """Get per-bucket EV-walk visit counts at a node.
+
+        Returns [num_buckets] uint32 array, or None if vc data is absent
+        (BPR3-only blueprint or v1 cache) or the node is missing.
+        Use this to gate cells by confidence: cells with low visit counts
+        produce noise-dominated averaged EVs.
+        """
+        action_arr = (ctypes.c_int * len(action_history))(*action_history)
+        nb_max = self._metadata.get(
+            "postflop_buckets" if street > 0 else "preflop_buckets", 200
+        )
+        buf = (ctypes.c_uint32 * nb_max)()
+        nb_out = ctypes.c_int(0)
+
+        rb = self._lib.bps_query_all_visit_counts(
+            self._reader,
+            action_arr,
+            len(action_history),
+            player,
+            street,
+            buf,
+            nb_max,
+            ctypes.byref(nb_out),
+        )
+        if rb == 0:
+            return None
+        nb = nb_out.value
+        return np.ctypeslib.as_array(buf, shape=(nb_max,))[:nb].copy()
 
     def get_strategy(
         self,

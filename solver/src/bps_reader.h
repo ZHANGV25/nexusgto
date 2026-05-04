@@ -64,6 +64,12 @@ typedef struct {
     uint16_t num_buckets;   /* actual bucket count for this node */
     uint8_t  num_actions;   /* 1-16 */
     uint8_t  _pad;
+    /* Visit-count offset into vc_data, valid only when vc_data != NULL.
+     * When vc_data is NULL (BPR3 load path or v1 cache), this field is
+     * meaningless and queries must check vc_data first. Reuses the 4
+     * implicit padding bytes at the end of the struct — keeps sizeof() at
+     * 24B so the on-disk layout in BPSC v1 caches stays compatible. */
+    uint32_t vc_offset;
 } BPSNodeMeta;
 
 /**
@@ -75,6 +81,11 @@ typedef struct {
     uint8_t     *occupied;      /* [table_size] — 0=empty, 1=occupied */
     uint8_t     *strat_data;    /* flat: uint8[nb][na] per node, concatenated */
     float       *ev_data;       /* flat: float32[nb][na] per node, concatenated */
+    /* Per-bucket visit counts from the EV walk, parallel to ev_data but
+     * one entry per bucket (not per action). Layout per visited node:
+     * uint32_t[num_buckets] starting at meta[i].vc_offset.
+     * NULL when no EV walk has run (BPR3 load path or v1 cache). */
+    uint32_t    *vc_data;
     int64_t      table_size;
     int64_t      num_nodes;     /* strategy nodes inserted */
     int64_t      num_ev_nodes;  /* EV nodes inserted (may differ from num_nodes) */
@@ -82,6 +93,8 @@ typedef struct {
     size_t       strat_data_used;
     size_t       ev_data_cap;   /* in floats */
     size_t       ev_data_used;  /* in floats */
+    size_t       vc_data_cap;   /* in uint32s */
+    size_t       vc_data_used;  /* in uint32s */
 } BPSTable;
 
 /**
@@ -233,6 +246,30 @@ BPS_EXPORT int bps_query_all_evs(const BPSReader *r,
                                    int player, int street,
                                    float *out, int out_size,
                                    int *num_buckets_out);
+
+/**
+ * Query per-bucket EV-walk visit counts at a decision node.
+ *
+ * Visit counts are written by ev_write_to_reader (post-EV-walk path) into
+ * the BPSC v2 cache. Used to filter low-confidence cells before drawing
+ * conclusions from averaged EVs.
+ *
+ * Args:
+ *   out: uint32 buffer, must hold at least num_buckets entries.
+ *   out_size: capacity of out (in uint32s).
+ *   num_buckets_out: receives the bucket count.
+ *
+ * Returns num_buckets on success (>=1), or 0 if:
+ *   - reader has no vc_data (BPR3-only load or v1 cache)
+ *   - node not found
+ *   - this node has no EVs (m->ev_offset == SIZE_MAX)
+ *   - out_size too small
+ */
+BPS_EXPORT int bps_query_all_visit_counts(const BPSReader *r,
+                                            const int *action_history, int action_len,
+                                            int player, int street,
+                                            uint32_t *out, int out_size,
+                                            int *num_buckets_out);
 
 /**
  * Query strategy for a single bucket at a decision node.

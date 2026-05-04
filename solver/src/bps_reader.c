@@ -800,6 +800,32 @@ int bps_query_all_evs(const BPSReader *r,
     return na;
 }
 
+int bps_query_all_visit_counts(const BPSReader *r,
+                                 const int *action_history, int action_len,
+                                 int player, int street,
+                                 uint32_t *out, int out_size,
+                                 int *num_buckets_out) {
+    if (!r || !r->evs_loaded || !out) return 0;
+    if (!r->table.vc_data) return 0;
+
+    uint64_t ah = compute_action_hash(action_history, action_len,
+                                       r->use_legacy_mixer);
+    int64_t idx = table_find(&r->table, ah, (uint8_t)player, (uint8_t)street);
+    if (idx < 0) return 0;
+
+    const BPSNodeMeta *m = &r->table.meta[idx];
+    if (m->ev_offset == SIZE_MAX) return 0;
+
+    int nb = m->num_buckets;
+    if (num_buckets_out) *num_buckets_out = nb;
+    if (out_size < nb) return 0;
+
+    const uint32_t *src = r->table.vc_data + m->vc_offset;
+    memcpy(out, src, (size_t)nb * sizeof(uint32_t));
+
+    return nb;
+}
+
 int bps_query_strategy(const BPSReader *r,
                         const int *action_history, int action_len,
                         int player, int street, int bucket,
@@ -1782,7 +1808,7 @@ int bps_hand_to_bucket_river_search(const BPSReader *r,
  *
  * Header (64 bytes):
  *   magic:            "BPSC" (4B)
- *   version:          uint32 (4B) — currently 1
+ *   version:          uint32 (4B) — 1 = strat+ev only, 2 = adds vc_data
  *   use_legacy_mixer: int32 (4B)
  *   postflop_buckets: int32 (4B)
  *   preflop_buckets:  int32 (4B)
@@ -1799,14 +1825,23 @@ int bps_hand_to_bucket_river_search(const BPSReader *r,
  *   occupied[table_size] — uint8 (1B each)
  *   strat_data[strat_data_used] — uint8
  *   ev_data[ev_data_used]       — float32
+ *   vc_data[vc_data_used]       — uint32_t (v2 only; size derived from
+ *                                  meta walk: sum of m->num_buckets over
+ *                                  visited nodes where ev_offset != SIZE_MAX)
  *
  * Writing the full table (including empty slots) makes reload a trivial
  * fread → the hash table is ready to use immediately with no re-hashing.
  * This wastes some disk (empty slots) but makes reload O(1) instead of
  * O(num_nodes) for re-insertion.
+ *
+ * v2 backwards-compat: meta[] is identical on disk between v1 and v2 — the
+ * new vc_offset field reuses 4 bytes that were previously implicit padding.
+ * v1 caches load fine under v2 code (vc_data section absent → vc_data
+ * stays NULL, queries return 0). v2 caches loaded by v1 code would silently
+ * ignore the trailing vc_data bytes (no crash; just no visit counts).
  */
 
-#define BPSC_VERSION 1
+#define BPSC_VERSION 2
 
 int bps_save_cache(const BPSReader *r, const char *path) {
     if (!r || !r->strategies_loaded || !path) return -1;
@@ -1848,6 +1883,11 @@ int bps_save_cache(const BPSReader *r, const char *path) {
     if (t->ev_data && t->ev_data_used > 0) {
         fwrite(t->ev_data, sizeof(float), t->ev_data_used, f);
     }
+    /* v2 vc_data section (per-bucket visit counts, parallel to ev_data
+     * but indexed per bucket not per action; size derivable from meta). */
+    if (t->vc_data && t->vc_data_used > 0) {
+        fwrite(t->vc_data, sizeof(uint32_t), t->vc_data_used, f);
+    }
 
     fclose(f);
 
@@ -1855,11 +1895,12 @@ int bps_save_cache(const BPSReader *r, const char *path) {
     size_t total = 64
         + (size_t)t->table_size * (sizeof(BPSNodeKey) + sizeof(BPSNodeMeta) + 1)
         + t->strat_data_used
-        + t->ev_data_used * sizeof(float);
+        + t->ev_data_used * sizeof(float)
+        + t->vc_data_used * sizeof(uint32_t);
     printf("[bps_reader] Saved cache: %zu MB (%lld nodes, %zu strat bytes, "
-           "%zu ev floats) to %s\n",
+           "%zu ev floats, %zu vc counts) to %s\n",
            total / (1024*1024), (long long)t->num_nodes,
-           t->strat_data_used, t->ev_data_used, path);
+           t->strat_data_used, t->ev_data_used, t->vc_data_used, path);
     fflush(stdout);
 
     return 0;
@@ -1879,9 +1920,9 @@ int bps_load_cache(BPSReader *r, const char *path) {
     }
 
     uint32_t ver;
-    if (fread(&ver, 4, 1, f) != 1 || ver != BPSC_VERSION) {
-        fprintf(stderr, "[bps_reader] Cache version mismatch: got %u, expected %u\n",
-                ver, BPSC_VERSION);
+    if (fread(&ver, 4, 1, f) != 1 || (ver != 1 && ver != 2)) {
+        fprintf(stderr, "[bps_reader] Cache version mismatch: got %u, expected 1 or 2\n",
+                ver);
         fclose(f);
         return -1;
     }
@@ -1974,13 +2015,45 @@ int bps_load_cache(BPSReader *r, const char *path) {
         }
     }
 
+    /* v2 vc_data section. Size derived from meta walk: sum num_buckets over
+     * visited nodes (those with ev_offset != SIZE_MAX). For v1 caches we
+     * skip this and leave vc_data NULL — queries will return 0. */
+    if (ver >= 2 && r->evs_loaded) {
+        size_t vc_data_used = 0;
+        for (int64_t i = 0; i < t->table_size; i++) {
+            if (!t->occupied[i]) continue;
+            if (t->meta[i].ev_offset == SIZE_MAX) continue;
+            vc_data_used += t->meta[i].num_buckets;
+        }
+        if (vc_data_used > 0) {
+            t->vc_data = (uint32_t *)malloc(vc_data_used * sizeof(uint32_t));
+            if (!t->vc_data) {
+                fprintf(stderr, "[bps_reader] OOM allocating VC cache (%zu uint32s)\n",
+                        vc_data_used);
+                /* not fatal — EVs still loaded, vc queries return 0 */
+            } else if (fread(t->vc_data, sizeof(uint32_t), vc_data_used, f)
+                       != vc_data_used) {
+                fprintf(stderr, "[bps_reader] Truncated VC cache (expected %zu uint32s)\n",
+                        vc_data_used);
+                free(t->vc_data);
+                t->vc_data = NULL;
+            } else {
+                t->vc_data_used = vc_data_used;
+                t->vc_data_cap = vc_data_used;
+            }
+        }
+    }
+
     fclose(f);
 
-    printf("[bps_reader] Cache loaded: %lld nodes, %lld ev nodes (%.1f MB total)\n",
+    printf("[bps_reader] Cache loaded: %lld nodes, %lld ev nodes, "
+           "vc_data %s (%.1f MB total, format v%u)\n",
            (long long)num_nodes, (long long)num_ev_nodes,
+           t->vc_data ? "present" : "absent",
            ((size_t)table_size * (sizeof(BPSNodeKey) + sizeof(BPSNodeMeta) + 1)
-            + strat_data_used + ev_data_used * sizeof(float))
-           / (1024.0 * 1024.0));
+            + strat_data_used + ev_data_used * sizeof(float)
+            + t->vc_data_used * sizeof(uint32_t))
+           / (1024.0 * 1024.0), ver);
     fflush(stdout);
 
     return 0;
@@ -2012,6 +2085,7 @@ void bps_reader_free(BPSReader *r) {
     free(t->occupied);   t->occupied = NULL;
     free(t->strat_data); t->strat_data = NULL;
     free(t->ev_data);    t->ev_data = NULL;
+    free(t->vc_data);    t->vc_data = NULL;
     t->table_size = 0;
     t->num_nodes = 0;
     t->num_ev_nodes = 0;
@@ -2019,6 +2093,8 @@ void bps_reader_free(BPSReader *r) {
     t->strat_data_used = 0;
     t->ev_data_cap = 0;
     t->ev_data_used = 0;
+    t->vc_data_cap = 0;
+    t->vc_data_used = 0;
     free(r->textures.bucket_cache);
     r->textures.bucket_cache = NULL;
     r->textures.loaded = 0;
