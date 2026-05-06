@@ -590,6 +590,12 @@ static void info_table_init(BPInfoTable *t, int64_t table_size) {
     t->max_probe_observed = 0;
 }
 
+/* Lazy-shrink event counter (Phase 3 warm-restart artifact). Atomic counter
+ * incremented every time info_table_find_or_create downsizes a slot's
+ * num_actions on first visit. Surfaces as a log line in bp_solve's per-batch
+ * progress so operators can see warm-restart progress. */
+static int64_t g_lazy_shrink_count = 0;
+
 /* Lock-free find-or-create using atomic CAS on the occupied flag.
  *
  * occupied states: 0 = empty, 1 = ready, 2 = being initialized
@@ -663,7 +669,14 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                  * See docs/PHASE3_RETRAIN_STATUS.md. */
                 if (num_actions > 0 &&
                     num_actions < t->sets[idx].num_actions) {
-                    t->sets[idx].num_actions = num_actions;
+                    /* Atomic store with release semantics so concurrent
+                     * readers see the shrink consistently. Plain assignment
+                     * is technically a data race even though the outcome
+                     * (smaller num_actions) is benign. Bug δ from the
+                     * 2026-05-03 audit. */
+                    __atomic_store_n(&t->sets[idx].num_actions, num_actions,
+                                     __ATOMIC_RELEASE);
+                    __atomic_fetch_add(&g_lazy_shrink_count, 1, __ATOMIC_RELAXED);
                 }
                 return idx;
             }
@@ -1566,6 +1579,67 @@ static float traverse(TraversalState *ts, int acting_order_idx,
 
             action_values[a] = traverse(&child, next_order, acting_order, num_in_order);
             node_value += strategy[a] * action_values[a];
+        }
+
+        /* CFV diagnostic instrumentation (BP_LOG_CFV=1).
+         *
+         * Investigating why CFR converged to AA-limps-65% at UTG when GTO
+         * theory + Pluribus's published outcome both say AA should raise
+         * ~95%+. Comparing AA (broken: 37% raise) vs JJ (converged: 96%
+         * raise) at the same UTG-open infoset structure tells us if the
+         * counterfactual values themselves are biased toward call.
+         *
+         * Three hypotheses (advisor's framing):
+         *   H1 — Field response: opponents fold too often to AA's raises,
+         *        so CFV(raise) ≈ small fold-pot win. Look for: action_values
+         *        at raise indices are roughly equal across raise sizes AND
+         *        much smaller than action_values[call].
+         *   H2 — Bucketing: postflop AA-after-raise gets averaged with weaker
+         *        hands. Look for: large variance across visits, raise CFVs
+         *        not consistently smaller than call.
+         *   H3 — Leaf rollouts: terminal value computation undervalues
+         *        AA-after-raise lines. Look for: per-visit raise CFV very
+         *        noisy.
+         *
+         * AA = bucket 0, JJ = bucket 69 in C enumeration (AA, AKs, AKo, ...,
+         * KK at 25, QQ at 48, JJ at 69, TT at 88, 22 at 168). Different from
+         * the JSON's hand_order which is reordered by extract_preflop_json.py.
+         *
+         * Bucket id verified against the comment in
+         * precompute/blueprint_worker_unified.py:80-110.
+         *
+         * Volume: AA-at-UTG-as-traverser ~1 visit per 1000 iters → 10K log
+         * lines per 10M iters per hand. Total ~2 MB log. Manageable.
+         */
+        {
+            static int cfv_log_enabled = -1;
+            if (cfv_log_enabled < 0) {
+                const char *e = getenv("BP_LOG_CFV");
+                cfv_log_enabled = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (cfv_log_enabled && street == 0 && ts->history_len == 0 && ap == 2 &&
+                (bucket == 0 || bucket == 69)) {
+                const char *hand_name = (bucket == 0) ? "AA" : "JJ";
+                fprintf(stderr, "[CFV] iter=%lld %s_UTG node_value=%.1f action_values=[",
+                        (long long)__atomic_load_n(&s->iterations_run, __ATOMIC_RELAXED),
+                        hand_name, node_value);
+                for (int a = 0; a < na; a++) {
+                    fprintf(stderr, "%.1f%s", action_values[a], a < na-1 ? "/" : "");
+                }
+                fprintf(stderr, "] strat=[");
+                for (int a = 0; a < na; a++) {
+                    fprintf(stderr, "%.3f%s", strategy[a], a < na-1 ? "/" : "");
+                }
+                fprintf(stderr, "] regrets=[");
+                for (int a = 0; a < na; a++) {
+                    fprintf(stderr, "%d%s", is->regrets[a], a < na-1 ? "/" : "");
+                }
+                fprintf(stderr, "] explored=[");
+                for (int a = 0; a < na; a++) {
+                    fprintf(stderr, "%d%s", explored[a], a < na-1 ? "/" : "");
+                }
+                fprintf(stderr, "]\n");
+            }
         }
 
         /* Update integer regrets for EXPLORED actions only (Hogwild: no lock).
@@ -3502,12 +3576,39 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                 double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
                 #endif
                 double rate = (batch_end > 0 && elapsed > 0) ? (double)batch_end / elapsed : 0.0;
+                /* Hash-table health stats. Operator-blindness on these is
+                 * what masked the 2026-04-28 OOM event for ~10 hours: 186M
+                 * insertion failures accumulated silently before the next
+                 * checkpoint surfaced the dropped count. Print every batch. */
+                int64_t ht_entries = __atomic_load_n(&s->info_table.num_entries, __ATOMIC_RELAXED);
+                int64_t ht_failures = __atomic_load_n(&s->info_table.insertion_failures, __ATOMIC_RELAXED);
+                int64_t ht_max_probe = __atomic_load_n(&s->info_table.max_probe_observed, __ATOMIC_RELAXED);
+                double load_pct = 100.0 * (double)ht_entries / (double)s->info_table.table_size;
                 printf("[BP] batch %lld/~%lld done at iter %lld (global %lld), "
-                       "%.1fs, %.0f iter/s, info sets: %lld\n",
+                       "%.1fs, %.0f iter/s, info sets: %lld (load %.1f%%, "
+                       "max_probe %lld, insertion_failures %lld)\n",
                        (long long)(batch + 1), (long long)num_batches_estimate,
                        (long long)batch_end, (long long)global_batch_end,
-                       elapsed, rate, (long long)s->info_table.num_entries);
+                       elapsed, rate, (long long)ht_entries, load_pct,
+                       (long long)ht_max_probe, (long long)ht_failures);
+                if (ht_failures > 0) {
+                    fprintf(stderr,
+                            "[BP][WARN] hash insertion_failures=%lld at iter %lld — "
+                            "table at %.1f%% load, max_probe=%lld. Bump --hash-size "
+                            "and restart before more entries are dropped.\n",
+                            (long long)ht_failures, (long long)global_batch_end,
+                            load_pct, (long long)ht_max_probe);
+                }
+                /* Lazy-shrink count: nonzero on Phase 3 warm-restarts where
+                 * legacy (allin-included) slots are being downsized to the
+                 * current (no-explicit-allin) action set on first visit. */
+                int64_t lazy_shrinks = __atomic_load_n(&g_lazy_shrink_count, __ATOMIC_RELAXED);
+                if (lazy_shrinks > 0) {
+                    printf("[BP] lazy_shrink_count=%lld (cumulative)\n",
+                           (long long)lazy_shrinks);
+                }
                 fflush(stdout);
+                fflush(stderr);
 
                 /* Decide whether to discount this batch */
                 if (global_batch_end <= s->config.discount_stop_iter &&
@@ -3800,6 +3901,20 @@ static int64_t load_regrets_serial(BPSolver *s, FILE *f,
     int64_t loaded = 0;
     int64_t merged = 0;
 
+    /* BP_RESET_STRATEGY_SUM=1: load regrets normally, but DROP the
+     * strategy_sum portion of every entry. Use case: recover from a
+     * corrupted average (e.g. the iter-2.8B hash-resize info-set loss
+     * documented in PHASE3_RETRAIN_STATUS / Phase B diagnostic). The
+     * regret state is preserved (fresh σ matches the converged regrets);
+     * only the time-averaged σ̄ is reset to zero so subsequent training
+     * rebuilds the average uniformly across all slots. */
+    const char *reset_env = getenv("BP_RESET_STRATEGY_SUM");
+    int reset_ss = (reset_env && reset_env[0] == '1');
+    if (reset_ss) {
+        printf("[BP] BP_RESET_STRATEGY_SUM=1: dropping strategy_sum from all entries\n");
+        fflush(stdout);
+    }
+
     int tmp_regrets[BP_MAX_ACTIONS];
     float tmp_ss[BP_MAX_ACTIONS];
 
@@ -3851,15 +3966,21 @@ static int64_t load_regrets_serial(BPSolver *s, FILE *f,
         int has_ss;
         fread(&has_ss, sizeof(int), 1, f);
         if (has_ss) {
-            if (!is->strategy_sum) {
-                is->strategy_sum = (float*)arena_alloc(na);
-            }
-            if (is->strategy_sum) {
-                fread(tmp_ss, sizeof(float), na, f);
-                for (int a = 0; a < na; a++)
-                    is->strategy_sum[a] += tmp_ss[a];
-            } else {
+            if (reset_ss) {
+                /* Skip the strategy_sum bytes; leave is->strategy_sum NULL
+                 * so first traversal lazy-allocates it to zero. */
                 fseek(f, na * sizeof(float), SEEK_CUR);
+            } else {
+                if (!is->strategy_sum) {
+                    is->strategy_sum = (float*)arena_alloc(na);
+                }
+                if (is->strategy_sum) {
+                    fread(tmp_ss, sizeof(float), na, f);
+                    for (int a = 0; a < na; a++)
+                        is->strategy_sum[a] += tmp_ss[a];
+                } else {
+                    fseek(f, na * sizeof(float), SEEK_CUR);
+                }
             }
         }
 
@@ -3986,6 +4107,18 @@ static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
         return -2;  /* caller will retry with serial */
     }
     printf("[BP] mmap: %zu bytes\n", mfile.size); fflush(stdout);
+
+    /* BP_RESET_STRATEGY_SUM=1: see serial loader for full rationale.
+     * Skip strategy_sum allocation/load on every entry; leave NULL for
+     * lazy-allocate-to-zero on first traversal. Pass 1 byte-walk still
+     * advances past the strategy_sum bytes (file layout is unchanged);
+     * only Pass 2's per-thread merge skips the read+atomic-add. */
+    const char *reset_env = getenv("BP_RESET_STRATEGY_SUM");
+    int reset_ss = (reset_env && reset_env[0] == '1');
+    if (reset_ss) {
+        printf("[BP] BP_RESET_STRATEGY_SUM=1: dropping strategy_sum from all entries\n");
+        fflush(stdout);
+    }
 
     /* Data starts just past the 28-byte BPR4 header (magic 4 + table_size 8 +
      * num_entries 8 + iterations 8). */
@@ -4160,7 +4293,7 @@ static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
             size_t has_ss_off = ep + 32 + (size_t)(4 * na);
             int has_ss;
             memcpy(&has_ss, base + has_ss_off, sizeof(int));
-            if (has_ss) {
+            if (has_ss && !reset_ss) {
                 /* Lazy strategy_sum allocation. Same CAS pattern as
                  * ensure_strategy_sum but inlined here to avoid the extra
                  * function call in the hot path. */

@@ -193,6 +193,19 @@ def load_bp_dll(build_dir):
             bp.bp_get_strategy.restype = ctypes.c_int
             bp.bp_num_info_sets.restype = ctypes.c_int64
             bp.bp_num_info_sets.argtypes = [ctypes.c_void_p]
+            # Hash-table health stats. All four out-pointers may be NULL.
+            # Without these in checkpoint_meta.json the 2026-04-28 OOM event
+            # was invisible until the next checkpoint surfaced the dropped
+            # info-set count — by then 186M entries had been lost.
+            if hasattr(bp, "bp_get_table_stats"):
+                bp.bp_get_table_stats.restype = None
+                bp.bp_get_table_stats.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int64),
+                    ctypes.POINTER(ctypes.c_int64),
+                    ctypes.POINTER(ctypes.c_int64),
+                    ctypes.POINTER(ctypes.c_int64),
+                ]
             bp.bp_export_strategies.restype = ctypes.c_int
             bp.bp_export_strategies.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
@@ -441,6 +454,36 @@ def main():
         if ret.returncode == 0 and os.path.exists(regret_local):
             n_loaded = bp_lib.bp_load_regrets(
                 solver, regret_local.encode('utf-8'))
+
+            # Post-load load-factor sanity check. The 2026-04-28 incident:
+            # checkpoint had 1.528B entries, was loaded into a 2B-slot table
+            # at near-saturation, OOM cascade dropped 186M entries silently.
+            # Refuse to proceed if the loaded count brings load factor above
+            # 0.85 — operator must bump --hash-size first.
+            if n_loaded > 0 and hasattr(bp_lib, "bp_get_table_stats"):
+                _e = ctypes.c_int64(0); _s = ctypes.c_int64(0)
+                _f = ctypes.c_int64(0); _p = ctypes.c_int64(0)
+                bp_lib.bp_get_table_stats(
+                    solver,
+                    ctypes.byref(_e), ctypes.byref(_s),
+                    ctypes.byref(_f), ctypes.byref(_p),
+                )
+                lf = (_e.value / _s.value) if _s.value > 0 else 0.0
+                print(f"[BP] post-load: entries={_e.value:,} table_size={_s.value:,} "
+                      f"load={lf*100:.1f}% max_probe={_p.value} "
+                      f"insertion_failures={_f.value}", flush=True)
+                if _f.value > 0:
+                    print(f"[BP][FATAL] {_f.value} insertion failures during load — "
+                          f"checkpoint partially dropped. Bump --hash-size and retry.",
+                          flush=True)
+                    sys.exit(2)
+                if lf > 0.85:
+                    print(f"[BP][FATAL] load factor {lf*100:.1f}% exceeds 0.85 "
+                          f"safety bound. Risk of probe-cap exhaustion during "
+                          f"training. Bump --hash-size to at least "
+                          f"{int(_e.value / 0.50):,} and retry.", flush=True)
+                    sys.exit(2)
+
             if n_loaded > 0 and args.no_explicit_allin:
                 # Phase 3 lazy-shrink: when --no-explicit-allin is set, the
                 # next find_or_create call for each infoset will shrink the
@@ -1191,6 +1234,20 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
             f"GB available) before next checkpoint.")
     os.replace(regret_tmp, regret_path)
 
+    # Hash-table health stats (None if older C lib lacks bp_get_table_stats)
+    ht_entries = ctypes.c_int64(0)
+    ht_table_size = ctypes.c_int64(0)
+    ht_failures = ctypes.c_int64(0)
+    ht_max_probe = ctypes.c_int64(0)
+    if hasattr(bp_lib, "bp_get_table_stats"):
+        bp_lib.bp_get_table_stats(
+            solver,
+            ctypes.byref(ht_entries),
+            ctypes.byref(ht_table_size),
+            ctypes.byref(ht_failures),
+            ctypes.byref(ht_max_probe),
+        )
+
     # Save checkpoint metadata — atomic write
     meta = {
         "type": "unified_blueprint",
@@ -1212,6 +1269,14 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
             add_explicit_allin=(0 if args.no_explicit_allin else 1)),
         "add_explicit_allin": (0 if args.no_explicit_allin else 1),
         "hash_mixer": "splitmix64",
+        # Hash-table health (added 2026-05-03 after the 3.05B silent-drop
+        # forensic). load_factor > 0.85 or insertion_failures > 0 is a
+        # ship-stopper for any subsequent training run.
+        "hash_table_size": ht_table_size.value,
+        "hash_load_factor": (ht_entries.value / ht_table_size.value
+                              if ht_table_size.value > 0 else 0.0),
+        "hash_insertion_failures": ht_failures.value,
+        "hash_max_probe_observed": ht_max_probe.value,
         "dcfr": {
             "alpha": os.environ.get("BPS_DCFR_ALPHA", ""),
             "beta": os.environ.get("BPS_DCFR_BETA", ""),
