@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve
+.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve subgame_preflop
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -33,6 +33,33 @@ $(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR
 # ── Street solver v2 (GPU re-solve support library) ──
 $(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
+
+# ── Preflop subgame CFR (CPU, OpenMP-parallel over hero buckets) ──
+# Pure CFR core: takes a flat tree + reaches + leaf values, returns σ̄.
+# No bps_reader / blueprint dependency; orchestration lives Python-side.
+# Uses -O3 -march=native to enable autovectorization of the inner bucket loops.
+subgame_preflop: $(BUILD_DIR)/subgame_preflop$(SHLIB_EXT)
+
+# OpenMP availability: gcc supports it directly; Apple clang needs
+# Homebrew libomp + explicit flags. Set OMP_FLAGS / OMP_LIBS in a
+# Mac-friendly way; falls back to no-OpenMP if neither is available.
+# Detection: if 'gcc' isn't actually clang we can use -fopenmp; else
+# try -Xpreprocessor -fopenmp -lomp via Homebrew.
+ifeq ($(shell $(CC) --version 2>&1 | grep -c clang),0)
+  SUBGAME_OMP_FLAGS = -fopenmp
+  SUBGAME_OMP_LIBS =
+else ifneq ($(wildcard /opt/homebrew/include/omp.h),)
+  SUBGAME_OMP_FLAGS = -Xpreprocessor -fopenmp -I/opt/homebrew/include
+  SUBGAME_OMP_LIBS = -L/opt/homebrew/lib -lomp
+else
+  SUBGAME_OMP_FLAGS =
+  SUBGAME_OMP_LIBS =
+endif
+
+$(BUILD_DIR)/subgame_preflop$(SHLIB_EXT): $(SRC_DIR)/subgame_preflop.c $(SRC_DIR)/subgame_preflop.h $(SRC_DIR)/bps_reader.h | $(BUILD_DIR)
+	$(CC) -O3 -march=native -Wall -Wextra -Wno-unused-parameter \
+	    $(SHLIB_FLAGS) $(SUBGAME_OMP_FLAGS) -I$(SRC_DIR) \
+	    $(SRC_DIR)/subgame_preflop.c -o $@ $(LDFLAGS) $(SUBGAME_OMP_LIBS)
 
 # ── Street solver v1 (legacy, for Python bindings compatibility) ──
 $(BUILD_DIR)/solver$(SHLIB_EXT): $(SRC_DIR)/solver.c $(SRC_DIR)/solver.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
