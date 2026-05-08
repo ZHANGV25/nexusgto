@@ -119,6 +119,11 @@ BPS_EXPORT int32_t rollout_leaf_info_sizeof(void) {
 typedef struct {
     uint64_t blueprint_miss_count;
     uint64_t zerosum_count;
+    uint64_t bucket_miss_count;
+     * Index by street: 0=preflop, 1=flop, 2=turn, 3=river. Distinguishes
+     * action_history hash failure (high miss on every street) from
+     * blueprint coverage sparseness (miss skewed to street≥1). */
+    uint64_t blueprint_miss_by_street[4];
 } RolloutObservability;
 
 #if defined(_MSC_VER)
@@ -130,6 +135,8 @@ static _Thread_local RolloutObservability g_rollout_obs;
 BPS_EXPORT void rollout_reset_observability(void) {
     g_rollout_obs.blueprint_miss_count = 0;
     g_rollout_obs.zerosum_count = 0;
+    g_rollout_obs.bucket_miss_count = 0;
+    for (int i = 0; i < 4; i++) g_rollout_obs.blueprint_miss_by_street[i] = 0;
 }
 
 BPS_EXPORT void rollout_get_observability(
@@ -137,6 +144,61 @@ BPS_EXPORT void rollout_get_observability(
 ) {
     if (out_miss)    *out_miss    = g_rollout_obs.blueprint_miss_count;
     if (out_zerosum) *out_zerosum = g_rollout_obs.zerosum_count;
+}
+
+BPS_EXPORT void rollout_get_bucket_miss_count(uint64_t *out_bucket_miss) {
+    if (out_bucket_miss) *out_bucket_miss = g_rollout_obs.bucket_miss_count;
+}
+
+ * into out[4] (street: 0=preflop, 1=flop, 2=turn, 3=river). */
+BPS_EXPORT void rollout_get_per_street_miss_counts(uint64_t out[4]) {
+    if (!out) return;
+    for (int i = 0; i < 4; i++) out[i] = g_rollout_obs.blueprint_miss_by_street[i];
+}
+
+/* Add to the per-thread observability counters. Used by the Python
+ * orchestration to fold worker-process counter totals back into the
+ * parent thread's view after a multiprocessing.Pool fan-out — workers
+ * each have their own thread-local copy, and the parent's view would
+ * otherwise stay at zero despite real misses. */
+BPS_EXPORT void rollout_add_observability(
+    uint64_t add_miss, uint64_t add_zerosum, uint64_t add_bucket_miss
+) {
+    g_rollout_obs.blueprint_miss_count += add_miss;
+    g_rollout_obs.zerosum_count        += add_zerosum;
+    g_rollout_obs.bucket_miss_count    += add_bucket_miss;
+}
+
+BPS_EXPORT void rollout_add_per_street_miss_counts(const uint64_t add[4]) {
+    if (!add) return;
+    for (int i = 0; i < 4; i++) g_rollout_obs.blueprint_miss_by_street[i] += add[i];
+}
+
+/* ── Tolerate-bucket-miss gate ───────────────────────────────────────── */
+
+/* -1 = uninitialized (lazy env read on first hot-path use); 0 = off; 1 = on.
+ * Process-wide (NOT thread-local): the toggle is a configuration choice
+ * for the whole rollout campaign, not a per-thread setting. The lazy-read
+ * race is benign — concurrent first-callers all observe the same env
+ * value and write the same int. */
+static int g_rollout_tolerate_bucket_miss = -1;
+
+static int rollout_should_tolerate_bucket_miss(void) {
+    int v = g_rollout_tolerate_bucket_miss;
+    if (v < 0) {
+        const char *e = getenv("ROLLOUT_TOLERATE_BUCKET_MISS");
+        v = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T')) ? 1 : 0;
+        g_rollout_tolerate_bucket_miss = v;
+    }
+    return v;
+}
+
+BPS_EXPORT void rollout_set_tolerate_bucket_miss(int enabled) {
+    g_rollout_tolerate_bucket_miss = enabled ? 1 : 0;
+}
+
+BPS_EXPORT int rollout_get_tolerate_bucket_miss(void) {
+    return rollout_should_tolerate_bucket_miss();
 }
 
 /* ── apply_bias ──────────────────────────────────────────────────────── */
@@ -211,14 +273,41 @@ BPS_EXPORT void rollout_apply_bias_c(
 
 /* ── classify_postflop_actions ───────────────────────────────────────── */
 
+/* Read once: whether to append an explicit all-in slot to postflop action
+ * sets. MUST match the training-time generate_actions() add_explicit_allin
+ * gate — otherwise the rollout's action-history indices contain a value the
+ * trainer never used at that position, and every subsequent blueprint query
+ * misses (cascading miss). phase3 trained with add_explicit_allin=0, so the
+ * default here is 0 too. Override via env BPS_ROLLOUT_ADD_EXPLICIT_ALLIN=1
+ * if you load a blueprint that WAS trained with the gate on. */
+static int g_rollout_add_explicit_allin = -1;
+
+static int rollout_should_add_explicit_allin(void) {
+    int v = __atomic_load_n(&g_rollout_add_explicit_allin, __ATOMIC_RELAXED);
+    if (v >= 0) return v;
+    const char *e = getenv("BPS_ROLLOUT_ADD_EXPLICIT_ALLIN");
+    int parsed = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' ||
+                        e[0] == 'y' || e[0] == 'Y' || e[0] == 'o' || e[0] == 'O'))
+                  ? 1 : 0;
+    __atomic_store_n(&g_rollout_add_explicit_allin, parsed, __ATOMIC_RELAXED);
+    return parsed;
+}
+
 /* Matches python/rollout.py::classify_postflop_actions.
  *
- * Returns the number of actions. Layout:
+ * Returns the number of actions. Layout (depending on
+ * BPS_ROLLOUT_ADD_EXPLICIT_ALLIN; phase3 default is OFF):
  *   tree-closed + facing_bet: [fold, call]
  *   tree-closed + !facing_bet: [check]
- *   open + facing_bet (first raise): [fold, call, raise×0.5, raise×1.0, allin]
- *   open + facing_bet (subsequent): [fold, call, raise×1.0, allin]
- *   open + !facing_bet:              [check, bet×0.5, bet×1.0, allin]
+ *   open + facing_bet (first raise):
+ *     allin off (default): [fold, call, raise×0.5, raise×1.0]
+ *     allin on:            [fold, call, raise×0.5, raise×1.0, allin]
+ *   open + facing_bet (subsequent):
+ *     allin off (default): [fold, call, raise×1.0]
+ *     allin on:            [fold, call, raise×1.0, allin]
+ *   open + !facing_bet:
+ *     allin off (default): [check, bet×0.5, bet×1.0]
+ *     allin on:            [check, bet×0.5, bet×1.0, allin]
  */
 BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
     int32_t facing_bet, int32_t raises_so_far,
@@ -226,6 +315,7 @@ BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
 ) {
     int32_t n = 0;
     int32_t tree_closed = (raises_so_far >= ROLLOUT_POSTFLOP_MAX_RAISES);
+    int32_t add_allin = rollout_should_add_explicit_allin();
 
     if (tree_closed) {
         if (facing_bet) {
@@ -243,27 +333,27 @@ BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
     if (facing_bet) {
         int32_t n_raises = (raises_so_far > 0) ? ROLLOUT_SUBSEQUENT_RAISE_N
                                                : ROLLOUT_FIRST_RAISE_N;
-        /* [fold, call, raise×…, allin] */
-        n = 2 + n_raises + 1;
+        /* [fold, call, raise×…, (allin)?] */
+        n = 2 + n_raises + (add_allin ? 1 : 0);
         if (cap >= n && out_cats) {
             out_cats[0] = ROLLOUT_CAT_FOLD;
             out_cats[1] = ROLLOUT_CAT_CALL;
             for (int32_t i = 0; i < n_raises; i++) {
                 out_cats[2 + i] = ROLLOUT_CAT_RAISE;
             }
-            out_cats[n - 1] = ROLLOUT_CAT_RAISE;  /* allin */
+            if (add_allin) out_cats[n - 1] = ROLLOUT_CAT_RAISE;  /* allin */
         }
         return n;
     }
 
-    /* not facing bet: [check, bet×0.5, bet×1.0, allin] */
-    n = 1 + ROLLOUT_FIRST_RAISE_N + 1;
+    /* not facing bet: [check, bet×0.5, bet×1.0, (allin)?] */
+    n = 1 + ROLLOUT_FIRST_RAISE_N + (add_allin ? 1 : 0);
     if (cap >= n && out_cats) {
         out_cats[0] = ROLLOUT_CAT_CALL;  /* check */
         for (int32_t i = 0; i < ROLLOUT_FIRST_RAISE_N; i++) {
             out_cats[1 + i] = ROLLOUT_CAT_RAISE;
         }
-        out_cats[n - 1] = ROLLOUT_CAT_RAISE;  /* allin */
+        if (add_allin) out_cats[n - 1] = ROLLOUT_CAT_RAISE;  /* allin */
     }
     return n;
 }
@@ -282,6 +372,7 @@ BPS_EXPORT void rollout_action_amount_chips_c(
     int32_t cats_n = rollout_classify_postflop_actions_c(
         facing_bet, raises_so_far, NULL, 0);
     int32_t tree_closed = (raises_so_far >= ROLLOUT_POSTFLOP_MAX_RAISES);
+    int32_t add_allin = rollout_should_add_explicit_allin();
 
     if (action_idx < 0 || action_idx >= cats_n) {
         /* Python raises ValueError; we return a conservative check. */
@@ -308,7 +399,7 @@ BPS_EXPORT void rollout_action_amount_chips_c(
             if (out_amount) *out_amount = a;
             return;
         }
-        if (action_idx == cats_n - 1) {
+        if (add_allin && action_idx == cats_n - 1) {
             if (out_kind)   *out_kind   = ROLLOUT_KIND_ALLIN;
             if (out_amount) *out_amount = stack;
             return;
@@ -349,7 +440,7 @@ BPS_EXPORT void rollout_action_amount_chips_c(
         if (out_amount) *out_amount = 0;
         return;
     }
-    if (action_idx == cats_n - 1) {
+    if (add_allin && action_idx == cats_n - 1) {
         if (out_kind)   *out_kind   = ROLLOUT_KIND_ALLIN;
         if (out_amount) *out_amount = stack;
         return;
@@ -641,19 +732,40 @@ static int rollout_simulate_one(
             } else {
                 bucket = -1;
             }
+            int32_t bucket_miss = 0;
             if (bucket < 0) {
-                char board_desc[64] = {0};
-                int off = 0;
-                for (int32_t bi = 0; bi < n_board && off < 60; bi++) {
-                    off += snprintf(board_desc + off, 64 - off,
-                                    "%d%s", board[bi], bi + 1 < n_board ? "," : "");
+                if (rollout_should_tolerate_bucket_miss()) {
+                    /* Coverage gap in the texture/bucket precompute
+                     * (e.g. paired-flushdraw flop textures missing from
+                     * texture_cache.bin: the precompute enumeration in
+                     * mccfr_blueprint.c emits only one of two variants
+                     * when r0==r1 or r1==r2). The .bps has no
+                     * strategies for these textures either, so the
+                     * principled response is the same as for any
+                     * coverage gap: Pluribus Alg.1 supplementary
+                     * uniform-on-legal-actions. We jump straight to
+                     * that branch by skipping the strategy lookup;
+                     * calling ca_assign_buckets_kmeans inline is not
+                     * an option (batch precompute, ~hundreds of ms
+                     * per board, and the bucket numbers it produces
+                     * index into other textures' trained buckets —
+                     * functionally arbitrary). */
+                    g_rollout_obs.bucket_miss_count++;
+                    bucket_miss = 1;
+                } else {
+                    char board_desc[64] = {0};
+                    int off = 0;
+                    for (int32_t bi = 0; bi < n_board && off < 60; bi++) {
+                        off += snprintf(board_desc + off, 64 - off,
+                                        "%d%s", board[bi], bi + 1 < n_board ? "," : "");
+                    }
+                    rollout_set_error(street, num_players,
+                        "hand_to_bucket returned %d for (%d,%d) on %d-card board "
+                        "[%s] (street=%d, player=%d); turn centroids loaded=%d",
+                        bucket, c0, c1, n_board, board_desc, street, p,
+                        r->turn_centroids_k);
+                    return -1;
                 }
-                rollout_set_error(street, num_players,
-                    "hand_to_bucket returned %d for (%d,%d) on %d-card board "
-                    "[%s] (street=%d, player=%d); turn centroids loaded=%d",
-                    bucket, c0, c1, n_board, board_desc, street, p,
-                    r->turn_centroids_k);
-                return -1;
             }
 
             int32_t facing_bet = (current_bet > street_bets[p]);
@@ -664,20 +776,33 @@ static int rollout_simulate_one(
                 ROLLOUT_MAX_ACTIONS_PER_NODE);
 
             /* Blueprint lookup — full seat for the blueprint's
-             * seat-indexed storage. */
+             * seat-indexed storage. Skipped on bucket_miss (no valid
+             * key to query); falls through to the same uniform fallback
+             * as a strategy miss. */
             int32_t full_seat = player_seats[p];
             float strat_full[BPS_MAX_ACTIONS];
-            int bp_na = rollout_lookup_strategy(
-                r, game_history, gah_len,
-                full_seat, bucket, street,
-                strat_full, BPS_MAX_ACTIONS);
+            int bp_na = 0;
+            if (!bucket_miss) {
+                bp_na = rollout_lookup_strategy(
+                    r, game_history, gah_len,
+                    full_seat, bucket, street,
+                    strat_full, BPS_MAX_ACTIONS);
+            }
             if (bp_na <= 0) {
                 /* Pluribus Algorithm 1 supplementary: σ̄ unavailable →
                  * uniform over the rollout tree's legal action set. The
                  * counter is exposed via rollout_get_observability so the
                  * substitution remains visible to callers (e.g., API
-                 * logs an alert if miss-rate exceeds a threshold). */
-                g_rollout_obs.blueprint_miss_count++;
+                 * logs an alert if miss-rate exceeds a threshold).
+                 * Bucket-miss cases already bumped bucket_miss_count
+                 * upstream; don't double-count them here. */
+                if (!bucket_miss) {
+                    g_rollout_obs.blueprint_miss_count++;
+                     * action_history hash mismatch (high miss everywhere) from
+                     * sparse coverage (miss skewed to deeper streets). */
+                    int32_t st = (street >= 0 && street < 4) ? street : 0;
+                    g_rollout_obs.blueprint_miss_by_street[st]++;
+                }
                 bp_na = n_actions;
                 float u = 1.0f / (float)n_actions;
                 for (int32_t i = 0; i < n_actions; i++) strat_full[i] = u;

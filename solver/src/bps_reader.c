@@ -1467,6 +1467,32 @@ int bps_hand_to_bucket_river(const BPSReader *r,
         if (board[i] == c0 || board[i] == c1) return -1;
     }
 
+    /* OCHS path (matches mccfr_blueprint.c:97-114 training-time bucketer).
+     * Required for phase3.bps and any blueprint trained with BPS_RIVER_OCHS=1.
+     * Pre-init: ochs_river_enabled=0, falls through to legacy EHS percentile. */
+    if (r->ochs_river_enabled && r->ochs_river_centroids_k > 0 &&
+        r->ochs_num_clusters > 0 && r->ochs_river_centroids != NULL) {
+        int hand[1][2] = {{ c0, c1 }};
+        /* Cap on opponent clusters; 16 is comfortably above Pluribus-default 8
+         * and keeps the feature buffer stack-resident. */
+        float feat[16];
+        int kc = r->ochs_num_clusters;
+        if (kc > 16) kc = 16;
+        int rc = ca_river_ochs_features(board, 5, (const int(*)[2])hand, 1,
+                                         r->ochs_cluster_of_169,
+                                         kc, feat);
+        if (rc == 0) {
+            return ca_nearest_centroid_nd(feat, kc,
+                                           r->ochs_river_centroids,
+                                           r->ochs_river_centroids_k);
+        }
+        /* fall through to legacy on feature failure (very rare) */
+    }
+
+    /* Legacy 200-sample EHS percentile path — for v1/v2 blueprints trained
+     * without OCHS (or as fallback if OCHS init failed). MUST match
+     * mccfr_blueprint.c:117-138 byte-for-byte. */
+
     /* Build available deck (52 minus board minus hero hand). */
     int blk[52] = {0};
     for (int b = 0; b < 5; b++) blk[board[b]] = 1;
@@ -1501,6 +1527,126 @@ int bps_hand_to_bucket_river(const BPSReader *r,
     if (bucket < 0) bucket = 0;
     if (bucket >= k) bucket = k - 1;
     return bucket;
+}
+
+int bps_init_ochs_river(BPSReader *r, int num_clusters) {
+    /* Mirrors mccfr_blueprint.c:2964-3120 training-time OCHS init. Single-
+     * threaded, deterministic xorshift seed 0x12345678DEADBEEF, 200 sampled
+     * river boards × 300 hands subsample, k-means to postflop_num_buckets
+     * (typically 200) centroids in 8-d (or num_clusters-d) space. ~1-2s. */
+    if (!r) return -1;
+    if (r->ochs_river_centroids) {
+        free(r->ochs_river_centroids);
+        r->ochs_river_centroids = NULL;
+    }
+    r->ochs_river_centroids_k = 0;
+    r->ochs_river_enabled = 0;
+
+    int kc = num_clusters > 0 ? num_clusters : CA_OCHS_DEFAULT_CLUSTERS;
+    if (kc > 16) kc = 16;  /* matches feat[16] cap in lookup path */
+
+    int target_buckets = r->num_postflop_buckets > 0 ? r->num_postflop_buckets : 200;
+
+    /* Step 1: 169 → kc OCHS cluster map. Deterministic. */
+    int actual_clusters = ca_compute_ochs_clusters(kc, 2000, r->ochs_cluster_of_169);
+    if (actual_clusters <= 0) {
+        fprintf(stderr, "[bps_reader] OCHS init: ca_compute_ochs_clusters failed\n");
+        return -1;
+    }
+    r->ochs_num_clusters = kc;
+
+    /* Step 2: k-cluster river centroids by sampling 200 boards × 300 hands.
+     * MUST match mccfr_blueprint.c:3041-3120 exactly (seed, sample sizes, etc.) */
+    int n_boards = 200;
+    int max_feat = n_boards * 300;
+    float *all_feat = (float*)malloc((size_t)max_feat * kc * sizeof(float));
+    if (!all_feat) {
+        fprintf(stderr, "[bps_reader] OCHS init: alloc failed\n");
+        return -1;
+    }
+    int n_feat = 0;
+
+    uint64_t brng = 0x12345678DEADBEEFULL;
+    int (*hands_buf)[2] = (int(*)[2])malloc((size_t)BPS_MAX_HANDS * 2 * sizeof(int));
+    if (!hands_buf) { free(all_feat); return -1; }
+
+    for (int bi = 0; bi < n_boards && n_feat < max_feat - 300; bi++) {
+        int deck[52];
+        for (int c = 0; c < 52; c++) deck[c] = c;
+        for (int i = 0; i < 5; i++) {
+            int j = i + (int)(bpr_rng_next(&brng) % (uint64_t)(52 - i));
+            int tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+        }
+        int board[5] = {deck[0], deck[1], deck[2], deck[3], deck[4]};
+
+        int nh = ca_generate_hands(board, 5, hands_buf);
+        int batch = (nh > 300) ? 300 : nh;
+        float *feats = (float*)malloc((size_t)batch * kc * sizeof(float));
+        if (!feats) continue;
+        int rc = ca_river_ochs_features(board, 5,
+                                         (const int(*)[2])hands_buf, batch,
+                                         r->ochs_cluster_of_169,
+                                         kc, feats);
+        if (rc == 0) {
+            int copy_n = batch;
+            if (n_feat + copy_n > max_feat) copy_n = max_feat - n_feat;
+            memcpy(all_feat + (size_t)n_feat * kc, feats,
+                   (size_t)copy_n * kc * sizeof(float));
+            n_feat += copy_n;
+        }
+        free(feats);
+    }
+    free(hands_buf);
+
+    if (n_feat <= 0) {
+        free(all_feat);
+        fprintf(stderr, "[bps_reader] OCHS init: no features collected\n");
+        return -1;
+    }
+
+    int *labels = (int*)malloc((size_t)n_feat * sizeof(int));
+    if (!labels) { free(all_feat); return -1; }
+    int actual = ca_assign_buckets_kmeans_nd(all_feat, n_feat, kc,
+                                              target_buckets, 20, labels);
+    (void)actual;
+
+    int *counts = (int*)calloc(target_buckets, sizeof(int));
+    float *sums = (float*)calloc((size_t)target_buckets * kc, sizeof(float));
+    if (!counts || !sums) {
+        free(labels); free(all_feat);
+        if (counts) free(counts); if (sums) free(sums);
+        return -1;
+    }
+    for (int f = 0; f < n_feat; f++) {
+        int b = labels[f];
+        counts[b]++;
+        for (int d = 0; d < kc; d++)
+            sums[(size_t)b * kc + d] += all_feat[(size_t)f * kc + d];
+    }
+
+    float *centroids = (float*)malloc((size_t)target_buckets * kc * sizeof(float));
+    if (!centroids) {
+        free(labels); free(counts); free(sums); free(all_feat);
+        return -1;
+    }
+    int kept = 0;
+    for (int b = 0; b < target_buckets; b++) {
+        if (counts[b] == 0) continue;
+        for (int d = 0; d < kc; d++)
+            centroids[(size_t)kept * kc + d] = sums[(size_t)b * kc + d] / counts[b];
+        kept++;
+    }
+
+    free(labels); free(counts); free(sums); free(all_feat);
+
+    r->ochs_river_centroids = centroids;
+    r->ochs_river_centroids_k = kept;
+    r->ochs_river_enabled = 1;
+
+    fprintf(stderr, "[bps_reader] OCHS river bucketing initialized: "
+            "%d clusters from %d samples (%d-d)\n",
+            kept, n_feat, kc);
+    return 0;
 }
 
 /* ── PA-EMD integration ─────────────────────────────────────────────── */
@@ -2118,6 +2264,13 @@ void bps_reader_free(BPSReader *r) {
     r->op1_num_textures = 0;
     r->op1_k = 0;
     r->op1_n_bins = 0;
+    if (r->ochs_river_centroids) {
+        free(r->ochs_river_centroids);
+        r->ochs_river_centroids = NULL;
+    }
+    r->ochs_river_centroids_k = 0;
+    r->ochs_river_enabled = 0;
+    r->ochs_num_clusters = 0;
     r->strategies_loaded = 0;
     r->evs_loaded = 0;
 }

@@ -140,5 +140,14 @@ $(BUILD_DIR)/test_pa_emd: tests/test_pa_emd.c $(SRC_DIR)/card_abstraction.c $(SR
 test_pa_emd: $(BUILD_DIR)/test_pa_emd
 	./$(BUILD_DIR)/test_pa_emd
 
+# ── BPS OCHS river bucketer regression test ──
+# Pins the Phase B fix: bps_init_ochs_river + bps_hand_to_bucket_river
+# routing through the OCHS path on representative river fixtures.
+$(BUILD_DIR)/test_bps_ochs_river: tests/test_bps_ochs_river.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_bps_ochs_river.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+
+test_bps_ochs_river: $(BUILD_DIR)/test_bps_ochs_river
+	./$(BUILD_DIR)/test_bps_ochs_river
+
 clean:
 	rm -rf $(BUILD_DIR)

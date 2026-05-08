@@ -300,6 +300,12 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         ]
         lib.bps_hand_to_bucket_river.restype = ctypes.c_int
 
+    if hasattr(lib, "bps_init_ochs_river"):
+        lib.bps_init_ochs_river.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+        ]
+        lib.bps_init_ochs_river.restype = ctypes.c_int
+
     lib.bps_reader_stats.argtypes = [
         ctypes.c_void_p,
         c_int64_p, c_int64_p, c_int64_p, c_int64_p,
@@ -735,6 +741,12 @@ class BPSReaderC:
         # centroids file exists anywhere.
         self._load_turn_centroids_auto(bps_path)
 
+        # Auto-init OCHS river bucketer so hand_to_bucket_river uses the
+        # same algorithm training did. Without this, runtime hashes to
+        # the wrong river bucket id and the rollout misses the blueprint.
+        # See PLAN.md §3 — Phase B fix.
+        self._init_ochs_river_auto()
+
     def _load_turn_centroids_auto(self, bps_path: str) -> None:
         """Auto-load TCN1 turn centroids from standard locations.
 
@@ -812,6 +824,47 @@ class BPSReaderC:
                 flush=True,
             )
 
+    def _init_ochs_river_auto(self) -> None:
+        """Auto-initialize OCHS river bucketing.
+
+        phase3 trained with BPS_RIVER_OCHS=1 (8-cluster OCHS k-means);
+        without this init the river bucketer falls back to 200-sample
+        EHS percentile, which produces different bucket ids than training
+        and causes ~99% blueprint_miss in the rollout (see PLAN.md §3).
+
+        Skipped silently when:
+          - the C symbol isn't present (older bps_reader.so build) — caller
+            should rebuild from src, but the legacy path keeps working.
+          - BPS_RIVER_OCHS=0 in the env (opt-out for v1/v2 blueprints).
+        """
+        if not hasattr(self._lib, "bps_init_ochs_river"):
+            print(
+                "[BPSReaderC] WARNING: bps_init_ochs_river not in this build "
+                "of bps_reader.so; rebuild to pick up the OCHS river fix.",
+                flush=True,
+            )
+            return
+        if os.environ.get("BPS_RIVER_OCHS", "1") == "0":
+            print(
+                "[BPSReaderC] BPS_RIVER_OCHS=0 in env, leaving river bucketer "
+                "on legacy EHS percentile path.",
+                flush=True,
+            )
+            return
+        kc = int(os.environ.get("BPS_RIVER_OCHS_CLUSTERS", "8"))
+        rc = self._lib.bps_init_ochs_river(self._reader, kc)
+        if rc != 0:
+            print(
+                f"[BPSReaderC] WARNING: bps_init_ochs_river failed (rc={rc}); "
+                f"river bucketer left on legacy EHS percentile.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[BPSReaderC] OCHS river bucketing initialized (k_clusters={kc}).",
+                flush=True,
+            )
+
     def _report_stats(self) -> None:
         """Print loaded reader statistics."""
         n_nodes = ctypes.c_int64(0)
@@ -834,6 +887,11 @@ class BPSReaderC:
         )
 
     def __del__(self) -> None:
+        # multiprocessing.Pool fork workers inherit a parent's BPSReaderC
+        # via COW; freeing the parent's memory from a child would corrupt
+        # the parent. Worker init sets _borrowed=True to skip free.
+        if getattr(self, "_borrowed", False):
+            return
         if hasattr(self, "_lib") and hasattr(self, "_reader"):
             self._lib.bps_reader_free(self._reader)
 

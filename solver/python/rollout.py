@@ -203,35 +203,46 @@ class RolloutLeaf:
 # ─── Action tree classification ──────────────────────────────────────────
 
 
+def _add_explicit_allin() -> bool:
+    """Whether to append an explicit all-in slot to postflop action sets.
+
+    MUST match the training-time generate_actions() add_explicit_allin gate.
+    Phase3 trained with add_explicit_allin=0, so default OFF. Override via
+    BPS_ROLLOUT_ADD_EXPLICIT_ALLIN=1 for blueprints trained with it on.
+    """
+    v = os.environ.get("BPS_ROLLOUT_ADD_EXPLICIT_ALLIN", "0")
+    return v not in ("0", "", "false", "False", "no", "No", "off", "Off")
+
+
 def classify_postflop_actions(
     facing_bet: bool, raises_so_far: int,
 ) -> List[ActionCategory]:
     """Build the category vector for the bias transform.
 
     This must match the action tree the solver exposes to the rollout
-    (see build_postflop_actions). Each position in the returned list
-    corresponds to one action index in the order the solver would
-    emit them.
+    AND the trainer's generate_actions() enumeration. The explicit all-in
+    slot is gated by BPS_ROLLOUT_ADD_EXPLICIT_ALLIN (default OFF for phase3).
     """
     if raises_so_far >= POSTFLOP_MAX_RAISES:
-        # Tree closed — only fold or call if facing a bet, else check.
         return [ActionCategory.FOLD, ActionCategory.CALL] if facing_bet \
             else [ActionCategory.CALL]  # check
 
+    add_allin = _add_explicit_allin()
+
     if facing_bet:
-        # [fold, call, raise_0.5, raise_1.0, all-in]  (first raise)
-        # [fold, call, raise_1.0, all-in]             (subsequent raise)
         bet_fracs = SUBSEQUENT_BET_FRACTIONS if raises_so_far > 0 \
             else POSTFLOP_BET_FRACTIONS
         cats = [ActionCategory.FOLD, ActionCategory.CALL]
         cats.extend([ActionCategory.RAISE] * len(bet_fracs))
-        cats.append(ActionCategory.RAISE)  # all-in
+        if add_allin:
+            cats.append(ActionCategory.RAISE)  # all-in
         return cats
 
-    # No bet yet: [check, bet_0.5, bet_1.0, all-in]
+    # No bet yet: [check, bet_0.5, bet_1.0, (all-in)?]
     cats = [ActionCategory.CALL]  # check
     cats.extend([ActionCategory.RAISE] * len(POSTFLOP_BET_FRACTIONS))
-    cats.append(ActionCategory.RAISE)  # all-in
+    if add_allin:
+        cats.append(ActionCategory.RAISE)  # all-in
     return cats
 
 
@@ -258,6 +269,8 @@ def action_amount_chips(
 
     tree_closed = raises_so_far >= POSTFLOP_MAX_RAISES
 
+    add_allin = _add_explicit_allin()
+
     if facing_bet:
         if action_idx == 0:
             return ("fold", 0)
@@ -266,8 +279,8 @@ def action_amount_chips(
         if tree_closed:
             # Should not reach — tree closed has only fold/call.
             return ("call", min(to_call, stack))
-        # All-in is the last slot; intermediate slots are sized raises.
-        if action_idx == len(cats) - 1:
+        # All-in is the last slot ONLY when the explicit gate is on.
+        if add_allin and action_idx == len(cats) - 1:
             return ("allin", stack)
         # Sized raise
         frac_slot = action_idx - 2
@@ -284,7 +297,7 @@ def action_amount_chips(
         return ("check", 0)
     if tree_closed:
         return ("check", 0)
-    if action_idx == len(cats) - 1:
+    if add_allin and action_idx == len(cats) - 1:
         return ("allin", stack)
     frac_slot = action_idx - 1
     frac = POSTFLOP_BET_FRACTIONS[frac_slot]

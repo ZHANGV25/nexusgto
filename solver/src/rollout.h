@@ -295,6 +295,48 @@ BPS_EXPORT void rollout_get_observability(
     uint64_t *out_miss, uint64_t *out_zerosum
 );
 
+/* Per-thread bucket-lookup miss counter. Bumped when the tolerate-miss
+ * gate (see rollout_set_tolerate_bucket_miss) substitutes uniform for an
+ * otherwise-fatal hand_to_bucket failure. Distinct from blueprint miss:
+ * blueprint miss = bucket existed but no σ̄ stored; bucket miss = no
+ * bucket assignment exists for the (board, hand) pair (e.g. paired-
+ * flushdraw flop textures missing from texture_cache.bin). */
+BPS_EXPORT void rollout_get_bucket_miss_count(uint64_t *out_bucket_miss);
+
+/* Add to the per-thread observability counters. Used by Python
+ * orchestrations to fold worker-process counter totals into the parent
+ * thread's view after a multiprocessing.Pool fan-out (each worker has
+ * its own thread-local copy; without this the parent stays at zero
+ * despite real misses in workers). */
+BPS_EXPORT void rollout_add_observability(
+    uint64_t add_miss, uint64_t add_zerosum, uint64_t add_bucket_miss
+);
+
+/* ── Bucket-miss tolerance gate ─────────────────────────────────────── */
+
+/* When enabled, a hand_to_bucket failure no longer aborts the rollout.
+ * Instead, the call falls through to the same uniform-on-legal-actions
+ * fallback used for missing-strategy info sets (Pluribus Algorithm 1
+ * supplementary). The bucket-miss counter is bumped so the substitution
+ * remains observable; callers can read it via rollout_get_bucket_miss_count.
+ *
+ * Off by default. Two ways to enable:
+ *   1. Set env ROLLOUT_TOLERATE_BUCKET_MISS=1 before the .so loads (read
+ *      lazily on first hot-path use; cached per process).
+ *   2. Call rollout_set_tolerate_bucket_miss(1) at runtime (overrides env).
+ *
+ * Background: the texture-cache precompute in mccfr_blueprint.c has a
+ * paired-flushdraw enumeration bug that omits ~1% of flop textures.
+ * The .bps strategies for those textures don't exist either, so the
+ * principled fallback (uniform per §C1) is the same fallback used at
+ * any coverage gap. Calling ca_assign_buckets_kmeans inline is NOT a
+ * viable alternative — it's a batch precompute (Lloyd's 20-iter on all
+ * ~1081 hands per board with Monte Carlo EHS) that costs hundreds of
+ * ms per board and produces bucket numbers indexed against textures
+ * the .bps wasn't trained on. */
+BPS_EXPORT void rollout_set_tolerate_bucket_miss(int enabled);
+BPS_EXPORT int  rollout_get_tolerate_bucket_miss(void);
+
 #ifdef __cplusplus
 }
 #endif

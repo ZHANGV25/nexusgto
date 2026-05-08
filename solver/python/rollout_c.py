@@ -229,6 +229,29 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.rollout_get_observability.restype = None
 
+    lib.rollout_get_bucket_miss_count.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.rollout_get_bucket_miss_count.restype = None
+
+    lib.rollout_set_tolerate_bucket_miss.argtypes = [ctypes.c_int]
+    lib.rollout_set_tolerate_bucket_miss.restype = None
+
+    lib.rollout_get_tolerate_bucket_miss.argtypes = []
+    lib.rollout_get_tolerate_bucket_miss.restype = ctypes.c_int
+
+    lib.rollout_add_observability.argtypes = [
+        ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
+    ]
+    lib.rollout_add_observability.restype = None
+
+    if hasattr(lib, "rollout_get_per_street_miss_counts"):
+        lib.rollout_get_per_street_miss_counts.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+        lib.rollout_get_per_street_miss_counts.restype = None
+    if hasattr(lib, "rollout_add_per_street_miss_counts"):
+        lib.rollout_add_per_street_miss_counts.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+        lib.rollout_add_per_street_miss_counts.restype = None
+
     lib.rollout_leaf_info_sizeof.argtypes = []
     lib.rollout_leaf_info_sizeof.restype = ctypes.c_int32
 
@@ -292,6 +315,9 @@ def get_rollout_observability() -> Tuple[int, int]:
       - zerosum_count: σ̄ entry present but truncated strategy summed
         to zero (data integrity issue; should be rare).
 
+    The bucket-miss counter (used when the tolerate-miss gate is
+    enabled) is exposed separately via get_rollout_bucket_miss_count.
+
     Callers that care about coverage should reset before each solve and
     read after to scope counts to that solve.
     """
@@ -300,6 +326,81 @@ def get_rollout_observability() -> Tuple[int, int]:
     zerosum = ctypes.c_uint64(0)
     lib.rollout_get_observability(ctypes.byref(miss), ctypes.byref(zerosum))
     return (int(miss.value), int(zerosum.value))
+
+
+def get_rollout_bucket_miss_count() -> int:
+    """Read the per-thread bucket-lookup miss counter.
+
+    Bumped each time the rollout would have aborted on a hand_to_bucket
+    failure but the tolerate-miss gate let it fall through to uniform-
+    on-legal-actions instead. Distinct from blueprint miss (bucket
+    existed but no σ̄ stored).
+    """
+    lib = _lib()
+    bucket_miss = ctypes.c_uint64(0)
+    lib.rollout_get_bucket_miss_count(ctypes.byref(bucket_miss))
+    return int(bucket_miss.value)
+
+
+def get_rollout_per_street_miss_counts() -> Tuple[int, int, int, int]:
+
+    Returns (preflop, flop, turn, river) miss counts. Distinguishes
+    action_history hash mismatch (high miss everywhere) from blueprint
+    coverage sparseness (miss skewed to deeper streets).
+    Returns (0,0,0,0) on builds without the symbol.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_per_street_miss_counts"):
+        return (0, 0, 0, 0)
+    arr = (ctypes.c_uint64 * 4)()
+    lib.rollout_get_per_street_miss_counts(arr)
+    return (int(arr[0]), int(arr[1]), int(arr[2]), int(arr[3]))
+
+
+def add_rollout_per_street_miss_counts(counts: Tuple[int, int, int, int]) -> None:
+    """Fold per-worker per-street counts into the parent's view (fork-pool aggregation)."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_add_per_street_miss_counts"):
+        return
+    arr = (ctypes.c_uint64 * 4)(*[int(c) for c in counts])
+    lib.rollout_add_per_street_miss_counts(arr)
+
+
+def set_rollout_tolerate_bucket_miss(enabled: bool) -> None:
+    """Enable/disable the rollout's bucket-miss tolerance gate.
+
+    When enabled, a hand_to_bucket failure no longer aborts the rollout;
+    instead the call falls through to uniform-on-legal-actions (Pluribus
+    Algorithm 1 supplementary). Each substitution bumps the bucket-miss
+    counter (see get_rollout_bucket_miss_count).
+
+    Off by default. Also configurable via the env
+    ROLLOUT_TOLERATE_BUCKET_MISS=1 (read lazily on first hot-path call).
+    Calling this overrides the env value.
+    """
+    _lib().rollout_set_tolerate_bucket_miss(1 if enabled else 0)
+
+
+def get_rollout_tolerate_bucket_miss() -> bool:
+    return bool(_lib().rollout_get_tolerate_bucket_miss())
+
+
+def add_rollout_observability(
+    add_miss: int, add_zerosum: int, add_bucket_miss: int
+) -> None:
+    """Add to the per-thread observability counters.
+
+    Used by orchestrations that fan out via multiprocessing.Pool — each
+    worker process has its own thread-local counter copy, so the
+    parent's view stays at zero despite real misses. The parent reads
+    each worker's counters at end-of-task and folds the totals back in
+    via this call.
+    """
+    _lib().rollout_add_observability(
+        ctypes.c_uint64(int(add_miss)),
+        ctypes.c_uint64(int(add_zerosum)),
+        ctypes.c_uint64(int(add_bucket_miss)),
+    )
 
 
 # ─── Pure-math thin wrappers (used by parity tests) ──────────────────────

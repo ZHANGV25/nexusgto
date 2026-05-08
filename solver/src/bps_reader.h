@@ -165,6 +165,19 @@ typedef struct {
     int      op1_n_bins;           /* 50 at ship-time */
     int      op1_turn_loaded;      /* 1 after bps_load_op1_per_flop_turn_centroids */
     int      op1_river_loaded;     /* 1 after bps_load_op1_per_flop_river_centroids */
+
+    /* OCHS river bucketing — matches mccfr_blueprint.c:2964-3120 training-time
+     * init. When ochs_river_enabled=1, bps_hand_to_bucket_river() routes via
+     * OCHS (8-d feature vector → k-means centroids) instead of the legacy
+     * 200-sample EHS percentile path. Required to match training-time bucket
+     * ids on phase3 (and any blueprint trained with BPS_RIVER_OCHS=1).
+     * Initialize via bps_init_ochs_river(). Pre-init this is all zero and
+     * the legacy EHS-percentile path runs (back-compat for v1/v2 blueprints). */
+    int      ochs_river_enabled;       /* 0=use EHS percentile, 1=use OCHS */
+    int      ochs_num_clusters;        /* opponent clusters, typically 8 */
+    int      ochs_cluster_of_169[169]; /* 169-class → cluster id map */
+    float   *ochs_river_centroids;     /* [k * ochs_num_clusters] flat */
+    int      ochs_river_centroids_k;   /* number of populated centroids (≤200) */
 } BPSReader;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -403,10 +416,15 @@ BPS_EXPORT int bps_hand_to_bucket_turn(const BPSReader *r,
 /**
  * Map a hand on a 5-card river board to its bucket index.
  *
- * Uses the same deterministic 200-sample EHS percentile as training
- * (see bps_ev_walk.c:880-898). RNG seed is derived from
- * (c0, c1, board) so the same hand on the same board always maps
- * to the same bucket.
+ * When `ochs_river_enabled=1` (set by bps_init_ochs_river), uses the
+ * Pluribus-faithful OCHS path: 8-d equity-vs-cluster feature vector →
+ * nearest centroid in 200-bucket k-means. Matches training-time bucket
+ * ids exactly when training also used OCHS. **This is required for
+ * phase3.bps and any blueprint trained with BPS_RIVER_OCHS=1.**
+ *
+ * Otherwise falls through to the legacy 200-sample EHS percentile path
+ * (deterministic from (c0, c1, board) via xorshift seed). Suitable for
+ * v1/v2 blueprints trained without OCHS.
  *
  * Args:
  *   r: loaded reader
@@ -418,6 +436,35 @@ BPS_EXPORT int bps_hand_to_bucket_turn(const BPSReader *r,
  */
 BPS_EXPORT int bps_hand_to_bucket_river(const BPSReader *r,
                                           const int *board, int c0, int c1);
+
+/**
+ * Initialize OCHS river bucketing on the reader.
+ *
+ * Computes:
+ *   1. The 169 → k OCHS opponent cluster map via ca_compute_ochs_clusters.
+ *      Deterministic (fixed seed inside ca_compute_ehs); ~1s.
+ *   2. The k-cluster river centroids by sampling 200 random river boards
+ *      × 300 hands and running 20 iterations of k-means against the
+ *      target_buckets target. Mirrors mccfr_blueprint.c:3037-3120
+ *      training-time init (same xorshift seed 0x12345678DEADBEEF, same
+ *      sample sizes, same percentile-seeded k-means, single-threaded).
+ *      ~1s.
+ *
+ * After success, ochs_river_enabled=1, and bps_hand_to_bucket_river()
+ * routes via the OCHS path. The locally-recomputed centroids match
+ * training-time centroids bit-for-bit when run on the same fp env
+ * (small drift possible across compilers/architectures; if observed,
+ * load training-time centroids from disk via the legacy /tmp/
+ * river_centroids.bin path captured at training time).
+ *
+ * Args:
+ *   r: reader handle (already loaded; postflop_buckets must be set)
+ *   num_clusters: opponent clusters (default 8 if <=0). MUST match what
+ *                 training used (BPS_RIVER_OCHS_CLUSTERS).
+ *
+ * Returns 0 on success, -1 on alloc/feature failure.
+ */
+BPS_EXPORT int bps_init_ochs_river(BPSReader *r, int num_clusters);
 
 /* ── PA-EMD integration ──────────────────────────────────────────── */
 
