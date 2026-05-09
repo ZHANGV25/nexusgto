@@ -27,8 +27,8 @@ $(BUILD_DIR):
 # Requires both mccfr_blueprint.c and card_abstraction.c (k-means bucketing)
 blueprint: $(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT)
 
-$(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
 
 # ── Street solver v2 (GPU re-solve support library) ──
 $(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
@@ -119,8 +119,8 @@ test: $(BUILD_DIR)/test_phase1
 # Statically links the blueprint solver for a self-contained test binary.
 # Python-side verifier (tests/test_phase_1_3_synthetic.py) consumes the
 # bundle this produces and asserts CFR identity + enumerated ground truth.
-$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fopenmp -I$(SRC_DIR) tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp -I$(SRC_DIR) tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
 
 test_phase_1_3: $(BUILD_DIR)/test_phase_1_3
 	./$(BUILD_DIR)/test_phase_1_3 $(BUILD_DIR)/phase_1_3_synthetic.tbn
@@ -148,6 +148,100 @@ $(BUILD_DIR)/test_bps_ochs_river: tests/test_bps_ochs_river.c $(SRC_DIR)/bps_rea
 
 test_bps_ochs_river: $(BUILD_DIR)/test_bps_ochs_river
 	./$(BUILD_DIR)/test_bps_ochs_river
+
+# ── Phase R Block A.1: dispatch helper unit tests ──
+# Pure helper (mccfr_phase_r.c) tested in isolation — no card_abstraction
+# / hand_eval / OMP needed. Mac-runnable, <1s wall.
+$(BUILD_DIR)/test_phase_r_dispatch: tests/test_phase_r_dispatch.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_dispatch.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+
+test_phase_r_dispatch: $(BUILD_DIR)/test_phase_r_dispatch
+	./$(BUILD_DIR)/test_phase_r_dispatch
+
+# ── Phase R Block A.2: cont-ev table unit tests ──
+# Tests the boundary EV slot table (mccfr_cont_ev_table.{c,h}) in
+# isolation. Uses OpenMP for the multi-thread CAS test (T5) — falls
+# back to a SKIP if OMP isn't available (Mac without libomp).
+$(BUILD_DIR)/test_cont_ev_table: tests/test_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+
+test_cont_ev_table: $(BUILD_DIR)/test_cont_ev_table
+	./$(BUILD_DIR)/test_cont_ev_table
+
+# ── Phase R Block A.2: cont-bias reweighting helper unit tests ──
+# Pure math (bp_apply_cont_bias in mccfr_phase_r.c). Mac-runnable, <1s.
+$(BUILD_DIR)/test_cont_bias_strategy: tests/test_cont_bias_strategy.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_bias_strategy.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+
+test_cont_bias_strategy: $(BUILD_DIR)/test_cont_bias_strategy
+	./$(BUILD_DIR)/test_cont_bias_strategy
+
+# ── Phase R Block A.2: byte-identity regression smoke ──
+# Drives the full trainer with depth_limit_cont_strats=0 (default) on a
+# 6p postflop fixture, single-thread, twice with the same seed, and
+# byte-compares the saved regret tables. Must produce identical bytes
+# on both runs (determinism), which combined with the unit-level T1
+# invariant in test_phase_r_dispatch.c proves byte-identity to legacy.
+#
+# Compiled WITHOUT -fopenmp so it runs on Mac with Apple clang. The
+# trainer's omp pragmas degrade to no-ops; bp_solve runs single-threaded.
+$(BUILD_DIR)/test_phase_r_regression_smoke: tests/test_phase_r_regression_smoke.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_regression_smoke.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_phase_r_regression_smoke: $(BUILD_DIR)/test_phase_r_regression_smoke
+	./$(BUILD_DIR)/test_phase_r_regression_smoke 10000
+
+# ── Phase R Block A.2: HEADS-branch rollout integration ──
+# Drives the trainer with depth_limit_cont_strats=1, prob=1.0 on a 3p
+# postflop fixture. Verifies the HEADS-branch rollout dispatcher fires,
+# allocates cont-ev table slots, and accumulates ev_count > 0 with
+# finite ev_sum values. Mac-runnable, ~10-20s.
+$(BUILD_DIR)/test_phase_r_heads_rollout: tests/test_phase_r_heads_rollout.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_heads_rollout.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_phase_r_heads_rollout: $(BUILD_DIR)/test_phase_r_heads_rollout
+	./$(BUILD_DIR)/test_phase_r_heads_rollout
+
+# ── Phase R Block A.2: cont-bias signed-regrets correctness ──
+# Drives 3p-AA-on-flop fixture with prob=1.0, asserts raise-bias EV >
+# fold-bias EV (gates against bias-index swap, sign-inversion bugs).
+# Plus T3: bp_compute_action_hash determinism (cont-bias-free by
+# signature). Mac-runnable, ~10-15s.
+$(BUILD_DIR)/test_phase_r_cont_strat_signed: tests/test_phase_r_cont_strat_signed.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_cont_strat_signed.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_phase_r_cont_strat_signed: $(BUILD_DIR)/test_phase_r_cont_strat_signed
+	./$(BUILD_DIR)/test_phase_r_cont_strat_signed
+
+# ── Combined Phase R test target ──
+test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
+                  test_cont_bias_strategy test_phase_r_regression_smoke \
+                  test_phase_r_heads_rollout test_phase_r_cont_strat_signed
+	@echo ""
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "  Phase R Block A.1 + A.2 test suite — all green"
+	@echo "═══════════════════════════════════════════════════════════"
 
 clean:
 	rm -rf $(BUILD_DIR)

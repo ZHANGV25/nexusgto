@@ -24,6 +24,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "mccfr_cont_ev_table.h"
 
 /* ── Limits ──────────────────────────────────────────────────────────── */
 
@@ -31,6 +32,14 @@
 #define BP_MAX_HANDS      1326   /* max hands per player (all possible 2-card combos) */
 #define BP_MAX_ACTIONS    16
 #define BP_MAX_BOARD      5
+
+/* Action-type tags. Mirrors the static ACT_* defines inside
+ * mccfr_blueprint.c — promoted to the header so Phase R helpers in
+ * mccfr_phase_r.c can classify actions for cont-bias reweighting. */
+#define BP_ACT_FOLD     0
+#define BP_ACT_CHECK    1
+#define BP_ACT_CALL     2
+#define BP_ACT_BET      3
 
 /* Hash table sizing.
  * Per-texture: ~5-50M info sets depending on player count and bet sizes.
@@ -184,6 +193,52 @@ typedef struct {
      *     are unaffected. See docs/PHASE3_RETRAIN_STATUS.md. */
     int add_explicit_allin;
 
+    /* Phase R: depth-limit dispatch + cont-strat sampling at multiway-flop
+     * boundary (mirror of street_solve.cu:159-186 §4 dispatch).
+     *
+     * depth_limit_cont_strats:
+     *   0 = legacy full-game-depth MCCFR (default; existing checkpoints
+     *       carry forward unchanged).
+     *   1 = at end-of-multiway-flop, with probability cont_strat_prob,
+     *       terminate the recursion and accumulate to the cont-strat EV
+     *       slot table; otherwise recurse legacy. Block A.1 wires the
+     *       dispatch site; Block A.2 fills in the HEADS-branch rollout.
+     *
+     * cont_strat_prob:
+     *   p_boundary in [0, 1]; default 0.5. Probability that a multiway-
+     *   flop iter terminates at the boundary (HEADS) vs. recurses past
+     *   it (TAILS). TAILS keeps multiway turn/river σ̄ co-evolving;
+     *   HEADS accumulates cont-bias EVs against the running σ̄. See
+     *   docs/PHASE_R_TRAINER_SPEC.md §3.
+     *
+     * INVARIANT (A.1 byte-identical regression): when
+     * depth_limit_cont_strats == 0, the dispatch helper returns 0
+     * deterministically without consuming RNG. The new field's
+     * presence in BPSolver does NOT change traversal behavior unless
+     * the flag is explicitly enabled. */
+    int depth_limit_cont_strats;
+    float cont_strat_prob;
+
+    /* Phase R Block A.2 — boundary EV slot table.
+     *
+     * Allocated lazily on bp_set_depth_limit_cont_strats(s, 1) using
+     * cont_ev_table_size_hint (see below) as the requested capacity.
+     * Stays NULL when the feature is OFF.
+     *
+     * Storage: float ev_sum[4] (Linear-CFR-discounted via the same
+     * periodic-discount tick that scales the regret table) + int64
+     * ev_count[4] (unweighted visit count) per slot, keyed on
+     * (action_hash_at_boundary, traverser, bucket).
+     *
+     * Free'd by bp_free. */
+    BPContEVTable cont_ev_table;
+
+    /* Requested capacity for cont_ev_table at allocation time.
+     * 0 → use the spec §4 default (1<<26 ≈ 67M slots, ~5GB at 72B/slot).
+     * Tests override via bp_set_cont_ev_table_size to keep the unit-test
+     * footprint small (~MB). */
+    int64_t cont_ev_table_size_hint;
+
     /* Pot, stacks, and blinds */
     int starting_pot;       /* pot at start of postflop (when include_preflop=0) */
     int effective_stack;    /* stack at start of postflop (when include_preflop=0) */
@@ -325,6 +380,119 @@ BP_EXPORT int bp_set_preflop_tier(BPSolver *s, int level,
  * See docs/PHASE3_RETRAIN_STATUS.md.
  */
 BP_EXPORT int bp_set_add_explicit_allin(BPSolver *s, int enabled);
+
+/**
+ * Phase R: enable/disable the depth-limit + cont-strat-sampling dispatch
+ * at multiway-flop boundary. See docs/PHASE_R_TRAINER_SPEC.md.
+ *
+ * enabled = 0 → legacy full-game-depth MCCFR (default).
+ * enabled = 1 → boundary dispatch active; A.1 wires the site, A.2 fills
+ *               in the HEADS-branch rollout.
+ *
+ * With enabled=0, the trainer is byte-identical to legacy on every iter:
+ * the dispatch helper short-circuits before consuming RNG.
+ */
+BP_EXPORT int bp_set_depth_limit_cont_strats(BPSolver *s, int enabled);
+
+/**
+ * Phase R: set the boundary-coin-flip probability `p_boundary`.
+ *
+ * prob = probability of HEADS (terminate) vs TAILS (continue legacy)
+ * at the multiway-flop boundary, used only when
+ * depth_limit_cont_strats == 1. Default 0.5. Must be in [0, 1].
+ *
+ * Returns 0 on success, -1 if prob is out of range.
+ */
+BP_EXPORT int bp_set_cont_strat_prob(BPSolver *s, float prob);
+
+/**
+ * Phase R: set the cont-ev table size hint.
+ *
+ * Must be called BEFORE bp_set_depth_limit_cont_strats(s, 1) for the
+ * setting to take effect — the table is allocated lazily on the first
+ * call to bp_set_depth_limit_cont_strats with enabled=1, using this
+ * hint as the requested capacity (prime-promoted internally).
+ *
+ * Pass `size_hint = 0` to fall back to the spec default (1<<26).
+ *
+ * Returns 0 on success, -1 on invalid args.
+ */
+BP_EXPORT int bp_set_cont_ev_table_size(BPSolver *s, int64_t size_hint);
+
+/**
+ * Phase R helper: pure dispatch decision for the depth-limit boundary.
+ *
+ * Returns 1 if the trainer should TERMINATE at this end-of-street (HEADS
+ * branch — sample joint cont-bias and accumulate EV slot). Returns 0 if
+ * the trainer should continue legacy recursion (TAILS branch or non-
+ * boundary site).
+ *
+ * Pure function (no global state). Exposed so tests can verify the
+ * dispatch matrix without exercising the full traverse() path.
+ *
+ * Invariant: when flag == 0, returns 0 without touching `*rng_state`.
+ * (Required by the bit-identical regression test — see spec §7.)
+ *
+ * Called at end-of-street sites where round_done() has fired:
+ *   - num_board: current board count (3 = end-of-flop, 4 = end-of-turn,
+ *                5 = end-of-river → caller already has showdown branch).
+ *   - n_active: number of non-folded players at this site.
+ *   - flag: 0 or 1 (BPSolver::depth_limit_cont_strats).
+ *   - prob: BPSolver::cont_strat_prob, ignored when flag == 0.
+ *   - rng_state: per-thread xorshift state; consumed only on multiway
+ *                flop with flag == 1.
+ */
+BP_EXPORT int bp_should_dispatch_to_boundary(int num_board, int n_active,
+                                              int flag, float prob,
+                                              uint64_t *rng_state);
+
+/**
+ * Phase R Block A.2 — pure-math cont-bias reweighting helper.
+ *
+ * Applies one of four Pluribus §C2 cont-bias reweightings to an
+ * already-computed average strategy:
+ *   bias 0: baseline (no reweight) — out = avg_strategy
+ *   bias 1: fold-bias — ×5 weight on actions with type BP_ACT_FOLD
+ *   bias 2: call-bias — ×5 weight on actions with BP_ACT_CHECK or BP_ACT_CALL
+ *   bias 3: raise-bias — ×5 weight on actions with type BP_ACT_BET
+ *
+ * The reweighted distribution is L1-normalized into `out[]`. If the
+ * reweighted sum is zero (e.g., all input probabilities are zero AND
+ * the bias targets a non-existent action class), `out[]` falls back
+ * to a uniform distribution.
+ *
+ * Pure function — no allocation, no global state, no RNG. Spec:
+ * docs/PHASE_R_TRAINER_SPEC.md §3.
+ *
+ * Args:
+ *   avg_strategy   [num_actions]   probabilities (need not sum to 1; will be
+ *                                  used as relative weights then renormalized)
+ *   action_types   [num_actions]   BP_ACT_FOLD / CHECK / CALL / BET
+ *   num_actions                    1..BP_MAX_ACTIONS
+ *   bias                           0..3 — out-of-range produces baseline
+ *   out            [num_actions]   reweighted, L1-normalized distribution
+ */
+BP_EXPORT void bp_apply_cont_bias(const float *avg_strategy,
+                                   const int *action_types,
+                                   int num_actions, int bias,
+                                   float *out);
+
+/**
+ * Phase R Block A.2 — pure action-history hash (mirrors trainer-internal
+ * `compute_action_hash` at mccfr_blueprint.c:526).
+ *
+ * Exposed in the header so a regression test can pin the invariant
+ * documented in spec §4: cont-bias does NOT enter the action_hash
+ * computation. The function signature takes only `(actions, n_actions)`
+ * — by construction cont_bias cannot affect the output. A test asserts
+ * that the returned hash is deterministic and unaffected by Phase R
+ * state (flag, prob, cont_bias_per_player) by re-deriving from the
+ * raw action history alone.
+ *
+ * Pure function: no global state read or written beyond the legacy
+ * mixer mode flag (set via bp_set_legacy_hash_mixer).
+ */
+BP_EXPORT uint64_t bp_compute_action_hash(const int *actions, int num_actions);
 
 /**
  * Phase 3 post-load fixup: drop the trailing allin slot from infosets

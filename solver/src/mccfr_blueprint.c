@@ -538,6 +538,15 @@ static uint64_t compute_action_hash(const int *actions, int num_actions) {
     return h;
 }
 
+/* Phase R Block A.2 — exposed wrapper. The static compute_action_hash
+ * is unchanged; this is just the public-symbol bridge so a regression
+ * test can pin the spec §4 invariant that cont-bias does NOT enter the
+ * hash. The function signature itself is the proof: it takes only
+ * (actions, num_actions). */
+uint64_t bp_compute_action_hash(const int *actions, int num_actions) {
+    return compute_action_hash(actions, num_actions);
+}
+
 /* Round n up to the next prime. Used by info_table_init to ensure the
  * modulo operation in slot derivation produces uniform distribution.
  *
@@ -1013,6 +1022,22 @@ typedef struct {
 
     int action_history[256];
     int history_len;
+
+    /* Phase R Block A.2 — per-player cont-bias mode tag.
+     *
+     * cont_bias_per_player[p] ∈ {-1, 0, 1, 2, 3}:
+     *   -1: legacy CFR (regret-match σ for traverser exploration; σ from
+     *       current regrets sampled for non-traverser). Default at every
+     *       allocation site so depth_limit_cont_strats=0 paths are
+     *       byte-identical to legacy.
+     *   0..3: cont-bias active for this player. Action-sampling at every
+     *       descendant info-set within the boundary subtree applies
+     *       bp_apply_cont_bias to the avg-strategy and samples one
+     *       action; regrets and strategy_sum are NOT updated.
+     *
+     * Set by the HEADS-branch rollout dispatcher in traverse() at
+     * line 1224, propagated through `child = *ts` copies. */
+    int cont_bias_per_player[BP_MAX_PLAYERS];
 } TraversalState;
 
 static float traverse(TraversalState *ts, int acting_order_idx,
@@ -1201,6 +1226,133 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             return eval_showdown_n(s, ts->board, ts->traverser,
                                     ts->active, ts->sampled_hands,
                                     ts->pot, ts->invested);
+        }
+
+        /* Phase R depth-limit dispatch (mirror of street_solve.cu §4
+         * line 159-186). With depth_limit_cont_strats=0, the helper
+         * returns 0 deterministically WITHOUT consuming the per-thread
+         * RNG — making this trainer byte-identical to legacy on every
+         * iter (spec §7 regression invariant).
+         *
+         * With flag ON at the multiway flop boundary, coin-flip on
+         * cont_strat_prob: HEADS terminates here; TAILS falls through
+         * to the legacy recursion below. Block A.1 wires the dispatch
+         * site — Block A.2 will replace the placeholder 0.0f return
+         * with the actual cont-bias rollout (sample joint bias tuple,
+         * walk turn+river+showdown using bias-reweighted σ̄, accumulate
+         * to boundary EV slot). DO NOT enable the flag for production
+         * training before A.2 lands. */
+        if (bp_should_dispatch_to_boundary(ts->num_board, n_active,
+                                            s->depth_limit_cont_strats,
+                                            s->cont_strat_prob,
+                                            ts->rng)) {
+            /* Block A.2 — HEADS branch: cont-bias rollout to populate
+             * the boundary EV slot.
+             *
+             * 1. Sample independent uniform cont-bias per active player.
+             * 2. Lookup-or-create the cont-ev slot keyed on
+             *    (action_hash_at_boundary, traverser, traverser_bucket).
+             * 3. Build child TraversalState, deal turn, set
+             *    cont_bias_per_player on the child, recurse.
+             * 4. The descendant info-set visits hit the action-sampling
+             *    gate at line ~1535, which reads σ̄ and samples bias-
+             *    reweighted actions WITHOUT updating regrets/strategy_sum.
+             * 5. Accumulate the resulting EV into ev_sum[traverser_bias]. */
+
+            int bias_tuple[BP_MAX_PLAYERS];
+            for (int p = 0; p < BP_MAX_PLAYERS; p++) bias_tuple[p] = -1;
+            for (int p = 0; p < NP; p++) {
+                if (ts->active[p])
+                    bias_tuple[p] = rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
+            }
+            int trav_bias = bias_tuple[ts->traverser];
+
+            uint64_t boundary_action_hash = compute_action_hash(
+                ts->action_history, ts->history_len);
+            int trav_bucket;
+            if (ts->flop_cache && ts->flop_cache->computed) {
+                trav_bucket = ts->flop_cache->buckets[
+                    ts->sampled_hands[ts->traverser]];
+            } else {
+                trav_bucket = get_bucket(s, 1, ts->traverser,
+                                          ts->sampled_hands[ts->traverser]);
+            }
+
+            BPContEVEntry *cb_slot = NULL;
+            if (s->cont_ev_table.entries != NULL && trav_bias >= 0 &&
+                ts->active[ts->traverser]) {
+                cb_slot = bp_cont_ev_find_or_create(&s->cont_ev_table,
+                                                     boundary_action_hash,
+                                                     ts->traverser,
+                                                     trav_bucket);
+            }
+
+            /* Build blocked set + next-card pool (mirror legacy turn-deal). */
+            int blocked2[52] = {0};
+            for (int b = 0; b < ts->num_board; b++) blocked2[ts->board[b]] = 1;
+            for (int p = 0; p < NP; p++) {
+                if (!ts->active[p]) continue;
+                int hh = ts->sampled_hands[p];
+                blocked2[s->hands[p][hh][0]] = 1;
+                blocked2[s->hands[p][hh][1]] = 1;
+            }
+            int valid2[52], nv2 = 0;
+            for (int c = 0; c < 52; c++) if (!blocked2[c]) valid2[nv2++] = c;
+            if (nv2 == 0) return 0.0f;
+
+            TraversalState next = *ts;
+            memset(next.bets, 0, sizeof(next.bets));
+            memset(next.has_acted, 0, sizeof(next.has_acted));
+            next.num_raises = 0;
+            for (int p = 0; p < BP_MAX_PLAYERS; p++)
+                next.cont_bias_per_player[p] = bias_tuple[p];
+
+            /* Deal turn card; canonicalize via the existing suit_map. */
+            int dealt = valid2[rng_int(ts->rng, nv2)];
+            next.board[next.num_board++] = dealt;
+            if (next.num_canon_board < 5) {
+                int rank = dealt >> 2, suit = dealt & 3;
+                int canon_suit = (next.suit_map[suit] >= 0)
+                    ? next.suit_map[suit] : suit;
+                next.canon_board[next.num_canon_board++] =
+                    rank * 4 + canon_suit;
+            }
+
+            /* Pre-compute turn bucket cache (mirrors line 1397-1410 of
+             * the legacy turn-deal path). */
+            if (s->turn_centroids_k > 0) {
+                for (int p = 0; p < NP; p++) {
+                    next.turn_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph[1][2];
+                    ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
+                    ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
+                    float feat[1][3];
+                    ca_compute_features(next.board, 4,
+                                         (const int(*)[2])ph, 1, 200, feat);
+                    next.turn_bucket[p] = ca_nearest_centroid(
+                        feat[0],
+                        (const float(*)[3])s->turn_centroids,
+                        s->turn_centroids_k);
+                }
+            }
+
+            float boundary_ev = traverse(&next, 0,
+                                          acting_order, num_in_order);
+
+            /* Accumulate to slot. ev_sum uses the atomic float add to
+             * tolerate Hogwild concurrency; ev_count uses a relaxed
+             * fetch_add. The Linear-CFR discount is applied to ev_sum
+             * at the periodic discount tick (see bp_solve), NOT per-
+             * visit — matches the trainer's regret-update convention. */
+            if (cb_slot != NULL) {
+                bp_cont_ev_atomic_add_f32(&cb_slot->ev_sum[trav_bias],
+                                           boundary_ev);
+                __atomic_fetch_add(&cb_slot->ev_count[trav_bias], 1,
+                                    __ATOMIC_RELAXED);
+            }
+
+            return boundary_ev;
         }
 
         /* Build blocked set: board cards + all active players' cards */
@@ -1488,6 +1640,92 @@ static float traverse(TraversalState *ts, int acting_order_idx,
      * the hand+board situation via EHS/k-means clustering. */
     key.board_hash = 0;
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
+
+    /* Phase R Block A.2 — cont-bias action-sampling gate.
+     *
+     * Active when this player has a cont-bias tag (set by the HEADS-
+     * branch rollout dispatcher). In cont-bias mode:
+     *   - Read-only info-set probe (NO create) — same pattern as
+     *     traverse_ev (line 2035-2052). On miss, σ̄ falls back to
+     *     uniform; the rollout EV then reflects uninformed play at
+     *     uncovered info-sets, which is acceptable per spec §3 and
+     *     resolves as TAILS branches accumulate σ̄ for those nodes.
+     *   - Reweight σ̄ via bp_apply_cont_bias.
+     *   - Sample one action; do NOT update regrets or strategy_sum.
+     *   - The per-info-set arena and num_entries are unaffected. */
+    {
+        int my_bias = ts->cont_bias_per_player[ap];
+        if (my_bias >= 0) {
+            BPInfoSet *cb_is = NULL;
+            uint64_t h = hash_combine(key.board_hash, key.action_hash);
+            h = hash_combine(h, (uint64_t)key.player);
+            h = hash_combine(h, (uint64_t)key.street);
+            h = hash_combine(h, (uint64_t)key.bucket);
+            int64_t slot0 = (int64_t)(h % (uint64_t)s->info_table.table_size);
+            for (int probe = 0; probe < HASH_PROBE_LIMIT_READ; probe++) {
+                int64_t idx = (slot0 + probe) % s->info_table.table_size;
+                int state = __atomic_load_n(&s->info_table.occupied[idx],
+                                             __ATOMIC_ACQUIRE);
+                if (state == 0) break;
+                if (state == 2) continue;
+                if (key_eq(&s->info_table.keys[idx], &key)) {
+                    cb_is = &s->info_table.sets[idx];
+                    break;
+                }
+            }
+
+            int local_na = na;
+            float avg[BP_MAX_ACTIONS];
+            if (cb_is != NULL) {
+                if (local_na > cb_is->num_actions) local_na = cb_is->num_actions;
+                avg_strategy(cb_is, avg, local_na);
+            } else {
+                /* Uninformed: uniform σ̄ at uncovered info-sets. Spec §3
+                 * accepts this; eventual TAILS visits populate σ̄ properly. */
+                float u = 1.0f / (float)local_na;
+                for (int a = 0; a < local_na; a++) avg[a] = u;
+            }
+
+            int types[BP_MAX_ACTIONS];
+            for (int a = 0; a < local_na; a++) types[a] = actions[a].type;
+
+            float biased[BP_MAX_ACTIONS];
+            bp_apply_cont_bias(avg, types, local_na, my_bias, biased);
+
+            int sampled = sample_action(biased, local_na, ts->rng);
+
+            TraversalState child = *ts;
+            child.action_history[child.history_len++] = sampled;
+            if (actions[sampled].type == ACT_FOLD) {
+                child.active[ap] = 0;
+            } else if (actions[sampled].type == ACT_CHECK) {
+                child.has_acted[ap] = 1;
+            } else if (actions[sampled].type == ACT_CALL) {
+                int call_amount = (to_call > child.stacks[ap])
+                    ? child.stacks[ap] : to_call;
+                child.bets[ap] += call_amount;
+                child.invested[ap] += call_amount;
+                child.stacks[ap] -= call_amount;
+                child.pot += call_amount;
+                child.has_acted[ap] = 1;
+            } else {
+                int amount = actions[sampled].amount;
+                if (amount > child.stacks[ap]) amount = child.stacks[ap];
+                child.bets[ap] += amount;
+                child.invested[ap] += amount;
+                child.stacks[ap] -= amount;
+                child.pot += amount;
+                child.has_acted[ap] = 1;
+                for (int p = 0; p < NP; p++)
+                    if (p != ap && child.active[p]) child.has_acted[p] = 0;
+                child.num_raises++;
+            }
+            int next_ord = next_active(acting_order, num_in_order,
+                                       ts->active, NP, acting_order_idx);
+            if (next_ord < 0) next_ord = acting_order_idx;
+            return traverse(&child, next_ord, acting_order, num_in_order);
+        }
+    }
 
     int64_t is_slot = info_table_find_or_create(&s->info_table, key, na);
     if (is_slot < 0) {
@@ -2410,6 +2648,17 @@ int bp_init_ex(BPSolver *s, int num_players,
     for (int i = 0; i < nt; i++)
         s->rng_states[i * 8] = 0xDEADBEEF12345678ULL + (uint64_t)i * 6364136223846793005ULL;
 
+    /* Phase R defaults — mirror bp_init_unified. With these defaults
+     * the dispatch helper short-circuits and traverse() is byte-
+     * identical to legacy. The 0.5f default for cont_strat_prob only
+     * matters if a caller subsequently sets depth_limit_cont_strats=1
+     * without also setting cont_strat_prob. */
+    s->depth_limit_cont_strats = 0;
+    s->cont_strat_prob = 0.5f;
+    /* Block A.2: cont_ev_table un-allocated by default; lazy alloc in
+     * bp_set_depth_limit_cont_strats. memset above zeroed
+     * cont_ev_table.entries to NULL and cont_ev_table_size_hint to 0. */
+
     return 0;
 }
 
@@ -2476,6 +2725,15 @@ int bp_init_unified(BPSolver *s, int num_players,
      * v3 training + every existing test). Phase 3 trainer overrides
      * via bp_set_add_explicit_allin(). */
     s->add_explicit_allin = 1;
+
+    /* Phase R: default to legacy full-game-depth MCCFR.
+     * Spec: docs/PHASE_R_TRAINER_SPEC.md. With these defaults the
+     * dispatch helper short-circuits and traverse() behaves
+     * byte-identically to legacy. */
+    s->depth_limit_cont_strats = 0;
+    s->cont_strat_prob = 0.5f;
+    /* Block A.2: cont_ev_table un-allocated by default; lazy alloc
+     * in bp_set_depth_limit_cont_strats. */
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
@@ -3482,6 +3740,9 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                 for (int p = 0; p < BP_MAX_PLAYERS; p++) {
                     ts.turn_bucket[p] = -1;
                     ts.river_bucket[p] = -1;
+                    /* Phase R Block A.2: -1 = no cont-bias mode (legacy CFR).
+                     * Set by HEADS-branch rollout when it fires. */
+                    ts.cont_bias_per_player[p] = -1;
                 }
                 memcpy(ts.sampled_hands, sampled_hands, sizeof(sampled_hands));
 
@@ -3640,6 +3901,20 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
              * thread team. These functions use `#pragma omp for nowait`. */
             if (do_discount) {
                 apply_discount(&s->info_table, discount_value);
+                /* Phase R Block A.2: also discount the cont-ev table's
+                 * ev_sum entries (ev_count is unweighted by spec §4).
+                 * Single-threaded inside the parallel region — fine
+                 * because the cont-ev table is small relative to the
+                 * info table; one thread's pass is fast. The omp barrier
+                 * below ensures all threads see the discounted values
+                 * before resuming the next batch. */
+                #ifdef _OPENMP
+                #pragma omp single nowait
+                #endif
+                {
+                    bp_cont_ev_apply_discount(&s->cont_ev_table,
+                                               discount_value);
+                }
             }
             if (do_snapshot) {
                 accumulate_snapshot(&s->info_table);
@@ -4484,6 +4759,7 @@ int bp_load_texture_cache(BPSolver *s, const char *path) {
 
 void bp_free(BPSolver *s) {
     info_table_free(&s->info_table);
+    bp_cont_ev_free(&s->cont_ev_table);
     if (s->rng_states) free(s->rng_states);
     if (s->texture_bucket_cache) free(s->texture_bucket_cache);
     if (s->river_centroids) free(s->river_centroids);
@@ -4733,6 +5009,10 @@ int bp_compute_action_evs(BPSolver *s, int64_t num_iterations) {
             for (int p = 0; p < BP_MAX_PLAYERS; p++) {
                 ts.turn_bucket[p] = -1;
                 ts.river_bucket[p] = -1;
+                /* Phase R Block A.2: -1 default. traverse_ev does not
+                 * gate on cont_bias, but we keep the field consistent
+                 * across all TraversalState allocations. */
+                ts.cont_bias_per_player[p] = -1;
             }
             memcpy(ts.sampled_hands, sampled_hands, sizeof(sampled_hands));
 

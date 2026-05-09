@@ -231,6 +231,17 @@ def load_bp_dll(build_dir):
             if hasattr(bp, "bp_drop_trailing_allin_slot"):
                 bp.bp_drop_trailing_allin_slot.restype = ctypes.c_int64
                 bp.bp_drop_trailing_allin_slot.argtypes = [ctypes.c_void_p]
+            # Phase R hooks (no-op if older C lib doesn't have them).
+            if hasattr(bp, "bp_set_depth_limit_cont_strats"):
+                bp.bp_set_depth_limit_cont_strats.restype = ctypes.c_int
+                bp.bp_set_depth_limit_cont_strats.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int,
+                ]
+            if hasattr(bp, "bp_set_cont_strat_prob"):
+                bp.bp_set_cont_strat_prob.restype = ctypes.c_int
+                bp.bp_set_cont_strat_prob.argtypes = [
+                    ctypes.c_void_p, ctypes.c_float,
+                ]
             bp.bp_save_texture_cache.restype = ctypes.c_int
             bp.bp_save_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_load_texture_cache.restype = ctypes.c_int
@@ -296,6 +307,33 @@ def main():
     parser.add_argument("--river-ochs-clusters", type=int,
                         default=int(os.environ.get("BPS_RIVER_OCHS_CLUSTERS", "0") or 0),
                         help="Number of opponent clusters for OCHS (0=default 8).")
+    # Phase R: depth-limit + cont-strat-sampling dispatch at multiway-flop
+    # boundary. See docs/PHASE_R_TRAINER_SPEC.md. Block A.1 wires the
+    # dispatch site (Block A.2 fills in the HEADS-branch rollout). DO NOT
+    # enable for production training before A.2 lands.
+    parser.add_argument("--depth-limit-cont-strats", action="store_true",
+                        default=(os.environ.get("BPS_DEPTH_LIMIT_CONT_STRATS",
+                                                "0") == "1"),
+                        help="Phase R: terminate the trainer recursion at "
+                             "multiway-flop boundaries with probability "
+                             "--cont-strat-prob, sample joint cont-bias, "
+                             "rollout to showdown, accumulate boundary EV "
+                             "slots. Default OFF for backward compatibility "
+                             "with existing checkpoints. WARNING: only "
+                             "Block A.1 of Phase R has shipped (dispatch "
+                             "wiring); A.2 (rollout) is not yet "
+                             "implemented — enabling this flag currently "
+                             "produces zero-EV at boundaries. See "
+                             "docs/PHASE_R_TRAINER_SPEC.md.")
+    parser.add_argument("--cont-strat-prob", type=float,
+                        default=float(os.environ.get(
+                            "BPS_CONT_STRAT_PROB", "0.5")),
+                        help="Phase R: probability of HEADS (terminate at "
+                             "multiway-flop boundary) vs TAILS (continue "
+                             "legacy recursion). Used only when "
+                             "--depth-limit-cont-strats is set. Must be in "
+                             "[0, 1]. Default 0.5; probe (Step 1) may "
+                             "argue for a different default.")
     args = parser.parse_args()
 
     print(f"=== Unified 6-Player Blueprint (Pluribus-style) ===")
@@ -412,6 +450,27 @@ def main():
                   "patch.")
             sys.exit(1)
         bp_lib.bp_set_add_explicit_allin(solver, 0)
+
+    # Phase R: depth-limit + cont-strat-sampling dispatch.
+    # See docs/PHASE_R_TRAINER_SPEC.md.
+    if args.depth_limit_cont_strats:
+        if not hasattr(bp_lib, "bp_set_depth_limit_cont_strats"):
+            print("FATAL: --depth-limit-cont-strats requested but the "
+                  "loaded mccfr_blueprint.so doesn't export "
+                  "bp_set_depth_limit_cont_strats. Rebuild from the "
+                  "Phase R branch.")
+            sys.exit(1)
+        if not (0.0 <= args.cont_strat_prob <= 1.0):
+            print(f"FATAL: --cont-strat-prob {args.cont_strat_prob} out "
+                  "of [0, 1]")
+            sys.exit(1)
+        bp_lib.bp_set_cont_strat_prob(
+            solver, ctypes.c_float(args.cont_strat_prob))
+        bp_lib.bp_set_depth_limit_cont_strats(solver, 1)
+        print("WARNING: --depth-limit-cont-strats is Block A.1 wiring "
+              "only; Block A.2 (cont-bias rollout) has not yet shipped. "
+              "Boundary leaves currently return 0 EV. Do NOT use this "
+              "for production training.")
 
     # Set tiered preflop sizing (overrides flat sizes)
     for level, sizes in sorted(PREFLOP_TIERS.items()):
