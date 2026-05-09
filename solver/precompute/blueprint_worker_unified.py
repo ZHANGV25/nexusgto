@@ -308,9 +308,11 @@ def main():
                         default=int(os.environ.get("BPS_RIVER_OCHS_CLUSTERS", "0") or 0),
                         help="Number of opponent clusters for OCHS (0=default 8).")
     # Phase R: depth-limit + cont-strat-sampling dispatch at multiway-flop
-    # boundary. See docs/PHASE_R_TRAINER_SPEC.md. Block A.1 wires the
-    # dispatch site (Block A.2 fills in the HEADS-branch rollout). DO NOT
-    # enable for production training before A.2 lands.
+    # boundary. See docs/PHASE_R_TRAINER_SPEC.md. Blocks A.1, A.2, B.1,
+    # B.2, B.3 + B.4 production wire-in shipped through Step 8 — the
+    # boundary now dispatches via HEADS-rollout, populates the cont-ev
+    # table, and round-trips through BPR5 storage. Probe-readiness gate
+    # closed Step 8.
     parser.add_argument("--depth-limit-cont-strats", action="store_true",
                         default=(os.environ.get("BPS_DEPTH_LIMIT_CONT_STRATS",
                                                 "0") == "1"),
@@ -319,12 +321,10 @@ def main():
                              "--cont-strat-prob, sample joint cont-bias, "
                              "rollout to showdown, accumulate boundary EV "
                              "slots. Default OFF for backward compatibility "
-                             "with existing checkpoints. WARNING: only "
-                             "Block A.1 of Phase R has shipped (dispatch "
-                             "wiring); A.2 (rollout) is not yet "
-                             "implemented — enabling this flag currently "
-                             "produces zero-EV at boundaries. See "
-                             "docs/PHASE_R_TRAINER_SPEC.md.")
+                             "with existing BPR4 checkpoints. The BPR5 "
+                             "trailer write fires automatically on "
+                             "bp_save_regrets when cont-strat dispatch has "
+                             "populated >=1 boundary slot.")
     parser.add_argument("--cont-strat-prob", type=float,
                         default=float(os.environ.get(
                             "BPS_CONT_STRAT_PROB", "0.5")),
@@ -334,7 +334,34 @@ def main():
                              "--depth-limit-cont-strats is set. Must be in "
                              "[0, 1]. Default 0.5; probe (Step 1) may "
                              "argue for a different default.")
+    parser.add_argument("--checkpoint-prefix", type=str, default="",
+                        help="Phase R probe / experimental runs: prepend "
+                             "this path component to every S3 key written "
+                             "by this worker (regrets_latest.bin, "
+                             "regrets_NNNM.bin, checkpoint_meta.json, "
+                             "unified_blueprint.bps, summaries/, probes/). "
+                             "Empty (default) preserves legacy canonical "
+                             "key layout. Use e.g. "
+                             "'phase_r_probe/run_<timestamp>' to keep an "
+                             "experimental run from clobbering production "
+                             "canonical keys. Trailing slashes are stripped.")
+    parser.add_argument("--snapshot-bps-every-chunk", action="store_true",
+                        default=(os.environ.get(
+                            "BPS_SNAPSHOT_BPS_EVERY_CHUNK", "0") == "1"),
+                        help="Phase R probe: at every mini_chunk boundary "
+                             "(BPS_MINI_CHUNK iters), export a "
+                             "strategy-only .bps snapshot to "
+                             "<prefix>/strategy_snapshots/blueprint_<NNN>M.bps. "
+                             "Used to compute reach-weighted exploitability "
+                             "at every probe checkpoint instead of just the "
+                             "final state. Cost: ~3 min wall + ~5 GB upload "
+                             "per snapshot on 2B-info-set blueprint. "
+                             "Requires --checkpoint-prefix to be set "
+                             "(belt-and-braces guard against accidentally "
+                             "publishing experimental snapshots).")
     args = parser.parse_args()
+    # Normalise checkpoint prefix: strip surrounding slashes; empty stays empty.
+    args.checkpoint_prefix = args.checkpoint_prefix.strip("/").strip()
 
     print(f"=== Unified 6-Player Blueprint (Pluribus-style) ===")
     print(f"Players: {NUM_PLAYERS}")
@@ -467,10 +494,10 @@ def main():
         bp_lib.bp_set_cont_strat_prob(
             solver, ctypes.c_float(args.cont_strat_prob))
         bp_lib.bp_set_depth_limit_cont_strats(solver, 1)
-        print("WARNING: --depth-limit-cont-strats is Block A.1 wiring "
-              "only; Block A.2 (cont-bias rollout) has not yet shipped. "
-              "Boundary leaves currently return 0 EV. Do NOT use this "
-              "for production training.")
+        print(f"[Phase R] depth-limit cont-strat dispatch ACTIVE "
+              f"(cont_strat_prob={args.cont_strat_prob}). HEADS-branch "
+              f"rollouts will populate boundary EV slots; "
+              f"bp_save_regrets writes BPR5 trailer on completion.")
 
     # Set tiered preflop sizing (overrides flat sizes)
     for level, sizes in sorted(PREFLOP_TIERS.items()):
@@ -739,7 +766,12 @@ def main():
 
     # Solve in mini-chunks (50M) with lightweight strategy probes between each.
     # Full checkpoint (regret save + S3 upload) only at adaptive milestones.
-    mini_chunk = 50_000_000  # strategy probe every 50M iterations
+    # Phase R probe / experiments override via BPS_MINI_CHUNK env to get a
+    # finer-grained convergence trajectory (e.g. 10M for 5 points across a
+    # 50M-iter run). Capped to avoid pathological 0/negative values.
+    mini_chunk = max(
+        1_000_000,
+        int(os.environ.get("BPS_MINI_CHUNK", "50000000")))
 
     while iters_done < total_iters:
         # Solve one mini-chunk
@@ -787,6 +819,19 @@ def main():
                         flush=True,
                     )
 
+        # Phase R probe: per-mini_chunk strategy snapshot for reach-weighted
+        # exploitability trajectory. Gated on the CLI flag + a non-empty
+        # checkpoint_prefix (the helper itself enforces the prefix guard;
+        # the gate here just avoids the wasted print on the legacy path).
+        if (args.snapshot_bps_every_chunk
+                and args.checkpoint_prefix
+                and iters_done < total_iters):
+            # Skip the snapshot at the FINAL chunk — _export_checkpoint
+            # writes the canonical-equivalent (prefixed) BPS at iters_done
+            # == total_iters anyway, so the snapshot would be redundant.
+            _export_strategy_snapshot(
+                bp_lib, solver, args, iters_done, n_is, elapsed)
+
         # Lightweight strategy probe: extract strategies + raw regrets
         # directly from memory via bp_get_strategy/bp_get_regrets (no disk I/O).
         probe = _probe_preflop(bp_lib, solver)
@@ -801,6 +846,9 @@ def main():
                 with open(probe_path, 'w') as pf:
                     pf.write(f"iteration: {iters_done}\n{probe}\n")
                 try:
+                    s3_prefix = (
+                        f"{args.checkpoint_prefix}/"
+                        if args.checkpoint_prefix else "")
                     subprocess.run(
                         ["aws", "s3", "cp", probe_path,
                          "--quiet"], capture_output=True, timeout=30)
@@ -1235,6 +1283,153 @@ def _s3_upload_with_retry(local_path, s3_uri, max_attempts=3, delay=5,
             )
 
 
+def _stream_bps_export(bp_lib, solver, bps_path, meta_dict):
+    """OOM-safe streaming export of strategies to a .bps file.
+
+    Used by both the final-checkpoint export (`_export_checkpoint`) and
+    per-mini-chunk strategy snapshots (`_export_strategy_snapshot`). See
+    `_export_checkpoint` for the historical incident that motivated the
+    streaming pattern.
+
+    Returns the on-disk compressed_size in bytes, or 0 if the solver had
+    no strategies to export (caller should treat that as a no-op).
+    """
+    import lzma
+    import struct
+
+    needed = ctypes.c_size_t(0)
+    bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
+    strat_size = needed.value
+    if strat_size <= 0:
+        return 0
+
+    print(f"  Streaming strat export: "
+          f"{strat_size / 1024 / 1024 / 1024:.2f} GiB raw",
+          flush=True)
+    strat_buf = (ctypes.c_char * strat_size)()
+    written = ctypes.c_size_t(0)
+    bp_lib.bp_export_strategies(solver, strat_buf, strat_size,
+                                ctypes.byref(written))
+    written_bytes = written.value
+    meta_bytes = json.dumps(meta_dict, separators=(',', ':')).encode('utf-8')
+
+    CHUNK = 64 * 1024 * 1024  # 64 MB compress chunks
+    out_tmp = bps_path + ".tmp"
+    compressor = lzma.LZMACompressor(preset=1)
+    compressed_size = 0
+
+    with open(out_tmp, 'wb') as f:
+        f.write(b'BPS3')
+        header_compressed_size_offset = f.tell()
+        f.write(struct.pack('<QI', 0, len(meta_bytes)))
+        mv = memoryview(strat_buf)[:written_bytes]
+        pos = 0
+        last_pct_logged = -1
+        while pos < written_bytes:
+            chunk_end = min(pos + CHUNK, written_bytes)
+            out_chunk = compressor.compress(mv[pos:chunk_end])
+            if out_chunk:
+                f.write(out_chunk)
+                compressed_size += len(out_chunk)
+            pos = chunk_end
+            pct = int(100 * pos / written_bytes)
+            if pct >= last_pct_logged + 10:
+                print(f"    compress {pct}% "
+                      f"(in={pos / 1024 / 1024 / 1024:.1f} GiB, "
+                      f"out={compressed_size / 1024 / 1024 / 1024:.2f} GiB)",
+                      flush=True)
+                last_pct_logged = pct
+        tail = compressor.flush()
+        if tail:
+            f.write(tail)
+            compressed_size += len(tail)
+        f.write(meta_bytes)
+        f.seek(header_compressed_size_offset)
+        f.write(struct.pack('<Q', compressed_size))
+
+    os.replace(out_tmp, bps_path)
+    return compressed_size
+
+
+def _export_strategy_snapshot(bp_lib, solver, args, iters_done, n_is,
+                              elapsed):
+    """Export a strategy-only snapshot at a probe checkpoint.
+
+    Phase R / experimental runs request these via the brief's "5 trajectory
+    points" requirement. Skips the regret save (~105 GB) and writes only
+    the .bps to a versioned, prefix-aware S3 key. Caller should ensure
+    --checkpoint-prefix is set so we never write to canonical
+    `unified_blueprint.bps`.
+    """
+    if not args.s3_bucket:
+        return  # local-only run; nothing to upload
+    if not args.checkpoint_prefix:
+        # Refuse to write strategy snapshots without a prefix — the
+        # `unified_blueprint_<iter_tag>.bps` versioned key is stable and
+        # safe, but explicit prefix-gating is a belt-and-braces guard
+        # against accidentally publishing experimental snapshots to
+        # canonical-adjacent keys (an audit-friendly invariant: snapshot
+        # path always contains the run-id).
+        print(f"  [snapshot] skipping — --checkpoint-prefix required for "
+              f"strategy snapshots", flush=True)
+        return
+
+    iter_tag = (
+        f"{iters_done // 1_000_000_000}B"
+        if iters_done >= 1_000_000_000 and iters_done % 1_000_000_000 == 0
+        else f"{iters_done // 1_000_000}M")
+
+    snapshot_dir = os.path.join(args.output_dir, "strategy_snapshots")
+    os.makedirs(snapshot_dir, exist_ok=True)
+    bps_path = os.path.join(snapshot_dir, f"blueprint_{iter_tag}.bps")
+
+    snapshot_meta = {
+        "type": "phase_r_strategy_snapshot",
+        "num_players": NUM_PLAYERS,
+        "iterations": iters_done,
+        "num_info_sets": n_is,
+        "time_seconds": round(elapsed),
+        "checkpoint": f"snapshot_{iter_tag}",
+        "config_hash": _compute_config_hash(
+            add_explicit_allin=(0 if args.no_explicit_allin else 1)),
+        "add_explicit_allin": (0 if args.no_explicit_allin else 1),
+        "depth_limit_cont_strats": int(args.depth_limit_cont_strats),
+        "cont_strat_prob": args.cont_strat_prob,
+        "checkpoint_prefix": args.checkpoint_prefix,
+        "snapshot_only": True,
+    }
+    t_export = time.time()
+    compressed_size = _stream_bps_export(bp_lib, solver, bps_path,
+                                         snapshot_meta)
+    if compressed_size <= 0:
+        print(f"  [snapshot {iter_tag}] no strategies to export "
+              f"(empty arena)", flush=True)
+        return
+
+    s3_prefix = f"{args.checkpoint_prefix}/"
+    s3_key = (
+        f"blueprint_{iter_tag}.bps")
+    try:
+        _s3_upload_with_retry(bps_path, s3_key)
+        print(f"  [snapshot {iter_tag}] "
+              f"{compressed_size / 1024 / 1024:.0f} MB compressed, "
+              f"export+upload {(time.time() - t_export):.0f}s, "
+              f"key={s3_key}", flush=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            RuntimeError) as e:
+        print(f"  [snapshot {iter_tag}] upload failed: {e} — local copy "
+              f"retained at {bps_path}", flush=True)
+    finally:
+        # Delete the local .bps to free EBS space — the upload either
+        # succeeded (S3 has the durable copy) or failed (we leave the
+        # file for inspection, but next probe will overwrite it).
+        if compressed_size > 0:
+            try:
+                os.remove(bps_path)
+            except OSError:
+                pass
+
+
 def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
                        label=None):
     """Export strategy + regret checkpoint and upload to S3.
@@ -1349,96 +1544,26 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
     os.replace(meta_tmp, meta_path)
 
     # ── Save strategy .bps (for runtime use) ──
-    # Only export .bps on final checkpoint — intermediate exports are too
-    # expensive (300M+ info sets × LZMA compress = minutes per checkpoint).
-    # The regret checkpoint is sufficient for resume; .bps is only needed
-    # for the runtime solver after training completes.
+    # Only export .bps on final checkpoint — intermediate full-checkpoint
+    # exports are too expensive (300M+ info sets × LZMA compress = minutes
+    # per checkpoint). The regret checkpoint is sufficient for resume;
+    # canonical .bps is only needed for the runtime solver after training
+    # completes. Per-mini-chunk experimental snapshots are emitted via
+    # `_export_strategy_snapshot` (Phase R probe path) — those write to a
+    # prefixed S3 key, never to the canonical `unified_blueprint.bps`.
     bps_path = os.path.join(args.output_dir, "unified_blueprint.bps")
     regret_mb = os.path.getsize(regret_path) / 1024 / 1024
 
     if label == "final":
-        # OOM-safe streaming export.
-        #
-        # Prior pattern materialized the entire raw strat (~23 GB) AND a
-        # `bytes()` copy of it AND the full LZMA output in Python memory
-        # simultaneously. With the regret hash table still alive (~75 GB
-        # table arrays + ~25 GB arena) plus OS write buffers, peak crossed
-        # the c6a.metal 384 GB ceiling under load and got OOM-killed mid
-        # multipart upload — the truncation that cost the 3B run.
-        #
-        # New pattern:
-        #   1. Single `bp_export_strategies` call into one C-side buffer
-        #      (Python sees it via ctypes; no `bytes()` copy).
-        #   2. Compress the buffer slice-by-slice with `LZMACompressor`,
-        #      streaming each chunk straight into the output file. Only
-        #      a small (~1 MB) compressor working set lives in RAM.
-        #   3. Outer .bps wrapper is written with a placeholder header,
-        #      then we patch in the real compressed_size after streaming.
-        needed = ctypes.c_size_t(0)
-        bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
-        strat_size = needed.value
-
-        if strat_size > 0:
-            print(f"  Streaming strat export: {strat_size / 1024 / 1024 / 1024:.2f} GiB raw",
-                  flush=True)
-            strat_buf = (ctypes.c_char * strat_size)()
-            written = ctypes.c_size_t(0)
-            bp_lib.bp_export_strategies(solver, strat_buf, strat_size,
-                                        ctypes.byref(written))
-            written_bytes = written.value
-            meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
-
-            # Stream LZMA directly to file. Use `memoryview` over strat_buf
-            # so we don't allocate a Python `bytes` copy of the whole buffer.
-            CHUNK = 64 * 1024 * 1024  # 64 MB compress chunks
-            out_tmp = bps_path + ".tmp"
-
-            # Strategy: write header with placeholder compressed_size = 0,
-            # stream-compress to disk past the header, fseek back and patch
-            # the header. Atomically rename at the end.
-            compressor = lzma.LZMACompressor(preset=1)
-            compressed_size = 0
-
-            with open(out_tmp, 'wb') as f:
-                # Header placeholder. compressed_size=0 will be patched.
-                f.write(b'BPS3')
-                header_compressed_size_offset = f.tell()
-                f.write(struct.pack('<QI', 0, len(meta_bytes)))
-
-                # Stream raw strat_buf in 64 MB chunks through the compressor.
-                mv = memoryview(strat_buf)[:written_bytes]
-                pos = 0
-                last_pct_logged = -1
-                while pos < written_bytes:
-                    chunk_end = min(pos + CHUNK, written_bytes)
-                    # memoryview slice avoids the per-chunk bytes() copy
-                    # (lzma.compress accepts buffer-protocol objects directly).
-                    out_chunk = compressor.compress(mv[pos:chunk_end])
-                    if out_chunk:
-                        f.write(out_chunk)
-                        compressed_size += len(out_chunk)
-                    pos = chunk_end
-                    pct = int(100 * pos / written_bytes)
-                    if pct >= last_pct_logged + 10:
-                        print(f"    compress {pct}% "
-                              f"(in={pos / 1024 / 1024 / 1024:.1f} GiB, "
-                              f"out={compressed_size / 1024 / 1024 / 1024:.2f} GiB)",
-                              flush=True)
-                        last_pct_logged = pct
-                tail = compressor.flush()
-                if tail:
-                    f.write(tail)
-                    compressed_size += len(tail)
-
-                # Now write meta footer.
-                f.write(meta_bytes)
-
-                # Patch the compressed_size field in the header.
-                f.seek(header_compressed_size_offset)
-                f.write(struct.pack('<Q', compressed_size))
-
-            os.replace(out_tmp, bps_path)
-
+        # OOM-safe streaming export. Prior pattern materialized the entire
+        # raw strat (~23 GB) AND a `bytes()` copy of it AND the full LZMA
+        # output in Python memory simultaneously. With the regret hash
+        # table still alive plus OS write buffers, peak crossed the c6a.metal
+        # 384 GB ceiling under load and got OOM-killed mid multipart upload
+        # — the truncation that cost the 3B run. See `_stream_bps_export`
+        # for the streaming pattern that replaced it.
+        compressed_size = _stream_bps_export(bp_lib, solver, bps_path, meta)
+        if compressed_size > 0:
             comp_mb = compressed_size / 1024 / 1024
             print(f"  Final checkpoint: strategy={comp_mb:.0f}MB compressed, "
                   f"regrets={regret_mb:.0f}MB", flush=True)
@@ -1449,10 +1574,15 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
 
     # ── Upload to S3 (with retries) ──
     if args.s3_bucket:
+        # Phase R / experimental runs may set --checkpoint-prefix to keep
+        # their outputs from clobbering production canonical keys.
+        s3_prefix = (
+            f"{args.checkpoint_prefix}/"
+            if args.checkpoint_prefix else "")
         # Always upload latest (for resume)
         uploads = [
-            (regret_path, "checkpoints/regrets_latest.bin"),
-            (meta_path, "checkpoint_meta.json"),
+            (regret_path, f"{s3_prefix}checkpoints/regrets_latest.bin"),
+            (meta_path, f"{s3_prefix}checkpoint_meta.json"),
         ]
         # Also save a timestamped copy of every checkpoint for later analysis.
         # Use "XB" for exact billions, "XM" otherwise (avoids collisions
@@ -1461,11 +1591,11 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
             iter_tag = f"{iters_done // 1_000_000_000}B"
         else:
             iter_tag = f"{iters_done // 1_000_000}M"
-        uploads.append((regret_path, f"checkpoints/regrets_{iter_tag}.bin"))
-        uploads.append((meta_path, f"checkpoints/meta_{iter_tag}.json"))
+        uploads.append((regret_path, f"{s3_prefix}checkpoints/regrets_{iter_tag}.bin"))
+        uploads.append((meta_path, f"{s3_prefix}checkpoints/meta_{iter_tag}.json"))
 
         if label == "final" and os.path.exists(bps_path):
-            uploads.append((bps_path, "unified_blueprint.bps"))
+            uploads.append((bps_path, f"{s3_prefix}unified_blueprint.bps"))
 
         # ── Run extract_roots for convergence monitoring ──
         extract_bin = os.path.join(args.build_dir, "extract_roots")
@@ -1489,12 +1619,12 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
 
         # Upload small files FIRST (summary + meta) so results are visible
         # immediately, then upload the large regret file once + server-side copy.
-        small_uploads = [(meta_path, "checkpoint_meta.json"),
-                         (meta_path, f"checkpoints/meta_{iter_tag}.json")]
+        small_uploads = [(meta_path, f"{s3_prefix}checkpoint_meta.json"),
+                         (meta_path, f"{s3_prefix}checkpoints/meta_{iter_tag}.json")]
         if summary_path and os.path.exists(summary_path):
-            small_uploads.append((summary_path, f"summaries/strategy_{iter_tag}.txt"))
+            small_uploads.append((summary_path, f"{s3_prefix}summaries/strategy_{iter_tag}.txt"))
         if label == "final" and os.path.exists(bps_path):
-            small_uploads.append((bps_path, "unified_blueprint.bps"))
+            small_uploads.append((bps_path, f"{s3_prefix}unified_blueprint.bps"))
 
         for local, s3key in small_uploads:
             if os.path.exists(local):
