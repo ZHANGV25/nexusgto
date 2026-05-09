@@ -56,6 +56,13 @@ def _get_lib():
         raise FileNotFoundError(f"street_solve not found at {lib_path}")
     _LIB = ctypes.CDLL(lib_path)
     _LIB.ss_build_tree.restype = ctypes.c_int
+    # Phase R Block B.3 (Step 6): per-level bet_sizes API. Older
+    # libstreet_solve.so builds (pre-Step 6) won't export
+    # ss_build_tree2; tolerate that here so this binding loads
+    # against either build, and let the caller surface the missing
+    # symbol only when subsequent_bet_sizes is actually passed.
+    if hasattr(_LIB, "ss_build_tree2"):
+        _LIB.ss_build_tree2.restype = ctypes.c_int
     _LIB.ss_solve_gpu.restype = ctypes.c_int
     _LIB.ss_free_tree.restype = None
     _LIB.ss_free_output.restype = None
@@ -225,7 +232,9 @@ class StreetSolverGPU:
                  # Common options
                  bet_sizes=None, leaf_values=None,
                  use_cont_strats=True, leaf_value_fn=None,
-                 add_explicit_allin=True):
+                 add_explicit_allin=True,
+                 # Phase R Block B.3 (Step 6): per-level bet_sizes
+                 subsequent_bet_sizes=None):
         """
         Args:
             board: list of card strings or ints
@@ -234,7 +243,13 @@ class StreetSolverGPU:
             oop_range/ip_range: 2-player mode (backward compat)
             player_ranges: list of [(c0,c1,w), ...] per player (N-player mode)
             acting_order: list of player indices in acting order (default: [0,1,...,N-1])
-            bet_sizes: bet fractions (default [0.33, 0.75, 1.5])
+            bet_sizes: first-raise bet fractions (default [0.33, 0.75, 1.5]).
+                Used at every node where num_raises == 0.
+            subsequent_bet_sizes: bet fractions for raises 2..max (num_raises > 0).
+                Default None → replicate `bet_sizes` (matches kernel's
+                NULL/0 fallback in ss_build_tree2 backward-compat shim).
+                For v3/phase3 production: pass [1.0] to mirror trainer's
+                SUBSEQUENT_BET_SIZES (mccfr_blueprint.c:1594-1602).
             leaf_values: np.array or None
             use_cont_strats: expand leaves with continuation strategies
             leaf_value_fn: callback to compute leaf values from tree
@@ -300,6 +315,7 @@ class StreetSolverGPU:
         if bet_sizes is None:
             bet_sizes = [0.33, 0.75, 1.5]
         self.bet_sizes = bet_sizes
+        self.subsequent_bet_sizes = subsequent_bet_sizes
 
         if acting_order is None:
             acting_order = list(range(self.num_players))
@@ -316,15 +332,33 @@ class StreetSolverGPU:
         self._tree = SSTreeData()
         use_cs = 1 if (use_cont_strats and not self.is_river) else 0
 
-        err = self.lib.ss_build_tree(
-            board_arr, self.num_board,
-            pot, stack,
-            bet_arr, len(bet_sizes),
-            self.num_players, order_arr,
-            1 if self.is_river else 0,
-            use_cs,
-            1 if add_explicit_allin else 0,
-            ctypes.byref(self._tree))
+        # Phase R Block B.3 (Step 6): if caller provided
+        # subsequent_bet_sizes, route through ss_build_tree2 (per-level
+        # bet_sizes API). Otherwise fall through to the legacy
+        # ss_build_tree shim, which forwards subsequent=NULL/0 → kernel
+        # replicates first.
+        if subsequent_bet_sizes is not None:
+            sub_arr = (ctypes.c_float * len(subsequent_bet_sizes))(*subsequent_bet_sizes)
+            err = self.lib.ss_build_tree2(
+                board_arr, self.num_board,
+                pot, stack,
+                bet_arr, len(bet_sizes),
+                sub_arr, len(subsequent_bet_sizes),
+                self.num_players, order_arr,
+                1 if self.is_river else 0,
+                use_cs,
+                1 if add_explicit_allin else 0,
+                ctypes.byref(self._tree))
+        else:
+            err = self.lib.ss_build_tree(
+                board_arr, self.num_board,
+                pot, stack,
+                bet_arr, len(bet_sizes),
+                self.num_players, order_arr,
+                1 if self.is_river else 0,
+                use_cs,
+                1 if add_explicit_allin else 0,
+                ctypes.byref(self._tree))
         if err != 0:
             raise RuntimeError("ss_build_tree failed")
 

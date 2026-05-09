@@ -917,16 +917,14 @@ static inline int board_to_street(int num_board) {
 
 /* ── Betting tree (generated on-the-fly) ─────────────────────────── */
 
-#define ACT_FOLD    0
-#define ACT_CHECK   1
-#define ACT_CALL    2
-#define ACT_BET     3
+#define ACT_FOLD    BP_ACT_FOLD
+#define ACT_CHECK   BP_ACT_CHECK
+#define ACT_CALL    BP_ACT_CALL
+#define ACT_BET     BP_ACT_BET
 
-typedef struct {
-    int type;
-    int bet_idx;
-    int amount;
-} BPAction;
+/* BPAction typedef now lives in mccfr_blueprint.h (Phase R Block B.3,
+ * Step 6 — exposed so the encoding-alignment test can drive a
+ * pure-C trainer-walker against the same emission contract). */
 
 static int generate_actions(BPAction *out, int max_out,
                             int pot, int stack, int to_call,
@@ -963,6 +961,23 @@ static int generate_actions(BPAction *out, int max_out,
         }
     }
     return n;
+}
+
+/* Phase R Block B.3 (Step 6) — exposed wrapper for generate_actions.
+ * The static generate_actions is unchanged; this bridge lets the
+ * encoding-alignment test (`tests/test_b3_encoding_alignment.c`) drive
+ * a pure-C trainer-side walker that reproduces the production action
+ * emission contract byte-for-byte. The kernel-built tree is then
+ * cross-validated against this walker. */
+int bp_generate_actions(BPAction *out, int max_out,
+                         int pot, int stack, int to_call,
+                         int num_raises, int max_raises,
+                         const float *bet_sizes, int num_bet_sizes,
+                         int add_explicit_allin) {
+    return generate_actions(out, max_out, pot, stack, to_call,
+                            num_raises, max_raises,
+                            bet_sizes, num_bet_sizes,
+                            add_explicit_allin);
 }
 
 /* ── Traversal state ─────────────────────────────────────────────── */

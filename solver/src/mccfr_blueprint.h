@@ -41,6 +41,19 @@
 #define BP_ACT_CALL     2
 #define BP_ACT_BET      3
 
+/* BPAction — single emitted action from the trainer's
+ * generate_actions(). Promoted to the header in Phase R Block B.3
+ * (Step 6) so the encoding-alignment test can drive a pure-C
+ * trainer-walker against the same emission contract the production
+ * traverse() uses. */
+typedef struct {
+    int type;     /* BP_ACT_FOLD/CHECK/CALL/BET */
+    int bet_idx;  /* -1 for non-bet; index into bet_sizes[] for bet/raise */
+    int amount;   /* total chips committed by this action (call=to_call, raise=to_call+raise) */
+} BPAction;
+
+#define BP_MAX_GEN_ACTIONS 16
+
 /* Hash table sizing.
  * Per-texture: ~5-50M info sets depending on player count and bet sizes.
  * BP_HASH_SIZE_MEDIUM (64M slots) fits ~45M info sets at 70% load.
@@ -493,6 +506,32 @@ BP_EXPORT void bp_apply_cont_bias(const float *avg_strategy,
  * mixer mode flag (set via bp_set_legacy_hash_mixer).
  */
 BP_EXPORT uint64_t bp_compute_action_hash(const int *actions, int num_actions);
+
+/* Phase R Block B.3 (Step 6) — exposed wrapper for the static
+ * generate_actions inside mccfr_blueprint.c. Mirrors the production
+ * action-emission contract byte-for-byte (same indices, same
+ * fold/check/call/raise ordering, same allin saturation + dedup,
+ * same explicit-allin gate). The encoding-alignment test drives a
+ * pure-C trainer-walker against this wrapper to cross-validate the
+ * kernel-built tree.
+ *
+ * Args mirror generate_actions:
+ *   out, max_out         — output buffer for emitted BPAction[].
+ *   pot, stack, to_call  — current decision-node state.
+ *   num_raises, max_raises — raise-cap state.
+ *   bet_sizes, num_bet_sizes — current per-level bet-size fractions.
+ *     (Caller selects between *_first / *_subsequent via num_raises,
+ *     same as the trainer's traverse() does at mccfr_blueprint.c:
+ *     1581-1602.)
+ *   add_explicit_allin   — global flag (s->add_explicit_allin).
+ *
+ * Returns: number of actions emitted (≥ 1, ≤ max_out, ≤ BP_MAX_GEN_ACTIONS).
+ */
+BP_EXPORT int bp_generate_actions(BPAction *out, int max_out,
+                                   int pot, int stack, int to_call,
+                                   int num_raises, int max_raises,
+                                   const float *bet_sizes, int num_bet_sizes,
+                                   int add_explicit_allin);
 
 /**
  * Phase 3 post-load fixup: drop the trailing allin slot from infosets

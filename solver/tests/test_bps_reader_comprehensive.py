@@ -233,14 +233,21 @@ def test_hand_to_bucket_matches_raw_cache():
             for hi in sample_indices:
                 c0, c1 = actual_hands[hi]
                 cc0, cc1 = _map_hand_to_canonical(c0, c1, suit_map)
+                if cc0 > cc1:
+                    cc0, cc1 = cc1, cc0
 
-                # Find canonical hand index
-                try:
-                    canon_idx = canon_hands.index((cc0, cc1))
-                except ValueError:
-                    continue  # hand not in canonical list (shouldn't happen)
+                # Phase R Block B.3 (Step 6): the trainer's storage at
+                # mccfr_blueprint.c:3002 writes to cache_row[full_idx] where
+                # full_idx is the FULL-deck pair index (0..1325, ignoring
+                # blocked-card filtering). The reader's bps_hand_to_bucket
+                # was fixed in Step 6 to read from the same slot.
+                # Pre-fix this test compared against canon_hands.index(...)
+                # which is BOARD-FILTERED — that was calibrated to the
+                # reader's broken behavior, not to the trainer's actual
+                # storage.
+                full_idx = cc0 * 51 - cc0 * (cc0 - 1) // 2 + cc1 - cc0 - 1
 
-                expected_bucket = int(bucket_data[raw_tex_idx, canon_idx])
+                expected_bucket = int(bucket_data[raw_tex_idx, full_idx])
                 actual_bucket = reader.hand_to_bucket(board, c0, c1)
 
                 if actual_bucket != expected_bucket:
@@ -250,7 +257,7 @@ def test_hand_to_bucket_matches_raw_cache():
                             f"  MISMATCH: board={cards_str(board)} "
                             f"hand={card_str(c0)}{card_str(c1)} "
                             f"expected={expected_bucket} got={actual_bucket} "
-                            f"canon_idx={canon_idx}"
+                            f"full_idx={full_idx}"
                         )
                 tested += 1
 

@@ -318,16 +318,59 @@ $(BUILD_DIR)/test_phase_r_discount_gate: tests/test_phase_r_discount_gate.c \
 test_phase_r_discount_gate: $(BUILD_DIR)/test_phase_r_discount_gate
 	./$(BUILD_DIR)/test_phase_r_discount_gate
 
+# ── Phase R Block B.3 (Step 6): encoding-alignment PASS gate ──
+# Cross-validates kernel-built tree action emission against the
+# trainer's bp_generate_actions byte-for-byte, on v3/phase3 production
+# config. Mac-runnable via the ss_tree_builder.{c,h} extraction.
+$(BUILD_DIR)/test_b3_encoding_alignment: tests/test_b3_encoding_alignment.c \
+        $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h \
+        $(SRC_DIR)/ss_action_hash.c $(SRC_DIR)/ss_action_hash.h \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/cuda/street_solve.cuh \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_b3_encoding_alignment.c \
+	    $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_action_hash.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_b3_encoding_alignment: $(BUILD_DIR)/test_b3_encoding_alignment
+	./$(BUILD_DIR)/test_b3_encoding_alignment
+
+# ── Phase R Block B.3 (Step 6): bucket-lookup divergence test ──
+# HARD GATE before B.3 PASS. Loads /tmp/texture_cache.bin (or
+# BPS_TEXTURE_CACHE override) via both bp_load_texture_cache and
+# bps_load_texture_cache, walks all 1755 canonical flop boards and
+# all non-blocked (c0,c1) pairs, asserts trainer-stored bucket ==
+# reader-queried bucket on every covered query.
+$(BUILD_DIR)/test_b3_bucket_alignment: tests/test_b3_bucket_alignment.c \
+        $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_b3_bucket_alignment.c \
+	    $(SRC_DIR)/bps_reader.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_b3_bucket_alignment: $(BUILD_DIR)/test_b3_bucket_alignment
+	./$(BUILD_DIR)/test_b3_bucket_alignment
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
                   test_phase_r_heads_rollout test_phase_r_cont_strat_signed \
                   test_bps_query_boundary_ev test_bpr5_roundtrip \
                   test_phase_r_save_load_e2e test_ss_action_hash \
-                  test_phase_r_discount_gate
+                  test_phase_r_discount_gate test_b3_encoding_alignment \
+                  test_b3_bucket_alignment
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
-	@echo "  Phase R Block A + B.1 + B.2 + B.3 (partial) — all green"
+	@echo "  Phase R Block A + B.1 + B.2 + B.3 — all green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:

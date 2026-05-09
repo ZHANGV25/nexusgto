@@ -1005,6 +1005,27 @@ static void tex_index_rebuild(BPSTextureCache *tc) {
  * excluding 3 board cards. This reproduces the exact iteration order from
  * card_abstraction.c:ca_generate_hands (nested c0<c1 loops, skip blocked).
  */
+/* Phase R Block B.3 (Step 6) FIX: align with trainer's storage formula.
+ *
+ * Trainer storage (mccfr_blueprint.c:3002) writes to
+ *   cache_row[full_idx]
+ * where `full_idx = c0*51 - c0*(c0-1)/2 + c1-c0-1` is the full-deck
+ * pair index (ignoring board-blocking).
+ *
+ * Trainer runtime read (mccfr_blueprint.c:1619) indexes
+ *   flop_cache->buckets[ts->sampled_hands[ap]]
+ * where `sampled_hands[ap]` is an index into `s->hands[ap]`, which
+ * was populated by the c0<c1 all-1326-pair enumeration in
+ * bp_init_unified at lines 2690-2696. So sampled_hands[ap] IS the
+ * full-deck pair index — same index space as storage.
+ *
+ * Pre-fix: this function used a board-FILTERED counting loop, yielding
+ * a different index space than the trainer's storage. Empirically
+ * verified divergent on 98.28% of 2.06M covered (board, hand) queries
+ * via `tests/test_b3_bucket_alignment.c`. RESOLVED Step 6 with
+ * the formula below — same as trainer's storage formula — restoring
+ * byte-equal lookups across all covered textures.
+ */
 static int hand_index_for(const int *board, int c0, int c1) {
     int blocked[52] = {0};
     for (int i = 0; i < 3; i++) blocked[board[i]] = 1;
@@ -1015,16 +1036,7 @@ static int hand_index_for(const int *board, int c0, int c1) {
     /* Ensure c0 < c1 */
     if (c0 > c1) { int tmp = c0; c0 = c1; c1 = tmp; }
 
-    int idx = 0;
-    for (int a = 0; a < 52; a++) {
-        if (blocked[a]) continue;
-        for (int b = a + 1; b < 52; b++) {
-            if (blocked[b]) continue;
-            if (a == c0 && b == c1) return idx;
-            idx++;
-        }
-    }
-    return -1;  /* should not reach here */
+    return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
 }
 
 int bps_load_texture_cache(BPSReader *r, const char *path,

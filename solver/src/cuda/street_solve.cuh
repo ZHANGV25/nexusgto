@@ -286,6 +286,38 @@ SS_EXPORT int ss_build_tree(
 );
 
 /**
+ * Phase R Block B.3 (Step 6): per-level bet_sizes API.
+ *
+ * Mirrors the trainer's per-call-site cur_bet_sizes selection
+ * (mccfr_blueprint.c:1573-1606): postflop first raise uses
+ * `bet_sizes_first`, subsequent raises (num_raises > 0) use
+ * `bet_sizes_subsequent`. Closes encoding-alignment Divergence #1
+ * documented in docs/PHASE_R_B3_BLOCKED.md.
+ *
+ * Backward-compat: pass `bet_sizes_subsequent = NULL,
+ * num_bet_sizes_subsequent = 0` to replicate `bet_sizes_first` for
+ * both raise levels (matches trainer fallthrough at
+ * mccfr_blueprint.c:1598 when `s->num_subsequent_bet_sizes == 0`).
+ *
+ * Preflop tiers do NOT enter this API — kernel root is at flop;
+ * preflop bytes come via `root_action_prefix` per the
+ * ss_action_hash contract (src/ss_action_hash.h:53-60).
+ *
+ * The legacy ss_build_tree() is retained as a thin shim that
+ * forwards `bet_sizes_first = bet_sizes, subsequent = NULL/0`.
+ */
+SS_EXPORT int ss_build_tree2(
+    const int *board, int num_board,
+    int starting_pot, int effective_stack,
+    const float *bet_sizes_first, int num_bet_sizes_first,
+    const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
+    int num_players, const int *acting_order,
+    int is_river, int use_cont_strats,
+    int add_explicit_allin,
+    SSTreeData *tree_out
+);
+
+/**
  * Solve the N-player single-street tree on GPU using Linear CFR.
  *
  * CFR cycles through all num_players traversers per iteration.

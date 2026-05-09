@@ -317,7 +317,10 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
         2026-05-01 diagnosis).
 
     Args:
-        tree_data: SSTreeData ctypes struct (after ss_build_tree)
+        tree_data: SSTreeData ctypes struct (after ss_build_tree or
+            ss_build_tree2 — Phase R Block B.3 Step 6 added the
+            per-level bet_sizes variant; SSTreeData layout is unchanged
+            so consumers don't need to switch)
         num_players: number of active players (2-6)
 
     Returns:
