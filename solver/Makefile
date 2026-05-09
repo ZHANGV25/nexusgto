@@ -96,9 +96,9 @@ NVCC ?= nvcc
 SS_GPU_ARCH ?= sm_75
 street_solve: $(BUILD_DIR)/street_solve$(SHLIB_EXT)
 
-$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
-	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) \
-	    $(SRC_DIR)/cuda/street_solve.cu -o $@
+$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h | $(BUILD_DIR)
+	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -I$(SRC_DIR) \
+	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c -o $@
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
