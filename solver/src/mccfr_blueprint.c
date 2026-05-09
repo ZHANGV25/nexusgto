@@ -3907,13 +3907,23 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                  * because the cont-ev table is small relative to the
                  * info table; one thread's pass is fast. The omp barrier
                  * below ensures all threads see the discounted values
-                 * before resuming the next batch. */
-                #ifdef _OPENMP
-                #pragma omp single nowait
-                #endif
-                {
-                    bp_cont_ev_apply_discount(&s->cont_ev_table,
-                                               discount_value);
+                 * before resuming the next batch.
+                 *
+                 * Step 5 sharp-edge fix: gate on depth_limit_cont_strats.
+                 * Without the gate, a loader-only flow (load BPR5 →
+                 * disable Phase R → call bp_solve) would silently scale
+                 * loaded ev_sums each discount tick. The flag is the
+                 * authoritative "is Phase R producing fresh slots this
+                 * run?" signal — if it's OFF, the table is read-only
+                 * (loaded-from-disk) and discount must NOT apply. */
+                if (s->depth_limit_cont_strats) {
+                    #ifdef _OPENMP
+                    #pragma omp single nowait
+                    #endif
+                    {
+                        bp_cont_ev_apply_discount(&s->cont_ev_table,
+                                                   discount_value);
+                    }
                 }
             }
             if (do_snapshot) {

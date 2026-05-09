@@ -299,12 +299,32 @@ $(BUILD_DIR)/test_ss_action_hash: tests/test_ss_action_hash.c \
 test_ss_action_hash: $(BUILD_DIR)/test_ss_action_hash
 	./$(BUILD_DIR)/test_ss_action_hash
 
+# ── Phase R Step 5: discount-sweep gate regression ──
+# Pins the gate at mccfr_blueprint.c:3915 (`if (s->depth_limit_cont_strats)`
+# around bp_cont_ev_apply_discount). Without the gate, a loader-only
+# flow that loads a populated BPR5 trailer into a flag-OFF solver and
+# then runs bp_solve would silently scale every loaded ev_sum on each
+# discount tick. Mac-runnable, ~5-10s wall.
+$(BUILD_DIR)/test_phase_r_discount_gate: tests/test_phase_r_discount_gate.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_discount_gate.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_phase_r_discount_gate: $(BUILD_DIR)/test_phase_r_discount_gate
+	./$(BUILD_DIR)/test_phase_r_discount_gate
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
                   test_phase_r_heads_rollout test_phase_r_cont_strat_signed \
                   test_bps_query_boundary_ev test_bpr5_roundtrip \
-                  test_phase_r_save_load_e2e test_ss_action_hash
+                  test_phase_r_save_load_e2e test_ss_action_hash \
+                  test_phase_r_discount_gate
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
 	@echo "  Phase R Block A + B.1 + B.2 + B.3 (partial) — all green"
