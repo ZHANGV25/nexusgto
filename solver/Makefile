@@ -279,15 +279,35 @@ $(BUILD_DIR)/test_phase_r_save_load_e2e: tests/test_phase_r_save_load_e2e.c \
 test_phase_r_save_load_e2e: $(BUILD_DIR)/test_phase_r_save_load_e2e
 	./$(BUILD_DIR)/test_phase_r_save_load_e2e
 
+# ── Phase R Block B.3: ss_compute_leaf_action_hashes contract ──
+# CPU-only Mac-runnable test — hand-builds SSNode trees, validates the
+# kernel-side root-to-leaf walk reproduces bp_compute_action_hash for
+# every leaf. PASS gate per spec §9.
+$(BUILD_DIR)/test_ss_action_hash: tests/test_ss_action_hash.c \
+        $(SRC_DIR)/ss_action_hash.c $(SRC_DIR)/ss_action_hash.h \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/cuda/street_solve.cuh \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_ss_action_hash.c \
+	    $(SRC_DIR)/ss_action_hash.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_ss_action_hash: $(BUILD_DIR)/test_ss_action_hash
+	./$(BUILD_DIR)/test_ss_action_hash
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
                   test_phase_r_heads_rollout test_phase_r_cont_strat_signed \
                   test_bps_query_boundary_ev test_bpr5_roundtrip \
-                  test_phase_r_save_load_e2e
+                  test_phase_r_save_load_e2e test_ss_action_hash
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
-	@echo "  Phase R Block A.1 + A.2 + B.1 + B.2 test suite — all green"
+	@echo "  Phase R Block A + B.1 + B.2 + B.3 (partial) — all green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:
