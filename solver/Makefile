@@ -234,13 +234,60 @@ $(BUILD_DIR)/test_phase_r_cont_strat_signed: tests/test_phase_r_cont_strat_signe
 test_phase_r_cont_strat_signed: $(BUILD_DIR)/test_phase_r_cont_strat_signed
 	./$(BUILD_DIR)/test_phase_r_cont_strat_signed
 
+# ── Phase R Block B.2: bps_query_boundary_ev contract ──
+# Pure-table test; no trainer dep. ~<1s wall.
+$(BUILD_DIR)/test_bps_query_boundary_ev: tests/test_bps_query_boundary_ev.c \
+        $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_bps_query_boundary_ev.c \
+	    $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+
+test_bps_query_boundary_ev: $(BUILD_DIR)/test_bps_query_boundary_ev
+	./$(BUILD_DIR)/test_bps_query_boundary_ev
+
+# ── Phase R Block B.1: BPR5 writer/reader round-trip ──
+# Drives the full trainer (5K iters, prob=1.0) on a 3p postflop fixture,
+# bp_save_regrets to /tmp, bp_load_regrets into a fresh BPSolver, asserts
+# byte-exact match on every (action_hash, player, bucket) → (ev_sum[4],
+# ev_count[4]) tuple. Mac-runnable, ~10-20s.
+$(BUILD_DIR)/test_bpr5_roundtrip: tests/test_bpr5_roundtrip.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_bpr5_roundtrip.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
+	./$(BUILD_DIR)/test_bpr5_roundtrip
+
+# ── Phase R Block B.1+B.2: end-to-end save → load → query parity ──
+# 5K-iter trainer drive with prob=1.0; capture one populated slot's
+# (ev_sum, ev_count); save+load; query via bp_query_boundary_ev; assert
+# byte-exact match on stored fields and OK status with the divided ratio.
+$(BUILD_DIR)/test_phase_r_save_load_e2e: tests/test_phase_r_save_load_e2e.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_save_load_e2e.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_phase_r_save_load_e2e: $(BUILD_DIR)/test_phase_r_save_load_e2e
+	./$(BUILD_DIR)/test_phase_r_save_load_e2e
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
-                  test_phase_r_heads_rollout test_phase_r_cont_strat_signed
+                  test_phase_r_heads_rollout test_phase_r_cont_strat_signed \
+                  test_bps_query_boundary_ev test_bpr5_roundtrip \
+                  test_phase_r_save_load_e2e
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
-	@echo "  Phase R Block A.1 + A.2 test suite — all green"
+	@echo "  Phase R Block A.1 + A.2 + B.1 + B.2 test suite — all green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <math.h>
 
 /* ── Probe / hashing primitives ──────────────────────────────────────
  *
@@ -286,6 +287,47 @@ void bp_cont_ev_atomic_add_f32(float *dst, float val) {
         /* CAS failed — old_u32 has been updated to the current value.
          * Retry with the fresh load. */
     }
+}
+
+BPBoundaryEVStatus bp_query_boundary_ev(const BPContEVTable *t,
+                                         uint64_t action_hash,
+                                         int player, int bucket,
+                                         int cont_bias,
+                                         float *out_ev) {
+    /* NaN sentinel for every non-OK path. Caller MUST check status. */
+    if (out_ev) *out_ev = NAN;
+
+    if (cont_bias < 0 || cont_bias >= BP_CONT_EV_NUM_BIASES) {
+        return BP_BOUNDARY_EV_INVALID;
+    }
+
+    BPContEVEntry *e = bp_cont_ev_find(t, action_hash, player, bucket);
+    if (e == NULL) {
+        return BP_BOUNDARY_EV_MISS;
+    }
+
+    int64_t cnt = e->ev_count[cont_bias];
+    if (cnt <= 0) {
+        return BP_BOUNDARY_EV_EMPTY_BIAS;
+    }
+
+    if (out_ev) {
+        *out_ev = e->ev_sum[cont_bias] / (float)cnt;
+    }
+    return BP_BOUNDARY_EV_OK;
+}
+
+BPBoundaryEVStatus bps_query_boundary_ev(const BPContEVTable *t,
+                                          uint64_t action_hash,
+                                          int player, int bucket,
+                                          int cont_bias,
+                                          float *out_ev) {
+    /* Kernel/Python-facing alias. Identical semantics — both symbols
+     * ship from this TU so kernel-side builds (and bps_reader.c
+     * consumers) don't have to add a separate TU just to resolve the
+     * bps_-prefixed name. */
+    return bp_query_boundary_ev(t, action_hash, player, bucket,
+                                 cont_bias, out_ev);
 }
 
 void bp_cont_ev_apply_discount(BPContEVTable *t, float discount) {

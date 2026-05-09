@@ -131,6 +131,51 @@ void bp_cont_ev_atomic_add_f32(float *dst, float val);
  */
 void bp_cont_ev_apply_discount(BPContEVTable *t, float discount);
 
+/* ── Boundary EV query (Block B.2) ─────────────────────────────────
+ *
+ * Read-only query API for the kernel/runtime side. Status enum forces
+ * callers to check coverage rather than silently using a NaN sentinel.
+ *
+ * Per spec §5: NO silent fallback. Caller decides what EMPTY_BIAS or
+ * MISS means in their context (kernel default per spec: fail loud). */
+
+typedef enum {
+    BP_BOUNDARY_EV_OK         = 0,  /* slot found, ev_count[bias] > 0 — *out_ev valid */
+    BP_BOUNDARY_EV_EMPTY_BIAS = 1,  /* slot found, ev_count[bias] == 0 — *out_ev = NaN */
+    BP_BOUNDARY_EV_MISS       = 2,  /* slot not in table — *out_ev = NaN */
+    BP_BOUNDARY_EV_INVALID    = 3,  /* cont_bias out of range — *out_ev = NaN */
+} BPBoundaryEVStatus;
+
+/**
+ * Query the cont-bias EV at a boundary slot.
+ *
+ * On OK, *out_ev = ev_sum[cont_bias] / ev_count[cont_bias] — the
+ * Linear-CFR-weighted mean boundary EV from the traverser's
+ * perspective for the specified cont-bias.
+ *
+ * On any non-OK status, *out_ev is set to a NaN sentinel. Callers
+ * MUST check the returned status; do not consume *out_ev on non-OK.
+ *
+ * Pure read; safe to call concurrently with other readers (the
+ * underlying find uses ACQUIRE loads).
+ *
+ * `bps_query_boundary_ev` is the kernel/Python-facing alias of this
+ * function — same semantics, both symbols ship from
+ * mccfr_cont_ev_table.c so no extra TU has to be linked into the
+ * kernel-side build.
+ */
+BPBoundaryEVStatus bp_query_boundary_ev(const BPContEVTable *t,
+                                         uint64_t action_hash,
+                                         int player, int bucket,
+                                         int cont_bias,
+                                         float *out_ev);
+
+BPBoundaryEVStatus bps_query_boundary_ev(const BPContEVTable *t,
+                                          uint64_t action_hash,
+                                          int player, int bucket,
+                                          int cont_bias,
+                                          float *out_ev);
+
 #ifdef __cplusplus
 }
 #endif

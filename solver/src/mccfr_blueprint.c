@@ -4117,6 +4117,59 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
         written++;
     }
 
+    /* ── BPR5 trailer (Phase R Block B.1) ──
+     *
+     * Append boundary cont-bias EV slots iff Phase R was active (flag ON)
+     * AND at least one slot accumulated. Either condition false → no
+     * trailer, file ends at BPR4 entries — bit-identical to legacy.
+     * This is the load-bearing invariant for test_phase_r_regression_smoke.
+     *
+     * Wire layout (spec §5):
+     *   "BPR5"       (4 B)
+     *   int64 n_slots
+     *   per slot: int player | int bucket | uint64 action_hash
+     *           | float ev_sum[4] | int64 ev_count[4]
+     *
+     * Field order on the wire (player, bucket, action_hash) differs from
+     * the in-memory BPContEVEntry struct order — DO NOT struct-fwrite.
+     * `occupied` is in-memory state, not on disk. */
+    if (s->depth_limit_cont_strats == 1 &&
+        bp_cont_ev_count(&s->cont_ev_table) > 0) {
+        const BPContEVTable *cev = &s->cont_ev_table;
+        int64_t n_slots = bp_cont_ev_count(cev);
+
+        CHK_FW("BPR5", 1, 4, f);
+        CHK_FW(&n_slots, sizeof(int64_t), 1, f);
+
+        int64_t cev_written = 0;
+        for (int64_t i = 0; i < cev->table_size; i++) {
+            const BPContEVEntry *e = &cev->entries[i];
+            if (e->occupied != 1) continue;
+
+            CHK_FW(&e->player,      sizeof(int),      1, f);
+            CHK_FW(&e->bucket,      sizeof(int),      1, f);
+            CHK_FW(&e->action_hash, sizeof(uint64_t), 1, f);
+            CHK_FW(e->ev_sum,       sizeof(float),
+                   BP_CONT_EV_NUM_BIASES, f);
+            CHK_FW(e->ev_count,     sizeof(int64_t),
+                   BP_CONT_EV_NUM_BIASES, f);
+            cev_written++;
+        }
+
+        /* Counter mismatch is a hard data-corruption signal: the trailer
+         * header promised n_slots but we found a different count via
+         * walk. Don't proceed — the file would be unreadable. */
+        if (cev_written != n_slots) {
+            fprintf(stderr,
+                    "[BP] bp_save_regrets: BPR5 trailer count mismatch "
+                    "(header %lld, walked %lld). Aborting save.\n",
+                    (long long)n_slots, (long long)cev_written);
+            goto write_failed;
+        }
+        printf("[BP] BPR5 trailer: %lld boundary slots\n",
+               (long long)cev_written);
+    }
+
     /* Final flush — fclose may also report errors that prior fwrite missed
      * because of buffering. Treat fclose failure as ENOSPC too. */
     if (fflush(f) != 0) {
@@ -4170,7 +4223,8 @@ write_failed:
 static int64_t load_regrets_serial(BPSolver *s, FILE *f,
                                     int is_v4, int is_v3, int is_v2,
                                     int64_t saved_entries,
-                                    int64_t saved_iters) {
+                                    int64_t saved_iters,
+                                    int64_t *out_post_entries_off) {
     (void)is_v3; (void)is_v2;
     BPInfoTable *t = &s->info_table;
     int64_t loaded = 0;
@@ -4268,6 +4322,15 @@ static int64_t load_regrets_serial(BPSolver *s, FILE *f,
             }
         }
         loaded++;
+    }
+
+    /* Capture the byte offset just past the last BPR4 entry — used by
+     * bp_load_regrets to detect a BPR5 trailer (Phase R Block B.2). On
+     * truncated input this points mid-entry; the trailer parser will
+     * surface the corruption via magic mismatch. */
+    if (out_post_entries_off) {
+        long pos = ftell(f);
+        *out_post_entries_off = (pos < 0) ? -1 : (int64_t)pos;
     }
 
     s->iterations_run = saved_iters;
@@ -4375,7 +4438,8 @@ static void bp_file_map_close(BPFileMap *m) {
  * allocation uses the same CAS pattern as ensure_strategy_sum. */
 static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
                                            int64_t saved_entries,
-                                           int64_t saved_iters) {
+                                           int64_t saved_iters,
+                                           int64_t *out_post_entries_off) {
     BPFileMap mfile;
     if (bp_file_map_open(&mfile, path) != 0) {
         fprintf(stderr, "[BP] mmap failed on %s, falling back to serial\n", path);
@@ -4488,6 +4552,14 @@ static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
     printf("[BP] Pass 1 done: %lld entries\n", (long long)n_indexed);
 #endif
     fflush(stdout);
+
+    /* Capture the byte offset just past the last BPR4 entry — used by
+     * bp_load_regrets to detect a BPR5 trailer (Phase R Block B.2). On
+     * truncated input pos is at the truncation; the trailer parser will
+     * either see EOF (legacy) or surface the corruption via magic check. */
+    if (out_post_entries_off) {
+        *out_post_entries_off = (int64_t)pos;
+    }
 
     /* ── Pass 2: parallel hash inserts ── */
     BPInfoTable *t = &s->info_table;
@@ -4655,6 +4727,174 @@ static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
     return loaded;
 }
 
+/* Phase R Block B.2: parse the optional BPR5 trailer at `post_entries_off`.
+ *
+ * Returns 0 on success (trailer parsed, OR genuine EOF == legacy file),
+ * -1 on hard error (corrupt magic, sanity-bound violation, short read,
+ * find_or_create saturation, capacity-too-small for an existing table).
+ *
+ * Side effect on success-with-trailer: lazy-allocates s->cont_ev_table
+ * if NULL (sized to next_prime(max(2*n_slots, 1024))) and populates it
+ * with the trailer's slots. Does NOT flip s->depth_limit_cont_strats —
+ * caller controls trainer-flag separately. */
+static int bp_load_bpr5_trailer(BPSolver *s, const char *path,
+                                 int64_t post_entries_off) {
+    if (post_entries_off < 0) return 0;  /* loader didn't capture — skip */
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[BP] BPR5 trailer: fopen(%s) failed\n", path);
+        return -1;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long file_size_l = ftell(f);
+    if (file_size_l < 0) { fclose(f); return -1; }
+    int64_t file_size = (int64_t)file_size_l;
+
+    if (post_entries_off > file_size) {
+        fprintf(stderr,
+                "[BP] BPR5 trailer: post_entries_off=%lld > file_size=%lld\n",
+                (long long)post_entries_off, (long long)file_size);
+        fclose(f);
+        return -1;
+    }
+
+    int64_t remaining = file_size - post_entries_off;
+    if (remaining == 0) {
+        /* Genuine EOF — legacy BPR4 file, no trailer. Cleanly leave the
+         * cont_ev_table alone (NULL or pre-existing untouched). */
+        fclose(f);
+        return 0;
+    }
+
+    /* Sanity-bound the trailer header: 4 (magic) + 8 (n_slots) = 12 B. */
+    if (remaining < 12) {
+        fprintf(stderr,
+                "[BP] BPR5 trailer corrupt: %lld bytes after BPR4 entries "
+                "(need 0 for legacy or >=12 for trailer header)\n",
+                (long long)remaining);
+        fclose(f);
+        return -1;
+    }
+
+    if (fseek(f, (long)post_entries_off, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4) {
+        fprintf(stderr, "[BP] BPR5 trailer: short read on magic\n");
+        fclose(f); return -1;
+    }
+    if (memcmp(magic, "BPR5", 4) != 0) {
+        fprintf(stderr,
+                "[BP] BPR5 trailer: unexpected magic '%c%c%c%c' at offset "
+                "%lld (expected 'BPR5' or genuine EOF)\n",
+                magic[0], magic[1], magic[2], magic[3],
+                (long long)post_entries_off);
+        fclose(f); return -1;
+    }
+
+    int64_t n_slots;
+    if (fread(&n_slots, sizeof(int64_t), 1, f) != 1) {
+        fprintf(stderr, "[BP] BPR5 trailer: short read on n_slots\n");
+        fclose(f); return -1;
+    }
+
+    /* Per-slot wire size: 4(player) + 4(bucket) + 8(action_hash) +
+     * 16(ev_sum[4]) + 32(ev_count[4]) = 64 bytes. Match the writer. */
+    const int64_t SLOT_WIRE_BYTES = 64;
+    int64_t bytes_after_header = remaining - 12;
+    if (n_slots < 0 || n_slots > bytes_after_header / SLOT_WIRE_BYTES) {
+        fprintf(stderr,
+                "[BP] BPR5 trailer: n_slots=%lld out of range "
+                "(file has %lld bytes for slots, max %lld at %lld B/slot)\n",
+                (long long)n_slots, (long long)bytes_after_header,
+                (long long)(bytes_after_header / SLOT_WIRE_BYTES),
+                (long long)SLOT_WIRE_BYTES);
+        fclose(f); return -1;
+    }
+
+    if (n_slots == 0) {
+        /* Legal-but-unusual: writer skips trailer when count=0, so this
+         * shouldn't happen, but tolerate gracefully. */
+        printf("[BP] BPR5 trailer: 0 slots (no-op)\n");
+        fclose(f);
+        return 0;
+    }
+
+    /* Allocation policy:
+     *   - cont_ev_table.entries == NULL → lazy-alloc to next_prime(max(2*n_slots, 1024)).
+     *   - already allocated → require headroom (n_slots <= table_size / 2).
+     *     Don't auto-realloc — silently growing the table would hide
+     *     config mismatches (advisor item 2). */
+    if (s->cont_ev_table.entries == NULL) {
+        int64_t target = n_slots * 2;
+        if (target < 1024) target = 1024;
+        if (bp_cont_ev_init(&s->cont_ev_table, target) != 0) {
+            fprintf(stderr,
+                    "[BP] BPR5 trailer: bp_cont_ev_init(%lld) failed\n",
+                    (long long)target);
+            fclose(f); return -1;
+        }
+    } else if (n_slots > s->cont_ev_table.table_size / 2) {
+        fprintf(stderr,
+                "[BP] BPR5 trailer: cont_ev_table too small "
+                "(table_size=%lld) for n_slots=%lld. Free the existing "
+                "table or load into a fresh BPSolver.\n",
+                (long long)s->cont_ev_table.table_size,
+                (long long)n_slots);
+        fclose(f); return -1;
+    }
+
+    /* Stream slot-by-slot in wire order (advisor items 3 + 4). Wire
+     * order is (player, bucket, action_hash, ev_sum, ev_count) — NOT
+     * the in-memory struct order. */
+    int64_t loaded_slots = 0;
+    for (int64_t i = 0; i < n_slots; i++) {
+        int player, bucket;
+        uint64_t action_hash;
+        float ev_sum_buf[BP_CONT_EV_NUM_BIASES];
+        int64_t ev_count_buf[BP_CONT_EV_NUM_BIASES];
+
+        if (fread(&player,      sizeof(int),      1, f) != 1 ||
+            fread(&bucket,      sizeof(int),      1, f) != 1 ||
+            fread(&action_hash, sizeof(uint64_t), 1, f) != 1 ||
+            fread(ev_sum_buf,   sizeof(float),    BP_CONT_EV_NUM_BIASES, f)
+                != (size_t)BP_CONT_EV_NUM_BIASES ||
+            fread(ev_count_buf, sizeof(int64_t),  BP_CONT_EV_NUM_BIASES, f)
+                != (size_t)BP_CONT_EV_NUM_BIASES) {
+            fprintf(stderr,
+                    "[BP] BPR5 trailer: short read on slot %lld/%lld\n",
+                    (long long)i, (long long)n_slots);
+            fclose(f); return -1;
+        }
+
+        BPContEVEntry *e = bp_cont_ev_find_or_create(&s->cont_ev_table,
+                                                      action_hash,
+                                                      player, bucket);
+        if (e == NULL) {
+            fprintf(stderr,
+                    "[BP] BPR5 trailer: find_or_create saturated at slot "
+                    "%lld/%lld\n", (long long)i, (long long)n_slots);
+            fclose(f); return -1;
+        }
+        /* Direct overwrite: a fresh entry has zeroed fields; if the
+         * entry pre-existed (rare re-load case), the loaded file is
+         * canonical and intentionally overwrites in-memory state. */
+        memcpy(e->ev_sum, ev_sum_buf, sizeof(ev_sum_buf));
+        memcpy(e->ev_count, ev_count_buf, sizeof(ev_count_buf));
+        loaded_slots++;
+    }
+
+    fclose(f);
+    printf("[BP] BPR5 trailer: loaded %lld boundary slots\n",
+           (long long)loaded_slots);
+    return 0;
+}
+
 int64_t bp_load_regrets(BPSolver *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -4701,20 +4941,45 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
     const char *legacy = getenv("BP_LEGACY_LOADER");
     int force_serial = (legacy && legacy[0] == '1');
 
+    int64_t loaded_count;
+    int64_t post_entries_off = -1;
+
     if (is_v4 && !force_serial) {
         fclose(f);  /* parallel loader opens its own mmap */
-        int64_t n = load_regrets_mmap_parallel(s, path, saved_entries, saved_iters);
-        if (n != -2) return n;  /* success or hard failure */
-        /* -2 = mmap failed, fall back to serial — re-open and seek past header */
-        f = fopen(path, "rb");
-        if (!f) return -1;
-        fseek(f, 28, SEEK_SET);
+        loaded_count = load_regrets_mmap_parallel(s, path,
+                                                   saved_entries, saved_iters,
+                                                   &post_entries_off);
+        if (loaded_count == -2) {
+            /* mmap failed — fall back to serial. Re-open and seek past
+             * header (post-magic + 24 B). */
+            f = fopen(path, "rb");
+            if (!f) return -1;
+            fseek(f, 28, SEEK_SET);
+            loaded_count = load_regrets_serial(s, f, is_v4, is_v3, is_v2,
+                                                saved_entries, saved_iters,
+                                                &post_entries_off);
+            fclose(f);
+        }
+    } else {
+        loaded_count = load_regrets_serial(s, f, is_v4, is_v3, is_v2,
+                                            saved_entries, saved_iters,
+                                            &post_entries_off);
+        fclose(f);
     }
 
-    int64_t n = load_regrets_serial(s, f, is_v4, is_v3, is_v2,
-                                     saved_entries, saved_iters);
-    fclose(f);
-    return n;
+    /* On entries-loader failure, propagate. The trailer is moot. */
+    if (loaded_count < 0) return loaded_count;
+
+    /* Phase R Block B.2: BPR5 trailer is a BPR4-only extension. For
+     * legacy BPR2/BPR3, the file format is closed and there is no
+     * trailer concept. */
+    if (is_v4 && post_entries_off >= 0) {
+        if (bp_load_bpr5_trailer(s, path, post_entries_off) != 0) {
+            return -1;
+        }
+    }
+
+    return loaded_count;
 }
 
 int bp_save_texture_cache(const BPSolver *s, const char *path) {
