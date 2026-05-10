@@ -509,6 +509,53 @@ def main():
             sys.exit(1)
     print(f"Tiered preflop: {len(PREFLOP_TIERS)} levels, max {PREFLOP_MAX_RAISES} raises")
 
+    # Phase R Step 11 hard preflight: verify the loaded/precomputed
+    # texture cache's mixer matches the runtime mixer. If it doesn't,
+    # bp_compute_flop_bucket_for_test returns -1 (texture_index_lookup
+    # fails on every flop), which means the in-tree flop info-set keying
+    # falls through to bucket_map[1] = identity = hand_idx — that's the
+    # system-wide bug Step 11 diagnosed. Abort BEFORE the long
+    # training rather than discovering it at the BPR5 verifier on day 2.
+    if hasattr(bp_lib, "bp_compute_flop_bucket_for_test"):
+        bp_lib.bp_compute_flop_bucket_for_test.restype = ctypes.c_int
+        bp_lib.bp_compute_flop_bucket_for_test.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int, ctypes.c_int]
+        # 3 known-distinct-texture flops covering rainbow/paired/monotone.
+        # rank<<2 | suit. card 0 = 2c, etc.
+        smoke_flops = [
+            ([0*4+0, 5*4+1, 11*4+2], "2c-7d-Kh rainbow"),
+            ([12*4+3, 12*4+0, 7*4+1], "As-Ac-9d paired"),
+            ([8*4+2, 4*4+2, 1*4+2],  "Th-6h-3h monotone"),
+        ]
+        smoke_fail = 0
+        for flop_cards, name in smoke_flops:
+            arr = (ctypes.c_int * 3)(*flop_cards)
+            b = bp_lib.bp_compute_flop_bucket_for_test(solver, arr, 0, 0)
+            ok = (0 <= b < 200)
+            print(f"[Phase R Step 11 preflight] flop {name} hand_idx=0 "
+                  f"-> bucket={b} {'PASS' if ok else 'FAIL'}", flush=True)
+            if not ok:
+                smoke_fail += 1
+        if smoke_fail > 0:
+            print(f"[FATAL] Phase R Step 11 preflight FAILED on "
+                  f"{smoke_fail}/{len(smoke_flops)} flops. The texture "
+                  f"cache's stored hashes do NOT match the runtime mixer "
+                  f"(boost vs splitmix). Abort before training: the "
+                  f"in-tree flop info-set keying would fall through to "
+                  f"bucket_map[1] identity (hand_idx, not flop bucket). "
+                  f"Recovery: rebuild texture_cache.bin under the runtime's "
+                  f"actual mixer, or call bp_set_legacy_hash_mixer() to "
+                  f"match the cache.", flush=True)
+            sys.exit(2)
+        print("[Phase R Step 11 preflight] PASS — texture lookup "
+              "returns valid buckets in [0, 200) for all 3 test flops.",
+              flush=True)
+    else:
+        print("[Phase R Step 11 preflight] bp_compute_flop_bucket_for_test "
+              "not present in DLL; skipping smoke test (older binary).",
+              flush=True)
+
     # Save texture cache for future runs (skips 65-min precompute next time)
     if not texture_loaded and args.s3_bucket:
         os.makedirs(args.output_dir, exist_ok=True)
