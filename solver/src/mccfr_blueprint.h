@@ -320,6 +320,19 @@ typedef struct {
     /* Stats */
     int64_t iterations_run;
     int64_t snapshots_saved;
+
+    /* Phase R Step 11 — zero-strategy-drift warm-start mode.
+     *
+     * When set (via BP_BOUNDARY_EV_ONLY=1 at solver init), traverse()
+     * skips ALL writes to is->regrets[] and is->strategy_sum[], and
+     * bp_solve() skips apply_discount() + accumulate_snapshot(). The
+     * cont-strat HEADS-branch path remains active so cont_ev_table
+     * keeps accumulating boundary EV slots — that is the whole point
+     * of EV-only mode: regenerate the BPR5 trailer from a frozen
+     * blueprint without drifting the underlying regrets/strategies.
+     *
+     * Default 0 (legacy CFR with regret + strategy_sum updates). */
+    int boundary_ev_only;
 } BPSolver;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -784,6 +797,35 @@ BP_EXPORT int bp_get_ev_visit_stats(const BPSolver *s, BPEVVisitStats *out);
  */
 BP_EXPORT int bp_export_buckets(const BPSolver *s, int street, int player,
                                  int *bucket_out);
+
+/**
+ * Phase R Step 11 — test wrapper for the multiway-flop boundary
+ * bucket-lookup helper. Exposed because the static helper takes a
+ * private TraversalState; the wrapper accepts the raw inputs needed
+ * to drive the same logic from a unit test.
+ *
+ * Mirrors compute_boundary_flop_bucket() inside mccfr_blueprint.c:
+ *   1. Canonicalize the 3 dealt flop cards (rank-descending, suit-pattern
+ *      → canonical suit assignment).
+ *   2. compute_board_hash on the canonical board.
+ *   3. texture_index_lookup → texture_idx.
+ *   4. Read s->texture_bucket_cache[texture_idx * BP_MAX_HANDS + hand_idx].
+ *
+ * Args:
+ *   s       — initialized BPSolver with texture cache loaded.
+ *   board   — 3 dealt flop cards (raw, NOT canonicalized).
+ *   player  — only used for bounds-checking; bucket lookup is player-
+ *             agnostic at the postflop layer.
+ *   hand_idx — full-deck pair index in [0, BP_MAX_HANDS).
+ *
+ * Returns:
+ *   ≥0  — flop bucket in [0, postflop_num_buckets).
+ *   -1  — texture cache empty or texture not found (defensive).
+ */
+BP_EXPORT int bp_compute_flop_bucket_for_test(const BPSolver *s,
+                                                const int *board,
+                                                int player,
+                                                int hand_idx);
 
 #ifdef __cplusplus
 }

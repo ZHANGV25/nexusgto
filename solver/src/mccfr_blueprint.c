@@ -992,6 +992,56 @@ typedef struct {
     int computed;
 } FlopBucketCache;
 
+/* Canonicalize a 3-card flop into the form used for texture-cache hashing.
+ * Mirrors the trainer's flop-deal logic at mccfr_blueprint.c (the
+ * preflop→flop branch, look for `int sorted[3] = {next.board[0]...}`).
+ *
+ * Sort cards by rank descending into sorted[3], then assign canonical
+ * suits based on the (rank, suit) pattern (trips, paired, monotone,
+ * flush-draw, rainbow). Result returned in canon_out[3].
+ *
+ * Pure function on raw card indices (rank<<2|suit). */
+static void canonicalize_flop_cards(int c0, int c1, int c2, int canon_out[3]) {
+    int sorted[3] = {c0, c1, c2};
+    for (int a = 0; a < 2; a++)
+        for (int b = a + 1; b < 3; b++)
+            if ((sorted[a] >> 2) < (sorted[b] >> 2)) {
+                int tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
+            }
+    int r0 = sorted[0] >> 2, r1 = sorted[1] >> 2, r2 = sorted[2] >> 2;
+    int s0 = sorted[0] & 3, s1 = sorted[1] & 3, s2 = sorted[2] & 3;
+
+    if (r0 == r1 && r1 == r2) {
+        canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 2; canon_out[2] = r2 * 4 + 1;
+    } else if (r0 == r1 || r1 == r2) {
+        if (r0 == r1) {
+            if (s2 == s0 || s2 == s1) {
+                canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 2; canon_out[2] = r2 * 4 + 3;
+            } else {
+                canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 2; canon_out[2] = r2 * 4 + 1;
+            }
+        } else {
+            if (s0 == s1 || s0 == s2) {
+                canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 3; canon_out[2] = r2 * 4 + 2;
+            } else {
+                canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 2; canon_out[2] = r2 * 4 + 1;
+            }
+        }
+    } else {
+        if (s0 == s1 && s1 == s2) {
+            canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 3; canon_out[2] = r2 * 4 + 3;
+        } else if (s0 == s1) {
+            canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 3; canon_out[2] = r2 * 4 + 2;
+        } else if (s0 == s2) {
+            canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 2; canon_out[2] = r2 * 4 + 3;
+        } else if (s1 == s2) {
+            canon_out[0] = r0 * 4 + 2; canon_out[1] = r1 * 4 + 3; canon_out[2] = r2 * 4 + 3;
+        } else {
+            canon_out[0] = r0 * 4 + 3; canon_out[1] = r1 * 4 + 2; canon_out[2] = r2 * 4 + 1;
+        }
+    }
+}
+
 typedef struct {
     BPSolver *solver;
     uint64_t *rng;           /* pointer to thread-local RNG */
@@ -1057,6 +1107,82 @@ typedef struct {
 
 static float traverse(TraversalState *ts, int acting_order_idx,
                       const int *acting_order, int num_in_order);
+
+/* Phase R Step 11 — bucket lookup for the multiway-flop boundary's
+ * cont-strat dispatch slot key.
+ *
+ * Recovery for Step 10 BPR5 trailer bug: every populated slot in the
+ * 1B-iter retrain stored `bucket = hand_idx` (range [0, 1325]) instead
+ * of a flop bucket (range [0, postflop_num_buckets)). Two upstream paths
+ * could both produce that:
+ *
+ *   1. ts->flop_cache NULL or unset (e.g., postflop-only init never deals
+ *      a flop, so the parent stack never allocates a FlopBucketCache).
+ *   2. Fall-through to get_bucket(s, 1, p, h), which reads
+ *      bucket_map[1][p][h]. bucket_map[1] is initialized to identity
+ *      (h → h) and is never overridden by Python's bp_set_buckets()
+ *      for postflop streets in the unified driver. Identity ≡ hand_idx.
+ *
+ * This helper bypasses BOTH paths. It re-canonicalizes ts->board[0..2]
+ * on the fly, hashes the canonical form, looks up the texture index,
+ * and reads s->texture_bucket_cache[texture_idx][hand_idx]. That is
+ * exactly the same lookup the parent's flop-deal block performs at the
+ * top of the round_done branch — so this is the single source of truth
+ * for "which bucket does this hand fall into on this dealt flop?"
+ *
+ * Returns -1 if the texture cache isn't loaded or the texture isn't
+ * found. Caller (the boundary-dispatch site) treats -1 as "skip slot
+ * accumulation" (cb_slot stays NULL → the EV is computed but no slot
+ * key is updated). In production runs num_cached_textures == 1755 and
+ * every canonical 3-card flop is in the cache, so -1 is unreachable. */
+static int compute_boundary_flop_bucket(const BPSolver *s,
+                                         const TraversalState *ts,
+                                         int player) {
+    if (ts->num_board < 3) return -1;
+    int hand_idx = ts->sampled_hands[player];
+    if (hand_idx < 0 || hand_idx >= BP_MAX_HANDS) return -1;
+
+    /* Test / no-abstraction path: no texture cache loaded. Fall back to
+     * bucket_map[street=1][player][hand_idx], which is identity in
+     * test fixtures (use_buckets=0). Production runs always have
+     * num_cached_textures == 1755 so this branch never fires there. */
+    if (s->num_cached_textures <= 0) {
+        return s->bucket_map[1][player][hand_idx];
+    }
+
+    int canon[3];
+    canonicalize_flop_cards(ts->board[0], ts->board[1], ts->board[2], canon);
+    uint64_t flop_hash = compute_board_hash(canon, 3);
+    int found = texture_index_lookup(s, flop_hash);
+    if (found < 0) {
+        /* Canonical 3-card flop not in cache — should not happen for
+         * any of the 1755 textures in production. Surface as -1 so
+         * the dispatcher skips slot accumulation (better to drop one
+         * slot than to insert a key with a bogus bucket). */
+        return -1;
+    }
+    return s->texture_bucket_cache[found * BP_MAX_HANDS + hand_idx];
+}
+
+/* Public test wrapper — see header for contract. Builds a synthetic
+ * TraversalState with just the board + sampled_hands[player] populated,
+ * then delegates to compute_boundary_flop_bucket(). Production code
+ * MUST NOT call this; use the static helper directly. */
+int bp_compute_flop_bucket_for_test(const BPSolver *s,
+                                     const int *board,
+                                     int player,
+                                     int hand_idx) {
+    if (!s || !board || player < 0 || player >= BP_MAX_PLAYERS) return -1;
+    if (hand_idx < 0 || hand_idx >= BP_MAX_HANDS) return -1;
+    TraversalState ts;
+    memset(&ts, 0, sizeof(ts));
+    ts.board[0] = board[0];
+    ts.board[1] = board[1];
+    ts.board[2] = board[2];
+    ts.num_board = 3;
+    ts.sampled_hands[player] = hand_idx;
+    return compute_boundary_flop_bucket(s, &ts, player);
+}
 
 static int count_active(const int *active, int n) {
     int c = 0;
@@ -1284,18 +1410,22 @@ static float traverse(TraversalState *ts, int acting_order_idx,
 
             uint64_t boundary_action_hash = compute_action_hash(
                 ts->action_history, ts->history_len);
-            int trav_bucket;
-            if (ts->flop_cache && ts->flop_cache->computed) {
-                trav_bucket = ts->flop_cache->buckets[
-                    ts->sampled_hands[ts->traverser]];
-            } else {
-                trav_bucket = get_bucket(s, 1, ts->traverser,
-                                          ts->sampled_hands[ts->traverser]);
-            }
+
+            /* Phase R Step 11 fix: compute the flop bucket directly from
+             * texture_bucket_cache, bypassing both ts->flop_cache (which
+             * Step 10's 1B retrain showed was effectively NULL/uncomputed
+             * at the dispatch point — 100% of saved slots had bucket == hand_idx)
+             * and bucket_map[1][p][h] (identity-initialized; never overridden
+             * by bp_set_buckets() for postflop streets in the unified driver,
+             * so it returns hand_idx too). The helper canonicalizes ts->board
+             * and reads texture_bucket_cache[tex][hand_idx] — the same lookup
+             * the parent's flop-deal block uses at the top of round_done. */
+            int trav_bucket = compute_boundary_flop_bucket(
+                s, ts, ts->traverser);
 
             BPContEVEntry *cb_slot = NULL;
             if (s->cont_ev_table.entries != NULL && trav_bias >= 0 &&
-                ts->active[ts->traverser]) {
+                ts->active[ts->traverser] && trav_bucket >= 0) {
                 cb_slot = bp_cont_ev_find_or_create(&s->cont_ev_table,
                                                      boundary_action_hash,
                                                      ts->traverser,
@@ -1899,18 +2029,24 @@ static float traverse(TraversalState *ts, int acting_order_idx,
          * Pluribus Algorithm 1: pruned actions' regrets are left unchanged.
          * Previously we updated all actions, giving pruned actions
          * delta = -node_value, pushing them deeper negative and preventing
-         * recovery (the root cause of the call trap at early positions). */
-        for (int a = 0; a < na; a++) {
-            if (!explored[a]) continue;
-            float raw_delta = action_values[a] - node_value;
-            int delta;
-            if (raw_delta > 2e9f) delta = (int)2e9;
-            else if (raw_delta < -2e9f) delta = (int)-2e9;
-            else delta = (int)raw_delta;
-            int64_t tmp = (int64_t)is->regrets[a] + (int64_t)delta;
-            if (tmp < BP_REGRET_FLOOR) is->regrets[a] = BP_REGRET_FLOOR;
-            else if (tmp > BP_REGRET_CEILING) is->regrets[a] = BP_REGRET_CEILING;
-            else is->regrets[a] = (int)tmp;
+         * recovery (the root cause of the call trap at early positions).
+         *
+         * Phase R Step 11: gated on !boundary_ev_only. EV-only mode
+         * preserves the loaded blueprint exactly while letting the cont-
+         * strat HEADS branch repopulate cont_ev_table with correct keys. */
+        if (!s->boundary_ev_only) {
+            for (int a = 0; a < na; a++) {
+                if (!explored[a]) continue;
+                float raw_delta = action_values[a] - node_value;
+                int delta;
+                if (raw_delta > 2e9f) delta = (int)2e9;
+                else if (raw_delta < -2e9f) delta = (int)-2e9;
+                else delta = (int)raw_delta;
+                int64_t tmp = (int64_t)is->regrets[a] + (int64_t)delta;
+                if (tmp < BP_REGRET_FLOOR) is->regrets[a] = BP_REGRET_FLOOR;
+                else if (tmp > BP_REGRET_CEILING) is->regrets[a] = BP_REGRET_CEILING;
+                else is->regrets[a] = (int)tmp;
+            }
         }
 
         /* Strategy sum: accumulate for preflop (street 0) on every traverser
@@ -1923,8 +2059,10 @@ static float traverse(TraversalState *ts, int acting_order_idx,
          * a coprime constant to fix the gcd(6, 10000)=2 aliasing while
          * preserving sparsity. Without the gate there is no aliasing issue
          * (every visit accumulates regardless of iteration parity), so all
-         * 6 players accumulate equally. */
-        if (street == 0) {
+         * 6 players accumulate equally.
+         *
+         * Phase R Step 11: also gated on !boundary_ev_only. */
+        if (street == 0 && !s->boundary_ev_only) {
             ensure_strategy_sum(is);
             if (is->strategy_sum) {
                 for (int a = 0; a < na; a++)
@@ -2674,6 +2812,17 @@ int bp_init_ex(BPSolver *s, int num_players,
      * bp_set_depth_limit_cont_strats. memset above zeroed
      * cont_ev_table.entries to NULL and cont_ev_table_size_hint to 0. */
 
+    /* Phase R Step 11: zero-drift warm-start mode. */
+    {
+        const char *e = getenv("BP_BOUNDARY_EV_ONLY");
+        s->boundary_ev_only = (e && e[0] == '1') ? 1 : 0;
+        if (s->boundary_ev_only) {
+            fprintf(stderr,
+                    "[BP] BP_BOUNDARY_EV_ONLY=1: regret + strategy_sum "
+                    "updates SKIPPED; cont_ev_table accumulation kept.\n");
+        }
+    }
+
     return 0;
 }
 
@@ -2749,6 +2898,17 @@ int bp_init_unified(BPSolver *s, int num_players,
     s->cont_strat_prob = 0.5f;
     /* Block A.2: cont_ev_table un-allocated by default; lazy alloc
      * in bp_set_depth_limit_cont_strats. */
+
+    /* Phase R Step 11: zero-drift warm-start mode. */
+    {
+        const char *e = getenv("BP_BOUNDARY_EV_ONLY");
+        s->boundary_ev_only = (e && e[0] == '1') ? 1 : 0;
+        if (s->boundary_ev_only) {
+            fprintf(stderr,
+                    "[BP] BP_BOUNDARY_EV_ONLY=1: regret + strategy_sum "
+                    "updates SKIPPED; cont_ev_table accumulation kept.\n");
+        }
+    }
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
@@ -3913,8 +4073,16 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
              * discount_value set to the same values. */
 
             /* Run the discount/snapshot in parallel using the existing
-             * thread team. These functions use `#pragma omp for nowait`. */
-            if (do_discount) {
+             * thread team. These functions use `#pragma omp for nowait`.
+             *
+             * Phase R Step 11: in BP_BOUNDARY_EV_ONLY mode, skip both
+             * the info_table discount AND the snapshot accumulation —
+             * EV-only mode promises byte-identity on regrets +
+             * strategy_sum across the run. Cont-ev discount is also
+             * skipped: the loaded BPR5 trailer (or the freshly-emitted
+             * one if BP_SKIP_BPR5_LOAD=1) should NOT be additionally
+             * scaled while we're rebuilding it. */
+            if (do_discount && !s->boundary_ev_only) {
                 apply_discount(&s->info_table, discount_value);
                 /* Phase R Block A.2: also discount the cont-ev table's
                  * ev_sum entries (ev_count is unweighted by spec §4).
@@ -3941,7 +4109,7 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                     }
                 }
             }
-            if (do_snapshot) {
+            if (do_snapshot && !s->boundary_ev_only) {
                 accumulate_snapshot(&s->info_table);
             }
             /* Explicit barrier: ensure all threads finish before next batch. */
@@ -4826,6 +4994,25 @@ static int bp_load_bpr5_trailer(BPSolver *s, const char *path,
     if (fread(&n_slots, sizeof(int64_t), 1, f) != 1) {
         fprintf(stderr, "[BP] BPR5 trailer: short read on n_slots\n");
         fclose(f); return -1;
+    }
+
+    /* Phase R Step 11: BP_SKIP_BPR5_LOAD=1 short-circuits the slot
+     * load. Used by the zero-drift warm-start launcher when the on-disk
+     * trailer was written with bad bucket keys (Step 10 bug); we
+     * regenerate the trailer from scratch in this run by leaving the
+     * cont_ev_table empty at startup so HEADS-branch dispatches all
+     * insert-as-fresh. Skip is gated AFTER the magic + n_slots checks
+     * so a corrupt trailer still fails loud. */
+    {
+        const char *skip = getenv("BP_SKIP_BPR5_LOAD");
+        if (skip && skip[0] == '1') {
+            fprintf(stderr,
+                    "[BP] BPR5 trailer: BP_SKIP_BPR5_LOAD=1, skipping load "
+                    "of %lld saved slots (cont_ev_table starts empty)\n",
+                    (long long)n_slots);
+            fclose(f);
+            return 0;
+        }
     }
 
     /* Per-slot wire size: 4(player) + 4(bucket) + 8(action_hash) +

@@ -360,6 +360,27 @@ $(BUILD_DIR)/test_b3_bucket_alignment: tests/test_b3_bucket_alignment.c \
 test_b3_bucket_alignment: $(BUILD_DIR)/test_b3_bucket_alignment
 	./$(BUILD_DIR)/test_b3_bucket_alignment
 
+# ── Phase R Step 11: boundary-bucket fix + EV-only invariance ──
+# Drives bp_init_unified (auto-loads /tmp/texture_cache.bin), then:
+#   T1: query bp_compute_flop_bucket_for_test on multiple flops × hands;
+#       assert every result is in [0, postflop_num_buckets).
+#   T2: with BP_BOUNDARY_EV_ONLY=1 set in env, run a small bp_solve and
+#       assert is->regrets stay zero + no strategy_sum allocations.
+#   T3: same EV-only run, assert every cont_ev_table slot's bucket is
+#       in [0, postflop_num_buckets) (the Gate C.1 acceptance criterion).
+$(BUILD_DIR)/test_phase_r_boundary_bucket: tests/test_phase_r_boundary_bucket.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_boundary_bucket.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_phase_r_boundary_bucket: $(BUILD_DIR)/test_phase_r_boundary_bucket
+	./$(BUILD_DIR)/test_phase_r_boundary_bucket
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
@@ -367,10 +388,10 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_bps_query_boundary_ev test_bpr5_roundtrip \
                   test_phase_r_save_load_e2e test_ss_action_hash \
                   test_phase_r_discount_gate test_b3_encoding_alignment \
-                  test_b3_bucket_alignment
+                  test_b3_bucket_alignment test_phase_r_boundary_bucket
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
-	@echo "  Phase R Block A + B.1 + B.2 + B.3 — all green"
+	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Step 11 — all green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:
