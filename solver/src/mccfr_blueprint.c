@@ -1544,7 +1544,13 @@ static float traverse(TraversalState *ts, int acting_order_idx,
              * so any texture with the same rank pattern + suit pattern gives
              * the same bucket mapping relative to hand indices. */
             if (s->num_cached_textures > 0) {
-                /* Canonicalize: sort cards by rank descending */
+                /* Sort cards by rank descending — needed both for the
+                 * canonical-suit assignment and for the suit_map fixup
+                 * below. Then delegate the canonical-suit assignment to
+                 * the shared canonicalize_flop_cards helper so the
+                 * boundary-bucket helper and this flop-deal block can't
+                 * drift (Step 11 lesson: bucket-source divergence is
+                 * the canonical bug class for this code path). */
                 int sorted[3] = {next.board[0], next.board[1], next.board[2]};
                 for (int a = 0; a < 2; a++)
                     for (int b = a+1; b < 3; b++)
@@ -1552,55 +1558,8 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                             int tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
                         }
 
-                int r0 = sorted[0]>>2, r1 = sorted[1]>>2, r2 = sorted[2]>>2;
-                int s0 = sorted[0]&3, s1 = sorted[1]&3, s2 = sorted[2]&3;
-
-                /* Determine canonical suits based on pattern */
                 int canon[3];
-                if (r0 == r1 && r1 == r2) {
-                    /* Trips: rainbow */
-                    canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                } else if (r0 == r1 || r1 == r2) {
-                    /* Paired board. Flush draw = kicker shares suit with a paired card.
-                     * Paired cards always have different suits (same rank). */
-                    if (r0 == r1) {
-                        /* Cards 0,1 are the pair, card 2 is the kicker.
-                         * Flush draw if kicker suit matches either paired card. */
-                        if (s2 == s0 || s2 == s1) {
-                            /* FD: kicker shares suit with a paired card.
-                             * Canon: pair different suits (s,h), kicker shares with first (s). */
-                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+3;
-                        } else {
-                            /* Rainbow: all three suits different */
-                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                        }
-                    } else {
-                        /* r1 == r2: cards 1,2 are the pair, card 0 is the kicker.
-                         * Flush draw if kicker suit matches either paired card. */
-                        if (s0 == s1 || s0 == s2) {
-                            /* FD: kicker shares suit with a paired card. */
-                            canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+2;
-                        } else {
-                            /* Rainbow */
-                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                        }
-                    }
-                } else {
-                    /* Unpaired: check suit pattern */
-                    if (s0 == s1 && s1 == s2) {
-                        /* Monotone */
-                        canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+3;
-                    } else if (s0 == s1) {
-                        canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+2;
-                    } else if (s0 == s2) {
-                        canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+3;
-                    } else if (s1 == s2) {
-                        canon[0] = r0*4+2; canon[1] = r1*4+3; canon[2] = r2*4+3;
-                    } else {
-                        /* Rainbow */
-                        canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                    }
-                }
+                canonicalize_flop_cards(sorted[0], sorted[1], sorted[2], canon);
 
                 uint64_t flop_hash = compute_board_hash(canon, 3);
                 /* Bug 7 fix: O(1) hashmap lookup instead of O(N) linear scan */
@@ -2201,39 +2160,8 @@ static float traverse_ev(TraversalState *ts, int acting_order_idx,
                             int tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
                         }
 
-                int r0 = sorted[0]>>2, r1 = sorted[1]>>2, r2 = sorted[2]>>2;
-                int s0 = sorted[0]&3, s1 = sorted[1]&3, s2 = sorted[2]&3;
-
                 int canon[3];
-                if (r0 == r1 && r1 == r2) {
-                    canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                } else if (r0 == r1 || r1 == r2) {
-                    if (r0 == r1) {
-                        if (s2 == s0 || s2 == s1) {
-                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+3;
-                        } else {
-                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                        }
-                    } else {
-                        if (s0 == s1 || s0 == s2) {
-                            canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+2;
-                        } else {
-                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                        }
-                    }
-                } else {
-                    if (s0 == s1 && s1 == s2) {
-                        canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+3;
-                    } else if (s0 == s1) {
-                        canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+2;
-                    } else if (s0 == s2) {
-                        canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+3;
-                    } else if (s1 == s2) {
-                        canon[0] = r0*4+2; canon[1] = r1*4+3; canon[2] = r2*4+3;
-                    } else {
-                        canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
-                    }
-                }
+                canonicalize_flop_cards(sorted[0], sorted[1], sorted[2], canon);
 
                 uint64_t flop_hash = compute_board_hash(canon, 3);
                 int found = texture_index_lookup(s, flop_hash);
