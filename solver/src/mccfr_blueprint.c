@@ -4673,6 +4673,29 @@ static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
         *out_post_entries_off = (int64_t)pos;
     }
 
+    /* Step 15 short-circuit: BP_LOAD_TRAILER_ONLY=1 skips Pass 2's
+     * BPR4 hash inserts entirely. Use this for cont_ev_table-only
+     * consumers (dump_cont_ev_table → CEVS cache) where the BPInfoTable
+     * load is wasted work — the hash thrash on a heavily-undersized
+     * BPInfoTable (e.g. 128M slots vs 2.4B entries) takes hours.
+     *
+     * Skipping leaves info_table empty; the caller MUST NOT then use
+     * any code path that queries it. Trailer is still parsed (the BPR5
+     * load loop in bp_load_regrets's wrapper runs after this function
+     * returns successfully). */
+    {
+        const char *trailer_only = getenv("BP_LOAD_TRAILER_ONLY");
+        if (trailer_only && trailer_only[0] == '1') {
+            printf("[BP] Pass 2: SKIPPED (BP_LOAD_TRAILER_ONLY=1; "
+                   "info_table left empty; trailer parse continues)\n");
+            fflush(stdout);
+            free(offsets);
+            bp_file_map_close(&mfile);
+            s->iterations_run = saved_iters;
+            return 0;
+        }
+    }
+
     /* ── Pass 2: parallel hash inserts ── */
     BPInfoTable *t = &s->info_table;
     int64_t loaded = 0;
