@@ -889,21 +889,33 @@ _POSTFLOP_BET_SIZES_PHASE3 = [0.5, 1.0]
 
 class _BPConfig(ctypes.Structure):
     """Mirror of BPConfig in src/mccfr_blueprint.h. Match field order
-    EXACTLY — see precompute/export_v2.py for the canonical list (the
-    six int64_t iter/interval fields were silently broken for ~8 months
-    when the Python mirror used `int`; we match the corrected layout)."""
+    EXACTLY — see precompute/blueprint_worker_unified.py for the canonical
+    layout (the six int64_t iter/interval fields were silently broken for
+    ~8 months when the Python mirror used `int`).
+
+    Step 15 incident: This struct was MISSING the trailing
+    river_ochs_{enabled,num_clusters} fields. When bp_default_config does
+    memset(config, 0, sizeof(BPConfig)) on the FULL C BPConfig size, it
+    walks past our ctypes buffer's end and the river_ochs_enabled byte
+    is read from adjacent heap garbage. Attempt 1 lucked into 0 (skip
+    OCHS init); attempt 2 lucked into nonzero, triggering a 30+ min
+    single-threaded k-means k=200 / dim=32608 / n=60k inside
+    bp_init_unified. Fix: include the trailing two fields explicitly.
+    """
     _fields_ = [
-        ("discount_stop_iter",  ctypes.c_int64),
-        ("discount_interval",   ctypes.c_int64),
-        ("prune_start_iter",    ctypes.c_int64),
-        ("snapshot_start_iter", ctypes.c_int64),
-        ("snapshot_interval",   ctypes.c_int64),
-        ("strategy_interval",   ctypes.c_int64),
-        ("num_threads",         ctypes.c_int),
-        ("hash_table_size",     ctypes.c_int64),
-        ("snapshot_dir",        ctypes.c_char_p),
-        ("include_preflop",     ctypes.c_int),
-        ("postflop_num_buckets", ctypes.c_int),
+        ("discount_stop_iter",     ctypes.c_int64),
+        ("discount_interval",      ctypes.c_int64),
+        ("prune_start_iter",       ctypes.c_int64),
+        ("snapshot_start_iter",    ctypes.c_int64),
+        ("snapshot_interval",      ctypes.c_int64),
+        ("strategy_interval",      ctypes.c_int64),
+        ("num_threads",            ctypes.c_int),
+        ("hash_table_size",        ctypes.c_int64),
+        ("snapshot_dir",           ctypes.c_char_p),
+        ("include_preflop",        ctypes.c_int),
+        ("postflop_num_buckets",   ctypes.c_int),
+        ("river_ochs_enabled",     ctypes.c_int),
+        ("river_ochs_num_clusters", ctypes.c_int),
     ]
 
 
