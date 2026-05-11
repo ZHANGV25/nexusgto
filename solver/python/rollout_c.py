@@ -252,6 +252,29 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         lib.rollout_add_per_street_miss_counts.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
         lib.rollout_add_per_street_miss_counts.restype = None
 
+    # Phase F Step 14: cont_ev_table consumer at end-of-flop multiway
+    # boundary. See src/rollout.h "Phase F" block.
+    if hasattr(lib, "rollout_set_cont_ev_table"):
+        lib.rollout_set_cont_ev_table.argtypes = [ctypes.c_void_p]
+        lib.rollout_set_cont_ev_table.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_table"):
+        lib.rollout_get_cont_ev_table.argtypes = []
+        lib.rollout_get_cont_ev_table.restype = ctypes.c_void_p
+    if hasattr(lib, "rollout_set_use_cont_ev_at_flop_boundary"):
+        lib.rollout_set_use_cont_ev_at_flop_boundary.argtypes = [ctypes.c_int]
+        lib.rollout_set_use_cont_ev_at_flop_boundary.restype = None
+    if hasattr(lib, "rollout_get_use_cont_ev_at_flop_boundary"):
+        lib.rollout_get_use_cont_ev_at_flop_boundary.argtypes = []
+        lib.rollout_get_use_cont_ev_at_flop_boundary.restype = ctypes.c_int
+    if hasattr(lib, "rollout_get_cont_ev_boundary_hit_count"):
+        lib.rollout_get_cont_ev_boundary_hit_count.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_boundary_hit_count.restype = None
+    if hasattr(lib, "rollout_reset_cont_ev_boundary_hit_count"):
+        lib.rollout_reset_cont_ev_boundary_hit_count.argtypes = []
+        lib.rollout_reset_cont_ev_boundary_hit_count.restype = None
+
     lib.rollout_leaf_info_sizeof.argtypes = []
     lib.rollout_leaf_info_sizeof.restype = ctypes.c_int32
 
@@ -753,3 +776,349 @@ def compute_subgame_leaf_values_sampled_c(
             reason=f"[rollout.c sampled] {msg}",
         )
     return out
+
+
+# ─── Phase F Step 14: cont_ev_table consumer ──────────────────────────
+
+
+def set_rollout_cont_ev_table(table_ptr: Optional[int]) -> None:
+    """Hand the rollout a cont_ev_table pointer (or None to clear).
+
+    `table_ptr` is the integer address of a populated BPContEVTable —
+    typically obtained via `load_cont_ev_table_from_bpr5` below. The
+    rollout stores the pointer in process-global state; the table must
+    outlive any rollout call that may consult it.
+
+    Process-global. In multiprocessing fork pools, set BEFORE forking
+    so workers inherit the same pointer via COW (the table itself is
+    read-only at consume time).
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_cont_ev_table"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_cont_ev_table — rebuild with "
+            "Phase F changes (src/rollout.c Step 14)."
+        )
+    lib.rollout_set_cont_ev_table(
+        ctypes.c_void_p(table_ptr if table_ptr else 0)
+    )
+
+
+def get_rollout_cont_ev_table() -> Optional[int]:
+    """Return the currently-set cont_ev_table pointer, or None."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_table"):
+        return None
+    p = lib.rollout_get_cont_ev_table()
+    return int(p) if p else None
+
+
+def set_use_cont_ev_at_flop_boundary(enabled: bool) -> None:
+    """Enable / disable the end-of-flop multiway boundary lookup.
+
+    When enabled (and a table pointer is set), the rollout short-
+    circuits at the boundary: queries cont_ev_table for hero's slot
+    at all 4 traverser-bias indices, returns the uniform mean as the
+    leaf payoff. MISS / EMPTY_BIAS / INVALID is fail-loud (raises
+    LeafValueUnavailable downstream).
+
+    When disabled (default), the rollout runs legacy turn + river
+    simulation regardless of table state. Process-global flag.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_use_cont_ev_at_flop_boundary"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_use_cont_ev_at_flop_boundary — "
+            "rebuild with Phase F changes (src/rollout.c Step 14)."
+        )
+    lib.rollout_set_use_cont_ev_at_flop_boundary(1 if enabled else 0)
+
+
+def get_use_cont_ev_at_flop_boundary() -> bool:
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_use_cont_ev_at_flop_boundary"):
+        return False
+    return bool(lib.rollout_get_use_cont_ev_at_flop_boundary())
+
+
+def get_cont_ev_boundary_hit_count() -> int:
+    """Number of times the boundary lookup successfully short-circuited
+    in the current thread. MISS / EMPTY_BIAS / INVALID outcomes do NOT
+    increment (they raise via rollout_set_error). Reset between solves
+    for scoped reporting via reset_cont_ev_boundary_hit_count.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_boundary_hit_count"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_boundary_hit_count(ctypes.byref(out))
+    return int(out.value)
+
+
+def reset_cont_ev_boundary_hit_count() -> None:
+    lib = _lib()
+    if not hasattr(lib, "rollout_reset_cont_ev_boundary_hit_count"):
+        return
+    lib.rollout_reset_cont_ev_boundary_hit_count()
+
+
+# ── BPR5 trailer loader (mccfr_blueprint.so) ────────────────────────────
+#
+# To get a populated cont_ev_table pointer, we construct a BPSolver with
+# enough configuration to mirror the trainer's slot key space (preflop
+# tiers + add_explicit_allin), then call bp_load_regrets — which parses
+# the BPR4 entries (most dropped if hash_table_size is small) and
+# loads the BPR5 trailer at the end into s->cont_ev_table.
+#
+# Use a smaller hash_table_size than training (e.g., 128M instead of
+# 4B) — this lets the BPInfoTable fit in ~10 GB instead of 256 GB.
+# The vast majority of BPR4 entries fail to insert (counted via
+# insertion_failures); they're irrelevant for our consumer (we only
+# want the cont_ev_table). The trailer loads independently at the end.
+
+
+_PREFLOP_TIERS_PHASE3 = {
+    0: [0.5, 0.7, 1.0],   # open raise
+    1: [0.7, 1.0],        # 3-bet
+    2: [1.0],             # 4-bet
+}
+_PREFLOP_MAX_RAISES_PHASE3 = 3
+_POSTFLOP_BET_SIZES_PHASE3 = [0.5, 1.0]
+
+
+class _BPConfig(ctypes.Structure):
+    """Mirror of BPConfig in src/mccfr_blueprint.h. Match field order
+    EXACTLY — see precompute/export_v2.py for the canonical list (the
+    six int64_t iter/interval fields were silently broken for ~8 months
+    when the Python mirror used `int`; we match the corrected layout)."""
+    _fields_ = [
+        ("discount_stop_iter",  ctypes.c_int64),
+        ("discount_interval",   ctypes.c_int64),
+        ("prune_start_iter",    ctypes.c_int64),
+        ("snapshot_start_iter", ctypes.c_int64),
+        ("snapshot_interval",   ctypes.c_int64),
+        ("strategy_interval",   ctypes.c_int64),
+        ("num_threads",         ctypes.c_int),
+        ("hash_table_size",     ctypes.c_int64),
+        ("snapshot_dir",        ctypes.c_char_p),
+        ("include_preflop",     ctypes.c_int),
+        ("postflop_num_buckets", ctypes.c_int),
+    ]
+
+
+class ContEVTableHolder:
+    """Owns a BPSolver allocated for a cont_ev_table load. The table
+    pointer is valid as long as this holder is alive. `__del__` calls
+    bp_free to release the BPInfoTable + cont_ev_table memory.
+
+    Get the table pointer via `holder.cont_ev_table_ptr` and pass it to
+    `set_rollout_cont_ev_table`. Lifetime contract: keep the holder
+    object alive for the duration of any rollout calls that may consult
+    the table.
+    """
+
+    def __init__(self, bp_lib: ctypes.CDLL, solver_buf, solver_ptr: int,
+                 table_ptr: int, n_slots: int, bin_path: str):
+        self._bp = bp_lib
+        self._solver_buf = solver_buf
+        self._solver_ptr = solver_ptr
+        self.cont_ev_table_ptr: int = table_ptr
+        self.n_slots: int = n_slots
+        self.bin_path: str = bin_path
+        self._freed = False
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass
+
+    def free(self) -> None:
+        if self._freed:
+            return
+        self._freed = True
+        try:
+            self._bp.bp_free(ctypes.c_void_p(self._solver_ptr))
+        except Exception:
+            pass
+
+
+def _find_blueprint_lib() -> ctypes.CDLL:
+    base = Path(__file__).resolve().parent.parent / "build"
+    ext = ".dll" if sys.platform == "win32" else ".so"
+    candidates = [base / f"mccfr_blueprint{ext}"]
+    env_path = os.environ.get("POKER_SOLVER_PATH")
+    if env_path:
+        candidates.append(Path(env_path) / "build" / f"mccfr_blueprint{ext}")
+    for p in candidates:
+        if p.exists():
+            return ctypes.CDLL(str(p))
+    searched = ", ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"mccfr_blueprint shared library not found. Searched: {searched}. "
+        f"Run 'make blueprint' in the poker-solver directory."
+    )
+
+
+def load_cont_ev_table_from_bpr5(
+    bin_path: str,
+    *,
+    hash_table_size: int = 128_000_000,
+    num_threads: int = 1,
+    num_players: int = 6,
+    sb: int = 50,
+    bb: int = 100,
+    initial_stack: int = 10000,
+    add_explicit_allin: bool = False,
+    verbose: bool = True,
+) -> ContEVTableHolder:
+    """Load a Step 10–style BPR4+BPR5 .bin file and return a holder
+    with the cont_ev_table pointer ready for `set_rollout_cont_ev_table`.
+
+    Mirrors the loader pattern in
+    tools/phase_r_probe_analysis/verify_bpr5_roundtrip.c — uses the
+    same v3/phase3 preflop tier setup so action_hash key space matches
+    the trained file.
+
+    `hash_table_size` defaults to 128M (≈10 GB BPInfoTable) — much
+    smaller than training's 4B (256 GB). Most BPR4 regret entries will
+    fail to insert (counted as insertion_failures); they're irrelevant
+    for our consumer. The BPR5 trailer at the end of the file loads
+    INDEPENDENTLY into s->cont_ev_table.
+
+    `add_explicit_allin=False` matches v3/phase3 (deep-stack nodes
+    have no allin in the trained action set; trainer spec §4 +
+    bp_set_add_explicit_allin(0) at verify_bpr5_roundtrip.c:73).
+
+    Raises FileNotFoundError if the .bin doesn't exist; RuntimeError
+    on any C-side init/load failure.
+    """
+    if not os.path.exists(bin_path):
+        raise FileNotFoundError(f"BPR5 .bin not found: {bin_path}")
+
+    bp = _find_blueprint_lib()
+
+    # Wire up the bp_* APIs we need.
+    bp.bp_default_config.argtypes = [ctypes.c_void_p]
+    bp.bp_default_config.restype = None
+    bp.bp_init_unified.argtypes = [
+        ctypes.c_void_p, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    bp.bp_init_unified.restype = ctypes.c_int
+    bp.bp_set_preflop_tier.argtypes = [
+        ctypes.c_void_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ctypes.c_int,
+    ]
+    bp.bp_set_preflop_tier.restype = ctypes.c_int
+    bp.bp_set_add_explicit_allin.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    bp.bp_set_add_explicit_allin.restype = ctypes.c_int
+    bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    bp.bp_load_regrets.restype = ctypes.c_int64
+    bp.bp_get_cont_ev_table_ptr.argtypes = [ctypes.c_void_p]
+    bp.bp_get_cont_ev_table_ptr.restype = ctypes.c_void_p
+    bp.bp_free.argtypes = [ctypes.c_void_p]
+    bp.bp_free.restype = None
+
+    # Slot count getter (defined in mccfr_cont_ev_table.c, exported).
+    if not hasattr(bp, "bp_cont_ev_count"):
+        raise RuntimeError(
+            "mccfr_blueprint.so missing bp_cont_ev_count — "
+            "the linked mccfr_cont_ev_table.c is too old."
+        )
+    bp.bp_cont_ev_count.argtypes = [ctypes.c_void_p]
+    bp.bp_cont_ev_count.restype = ctypes.c_int64
+
+    # Allocate the BPSolver struct (2 MB ought to be plenty; verify_bpr5
+    # uses the same).
+    solver_buf = (ctypes.c_char * (2 * 1024 * 1024))()
+    solver_ptr_int = ctypes.cast(solver_buf, ctypes.c_void_p).value or 0
+
+    # Configure.
+    config = _BPConfig()
+    bp.bp_default_config(ctypes.byref(config))
+    config.num_threads = int(num_threads)
+    config.include_preflop = 1
+    config.hash_table_size = int(hash_table_size)
+    config.postflop_num_buckets = 200
+
+    c_post = (ctypes.c_float * len(_POSTFLOP_BET_SIZES_PHASE3))(
+        *_POSTFLOP_BET_SIZES_PHASE3)
+    # bp_init_unified takes a "preflop bet sizes" template too; the
+    # actual preflop tree comes from bp_set_preflop_tier calls below.
+    pf_template = _PREFLOP_TIERS_PHASE3[0]
+    c_pre = (ctypes.c_float * len(pf_template))(*pf_template)
+
+    if verbose:
+        print(f"[cont_ev_loader] bp_init_unified "
+              f"(hash_size={hash_table_size:,}, threads={num_threads}) ...",
+              flush=True)
+    rc = bp.bp_init_unified(
+        ctypes.c_void_p(solver_ptr_int), num_players,
+        sb, bb, initial_stack,
+        c_post, len(_POSTFLOP_BET_SIZES_PHASE3),
+        c_pre, len(pf_template),
+        ctypes.byref(config),
+    )
+    if rc != 0:
+        raise RuntimeError(f"bp_init_unified rc={rc}")
+
+    # Apply tiered preflop sizing (mirrors verify_bpr5_roundtrip.c:65-72).
+    for level, sizes in sorted(_PREFLOP_TIERS_PHASE3.items()):
+        c_sizes = (ctypes.c_float * len(sizes))(*sizes)
+        rc = bp.bp_set_preflop_tier(
+            ctypes.c_void_p(solver_ptr_int), level,
+            c_sizes, len(sizes), _PREFLOP_MAX_RAISES_PHASE3,
+        )
+        if rc != 0:
+            bp.bp_free(ctypes.c_void_p(solver_ptr_int))
+            raise RuntimeError(f"bp_set_preflop_tier level {level} rc={rc}")
+
+    rc = bp.bp_set_add_explicit_allin(
+        ctypes.c_void_p(solver_ptr_int), 1 if add_explicit_allin else 0)
+    if rc != 0:
+        bp.bp_free(ctypes.c_void_p(solver_ptr_int))
+        raise RuntimeError(f"bp_set_add_explicit_allin rc={rc}")
+
+    # Load regrets — populates BPInfoTable (most entries dropped if hash
+    # too small) AND, at end-of-file, the BPR5 trailer into
+    # s->cont_ev_table.
+    file_gb = os.path.getsize(bin_path) / (1024 ** 3)
+    if verbose:
+        print(f"[cont_ev_loader] bp_load_regrets ({file_gb:.1f} GB) ...",
+              flush=True)
+    n_loaded = bp.bp_load_regrets(
+        ctypes.c_void_p(solver_ptr_int), bin_path.encode("utf-8"))
+    if n_loaded < 0:
+        bp.bp_free(ctypes.c_void_p(solver_ptr_int))
+        raise RuntimeError(f"bp_load_regrets rc={n_loaded}")
+
+    table_ptr = bp.bp_get_cont_ev_table_ptr(ctypes.c_void_p(solver_ptr_int))
+    table_ptr_int = int(table_ptr) if table_ptr else 0
+    if not table_ptr_int:
+        bp.bp_free(ctypes.c_void_p(solver_ptr_int))
+        raise RuntimeError("bp_get_cont_ev_table_ptr returned NULL")
+
+    n_slots = int(bp.bp_cont_ev_count(ctypes.c_void_p(table_ptr_int)))
+    if n_slots == 0:
+        bp.bp_free(ctypes.c_void_p(solver_ptr_int))
+        raise RuntimeError(
+            f"BPR5 trailer present but 0 slots loaded from {bin_path} — "
+            f"either the file has no trailer (legacy BPR4) or load was "
+            f"truncated."
+        )
+
+    if verbose:
+        print(f"[cont_ev_loader] cont_ev_table loaded: {n_slots:,} slots, "
+              f"{n_loaded:,} BPR4 entries (most dropped — hash too small)",
+              flush=True)
+
+    return ContEVTableHolder(
+        bp_lib=bp, solver_buf=solver_buf, solver_ptr=solver_ptr_int,
+        table_ptr=table_ptr_int, n_slots=n_slots, bin_path=bin_path,
+    )
+

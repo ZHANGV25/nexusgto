@@ -520,6 +520,26 @@ BP_EXPORT void bp_apply_cont_bias(const float *avg_strategy,
  */
 BP_EXPORT uint64_t bp_compute_action_hash(const int *actions, int num_actions);
 
+/**
+ * Phase F Step 14 — opaque-pointer accessor for the cont_ev_table.
+ *
+ * Returns a `BPContEVTable *` (cast to void* in the header to keep
+ * mccfr_cont_ev_table.h out of the dependency surface for clients that
+ * just want to forward the pointer to another consumer).
+ *
+ * Used by the Python bridge to retrieve the cont_ev_table populated by
+ * bp_load_regrets's BPR5 trailer parser, then hand the pointer to
+ * rollout_set_cont_ev_table for the §4b smoke (and onward to the API
+ * runtime path).
+ *
+ * The returned pointer aliases s->cont_ev_table — caller does NOT free
+ * it; lifetime is tied to the BPSolver. Returns NULL only if `s` is NULL
+ * (does NOT return NULL when the table is unallocated — the address of
+ * the embedded table is stable across the BPSolver's lifetime; check
+ * bp_cont_ev_count via the returned pointer to detect emptiness).
+ */
+BP_EXPORT void *bp_get_cont_ev_table_ptr(BPSolver *s);
+
 /* Phase R Block B.3 (Step 6) — exposed wrapper for the static
  * generate_actions inside mccfr_blueprint.c. Mirrors the production
  * action-emission contract byte-for-byte (same indices, same

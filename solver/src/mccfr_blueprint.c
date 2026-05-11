@@ -547,6 +547,15 @@ uint64_t bp_compute_action_hash(const int *actions, int num_actions) {
     return compute_action_hash(actions, num_actions);
 }
 
+/* Phase F Step 14 — opaque-pointer accessor for the cont_ev_table.
+ * See header for contract. Returns &s->cont_ev_table cast to void* so
+ * clients can forward the pointer to other consumers (e.g.,
+ * rollout_set_cont_ev_table) without including mccfr_cont_ev_table.h. */
+void *bp_get_cont_ev_table_ptr(BPSolver *s) {
+    if (!s) return NULL;
+    return (void *)&s->cont_ev_table;
+}
+
 /* Round n up to the next prime. Used by info_table_init to ensure the
  * modulo operation in slot derivation produces uniform distribution.
  *
