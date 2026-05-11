@@ -406,6 +406,20 @@ $(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.
 test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
 	./$(BUILD_DIR)/test_rollout_cont_ev_boundary
 
+# ── Standalone CEVS cache round-trip (Step 15) ──
+# Self-contained — links only against mccfr_cont_ev_table.c.
+$(BUILD_DIR)/test_cont_ev_standalone_roundtrip: \
+        tests/test_cont_ev_standalone_roundtrip.c \
+        $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h \
+        | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) \
+	    tests/test_cont_ev_standalone_roundtrip.c \
+	    $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_cont_ev_standalone_roundtrip: $(BUILD_DIR)/test_cont_ev_standalone_roundtrip
+	./$(BUILD_DIR)/test_cont_ev_standalone_roundtrip
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
@@ -414,7 +428,8 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_phase_r_save_load_e2e test_ss_action_hash \
                   test_phase_r_discount_gate test_b3_encoding_alignment \
                   test_b3_bucket_alignment test_phase_r_boundary_bucket \
-                  test_rollout_cont_ev_boundary
+                  test_rollout_cont_ev_boundary \
+                  test_cont_ev_standalone_roundtrip
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
 	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Sess 11 + Sess 14 — green"

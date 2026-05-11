@@ -20,6 +20,7 @@
 #define MCCFR_CONT_EV_TABLE_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -175,6 +176,79 @@ BPBoundaryEVStatus bps_query_boundary_ev(const BPContEVTable *t,
                                           int player, int bucket,
                                           int cont_bias,
                                           float *out_ev);
+
+/* ── BPR5 trailer body helpers (Step 15 refactor) ──────────────────
+ *
+ * The BPR5 trailer wire format ("BPR5" magic + int64 n_slots + per-slot
+ * payload) is consumed both inline-in-`.bin` (by bp_save_regrets /
+ * bp_load_regrets) AND as a standalone cache file (by the C2 fast-path).
+ * Both share these helpers so format drift is impossible.
+ *
+ * Wire layout (spec §5):
+ *   "BPR5" (4 B)
+ *   int64 n_slots
+ *   per slot: int player | int bucket | uint64 action_hash
+ *           | float ev_sum[4] | int64 ev_count[4]   (64 B/slot)
+ */
+
+/* Write the trailer body to an already-open binary FILE*. Writes
+ * "BPR5" magic + n_slots + all occupied slots in iteration order.
+ * Caller is responsible for fopen/fclose and for ensuring `f` is at the
+ * correct position. Returns 0 on success, -1 on fwrite error or a
+ * data-corruption check failure (occupied-walk count != bp_cont_ev_count). */
+int bp_cont_ev_write_trailer_body(FILE *f, const BPContEVTable *t);
+
+/* Read just the "BPR5" magic + n_slots header from an already-open
+ * FILE*. Returns 0 on success (and sets *out_n_slots), -1 on magic or
+ * read failure. n_slots is validated >= 0 but NOT bounded against any
+ * file-size expectation — caller does that contextually. */
+int bp_cont_ev_read_trailer_header(FILE *f, int64_t *out_n_slots);
+
+/* Read n_slots slot payloads from an already-open FILE* whose position
+ * is RIGHT AFTER the trailer header (immediately before the first
+ * slot). Lazy-allocates the table to next_prime(max(2*n_slots, 1024))
+ * when t->entries == NULL; requires headroom (n_slots <= table_size/2)
+ * otherwise. n_slots=0 is a legal no-op. Returns 0 on success, -1 on
+ * read / saturation / allocation failure. */
+int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots);
+
+/* Convenience: header + slots. Equivalent to
+ *   read_trailer_header(f, &n) ; read_trailer_slots(f, t, n)
+ * Use this when the caller doesn't need to peek n_slots between the
+ * two halves (e.g., the standalone load path). */
+int bp_cont_ev_read_trailer_body(FILE *f, BPContEVTable *t);
+
+/* ── Standalone cache save/load (Step 15) ──────────────────────────
+ *
+ * Self-contained cache file format ("CEVS") for caching the loaded
+ * boundary table out of band, so subsequent runs can pull a small
+ * (~2 GB at 34M slots) file instead of re-running bp_load_regrets on
+ * the full 124 GB BPR4+5 .bin.
+ *
+ * On-disk layout:
+ *   "CEVS"                    (4 B magic — distinct from inline "BPR5")
+ *   uint32 version            (1)
+ *   uint32 reserved           (0; must be zero)
+ *   int64  body_bytes         (sanity: bytes from end-of-header to EOF)
+ *   uint64 body_xor_checksum  (xor of 64-bit words in body, save-time)
+ *   [BPR5 body: "BPR5" + int64 n_slots + slot payload]
+ *
+ * Atomic write: data is staged to "<path>.tmp" + fsync + rename(2), so
+ * a partial write (SPOT reclaim, OOM) leaves no readable cache file
+ * to be silently consumed by a future run.
+ *
+ * Distinct magic prevents accidentally feeding a partial .bin or a
+ * stale cache to the wrong loader.
+ */
+#define BP_CONT_EV_STANDALONE_MAGIC      "CEVS"
+#define BP_CONT_EV_STANDALONE_VERSION    1
+
+int bp_cont_ev_save_standalone(const BPContEVTable *t, const char *path);
+
+/* Load a standalone cache file written by bp_cont_ev_save_standalone.
+ * Allocates / repopulates the table the same way bp_cont_ev_read_trailer_body
+ * does. Returns 0 on success, -1 on magic/version/checksum/read failure. */
+int bp_cont_ev_load_standalone(BPContEVTable *t, const char *path);
 
 #ifdef __cplusplus
 }

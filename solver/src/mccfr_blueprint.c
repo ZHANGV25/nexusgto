@@ -4265,39 +4265,21 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
      * `occupied` is in-memory state, not on disk. */
     if (s->depth_limit_cont_strats == 1 &&
         bp_cont_ev_count(&s->cont_ev_table) > 0) {
-        const BPContEVTable *cev = &s->cont_ev_table;
-        int64_t n_slots = bp_cont_ev_count(cev);
-
-        CHK_FW("BPR5", 1, 4, f);
-        CHK_FW(&n_slots, sizeof(int64_t), 1, f);
-
-        int64_t cev_written = 0;
-        for (int64_t i = 0; i < cev->table_size; i++) {
-            const BPContEVEntry *e = &cev->entries[i];
-            if (e->occupied != 1) continue;
-
-            CHK_FW(&e->player,      sizeof(int),      1, f);
-            CHK_FW(&e->bucket,      sizeof(int),      1, f);
-            CHK_FW(&e->action_hash, sizeof(uint64_t), 1, f);
-            CHK_FW(e->ev_sum,       sizeof(float),
-                   BP_CONT_EV_NUM_BIASES, f);
-            CHK_FW(e->ev_count,     sizeof(int64_t),
-                   BP_CONT_EV_NUM_BIASES, f);
-            cev_written++;
-        }
-
-        /* Counter mismatch is a hard data-corruption signal: the trailer
-         * header promised n_slots but we found a different count via
-         * walk. Don't proceed — the file would be unreadable. */
-        if (cev_written != n_slots) {
+        /* Step 15: delegate to the shared trailer helper so the
+         * standalone CEVS cache path can't drift from this writer. The
+         * helper writes "BPR5" + n_slots + slots and returns -1 on
+         * fwrite error or count-mismatch (the same data-corruption
+         * sentinel the inline code used to check). */
+        int64_t n_slots_before = bp_cont_ev_count(&s->cont_ev_table);
+        if (bp_cont_ev_write_trailer_body(f, &s->cont_ev_table) != 0) {
             fprintf(stderr,
-                    "[BP] bp_save_regrets: BPR5 trailer count mismatch "
-                    "(header %lld, walked %lld). Aborting save.\n",
-                    (long long)n_slots, (long long)cev_written);
+                    "[BP] bp_save_regrets: write_trailer_body failed "
+                    "(n_slots=%lld). Aborting save.\n",
+                    (long long)n_slots_before);
             goto write_failed;
         }
         printf("[BP] BPR5 trailer: %lld boundary slots\n",
-               (long long)cev_written);
+               (long long)n_slots_before);
     }
 
     /* Final flush — fclose may also report errors that prior fwrite missed
@@ -4913,23 +4895,13 @@ static int bp_load_bpr5_trailer(BPSolver *s, const char *path,
         return -1;
     }
 
-    char magic[4];
-    if (fread(magic, 1, 4, f) != 4) {
-        fprintf(stderr, "[BP] BPR5 trailer: short read on magic\n");
-        fclose(f); return -1;
-    }
-    if (memcmp(magic, "BPR5", 4) != 0) {
-        fprintf(stderr,
-                "[BP] BPR5 trailer: unexpected magic '%c%c%c%c' at offset "
-                "%lld (expected 'BPR5' or genuine EOF)\n",
-                magic[0], magic[1], magic[2], magic[3],
-                (long long)post_entries_off);
-        fclose(f); return -1;
-    }
-
+    /* Step 15 refactor: delegate magic+n_slots read to the shared
+     * helper (returns -1 on bad magic or short read; we still own the
+     * BP_SKIP_BPR5_LOAD env-gate and sanity-bound checks because they're
+     * specific to the inline-in-bin context, not the standalone CEVS
+     * cache path). */
     int64_t n_slots;
-    if (fread(&n_slots, sizeof(int64_t), 1, f) != 1) {
-        fprintf(stderr, "[BP] BPR5 trailer: short read on n_slots\n");
+    if (bp_cont_ev_read_trailer_header(f, &n_slots) != 0) {
         fclose(f); return -1;
     }
 
@@ -4956,7 +4928,7 @@ static int bp_load_bpr5_trailer(BPSolver *s, const char *path,
      * 16(ev_sum[4]) + 32(ev_count[4]) = 64 bytes. Match the writer. */
     const int64_t SLOT_WIRE_BYTES = 64;
     int64_t bytes_after_header = remaining - 12;
-    if (n_slots < 0 || n_slots > bytes_after_header / SLOT_WIRE_BYTES) {
+    if (n_slots > bytes_after_header / SLOT_WIRE_BYTES) {
         fprintf(stderr,
                 "[BP] BPR5 trailer: n_slots=%lld out of range "
                 "(file has %lld bytes for slots, max %lld at %lld B/slot)\n",
@@ -4974,73 +4946,15 @@ static int bp_load_bpr5_trailer(BPSolver *s, const char *path,
         return 0;
     }
 
-    /* Allocation policy:
-     *   - cont_ev_table.entries == NULL → lazy-alloc to next_prime(max(2*n_slots, 1024)).
-     *   - already allocated → require headroom (n_slots <= table_size / 2).
-     *     Don't auto-realloc — silently growing the table would hide
-     *     config mismatches (advisor item 2). */
-    if (s->cont_ev_table.entries == NULL) {
-        int64_t target = n_slots * 2;
-        if (target < 1024) target = 1024;
-        if (bp_cont_ev_init(&s->cont_ev_table, target) != 0) {
-            fprintf(stderr,
-                    "[BP] BPR5 trailer: bp_cont_ev_init(%lld) failed\n",
-                    (long long)target);
-            fclose(f); return -1;
-        }
-    } else if (n_slots > s->cont_ev_table.table_size / 2) {
-        fprintf(stderr,
-                "[BP] BPR5 trailer: cont_ev_table too small "
-                "(table_size=%lld) for n_slots=%lld. Free the existing "
-                "table or load into a fresh BPSolver.\n",
-                (long long)s->cont_ev_table.table_size,
-                (long long)n_slots);
-        fclose(f); return -1;
-    }
-
-    /* Stream slot-by-slot in wire order (advisor items 3 + 4). Wire
-     * order is (player, bucket, action_hash, ev_sum, ev_count) — NOT
-     * the in-memory struct order. */
-    int64_t loaded_slots = 0;
-    for (int64_t i = 0; i < n_slots; i++) {
-        int player, bucket;
-        uint64_t action_hash;
-        float ev_sum_buf[BP_CONT_EV_NUM_BIASES];
-        int64_t ev_count_buf[BP_CONT_EV_NUM_BIASES];
-
-        if (fread(&player,      sizeof(int),      1, f) != 1 ||
-            fread(&bucket,      sizeof(int),      1, f) != 1 ||
-            fread(&action_hash, sizeof(uint64_t), 1, f) != 1 ||
-            fread(ev_sum_buf,   sizeof(float),    BP_CONT_EV_NUM_BIASES, f)
-                != (size_t)BP_CONT_EV_NUM_BIASES ||
-            fread(ev_count_buf, sizeof(int64_t),  BP_CONT_EV_NUM_BIASES, f)
-                != (size_t)BP_CONT_EV_NUM_BIASES) {
-            fprintf(stderr,
-                    "[BP] BPR5 trailer: short read on slot %lld/%lld\n",
-                    (long long)i, (long long)n_slots);
-            fclose(f); return -1;
-        }
-
-        BPContEVEntry *e = bp_cont_ev_find_or_create(&s->cont_ev_table,
-                                                      action_hash,
-                                                      player, bucket);
-        if (e == NULL) {
-            fprintf(stderr,
-                    "[BP] BPR5 trailer: find_or_create saturated at slot "
-                    "%lld/%lld\n", (long long)i, (long long)n_slots);
-            fclose(f); return -1;
-        }
-        /* Direct overwrite: a fresh entry has zeroed fields; if the
-         * entry pre-existed (rare re-load case), the loaded file is
-         * canonical and intentionally overwrites in-memory state. */
-        memcpy(e->ev_sum, ev_sum_buf, sizeof(ev_sum_buf));
-        memcpy(e->ev_count, ev_count_buf, sizeof(ev_count_buf));
-        loaded_slots++;
-    }
-
+    /* Slot read + table populate are shared with the standalone CEVS
+     * path via the helper (Step 15 — no format drift between inline
+     * and standalone). */
+    int rc = bp_cont_ev_read_trailer_slots(f, &s->cont_ev_table, n_slots);
     fclose(f);
+    if (rc != 0) return -1;
+
     printf("[BP] BPR5 trailer: loaded %lld boundary slots\n",
-           (long long)loaded_slots);
+           (long long)n_slots);
     return 0;
 }
 

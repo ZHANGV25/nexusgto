@@ -956,6 +956,163 @@ class ContEVTableHolder:
             pass
 
 
+# ── Standalone CEVS cache holder (Step 15) ───────────────────────────
+
+
+class _BPContEVTableStandalone(ctypes.Structure):
+    """Mirror of BPContEVTable in src/mccfr_cont_ev_table.h. ONLY used
+    by the standalone loader (which owns the C-side struct directly).
+    The inline-in-BPSolver path uses bp_get_cont_ev_table_ptr instead.
+    Match field order EXACTLY — drift here scrambles every cont_ev_table
+    query."""
+    _fields_ = [
+        ("entries",            ctypes.c_void_p),   # BPContEVEntry *
+        ("table_size",         ctypes.c_int64),
+        ("num_entries",        ctypes.c_int64),
+        ("insertion_failures", ctypes.c_int64),
+        ("max_probe_observed", ctypes.c_int64),
+    ]
+
+
+class ContEVTableStandaloneHolder:
+    """Owns a heap-allocated BPContEVTable populated from a standalone
+    CEVS cache file. Faster than the BPR5 path (~10s vs ~20-30 min on
+    a 124 GB checkpoint) and doesn't need a BPSolver at all.
+
+    Lifetime contract: keep this object alive for the duration of any
+    rollout calls that consult the table. Free deterministically via
+    `.free()` or rely on `__del__`.
+    """
+
+    def __init__(self, bp_lib: ctypes.CDLL,
+                 table_struct: _BPContEVTableStandalone, path: str):
+        self._bp = bp_lib
+        self._table_struct = table_struct
+        self.cont_ev_table_ptr: int = ctypes.addressof(table_struct)
+        self.n_slots: int = int(table_struct.num_entries)
+        self.path: str = path
+        self._freed = False
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass
+
+    def free(self) -> None:
+        if self._freed:
+            return
+        self._freed = True
+        try:
+            self._bp.bp_cont_ev_free(
+                ctypes.byref(self._table_struct))
+        except Exception:
+            pass
+
+
+def load_cont_ev_table_standalone(path: str, *,
+                                   verbose: bool = True
+                                   ) -> ContEVTableStandaloneHolder:
+    """Load a standalone CEVS cache file written by either:
+      - `bp_cont_ev_save_standalone` from C, or
+      - `dump_cont_ev_table_to_file` Python wrapper below.
+
+    Returns a holder whose `.cont_ev_table_ptr` matches the layout the
+    rollout's `rollout_set_cont_ev_table` expects (a `BPContEVTable*`
+    cast to void*). Lifetime contract: keep the holder alive for the
+    duration of rollout calls.
+
+    Raises FileNotFoundError / RuntimeError on missing path / load
+    failure. The load itself is fast (~10s for 2 GB CEVS file).
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CEVS cache not found: {path}")
+
+    bp = _find_blueprint_lib()
+    bp.bp_cont_ev_load_standalone.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    bp.bp_cont_ev_load_standalone.restype = ctypes.c_int
+    bp.bp_cont_ev_free.argtypes = [ctypes.c_void_p]
+    bp.bp_cont_ev_free.restype = None
+
+    table = _BPContEVTableStandalone()
+    # Zero-init (the C side does memset internally but we want a known
+    # state in case the load fails partway).
+    ctypes.memset(ctypes.byref(table), 0, ctypes.sizeof(table))
+
+    if verbose:
+        size_gb = os.path.getsize(path) / (1024 ** 3)
+        print(f"[cev_standalone] BEFORE bp_cont_ev_load_standalone "
+              f"({path}, {size_gb:.2f} GB)",
+              flush=True)
+    t0 = time.monotonic()
+    rc = bp.bp_cont_ev_load_standalone(
+        ctypes.byref(table),
+        path.encode("utf-8"),
+    )
+    wall = time.monotonic() - t0
+    if verbose:
+        print(f"[cev_standalone] AFTER  bp_cont_ev_load_standalone "
+              f"rc={rc} ({wall:.2f}s, {table.num_entries:,} slots)",
+              flush=True)
+    if rc != 0:
+        raise RuntimeError(
+            f"bp_cont_ev_load_standalone({path}) failed rc={rc} — check "
+            f"stderr for the specific reason (bad magic/version/checksum/"
+            f"truncation)."
+        )
+    if table.num_entries == 0:
+        # Empty table is a legal save-state but useless for the bridge.
+        bp.bp_cont_ev_free(ctypes.byref(table))
+        raise RuntimeError(
+            f"CEVS file {path} loaded with 0 slots — likely an "
+            f"empty-state save. Re-dump from a populated source."
+        )
+    return ContEVTableStandaloneHolder(bp_lib=bp, table_struct=table,
+                                        path=path)
+
+
+def dump_cont_ev_table_to_file(holder, output_path: str,
+                                *, verbose: bool = True) -> None:
+    """Write the cont_ev_table owned by `holder` to a standalone CEVS
+    cache file. `holder` can be either a `ContEVTableHolder` (BPR5 load
+    path) or a `ContEVTableStandaloneHolder` (CEVS reload path) — the
+    function uses `cont_ev_table_ptr` from either.
+
+    Atomic write: data goes to <path>.tmp first, then rename(2). If the
+    process dies mid-write, no readable cache exists.
+
+    Raises RuntimeError on write failure.
+    """
+    bp = _find_blueprint_lib()
+    bp.bp_cont_ev_save_standalone.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    bp.bp_cont_ev_save_standalone.restype = ctypes.c_int
+
+    if verbose:
+        print(f"[cev_standalone] BEFORE bp_cont_ev_save_standalone "
+              f"({output_path}, n_slots={holder.n_slots:,})",
+              flush=True)
+    t0 = time.monotonic()
+    rc = bp.bp_cont_ev_save_standalone(
+        ctypes.c_void_p(holder.cont_ev_table_ptr),
+        output_path.encode("utf-8"),
+    )
+    wall = time.monotonic() - t0
+    if verbose:
+        print(f"[cev_standalone] AFTER  bp_cont_ev_save_standalone "
+              f"rc={rc} ({wall:.2f}s)",
+              flush=True)
+    if rc != 0:
+        raise RuntimeError(
+            f"bp_cont_ev_save_standalone({output_path}) failed rc={rc}"
+        )
+
+
 def _find_blueprint_lib() -> ctypes.CDLL:
     base = Path(__file__).resolve().parent.parent / "build"
     ext = ".dll" if sys.platform == "win32" else ".so"

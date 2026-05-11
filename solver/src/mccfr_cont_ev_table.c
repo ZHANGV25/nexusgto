@@ -17,10 +17,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
 #include <math.h>
+#include <unistd.h>
+#include <errno.h>
 
 /* ── Probe / hashing primitives ──────────────────────────────────────
  *
@@ -348,4 +351,356 @@ void bp_cont_ev_apply_discount(BPContEVTable *t, float discount) {
          * `ev_sum / ev_count` ratio at query time gives a Linear-CFR-
          * weighted EV per visit, which is what the kernel reads. */
     }
+}
+
+/* ── BPR5 trailer body helpers (Step 15) ─────────────────────────── */
+
+int bp_cont_ev_write_trailer_body(FILE *f, const BPContEVTable *t) {
+    if (!f || !t) return -1;
+    int64_t n_slots = bp_cont_ev_count(t);
+
+    if (fwrite("BPR5", 1, 4, f) != 4) return -1;
+    if (fwrite(&n_slots, sizeof(int64_t), 1, f) != 1) return -1;
+
+    int64_t cev_written = 0;
+    for (int64_t i = 0; i < t->table_size; i++) {
+        const BPContEVEntry *e = &t->entries[i];
+        if (__atomic_load_n(&e->occupied, __ATOMIC_ACQUIRE) != 1) continue;
+
+        if (fwrite(&e->player,      sizeof(int),      1, f) != 1) return -1;
+        if (fwrite(&e->bucket,      sizeof(int),      1, f) != 1) return -1;
+        if (fwrite(&e->action_hash, sizeof(uint64_t), 1, f) != 1) return -1;
+        if (fwrite(e->ev_sum,       sizeof(float),
+                   BP_CONT_EV_NUM_BIASES, f) != BP_CONT_EV_NUM_BIASES) return -1;
+        if (fwrite(e->ev_count,     sizeof(int64_t),
+                   BP_CONT_EV_NUM_BIASES, f) != BP_CONT_EV_NUM_BIASES) return -1;
+        cev_written++;
+    }
+
+    /* Data-corruption sentinel: bp_cont_ev_count and an occupied-walk
+     * MUST agree. Mirrors the inline check at mccfr_blueprint.c:4292. */
+    if (cev_written != n_slots) {
+        fprintf(stderr,
+                "[cev] write_trailer_body count mismatch: header %lld, "
+                "walked %lld\n",
+                (long long)n_slots, (long long)cev_written);
+        return -1;
+    }
+    return 0;
+}
+
+int bp_cont_ev_read_trailer_header(FILE *f, int64_t *out_n_slots) {
+    if (!f || !out_n_slots) return -1;
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4) {
+        fprintf(stderr, "[cev] read_trailer_header: short read on magic\n");
+        return -1;
+    }
+    if (memcmp(magic, "BPR5", 4) != 0) {
+        fprintf(stderr,
+                "[cev] read_trailer_header: unexpected magic '%c%c%c%c' "
+                "(expected 'BPR5')\n",
+                magic[0], magic[1], magic[2], magic[3]);
+        return -1;
+    }
+
+    int64_t n_slots;
+    if (fread(&n_slots, sizeof(int64_t), 1, f) != 1) {
+        fprintf(stderr, "[cev] read_trailer_header: short read on n_slots\n");
+        return -1;
+    }
+    if (n_slots < 0) {
+        fprintf(stderr,
+                "[cev] read_trailer_header: negative n_slots=%lld\n",
+                (long long)n_slots);
+        return -1;
+    }
+    *out_n_slots = n_slots;
+    return 0;
+}
+
+int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots) {
+    if (!f || !t) return -1;
+    if (n_slots < 0) return -1;
+    if (n_slots == 0) return 0;  /* legal no-op */
+
+    /* Allocation policy (matches mccfr_blueprint.c lazy-alloc):
+     *   - entries == NULL → lazy-alloc to next_prime(max(2*n_slots, 1024)).
+     *   - already allocated → require headroom (n_slots <= table_size/2). */
+    if (t->entries == NULL) {
+        int64_t target = n_slots * 2;
+        if (target < 1024) target = 1024;
+        if (bp_cont_ev_init(t, target) != 0) {
+            fprintf(stderr,
+                    "[cev] read_trailer_slots: bp_cont_ev_init(%lld) failed\n",
+                    (long long)target);
+            return -1;
+        }
+    } else if (n_slots > t->table_size / 2) {
+        fprintf(stderr,
+                "[cev] read_trailer_slots: table too small (size=%lld) "
+                "for n_slots=%lld. Free or init a fresh table.\n",
+                (long long)t->table_size, (long long)n_slots);
+        return -1;
+    }
+
+    for (int64_t i = 0; i < n_slots; i++) {
+        int player, bucket;
+        uint64_t action_hash;
+        float ev_sum_buf[BP_CONT_EV_NUM_BIASES];
+        int64_t ev_count_buf[BP_CONT_EV_NUM_BIASES];
+
+        if (fread(&player,      sizeof(int),      1, f) != 1 ||
+            fread(&bucket,      sizeof(int),      1, f) != 1 ||
+            fread(&action_hash, sizeof(uint64_t), 1, f) != 1 ||
+            fread(ev_sum_buf,   sizeof(float),    BP_CONT_EV_NUM_BIASES, f)
+                != (size_t)BP_CONT_EV_NUM_BIASES ||
+            fread(ev_count_buf, sizeof(int64_t),  BP_CONT_EV_NUM_BIASES, f)
+                != (size_t)BP_CONT_EV_NUM_BIASES) {
+            fprintf(stderr,
+                    "[cev] read_trailer_slots: short read on slot %lld/%lld\n",
+                    (long long)i, (long long)n_slots);
+            return -1;
+        }
+
+        BPContEVEntry *e = bp_cont_ev_find_or_create(t, action_hash,
+                                                      player, bucket);
+        if (e == NULL) {
+            fprintf(stderr,
+                    "[cev] read_trailer_slots: find_or_create saturated at "
+                    "slot %lld/%lld\n", (long long)i, (long long)n_slots);
+            return -1;
+        }
+        memcpy(e->ev_sum,   ev_sum_buf,   sizeof(ev_sum_buf));
+        memcpy(e->ev_count, ev_count_buf, sizeof(ev_count_buf));
+    }
+    return 0;
+}
+
+int bp_cont_ev_read_trailer_body(FILE *f, BPContEVTable *t) {
+    int64_t n_slots;
+    if (bp_cont_ev_read_trailer_header(f, &n_slots) != 0) return -1;
+    return bp_cont_ev_read_trailer_slots(f, t, n_slots);
+}
+
+/* ── Standalone CEVS cache file (Step 15) ───────────────────────── */
+
+/* Body XOR-checksum: read the file from the start of the BPR5 body to
+ * EOF in chunks, XOR-accumulating 64-bit words. Used to detect corruption
+ * during S3 round-trip or partial writes.
+ *
+ * Note: this is a tamper-detection check, not a cryptographic hash. Any
+ * change to the body changes the checksum with overwhelming probability.
+ * Trailing bytes that don't fit in an 8-byte word are zero-padded into
+ * the final word — same on save and load, so they cancel correctly. */
+static int cev_body_xor_checksum(FILE *f, long start_offset,
+                                  long end_offset, uint64_t *out) {
+    if (fseek(f, start_offset, SEEK_SET) != 0) return -1;
+    uint64_t acc = 0;
+    long remaining = end_offset - start_offset;
+    while (remaining > 0) {
+        uint8_t buf[4096];
+        size_t want = remaining < (long)sizeof(buf) ? (size_t)remaining
+                                                    : sizeof(buf);
+        size_t got = fread(buf, 1, want, f);
+        if (got == 0) return -1;
+        /* Pad the final partial-word chunk with zeros. */
+        size_t padded = (got + 7) & ~(size_t)7;
+        if (padded > sizeof(buf)) padded = sizeof(buf);
+        if (padded > got) memset(buf + got, 0, padded - got);
+        for (size_t i = 0; i < padded; i += 8) {
+            uint64_t w;
+            memcpy(&w, buf + i, sizeof(w));
+            acc ^= w;
+        }
+        remaining -= (long)got;
+    }
+    *out = acc;
+    return 0;
+}
+
+int bp_cont_ev_save_standalone(const BPContEVTable *t, const char *path) {
+    if (!t || !path) return -1;
+
+    /* Stage to <path>.tmp, fsync, rename. Atomic per POSIX rename(2). */
+    size_t tmp_len = strlen(path) + 5;
+    char *tmp_path = (char*)malloc(tmp_len);
+    if (!tmp_path) return -1;
+    snprintf(tmp_path, tmp_len, "%s.tmp", path);
+
+    /* "wb+" — write + read (so we can fread the body back for the
+     * checksum without reopening). Truncates on open. */
+    FILE *f = fopen(tmp_path, "wb+");
+    if (!f) { free(tmp_path); return -1; }
+
+    /* Header: "CEVS" + version + reserved + body_bytes (filled later) +
+     * checksum (filled later). 28 bytes total. */
+    if (fwrite(BP_CONT_EV_STANDALONE_MAGIC, 1, 4, f) != 4) goto bad;
+    uint32_t version = BP_CONT_EV_STANDALONE_VERSION, reserved = 0;
+    if (fwrite(&version,  sizeof(uint32_t), 1, f) != 1) goto bad;
+    if (fwrite(&reserved, sizeof(uint32_t), 1, f) != 1) goto bad;
+
+    /* Reserve 8 bytes for body_bytes and 8 for body_xor_checksum; we'll
+     * seek back and patch after writing the body. */
+    long header_size_pos = ftell(f);
+    int64_t placeholder_size = 0;
+    uint64_t placeholder_xor = 0;
+    if (fwrite(&placeholder_size, sizeof(int64_t),  1, f) != 1) goto bad;
+    if (fwrite(&placeholder_xor,  sizeof(uint64_t), 1, f) != 1) goto bad;
+
+    long body_start_off = ftell(f);
+
+    if (bp_cont_ev_write_trailer_body(f, t) != 0) goto bad;
+
+    long body_end_off = ftell(f);
+    int64_t body_bytes = (int64_t)(body_end_off - body_start_off);
+
+    /* Compute checksum by re-reading the body we just wrote. fflush
+     * first to ensure the kernel sees what we wrote before we fseek
+     * and fread. */
+    if (fflush(f) != 0) goto bad;
+    uint64_t body_xor = 0;
+    if (cev_body_xor_checksum(f, body_start_off, body_end_off, &body_xor) != 0)
+        goto bad;
+
+    /* Patch header in place. */
+    if (fseek(f, header_size_pos, SEEK_SET) != 0) goto bad;
+    if (fwrite(&body_bytes, sizeof(int64_t),  1, f) != 1) goto bad;
+    if (fwrite(&body_xor,   sizeof(uint64_t), 1, f) != 1) goto bad;
+
+    if (fflush(f) != 0) goto bad;
+    int fd = fileno(f);
+    if (fd >= 0) {
+        if (fsync(fd) != 0) {
+            /* Don't fail the save on fsync failure (some FSes return
+             * EINVAL on regular files); rename will still atomicize. */
+        }
+    }
+    if (fclose(f) != 0) {
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        fprintf(stderr,
+                "[cev] save_standalone: rename(%s -> %s) failed: %s\n",
+                tmp_path, path, strerror(errno));
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+    fprintf(stderr,
+            "[cev] save_standalone: %s (%lld body bytes, "
+            "xor=0x%016llx, %lld slots)\n",
+            path, (long long)body_bytes,
+            (unsigned long long)body_xor,
+            (long long)bp_cont_ev_count(t));
+    free(tmp_path);
+    return 0;
+
+bad:
+    fclose(f);
+    unlink(tmp_path);
+    free(tmp_path);
+    return -1;
+}
+
+int bp_cont_ev_load_standalone(BPContEVTable *t, const char *path) {
+    if (!t || !path) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[cev] load_standalone: fopen(%s) failed: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 ||
+        memcmp(magic, BP_CONT_EV_STANDALONE_MAGIC, 4) != 0) {
+        fprintf(stderr,
+                "[cev] load_standalone: bad magic '%c%c%c%c' "
+                "(expected '%s')\n",
+                magic[0], magic[1], magic[2], magic[3],
+                BP_CONT_EV_STANDALONE_MAGIC);
+        fclose(f); return -1;
+    }
+    uint32_t version, reserved;
+    if (fread(&version,  sizeof(uint32_t), 1, f) != 1 ||
+        fread(&reserved, sizeof(uint32_t), 1, f) != 1) {
+        fprintf(stderr, "[cev] load_standalone: short read on header\n");
+        fclose(f); return -1;
+    }
+    if (version != BP_CONT_EV_STANDALONE_VERSION) {
+        fprintf(stderr,
+                "[cev] load_standalone: unsupported version %u (expected %u)\n",
+                (unsigned)version, BP_CONT_EV_STANDALONE_VERSION);
+        fclose(f); return -1;
+    }
+    if (reserved != 0) {
+        fprintf(stderr,
+                "[cev] load_standalone: reserved field nonzero (0x%x)\n",
+                (unsigned)reserved);
+        fclose(f); return -1;
+    }
+
+    int64_t body_bytes;
+    uint64_t body_xor_stored;
+    if (fread(&body_bytes,      sizeof(int64_t),  1, f) != 1 ||
+        fread(&body_xor_stored, sizeof(uint64_t), 1, f) != 1) {
+        fprintf(stderr, "[cev] load_standalone: short read on header tail\n");
+        fclose(f); return -1;
+    }
+
+    long body_start = ftell(f);
+    if (body_start < 0) { fclose(f); return -1; }
+
+    /* Sanity check: body extends exactly to EOF. */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long file_end = ftell(f);
+    if (file_end < 0) { fclose(f); return -1; }
+    int64_t actual_body_bytes = (int64_t)(file_end - body_start);
+    if (actual_body_bytes != body_bytes) {
+        fprintf(stderr,
+                "[cev] load_standalone: body size mismatch — header says "
+                "%lld, file has %lld\n",
+                (long long)body_bytes, (long long)actual_body_bytes);
+        fclose(f); return -1;
+    }
+
+    /* Verify checksum BEFORE reading the body for real. */
+    uint64_t body_xor_actual;
+    if (cev_body_xor_checksum(f, body_start, file_end, &body_xor_actual) != 0) {
+        fprintf(stderr, "[cev] load_standalone: checksum read failed\n");
+        fclose(f); return -1;
+    }
+    if (body_xor_actual != body_xor_stored) {
+        fprintf(stderr,
+                "[cev] load_standalone: checksum mismatch — stored "
+                "0x%016llx, computed 0x%016llx (data corruption or "
+                "incomplete S3 download)\n",
+                (unsigned long long)body_xor_stored,
+                (unsigned long long)body_xor_actual);
+        fclose(f); return -1;
+    }
+
+    /* Body is verified intact. Rewind to body start and load via the
+     * shared trailer reader. */
+    if (fseek(f, body_start, SEEK_SET) != 0) { fclose(f); return -1; }
+    int rc = bp_cont_ev_read_trailer_body(f, t);
+    fclose(f);
+    if (rc != 0) {
+        fprintf(stderr,
+                "[cev] load_standalone: read_trailer_body failed (rc=%d)\n",
+                rc);
+        return -1;
+    }
+    fprintf(stderr,
+            "[cev] load_standalone: %s loaded (%lld body bytes, "
+            "xor=0x%016llx, %lld slots)\n",
+            path, (long long)body_bytes,
+            (unsigned long long)body_xor_stored,
+            (long long)bp_cont_ev_count(t));
+    return 0;
 }
