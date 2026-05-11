@@ -23,7 +23,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "bps_reader.h"   /* BPSReader and BPS_EXPORT */
+#include "bps_reader.h"            /* BPSReader and BPS_EXPORT */
+#include "mccfr_cont_ev_table.h"   /* BPContEVTable (Phase F consumer) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -311,6 +312,60 @@ BPS_EXPORT void rollout_get_bucket_miss_count(uint64_t *out_bucket_miss);
 BPS_EXPORT void rollout_add_observability(
     uint64_t add_miss, uint64_t add_zerosum, uint64_t add_bucket_miss
 );
+
+/* ── Phase F: cont_ev_table consumer at end-of-flop multiway boundary ──
+ *
+ * Phase R's trainer populates a `cont_ev_table` (BPR5 trailer of the
+ * regret-state file) with the traverser's expected showdown EV at the
+ * end-of-flop multiway boundary, keyed by
+ * (action_hash_at_boundary, traverser, hand_idx, traverser_cont_bias).
+ * Opponents' biases are averaged out via uniform MCCFR sampling during
+ * training (docs/PHASE_R_TRAINER_SPEC.md §3-4).
+ *
+ * When this consumer is enabled, the rollout short-circuits at the
+ * end-of-flop multiway boundary instead of rolling out turn + river:
+ * it computes the boundary action_hash, looks up the slot, and returns
+ * the uniform mean over the 4 traverser-bias EVs as the leaf value.
+ * The mean integrates over the same uniform bias distribution the
+ * producer sampled at training — the matching consumer to producer.
+ *
+ * Boundary criteria (all must hold; otherwise legacy turn+river rollout):
+ *   - flag enabled (rollout_set_use_cont_ev_at_flop_boundary)
+ *   - cont_ev_table handle set (rollout_set_cont_ev_table)
+ *   - street == ROLLOUT_STREET_FLOP at street_closed
+ *   - >= 3 active players (multiway)
+ *   - hero is one of the active players and has sampled hole cards
+ *   - n_board == 3 (flop dealt, turn not yet)
+ *
+ * On any cont_ev_table query returning != BP_BOUNDARY_EV_OK
+ * (EMPTY_BIAS / MISS / INVALID), the rollout fails loud — sets
+ * rollout_last_error and returns -1. No silent NaN-papering, no
+ * heuristic fallback (per docs/PHASE_R_TRAINER_SPEC.md §5 + the
+ * project-wide no-shortcuts directive).
+ *
+ * Flag OFF (default) is byte-identical to the legacy code path. */
+
+/* Set the cont_ev_table the rollout will query at the boundary. Pass
+ * NULL to clear. The table is owned by the caller (typically a loaded
+ * BPSolver's BPR5 trailer) and must outlive rollout calls. Process-
+ * global; set once at startup before launching workers. Thread-safe
+ * w.r.t. concurrent reads (the underlying find uses ACQUIRE loads). */
+BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t);
+BPS_EXPORT const BPContEVTable *rollout_get_cont_ev_table(void);
+
+/* Enable / disable the boundary lookup. When disabled (default), the
+ * rollout runs legacy turn + river simulation regardless of whether
+ * a cont_ev_table is set. Process-global; set once at startup. */
+BPS_EXPORT void rollout_set_use_cont_ev_at_flop_boundary(int enabled);
+BPS_EXPORT int  rollout_get_use_cont_ev_at_flop_boundary(void);
+
+/* Per-thread observability counter: number of times the boundary
+ * lookup was attempted and returned OK on all 4 biases (the success
+ * path that short-circuited the legacy rollout). MISS / EMPTY_BIAS
+ * fail loud and don't increment any counter — they raise via
+ * rollout_set_error. Used for smoke-test reporting. */
+BPS_EXPORT void rollout_get_cont_ev_boundary_hit_count(uint64_t *out_hits);
+BPS_EXPORT void rollout_reset_cont_ev_boundary_hit_count(void);
 
 /* ── Bucket-miss tolerance gate ─────────────────────────────────────── */
 

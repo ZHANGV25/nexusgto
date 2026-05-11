@@ -17,6 +17,14 @@
 #include <string.h>
 
 #include "hand_eval.h"
+#include "mccfr_cont_ev_table.h"  /* Phase F: cont_ev_table consumer */
+
+/* External declarations for the trainer-side action_hash function. We
+ * avoid including mccfr_blueprint.h because that pulls in the entire
+ * trainer header surface (card_abstraction, OMP types, etc.) which is
+ * out of scope for the rollout TU's link line. The single function we
+ * need is exported via BP_EXPORT — see src/mccfr_blueprint.h:521. */
+extern uint64_t bp_compute_action_hash(const int *actions, int num_actions);
 
 /* ── Compile-time caps ───────────────────────────────────────────────── */
 
@@ -68,6 +76,77 @@ static inline int32_t rollout_rand_weighted(
         if (u < acc) return i;
     }
     return n - 1;  /* numerical slack guard */
+}
+
+/* ── Phase F: cont_ev_table consumer state ────────────────────────────
+ *
+ * Process-global handle + flag. Set once at startup before workers
+ * fork (so each worker inherits the same pointer/flag via COW); the
+ * cont_ev_table itself is read-only at consume time so concurrent
+ * reads across workers are safe.
+ *
+ * The hit-count counter is per-thread (matches the existing
+ * observability pattern in this file). Workers' counts can be folded
+ * back via the existing add_observability pathway if needed; for the
+ * Phase 1 smoke we just sum across the parent thread.
+ */
+static const BPContEVTable *g_rollout_cont_ev_table = NULL;
+static int g_rollout_use_cont_ev_at_flop_boundary = 0;
+
+#if defined(_MSC_VER)
+static __declspec(thread) uint64_t g_rollout_cont_ev_boundary_hits = 0;
+#else
+static _Thread_local uint64_t g_rollout_cont_ev_boundary_hits = 0;
+#endif
+
+BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t) {
+    g_rollout_cont_ev_table = t;
+}
+
+BPS_EXPORT const BPContEVTable *rollout_get_cont_ev_table(void) {
+    return g_rollout_cont_ev_table;
+}
+
+BPS_EXPORT void rollout_set_use_cont_ev_at_flop_boundary(int enabled) {
+    g_rollout_use_cont_ev_at_flop_boundary = enabled ? 1 : 0;
+}
+
+BPS_EXPORT int rollout_get_use_cont_ev_at_flop_boundary(void) {
+    return g_rollout_use_cont_ev_at_flop_boundary;
+}
+
+BPS_EXPORT void rollout_get_cont_ev_boundary_hit_count(uint64_t *out_hits) {
+    if (out_hits) *out_hits = g_rollout_cont_ev_boundary_hits;
+}
+
+BPS_EXPORT void rollout_reset_cont_ev_boundary_hit_count(void) {
+    g_rollout_cont_ev_boundary_hits = 0;
+}
+
+/* Mirror of bps_reader.c::hand_index_for (static there).
+ * Returns the canonical full-deck pair index for the traverser's hole
+ * cards relative to a 3-card flop, in [0, 1326). The trainer's BPR5
+ * trailer encodes the boundary slot's `bucket` field as this value
+ * (per Phase R Step 11/12 — texture-cache mixer mismatch caused
+ * the trainer's bucket lookup to fall back to identity = hand_idx;
+ * the verifier accepts only this encoding, see
+ * tools/phase_r_probe_analysis/verify_bpr5_roundtrip.c).
+ *
+ * Inputs c0/c1 are 0..51 deck indices. The board is the 3 flop cards
+ * (only board[0..2] used). Returns -1 if the hero's hole cards are
+ * blocked by the flop (caller surfaces as fail-loud).
+ */
+static int rollout_hand_index_for_flop(const int32_t *board,
+                                        int32_t c0, int32_t c1) {
+    int blocked[52] = {0};
+    for (int i = 0; i < 3; i++) {
+        if (board[i] < 0 || board[i] >= 52) return -1;
+        blocked[board[i]] = 1;
+    }
+    if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52) return -1;
+    if (blocked[c0] || blocked[c1]) return -1;
+    if (c0 > c1) { int tmp = c0; c0 = c1; c1 = tmp; }
+    return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
 }
 
 /* ── Thread-local error surface ──────────────────────────────────────── */
@@ -926,10 +1005,84 @@ static int rollout_simulate_one(
 
 street_closed:
         /* End of street */
-        {
-            int32_t n_live = 0;
-            for (int32_t i = 0; i < num_players; i++) if (active[i]) n_live++;
-            if (n_live <= 1) break;
+        ;
+        int32_t n_live_at_close = 0;
+        for (int32_t i = 0; i < num_players; i++) if (active[i]) n_live_at_close++;
+        if (n_live_at_close <= 1) break;
+
+        /* Phase F: cont_ev_table boundary short-circuit.
+         *
+         * At end-of-flop in a multiway pot (and only there), the trainer
+         * accumulated the boundary EV slot. If the consumer is enabled,
+         * query the slot for hero's (action_hash, hand_idx) at all 4
+         * traverser-bias indices, take the uniform mean, and return that
+         * as the rollout's leaf value — short-circuiting the legacy
+         * turn + river simulation that produced the §4b degeneracy
+         * (uniform-on-legal fallback at 99% blueprint_miss).
+         *
+         * Bias-combination semantics: uniform mean. Pluribus §C2 calls
+         * for cont-strat to be a CFR-selectable action, but the trainer
+         * deliberately collapsed opponents' bias dimension via uniform
+         * MCCFR sampling (PHASE_R_TRAINER_SPEC §3-4) — the producer's
+         * σ̄ values were optimized against opps using uniform-mixed
+         * biases. Consuming with uniform mean preserves the same
+         * distribution: E_{b~uniform}[ev[b]] is the matching consumer.
+         *
+         * MISS / EMPTY_BIAS / INVALID is fail-loud per PHASE_R_TRAINER_SPEC
+         * §5. No silent NaN sentinel, no heuristic fallback. If the
+         * smoke surfaces coverage gaps at trafficked leaves, that's a
+         * Phase 2c retraining decision, not a runtime concern. */
+        if (g_rollout_use_cont_ev_at_flop_boundary
+            && street == ROLLOUT_STREET_FLOP
+            && n_live_at_close >= 3
+            && g_rollout_cont_ev_table != NULL
+            && hero_player >= 0 && hero_player < num_players
+            && active[hero_player]
+            && has_sample[hero_player]
+            && n_board >= 3) {
+            uint64_t bah = bp_compute_action_hash(game_history, gah_len);
+            int hidx = rollout_hand_index_for_flop(
+                board,
+                sampled_hands_c0[hero_player],
+                sampled_hands_c1[hero_player]);
+            if (hidx < 0) {
+                rollout_set_error(street, num_players,
+                    "cont_ev_table boundary: hand_index_for failed "
+                    "(hero c0=%d c1=%d on flop %d,%d,%d)",
+                    (int)sampled_hands_c0[hero_player],
+                    (int)sampled_hands_c1[hero_player],
+                    (int)board[0], (int)board[1], (int)board[2]);
+                return -1;
+            }
+            float ev_acc = 0.0f;
+            int n_ok = 0;
+            for (int bias = 0; bias < BP_CONT_EV_NUM_BIASES; bias++) {
+                float ev = 0.0f;
+                BPBoundaryEVStatus st = bp_query_boundary_ev(
+                    g_rollout_cont_ev_table, bah,
+                    hero_player, hidx, bias, &ev);
+                if (st == BP_BOUNDARY_EV_OK) {
+                    ev_acc += ev;
+                    n_ok++;
+                } else {
+                    const char *st_name =
+                        (st == BP_BOUNDARY_EV_EMPTY_BIAS) ? "EMPTY_BIAS" :
+                        (st == BP_BOUNDARY_EV_MISS)       ? "MISS" :
+                        (st == BP_BOUNDARY_EV_INVALID)    ? "INVALID" :
+                                                            "UNKNOWN";
+                    rollout_set_error(street, num_players,
+                        "cont_ev_table boundary: status=%s ah=0x%016llx "
+                        "player=%d hand_idx=%d bias=%d",
+                        st_name, (unsigned long long)bah,
+                        (int)hero_player, hidx, bias);
+                    return -1;
+                }
+            }
+            /* All 4 biases OK — uniform mean integrates over the
+             * producer's MCCFR-uniform bias sampling distribution. */
+            *out_payoff = ev_acc / (float)n_ok;
+            g_rollout_cont_ev_boundary_hits++;
+            return 0;
         }
 
         /* Deal next street */

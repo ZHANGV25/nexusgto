@@ -84,8 +84,8 @@ $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_re
 # Links bps_reader.c (blueprint queries); eval7 is header-only.
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
-$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
 
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
 # Builds with nvcc; requires CUDA toolkit on PATH. Targets sm_75 (T4 on
@@ -381,6 +381,31 @@ $(BUILD_DIR)/test_phase_r_boundary_bucket: tests/test_phase_r_boundary_bucket.c 
 test_phase_r_boundary_bucket: $(BUILD_DIR)/test_phase_r_boundary_bucket
 	./$(BUILD_DIR)/test_phase_r_boundary_bucket
 
+# ── Phase F Step 14: rollout.c cont_ev_table boundary consumer ──
+# Verifies that src/rollout.c, when configured with a populated
+# cont_ev_table and the boundary flag enabled, short-circuits the
+# end-of-flop multiway rollout: uniform mean over 4 bias EVs becomes
+# the leaf payoff; MISS / EMPTY_BIAS fails loud; flag OFF and HU flop
+# leave the boundary lookup inert. Mac-runnable, ~<1s.
+# Built WITHOUT -fopenmp — the public entry exercised here
+# (rollout_compute_leaf_values_all_hands_c on the skip-betting path)
+# never enters the OMP parallel regions.
+$(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.c \
+        $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h \
+        $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h \
+        $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_blueprint.h \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_rollout_cont_ev_boundary.c \
+	    $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c \
+	    $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_blueprint.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
+	./$(BUILD_DIR)/test_rollout_cont_ev_boundary
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
@@ -388,10 +413,11 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_bps_query_boundary_ev test_bpr5_roundtrip \
                   test_phase_r_save_load_e2e test_ss_action_hash \
                   test_phase_r_discount_gate test_b3_encoding_alignment \
-                  test_b3_bucket_alignment test_phase_r_boundary_bucket
+                  test_b3_bucket_alignment test_phase_r_boundary_bucket \
+                  test_rollout_cont_ev_boundary
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
-	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Step 11 — all green"
+	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Sess 11 + Sess 14 — green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:
