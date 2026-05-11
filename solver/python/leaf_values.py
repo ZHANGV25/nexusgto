@@ -64,6 +64,18 @@ class LeafValueUnavailable(RuntimeError):
         self.num_players = num_players
         super().__init__(f"[{street} {num_players}p] leaf oracle unavailable: {reason}")
 
+    # Step 15: ensure pickle round-trip across multiprocessing pool
+    # boundaries reconstructs the same exception. Default pickle uses
+    # cls(*self.args) which only has the formatted message → __init__
+    # signature mismatch → TypeError on result-handler thread, masking
+    # the real error from the worker. Explicit __reduce__ keeps the
+    # constructor args.
+    def __reduce__(self):
+        return (
+            self.__class__,
+            (self.street, self.reason, self.num_players),
+        )
+
 
 # ── First-order bias approximation (v3 fix for v2 .bps path) ─────────────
 #
