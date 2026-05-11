@@ -28,6 +28,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -996,7 +997,24 @@ def load_cont_ev_table_from_bpr5(
     if not os.path.exists(bin_path):
         raise FileNotFoundError(f"BPR5 .bin not found: {bin_path}")
 
+    # Step 15 instrumentation: every milestone gets a BEFORE/AFTER
+    # print with wall timing and flush=True so the live S3 uploader
+    # can show progress mid-run. Step 14 attempt 6 ran 2 hours silent
+    # because we had no visibility into which step was the long pole.
+    _t_load_start = time.monotonic()
+
+    def _log(msg: str) -> None:
+        if verbose:
+            print(f"[cont_ev_loader t+{time.monotonic() - _t_load_start:6.1f}s] {msg}",
+                  flush=True)
+
+    _log(f"BEGIN load_cont_ev_table_from_bpr5(bin_path={bin_path!r}, "
+         f"hash_table_size={hash_table_size:,}, num_threads={num_threads})")
+
+    _t = time.monotonic()
+    _log("BEFORE _find_blueprint_lib (CDLL load)")
     bp = _find_blueprint_lib()
+    _log(f"AFTER  _find_blueprint_lib ({time.monotonic() - _t:.2f}s)")
 
     # Wire up the bp_* APIs we need.
     bp.bp_default_config.argtypes = [ctypes.c_void_p]
@@ -1053,10 +1071,10 @@ def load_cont_ev_table_from_bpr5(
     pf_template = _PREFLOP_TIERS_PHASE3[0]
     c_pre = (ctypes.c_float * len(pf_template))(*pf_template)
 
-    if verbose:
-        print(f"[cont_ev_loader] bp_init_unified "
-              f"(hash_size={hash_table_size:,}, threads={num_threads}) ...",
-              flush=True)
+    _t = time.monotonic()
+    _log(f"BEFORE bp_init_unified (hash_size={hash_table_size:,}, "
+         f"threads={num_threads}, players={num_players}, "
+         f"sb/bb={sb}/{bb}, stack={initial_stack})")
     rc = bp.bp_init_unified(
         ctypes.c_void_p(solver_ptr_int), num_players,
         sb, bb, initial_stack,
@@ -1064,22 +1082,32 @@ def load_cont_ev_table_from_bpr5(
         c_pre, len(pf_template),
         ctypes.byref(config),
     )
+    _log(f"AFTER  bp_init_unified rc={rc} ({time.monotonic() - _t:.2f}s)")
     if rc != 0:
         raise RuntimeError(f"bp_init_unified rc={rc}")
 
     # Apply tiered preflop sizing (mirrors verify_bpr5_roundtrip.c:65-72).
     for level, sizes in sorted(_PREFLOP_TIERS_PHASE3.items()):
+        _t = time.monotonic()
+        _log(f"BEFORE bp_set_preflop_tier(level={level}, "
+             f"sizes={list(sizes)}, max_raises={_PREFLOP_MAX_RAISES_PHASE3})")
         c_sizes = (ctypes.c_float * len(sizes))(*sizes)
         rc = bp.bp_set_preflop_tier(
             ctypes.c_void_p(solver_ptr_int), level,
             c_sizes, len(sizes), _PREFLOP_MAX_RAISES_PHASE3,
         )
+        _log(f"AFTER  bp_set_preflop_tier(level={level}) "
+             f"rc={rc} ({time.monotonic() - _t:.2f}s)")
         if rc != 0:
             bp.bp_free(ctypes.c_void_p(solver_ptr_int))
             raise RuntimeError(f"bp_set_preflop_tier level {level} rc={rc}")
 
+    _t = time.monotonic()
+    _log(f"BEFORE bp_set_add_explicit_allin({1 if add_explicit_allin else 0})")
     rc = bp.bp_set_add_explicit_allin(
         ctypes.c_void_p(solver_ptr_int), 1 if add_explicit_allin else 0)
+    _log(f"AFTER  bp_set_add_explicit_allin rc={rc} "
+         f"({time.monotonic() - _t:.2f}s)")
     if rc != 0:
         bp.bp_free(ctypes.c_void_p(solver_ptr_int))
         raise RuntimeError(f"bp_set_add_explicit_allin rc={rc}")
@@ -1088,22 +1116,34 @@ def load_cont_ev_table_from_bpr5(
     # too small) AND, at end-of-file, the BPR5 trailer into
     # s->cont_ev_table.
     file_gb = os.path.getsize(bin_path) / (1024 ** 3)
-    if verbose:
-        print(f"[cont_ev_loader] bp_load_regrets ({file_gb:.1f} GB) ...",
-              flush=True)
+    _t = time.monotonic()
+    _log(f"BEFORE bp_load_regrets({bin_path}, {file_gb:.2f} GB) "
+         f"— this is the long pole (~minutes); if stuck here the BPR4 "
+         f"insertion-failures hash thrash is the suspect")
     n_loaded = bp.bp_load_regrets(
         ctypes.c_void_p(solver_ptr_int), bin_path.encode("utf-8"))
+    _log(f"AFTER  bp_load_regrets n_loaded={n_loaded} "
+         f"({time.monotonic() - _t:.2f}s, "
+         f"{file_gb / max(time.monotonic() - _t, 0.001):.2f} GB/s)")
     if n_loaded < 0:
         bp.bp_free(ctypes.c_void_p(solver_ptr_int))
         raise RuntimeError(f"bp_load_regrets rc={n_loaded}")
 
+    _t = time.monotonic()
+    _log("BEFORE bp_get_cont_ev_table_ptr")
     table_ptr = bp.bp_get_cont_ev_table_ptr(ctypes.c_void_p(solver_ptr_int))
     table_ptr_int = int(table_ptr) if table_ptr else 0
+    _log(f"AFTER  bp_get_cont_ev_table_ptr ptr=0x{table_ptr_int:x} "
+         f"({time.monotonic() - _t:.2f}s)")
     if not table_ptr_int:
         bp.bp_free(ctypes.c_void_p(solver_ptr_int))
         raise RuntimeError("bp_get_cont_ev_table_ptr returned NULL")
 
+    _t = time.monotonic()
+    _log("BEFORE bp_cont_ev_count")
     n_slots = int(bp.bp_cont_ev_count(ctypes.c_void_p(table_ptr_int)))
+    _log(f"AFTER  bp_cont_ev_count n_slots={n_slots:,} "
+         f"({time.monotonic() - _t:.2f}s)")
     if n_slots == 0:
         bp.bp_free(ctypes.c_void_p(solver_ptr_int))
         raise RuntimeError(
@@ -1112,10 +1152,9 @@ def load_cont_ev_table_from_bpr5(
             f"truncated."
         )
 
-    if verbose:
-        print(f"[cont_ev_loader] cont_ev_table loaded: {n_slots:,} slots, "
-              f"{n_loaded:,} BPR4 entries (most dropped — hash too small)",
-              flush=True)
+    _log(f"END   load_cont_ev_table_from_bpr5 — {n_slots:,} slots, "
+         f"{n_loaded:,} BPR4 entries (most dropped — hash too small), "
+         f"total {time.monotonic() - _t_load_start:.2f}s")
 
     return ContEVTableHolder(
         bp_lib=bp, solver_buf=solver_buf, solver_ptr=solver_ptr_int,
