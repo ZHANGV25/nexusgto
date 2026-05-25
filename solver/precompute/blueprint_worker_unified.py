@@ -44,22 +44,18 @@ INITIAL_STACK = 10000 # $10,000 = 100BB
 
 # Pluribus bet sizes: up to 14 for preflop, 3 for later rounds
 # Flat preflop sizes (used as fallback if tiered not set)
-PREFLOP_BET_SIZES = [0.5, 0.7, 1.0]
-# Postflop first raise: Pluribus turn/river = {0.5x, 1x, all-in}
-# (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
-POSTFLOP_BET_SIZES = [0.5, 1.0]
+PREFLOP_BET_SIZES = [0.7, 1.0]
+# Phase 2c pruning: single postflop bet size (all-in auto-added).
+POSTFLOP_BET_SIZES = [0.75]
 
-# Tiered preflop sizing (Pluribus uses up to 14 sizes per decision; we ship a
-# coarser tier but cover the bands humans actually open/3-bet/4-bet at).
-#
-# Enumerated tree (6p, 100BB): 380K preflop decision nodes × 169 buckets
-# = 64M preflop IS, 381K flop lines. Est ~350M total IS, ~220M encountered
-# with -300M pruning. 750M hash at 44% load = 42 GB metadata.
-# Hand-picked from 2B checkpoint regret analysis: r0.7x had highest
-# positive rate (29%), all 3 open sizes within 25-29%. 5-bet shove
-# dropped (0-6% positive = dead weight).
+# Tiered preflop sizing — Phase 2c pruned (Step 18, 2026-05-12).
+# Dropped 0.5x open size; pruning measurements
+# (tools/measure_pruning_impact.py Option B) project 89% reduction in
+# end-of-flop boundary action_hashes (1.8M → 205K), which lifts trainer
+# visits-per-slot from ~5 (useless) to ~43 static / ~100-130 effective
+# with Pluribus regret-based dynamic pruning at 10B iters.
 PREFLOP_TIERS = {
-    0: [0.5, 0.7, 1.0],              # open raise: 3 sizes (all viable per regret data)
+    0: [0.7, 1.0],                   # open raise: 2 sizes
     1: [0.7, 1.0],                   # 3-bet: 2 sizes
     2: [1.0],                        # 4-bet: 1 size (all-in auto-added)
 }
@@ -211,6 +207,20 @@ def load_bp_dll(build_dir):
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
                 ctypes.POINTER(ctypes.c_size_t)
             ]
+            # Phase R Step 19: streaming variant (no 12 GiB Python alloc).
+            # Gated on availability so older .so builds still load — we fall
+            # back to the legacy buffer path in `_stream_bps_export` if this
+            # symbol isn't present.
+            if hasattr(bp, "bp_export_strategies_streaming"):
+                # int (*emit)(const void *, size_t, void *)
+                bp.BP_EMIT_FN = ctypes.CFUNCTYPE(
+                    ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
+                    ctypes.c_void_p)
+                bp.bp_export_strategies_streaming.restype = ctypes.c_int
+                bp.bp_export_strategies_streaming.argtypes = [
+                    ctypes.c_void_p, bp.BP_EMIT_FN, ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_size_t)
+                ]
             bp.bp_set_preflop_tier.restype = ctypes.c_int
             bp.bp_set_preflop_tier.argtypes = [
                 ctypes.c_void_p, ctypes.c_int,
@@ -631,7 +641,19 @@ def main():
                 # (bp_load_regrets sets s->iterations_run)
                 # We can't easily read it from Python, but the C code printed it.
                 # Parse it from the checkpoint metadata instead.
+                #
+                # Phase 2c (Step 18, 2026-05-12): when --checkpoint-prefix is
+                # set, read from the per-run prefix instead of the canonical
+                # path. Symmetry with the write path below at lines 1638/1675
+                # (which already write to {prefix}/checkpoint_meta.json). The
+                # canonical path tracks phase3's 4.21B baseline whose
+                # config_hash differs from Phase 2c's pruned action set —
+                # without this, warm-restart on SPOT reclaim would trip the
+                # stale-checkpoint guard at line 712.
                 try:
+                    meta_prefix = (f"{args.checkpoint_prefix}/"
+                                   if args.checkpoint_prefix else "")
+                               f"{meta_prefix}checkpoint_meta.json")
                     meta_local = os.path.join(args.output_dir, "checkpoint_meta.json")
                     subprocess.run(
                         ["aws", "s3", "cp", meta_s3, meta_local, "--quiet"],
@@ -1334,9 +1356,13 @@ def _stream_bps_export(bp_lib, solver, bps_path, meta_dict):
     """OOM-safe streaming export of strategies to a .bps file.
 
     Used by both the final-checkpoint export (`_export_checkpoint`) and
-    per-mini-chunk strategy snapshots (`_export_strategy_snapshot`). See
-    `_export_checkpoint` for the historical incident that motivated the
-    streaming pattern.
+    per-mini-chunk strategy snapshots (`_export_strategy_snapshot`).
+
+    Step 19 (2026-05-13): rewritten to drive `bp_export_strategies_streaming`
+    so the raw strat blob is consumed in 4 MB chunks emitted by the C side,
+    rather than materializing the full (~12 GiB) strat_buf in Python via
+    `(ctypes.c_char * strat_size)()`. That single allocation OOM-killed
+    c7a.48xlarge (384 GB) at iter 1.05B mid-snapshot in Step 18.
 
     Returns the on-disk compressed_size in bytes, or 0 if the solver had
     no strategies to export (caller should treat that as a no-op).
@@ -1344,8 +1370,14 @@ def _stream_bps_export(bp_lib, solver, bps_path, meta_dict):
     import lzma
     import struct
 
+    # Size query first — both APIs accept emit/buf == NULL for this.
     needed = ctypes.c_size_t(0)
-    bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
+    if hasattr(bp_lib, "bp_export_strategies_streaming"):
+        bp_lib.bp_export_strategies_streaming(
+            solver, ctypes.cast(None, bp_lib.BP_EMIT_FN), None,
+            ctypes.byref(needed))
+    else:
+        bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
     strat_size = needed.value
     if strat_size <= 0:
         return 0
@@ -1353,49 +1385,97 @@ def _stream_bps_export(bp_lib, solver, bps_path, meta_dict):
     print(f"  Streaming strat export: "
           f"{strat_size / 1024 / 1024 / 1024:.2f} GiB raw",
           flush=True)
-    strat_buf = (ctypes.c_char * strat_size)()
-    written = ctypes.c_size_t(0)
-    bp_lib.bp_export_strategies(solver, strat_buf, strat_size,
-                                ctypes.byref(written))
-    written_bytes = written.value
-    meta_bytes = json.dumps(meta_dict, separators=(',', ':')).encode('utf-8')
 
-    CHUNK = 64 * 1024 * 1024  # 64 MB compress chunks
+    meta_bytes = json.dumps(meta_dict, separators=(',', ':')).encode('utf-8')
     out_tmp = bps_path + ".tmp"
     compressor = lzma.LZMACompressor(preset=1)
-    compressed_size = 0
+
+    # Per-call state for the emit callback — mutable via list to avoid
+    # `nonlocal` (which only binds enclosing-function locals; lambdas /
+    # callbacks are easier to reason about with explicit boxes).
+    state = {
+        "bytes_in": 0,
+        "compressed_size": 0,
+        "last_pct_logged": -1,
+        "file": None,
+        "err": None,
+    }
+
+    def _emit_callback(buf_ptr, n, _ctx):
+        try:
+            # Copy n bytes out of the C-owned scratch buffer. The copy is
+            # 4 MB max (BP_EXPORT_STREAM_BUF_SIZE); the previous code
+            # held the entire 12 GiB strat blob in Python memory — this
+            # is the whole point of the fix.
+            chunk = ctypes.string_at(buf_ptr, n)
+            out_chunk = compressor.compress(chunk)
+            if out_chunk:
+                state["file"].write(out_chunk)
+                state["compressed_size"] += len(out_chunk)
+            state["bytes_in"] += n
+            pct = int(100 * state["bytes_in"] / strat_size)
+            if pct >= state["last_pct_logged"] + 10:
+                print(f"    compress {pct}% "
+                      f"(in={state['bytes_in'] / 1024 / 1024 / 1024:.1f} GiB, "
+                      f"out={state['compressed_size'] / 1024 / 1024 / 1024:.2f} GiB)",
+                      flush=True)
+                state["last_pct_logged"] = pct
+            return 0
+        except Exception as e:
+            state["err"] = e
+            return -1
+
+    if hasattr(bp_lib, "bp_export_strategies_streaming"):
+        cb = bp_lib.BP_EMIT_FN(_emit_callback)
+    else:
+        cb = None  # legacy fallback path below allocates strat_buf
 
     with open(out_tmp, 'wb') as f:
         f.write(b'BPS3')
         header_compressed_size_offset = f.tell()
         f.write(struct.pack('<QI', 0, len(meta_bytes)))
-        mv = memoryview(strat_buf)[:written_bytes]
-        pos = 0
-        last_pct_logged = -1
-        while pos < written_bytes:
-            chunk_end = min(pos + CHUNK, written_bytes)
-            out_chunk = compressor.compress(mv[pos:chunk_end])
-            if out_chunk:
-                f.write(out_chunk)
-                compressed_size += len(out_chunk)
-            pos = chunk_end
-            pct = int(100 * pos / written_bytes)
-            if pct >= last_pct_logged + 10:
-                print(f"    compress {pct}% "
-                      f"(in={pos / 1024 / 1024 / 1024:.1f} GiB, "
-                      f"out={compressed_size / 1024 / 1024 / 1024:.2f} GiB)",
-                      flush=True)
-                last_pct_logged = pct
+        state["file"] = f
+
+        if cb is not None:
+            written = ctypes.c_size_t(0)
+            rc = bp_lib.bp_export_strategies_streaming(
+                solver, cb, None, ctypes.byref(written))
+            if rc != 0:
+                if state["err"] is not None:
+                    raise state["err"]
+                raise RuntimeError(
+                    f"bp_export_strategies_streaming returned {rc}")
+            if written.value != strat_size:
+                raise RuntimeError(
+                    f"strat export size mismatch: queried {strat_size}, "
+                    f"streamed {written.value}")
+        else:
+            # Legacy fallback: only kept so a brand-new code build that
+            # somehow ships an older .so still works. The OOM risk is
+            # back in this path — explicit so a future reader sees it.
+            strat_buf = (ctypes.c_char * strat_size)()
+            written = ctypes.c_size_t(0)
+            bp_lib.bp_export_strategies(solver, strat_buf, strat_size,
+                                        ctypes.byref(written))
+            CHUNK = 64 * 1024 * 1024
+            mv = memoryview(strat_buf)[:written.value]
+            pos = 0
+            while pos < written.value:
+                chunk_end = min(pos + CHUNK, written.value)
+                _emit_callback(
+                    ctypes.addressof(strat_buf) + pos, chunk_end - pos, None)
+                pos = chunk_end
+
         tail = compressor.flush()
         if tail:
             f.write(tail)
-            compressed_size += len(tail)
+            state["compressed_size"] += len(tail)
         f.write(meta_bytes)
         f.seek(header_compressed_size_offset)
-        f.write(struct.pack('<Q', compressed_size))
+        f.write(struct.pack('<Q', state["compressed_size"]))
 
     os.replace(out_tmp, bps_path)
-    return compressed_size
+    return state["compressed_size"]
 
 
 def _export_strategy_snapshot(bp_lib, solver, args, iters_done, n_is,
@@ -1444,6 +1524,29 @@ def _export_strategy_snapshot(bp_lib, solver, args, iters_done, n_is,
         "cont_strat_prob": args.cont_strat_prob,
         "checkpoint_prefix": args.checkpoint_prefix,
         "snapshot_only": True,
+        # Self-describing trainer-config block. Every downstream consumer
+        # (nexusgto-api postflop_provider, the metadata-patch script at
+        # promotion time, BPSReaderC's mixer selection) reads these off
+        # the .bps trailing JSON. Adding them here so future snapshots
+        # don't need the post-hoc patch_bps_meta.py step
+        # (see feedback_bps_snapshot_hash_mixer_runtime, 2026-05-24
+        # which patched 8.05B for hash_mixer + bucket counts; the
+        # 2026-05-25 fix extends to the full schema). Pulled from the
+        # same module-level constants the trainer itself uses.
+        "hash_mixer": "splitmix64",
+        "preflop_buckets": 169,        # hardcoded throughout trainer
+        "postflop_buckets": 200,
+        "preflop_bet_sizes": PREFLOP_BET_SIZES,
+        "preflop_tiers": {str(k): v for k, v in sorted(PREFLOP_TIERS.items())},
+        "preflop_max_raises": PREFLOP_MAX_RAISES,
+        "postflop_bet_sizes": POSTFLOP_BET_SIZES,
+        # SUBSEQUENT_BET_SIZES is fixed on the C side at
+        # mccfr_blueprint.c:1609-1612 (=[1.0] invariantly at every
+        # num_raises>=1 postflop site, no opp-history conditional).
+        # Stamp the literal so consumers can read it off metadata.
+        "subsequent_bet_sizes": [1.0],
+        "blinds": [SMALL_BLIND, BIG_BLIND],
+        "initial_stack": INITIAL_STACK,
     }
     t_export = time.time()
     compressed_size = _stream_bps_export(bp_lib, solver, bps_path,
