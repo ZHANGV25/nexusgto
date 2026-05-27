@@ -689,6 +689,27 @@ BP_EXPORT int bp_export_strategies(const BPSolver *s,
                                     unsigned char *buf, size_t buf_size,
                                     size_t *bytes_written);
 
+/* Streaming variant of bp_export_strategies — emits the same byte stream
+ * in O(few-MB) scratch, instead of materializing the entire strat blob in
+ * one contiguous buffer. Used by the worker's per-mini-chunk snapshot path
+ * to avoid a 12+ GiB Python-side allocation that OOM-killed c7a.48xlarge
+ * (384 GB) at iter 1.05B in Phase R Step 18.
+ *
+ * The emit callback receives chunks in the same order/format that
+ * bp_export_strategies writes to its output buffer. Return non-zero from
+ * the callback to abort export (the function then returns the same code).
+ *
+ * Call with emit=NULL to query the total size that will be emitted
+ * (mirrors the buf=NULL query mode of bp_export_strategies). When
+ * bytes_emitted is non-NULL, it's set to the projected total on size-only
+ * mode, and to the actually-emitted total on successful streaming.
+ */
+typedef int (*bp_emit_fn)(const void *buf, size_t n, void *ctx);
+
+BP_EXPORT int bp_export_strategies_streaming(const BPSolver *s,
+                                              bp_emit_fn emit, void *ctx,
+                                              size_t *bytes_emitted);
+
 /**
  * Save the full regret table to a binary file for checkpoint/resume.
  *

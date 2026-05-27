@@ -607,7 +607,14 @@ class StreetSolverGPU:
         return {}
 
     def get_all_strategies(self, player):
-        """Get strategies for ALL hands at player's first decision node."""
+        """Get strategies for ALL hands at player's first decision node.
+
+        Reads the FINAL-iteration regret-matched strategy (Pluribus §4
+        play-path) — by design this is often pure-deterministic per hand.
+        For chart display or Bayesian narrowing of an equilibrium mix, use
+        `get_all_avg_strategies` instead, which reads the sigma-bar
+        average that CFR actually converges.
+        """
         if not self._solved:
             raise RuntimeError("Must call solve() first")
         player_idx = self._resolve_player(player)
@@ -617,6 +624,41 @@ class StreetSolverGPU:
             if strat:
                 result[h] = strat
         return result
+
+    def get_all_avg_strategies(self, player):
+        """Get AVERAGE (sigma-bar) strategies for ALL hands at player's first
+        decision node — same shape as `get_all_strategies` but reads from
+        `avg_strategies` instead of `final_strategies`.
+
+        Use this for chart-display / equilibrium-policy consumers. The
+        final-iter strategy CFR ends on is a pure regret-matched argmax per
+        hand (Pluribus §4 play-path) which collapses display to one action
+        per hand even when the converged mix is non-degenerate.
+        """
+        if not self._solved:
+            raise RuntimeError("Must call solve() first")
+        player_idx = self._resolve_player(player)
+        max_h = self._max_hands
+        # Find the first avg-strategy decision node whose player matches.
+        for di in range(self._output.num_avg_nodes):
+            nidx = self._output.avg_strategy_node_ids[di]
+            node = self._tree.nodes[nidx]
+            if node.type != 0 or node.player != player_idx:
+                continue
+            na = node.num_children
+            labels = _build_labels_at_node(self._tree, nidx)
+            result = {}
+            for h in range(len(self.player_hands[player_idx])):
+                strat = {}
+                for a in range(min(na, len(labels))):
+                    freq = self._output.avg_strategies[
+                        di * SS_MAX_ACTIONS * max_h + a * max_h + h]
+                    if freq > 0.001:
+                        strat[labels[a]] = float(freq)
+                if strat:
+                    result[h] = strat
+            return result
+        return {}
 
     def get_avg_strategy(self, player):
         """Get weighted-average strategy at player's first decision.
