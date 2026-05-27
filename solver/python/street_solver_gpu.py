@@ -25,7 +25,7 @@ import ctypes
 import os
 import platform
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -43,30 +43,40 @@ except ImportError:
 
 # ── DLL loading ──────────────────────────────────────────────────────────
 
-_LIB = None
+# Filename → CDLL handle. Keyed by lib_filename (not abspath) so callers can
+# load a sibling .so (e.g. "street_solve_joint.so" for the Phase 5.1 JOINT
+# diagnostic) alongside the default without re-loading either.
+_LIB_CACHE: Dict[str, ctypes.CDLL] = {}
 
-def _get_lib():
-    global _LIB
-    if _LIB is not None:
-        return _LIB
+
+def _default_lib_filename() -> str:
+    return "street_solve.dll" if platform.system() == "Windows" else "street_solve.so"
+
+
+def _get_lib(lib_filename: Optional[str] = None):
+    if lib_filename is None:
+        lib_filename = _default_lib_filename()
+    cached = _LIB_CACHE.get(lib_filename)
+    if cached is not None:
+        return cached
     solver_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    lib_name = "street_solve.dll" if platform.system() == "Windows" else "street_solve.so"
-    lib_path = os.path.join(solver_dir, "build", lib_name)
+    lib_path = os.path.join(solver_dir, "build", lib_filename)
     if not os.path.exists(lib_path):
-        raise FileNotFoundError(f"street_solve not found at {lib_path}")
-    _LIB = ctypes.CDLL(lib_path)
-    _LIB.ss_build_tree.restype = ctypes.c_int
+        raise FileNotFoundError(f"street_solve library not found at {lib_path}")
+    lib = ctypes.CDLL(lib_path)
+    lib.ss_build_tree.restype = ctypes.c_int
     # Phase R Block B.3 (Step 6): per-level bet_sizes API. Older
     # libstreet_solve.so builds (pre-Step 6) won't export
     # ss_build_tree2; tolerate that here so this binding loads
     # against either build, and let the caller surface the missing
     # symbol only when subsequent_bet_sizes is actually passed.
-    if hasattr(_LIB, "ss_build_tree2"):
-        _LIB.ss_build_tree2.restype = ctypes.c_int
-    _LIB.ss_solve_gpu.restype = ctypes.c_int
-    _LIB.ss_free_tree.restype = None
-    _LIB.ss_free_output.restype = None
-    return _LIB
+    if hasattr(lib, "ss_build_tree2"):
+        lib.ss_build_tree2.restype = ctypes.c_int
+    lib.ss_solve_gpu.restype = ctypes.c_int
+    lib.ss_free_tree.restype = None
+    lib.ss_free_output.restype = None
+    _LIB_CACHE[lib_filename] = lib
+    return lib
 
 # ── ctypes structure mirrors (must match street_solve.cuh exactly) ───────
 
@@ -234,7 +244,11 @@ class StreetSolverGPU:
                  use_cont_strats=True, leaf_value_fn=None,
                  add_explicit_allin=True,
                  # Phase R Block B.3 (Step 6): per-level bet_sizes
-                 subsequent_bet_sizes=None):
+                 subsequent_bet_sizes=None,
+                 # Phase 5.1 (nexusgto-api): pick a non-default street_solve
+                 # variant (e.g. "street_solve_joint.so" compiled with
+                 # -DSS_CONT_STRAT_MODE=0). None → platform default.
+                 lib_filename: Optional[str] = None):
         """
         Args:
             board: list of card strings or ints
@@ -259,7 +273,7 @@ class StreetSolverGPU:
                 all-in (off-tree branches get uniform-on-zero σ̄ substitution
                 and CFR can pick the artifact). v3 sets this to False.
         """
-        self.lib = _get_lib()
+        self.lib = _get_lib(lib_filename)
 
         # Parse board
         if isinstance(board[0], str):

@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve subgame_preflop
+.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve street_solve_joint subgame_preflop
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -98,6 +98,19 @@ street_solve: $(BUILD_DIR)/street_solve$(SHLIB_EXT)
 
 $(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h | $(BUILD_DIR)
 	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -I$(SRC_DIR) \
+	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c -o $@
+
+# JOINT-mode variant for the nexusgto-api Phase 5.1 diagnostic
+# (docs/OP4_CONT_STRAT_MARGINAL_PLAN.md). Same sources, compiled with
+# -DSS_CONT_STRAT_MODE=0 so expand_continuation_leaves_n builds the 4^N
+# chain instead of the SAMPLED no-op. Diagnostic only — JOINT has the
+# sequential-observation deviation documented in the plan. Memory at
+# HU/3p/4p fits a T4 (0.01/0.21/5.31 GB per OP4_BENCH.md); n>=5 must
+# stay on SAMPLED.
+street_solve_joint: $(BUILD_DIR)/street_solve_joint$(SHLIB_EXT)
+
+$(BUILD_DIR)/street_solve_joint$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h | $(BUILD_DIR)
+	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -DSS_CONT_STRAT_MODE=0 -I$(SRC_DIR) \
 	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c -o $@
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
