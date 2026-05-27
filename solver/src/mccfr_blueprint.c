@@ -5117,151 +5117,57 @@ void bp_free(BPSolver *s) {
     memset(s, 0, sizeof(BPSolver));
 }
 
-/* ── Full strategy export ──────────────────────────────────────────
- *
- * Two entry points, both producing the IDENTICAL byte stream:
- *
- *   bp_export_strategies(s, buf, buf_size, &written)
- *     Legacy contiguous-buffer API. The caller allocates `buf` of size
- *     >= the value `bp_export_strategies(NULL, 0, &needed)` returns.
- *
- *   bp_export_strategies_streaming(s, emit, ctx, &emitted)
- *     New chunked API. Emits the same bytes in ~4 MB scratch chunks via
- *     a callback. Introduced in Phase R Step 19 to eliminate the
- *     12+ GiB Python-side allocation that OOM-killed c7a.48xlarge at
- *     iter 1.05B mid-snapshot in Step 18.
- *
- * The legacy API is now a thin wrapper over the streaming impl, so any
- * future change to the byte format only needs to land in one place. */
-
-/* Internal: count occupied slots + compute total encoded size. */
-static void bp_export_strategies_size(const BPInfoTable *t,
-                                       int *count_out, size_t *size_out) {
-    int count = 0;
-    /* Header: 4 bytes magic + 4 bytes num_entries + 4 bytes num_players. */
-    size_t total = 12;
-    for (int64_t i = 0; i < t->table_size; i++) {
-        if (t->occupied[i] != 1) continue;
-        /* Key: player(1)+street(1)+bucket(2)+board_hash(8)+action_hash(8)=20.
-         * Meta: num_actions(1)=1.
-         * Strategy: num_actions * 1 byte (uint8 quantized). */
-        total += 20 + 1 + (size_t)t->sets[i].num_actions;
-        count++;
-    }
-    *count_out = count;
-    *size_out = total;
-}
-
-/* Internal context used by the legacy wrapper's emit callback. */
-typedef struct {
-    unsigned char *dst;
-    size_t dst_size;
-    size_t pos;
-} bp_legacy_emit_ctx;
-
-static int bp_legacy_emit(const void *src, size_t n, void *ctx_) {
-    bp_legacy_emit_ctx *ctx = (bp_legacy_emit_ctx *)ctx_;
-    if (ctx->pos + n > ctx->dst_size) return -1;  /* shouldn't happen — caller checked */
-    memcpy(ctx->dst + ctx->pos, src, n);
-    ctx->pos += n;
-    return 0;
-}
+/* ── Full strategy export ────────────────────────────────────────── */
 
 int bp_export_strategies(const BPSolver *s,
                           unsigned char *buf, size_t buf_size,
                           size_t *bytes_written) {
     const BPInfoTable *t = &s->info_table;
-    int count;
-    size_t total;
-    bp_export_strategies_size(t, &count, &total);
+
+    /* First pass: compute required size */
+    size_t total = 0;
+    int count = 0;
+    /* Header: 4 bytes magic + 4 bytes num_entries + 4 bytes num_players */
+    total += 12;
+    for (int64_t i = 0; i < t->table_size; i++) {
+        if (t->occupied[i] != 1) continue;
+        BPInfoSet *is = &t->sets[i];
+        /* Key: player(1) + street(1) + bucket(2) + board_hash(8) + action_hash(8) = 20 bytes */
+        /* Meta: num_actions(1) = 1 byte */
+        /* Strategy: num_actions * 1 byte (uint8 quantized) */
+        total += 20 + 1 + is->num_actions;
+        count++;
+    }
 
     *bytes_written = total;
     if (buf == NULL) return 0;
     if (buf_size < total) return -1;
 
-    bp_legacy_emit_ctx ctx = { .dst = buf, .dst_size = buf_size, .pos = 0 };
-    int rc = bp_export_strategies_streaming(s, bp_legacy_emit, &ctx, NULL);
-    if (rc != 0) return rc;
-    /* Sanity: streaming impl should fill exactly `total` bytes. */
-    if (ctx.pos != total) return -2;
-    return 0;
-}
+    unsigned char *p = buf;
 
-/* Scratch buffer for the streaming impl. 4 MB chosen so the buffer fits
- * comfortably in L2/L3 cache and a `realloc`-free single allocation
- * covers the entire export. With ~25 bytes per entry, one buffer flush
- * spans roughly 160K info-sets — a tiny fraction of the 575M info-set
- * table size, but large enough that per-entry overhead is dominated by
- * the entry encoding itself, not the buffer-management loop. Tests
- * compile with `-DBP_EXPORT_STREAM_BUF_SIZE=<small>` to force multi-chunk
- * emit and exercise the flush/remainder paths. */
-#ifndef BP_EXPORT_STREAM_BUF_SIZE
-#define BP_EXPORT_STREAM_BUF_SIZE (4 * 1024 * 1024)
-#endif
-
-int bp_export_strategies_streaming(const BPSolver *s,
-                                    bp_emit_fn emit, void *ctx,
-                                    size_t *bytes_emitted) {
-    const BPInfoTable *t = &s->info_table;
-    int count;
-    size_t total;
-    bp_export_strategies_size(t, &count, &total);
-
-    if (emit == NULL) {
-        /* Size-only query mode. */
-        if (bytes_emitted) *bytes_emitted = total;
-        return 0;
-    }
-
-    unsigned char *scratch = (unsigned char *)malloc(BP_EXPORT_STREAM_BUF_SIZE);
-    if (!scratch) return -3;
-    size_t pos = 0;
-    size_t emitted_total = 0;
-    int err = 0;
+    memcpy(p, "BPS3", 4); p += 4;  /* v3: bucket-in-key format */
+    memcpy(p, &count, 4); p += 4;
     int np = s->num_players;
-
-    /* Append `n` bytes from `src` to scratch, flushing when full. */
-    #define APP(src_, n_) do {                                            \
-        const unsigned char *_p = (const unsigned char *)(src_);          \
-        size_t _n = (size_t)(n_);                                          \
-        while (_n > 0) {                                                   \
-            size_t _avail = (size_t)BP_EXPORT_STREAM_BUF_SIZE - pos;       \
-            size_t _copy = _n < _avail ? _n : _avail;                      \
-            memcpy(scratch + pos, _p, _copy);                              \
-            pos += _copy; _p += _copy; _n -= _copy;                        \
-            if (pos == (size_t)BP_EXPORT_STREAM_BUF_SIZE) {                \
-                err = emit(scratch, pos, ctx);                             \
-                if (err != 0) goto done;                                   \
-                emitted_total += pos;                                      \
-                pos = 0;                                                    \
-            }                                                               \
-        }                                                                   \
-    } while (0)
-
-    /* Header: "BPS3" magic + count + num_players. */
-    APP("BPS3", 4);
-    APP(&count, 4);
-    APP(&np, 4);
+    memcpy(p, &np, 4); p += 4;
 
     float strategy_buf[BP_MAX_ACTIONS];
-    unsigned char quant_buf[BP_MAX_ACTIONS];
     for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
-        const BPInfoKey *key = &t->keys[i];
-        const BPInfoSet *is = &t->sets[i];
+        BPInfoKey *key = &t->keys[i];
+        BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
 
         unsigned char player_byte = (unsigned char)key->player;
         unsigned char street_byte = (unsigned char)key->street;
         unsigned short bucket_short = (unsigned short)key->bucket;
-        APP(&player_byte, 1);
-        APP(&street_byte, 1);
-        APP(&bucket_short, 2);
-        APP(&key->board_hash, 8);
-        APP(&key->action_hash, 8);
+        memcpy(p, &player_byte, 1); p += 1;
+        memcpy(p, &street_byte, 1); p += 1;
+        memcpy(p, &bucket_short, 2); p += 2;
+        memcpy(p, &key->board_hash, 8); p += 8;
+        memcpy(p, &key->action_hash, 8); p += 8;
 
         unsigned char na_byte = (unsigned char)na;
-        APP(&na_byte, 1);
+        memcpy(p, &na_byte, 1); p += 1;
 
         /* Bug B fix: export the AVERAGE strategy from strategy_sum, not the
          * current regret-matched strategy. The average strategy is what
@@ -5293,25 +5199,11 @@ int bp_export_strategies_streaming(const BPSolver *s,
             int q = (int)(strategy_buf[a] * 255.0f + 0.5f);
             if (q < 0) q = 0;
             if (q > 255) q = 255;
-            quant_buf[a] = (unsigned char)q;
-        }
-        APP(quant_buf, na);
-    }
-
-    /* Flush remaining bytes in scratch. */
-    if (pos > 0) {
-        err = emit(scratch, pos, ctx);
-        if (err == 0) {
-            emitted_total += pos;
-            pos = 0;
+            *p++ = (unsigned char)q;
         }
     }
 
-done:
-    #undef APP
-    free(scratch);
-    if (err == 0 && bytes_emitted) *bytes_emitted = emitted_total;
-    return err;
+    return 0;
 }
 
 /* ── Phase 1.3: σ̄-sampled action EV computation + export ─────────── */

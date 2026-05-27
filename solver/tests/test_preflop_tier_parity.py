@@ -50,27 +50,34 @@ def test_preflop_tiers_match():
     )
 
 
-def test_preflop_max_raises_is_three():
-    """Phase 2c pruning (Step 18, 2026-05-12): MAX_RAISES=3 — open / 3-bet /
-    4-bet, with all-in auto-added at the 4-bet level. The earlier 4-tier setup
-    with an explicit 5-bet shove (worker.PREFLOP_TIERS[3] = [8.0]) was dropped
-    when Step 17 evidence showed only 0.0003% of action_hashes had all-6
-    player coverage and the action set needed pruning."""
+def test_tier_3_is_shove():
+    """Tier 3 (5-bet) must be jam-only. Verified in tests/query_5bet_jam.py:
+    the solver's 5-bet line was in active equilibrium at iter 400M."""
     worker = _load(WORKER_PY, "blueprint_worker_unified")
-    assert worker.PREFLOP_MAX_RAISES == 3
+    assert worker.PREFLOP_TIERS[3] == [8.0], (
+        "Tier 3 (5-bet) must be a single oversized pot-ratio (8.0) so the "
+        "solver collapses it to all-in. Changing this invalidates the "
+        "5-bet jam equilibrium verified at iter 400M."
+    )
 
 
-def test_tiers_cover_open_3bet_4bet():
-    """Three tiers must exist (open=0, 3bet=1, 4bet=2). The 5-bet level
-    is reachable but collapses to all-in via the auto-added all-in action."""
+def test_preflop_max_raises_is_four():
+    """PREFLOP_MAX_RAISES=4 per Pluribus Science 2019. Verified in
+    docs/pluribus_technical_details.md and SOLVER_CONFIG.md."""
     worker = _load(WORKER_PY, "blueprint_worker_unified")
-    assert sorted(worker.PREFLOP_TIERS.keys()) == [0, 1, 2]
+    assert worker.PREFLOP_MAX_RAISES == 4
+
+
+def test_tiers_cover_open_3bet_4bet_5bet():
+    """Four tiers must exist (open=0, 3bet=1, 4bet=2, 5bet=3)."""
+    worker = _load(WORKER_PY, "blueprint_worker_unified")
+    assert sorted(worker.PREFLOP_TIERS.keys()) == [0, 1, 2, 3]
 
 
 def test_sizes_are_monotonically_nonincreasing_in_count():
     """Fewer sizes at deeper raise levels — matches Pluribus-style tiering."""
     worker = _load(WORKER_PY, "blueprint_worker_unified")
-    counts = [len(worker.PREFLOP_TIERS[l]) for l in [0, 1, 2]]
+    counts = [len(worker.PREFLOP_TIERS[l]) for l in [0, 1, 2, 3]]
     for i in range(len(counts) - 1):
         assert counts[i] >= counts[i + 1], (
             f"Tier sizes must be monotonically non-increasing in count: "
@@ -80,7 +87,8 @@ def test_sizes_are_monotonically_nonincreasing_in_count():
 
 if __name__ == "__main__":
     test_preflop_tiers_match()
-    test_preflop_max_raises_is_three()
-    test_tiers_cover_open_3bet_4bet()
+    test_tier_3_is_shove()
+    test_preflop_max_raises_is_four()
+    test_tiers_cover_open_3bet_4bet_5bet()
     test_sizes_are_monotonically_nonincreasing_in_count()
     print("OK: preflop tier parity tests passed")

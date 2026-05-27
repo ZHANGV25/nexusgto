@@ -46,7 +46,7 @@ PLAYER_TO_POS = {v: k for k, v in POS_TO_PLAYER.items()}
 #
 # Level n = num_raises at that node. Level 0 = unraised (UTG opens).
 PREFLOP_TIERS = {
-    0: [0.7, 1.0],                   # open raise: 2 sizes (Phase 2c pruned)
+    0: [0.5, 0.7, 1.0],              # open raise: 3 sizes
     1: [0.7, 1.0],                   # 3-bet: 2 sizes
     2: [1.0],                        # 4-bet: 1 size (all-in auto-added)
 }

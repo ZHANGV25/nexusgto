@@ -77,25 +77,11 @@ int bp_set_depth_limit_cont_strats(BPSolver *s, int enabled) {
      * the existing table allocated (so toggling on/off mid-run doesn't
      * lose accumulated EVs). bp_free handles teardown. */
     if (enabled && s->cont_ev_table.entries == NULL) {
-        /* Default sized for Phase 2c full-run scale: 1<<28 ≈ 268M slots
-         * (~19 GB RAM at sizeof(BPContEVEntry)=72). At ~9M new slots per
-         * 1B training iters, 268M comfortably covers iter 10B with the
-         * load-factor-≤50% headroom rule (134M slot ceiling).
-         *
-         * 2026-05-18 bug: the previous default 1<<26 (67M) silently
-         * overflowed the 33.5M-slot headroom at iter 3.9B (n_slots=35.9M
-         * in regrets_latest.bin BPR5 trailer); read_trailer_slots returned
-         * "table too small" and bp_load_regrets returned -1, leaving the
-         * cont_ev_table empty and the trainer running with degraded Phase
-         * R cont-strat dispatch. See memory/project_phase_2c_cev_size_bug
-         * for the full forensic trail.
-         *
-         * Tests can override via bp_set_cont_ev_table_size before this
-         * call. The trailer loader (bp_cont_ev_read_trailer_slots) now
-         * also auto-grows when a pre-allocated table is too small. */
+        /* Spec §4 default: 1<<26 ≈ 67M slots. Tests can override via
+         * bp_set_cont_ev_table_size before this call. */
         int64_t target_size = (s->cont_ev_table_size_hint > 0)
             ? s->cont_ev_table_size_hint
-            : (int64_t)(1LL << 28);
+            : (int64_t)(1LL << 26);
         if (bp_cont_ev_init(&s->cont_ev_table, target_size) != 0) {
             fprintf(stderr,
                     "[BP] WARNING: bp_cont_ev_init(%lld) failed; "

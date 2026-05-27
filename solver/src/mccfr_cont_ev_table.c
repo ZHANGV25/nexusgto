@@ -427,12 +427,7 @@ int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots) {
 
     /* Allocation policy (matches mccfr_blueprint.c lazy-alloc):
      *   - entries == NULL → lazy-alloc to next_prime(max(2*n_slots, 1024)).
-     *   - already allocated but too small → auto-resize to next_prime(2*n_slots).
-     *     (2026-05-18: previous behavior of failing here silently dropped
-     *     the entire BPR5 trailer when a checkpoint outgrew the default
-     *     allocation. Auto-resize makes the loader robust to pre-sized
-     *     tables that haven't kept up with checkpoint growth.)
-     *   - already allocated and large enough → no-op. */
+     *   - already allocated → require headroom (n_slots <= table_size/2). */
     if (t->entries == NULL) {
         int64_t target = n_slots * 2;
         if (target < 1024) target = 1024;
@@ -443,24 +438,11 @@ int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots) {
             return -1;
         }
     } else if (n_slots > t->table_size / 2) {
-        /* Headroom rule (n_slots <= table_size/2) violated. Free and
-         * re-init to fit instead of failing — the BPR5 trailer is the
-         * authoritative source of truth and dropping it on the floor
-         * silently corrupts the Phase R cont-strat dispatch (see
-         * project_phase_2c_cev_size_bug memory). */
         fprintf(stderr,
-                "[cev] read_trailer_slots: table size %lld too small for "
-                "n_slots=%lld; auto-resizing.\n",
+                "[cev] read_trailer_slots: table too small (size=%lld) "
+                "for n_slots=%lld. Free or init a fresh table.\n",
                 (long long)t->table_size, (long long)n_slots);
-        bp_cont_ev_free(t);
-        int64_t target = n_slots * 2;
-        if (target < 1024) target = 1024;
-        if (bp_cont_ev_init(t, target) != 0) {
-            fprintf(stderr,
-                    "[cev] read_trailer_slots: re-init to %lld slots "
-                    "failed\n", (long long)target);
-            return -1;
-        }
+        return -1;
     }
 
     for (int64_t i = 0; i < n_slots; i++) {
