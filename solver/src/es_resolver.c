@@ -468,7 +468,16 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
 
-        #pragma omp for schedule(static)
+        /* schedule(dynamic) so OpenMP hands out `it` from a SHARED counter —
+         * concurrently-processed `it` values cluster near current global
+         * progress. This is load-bearing for LINEAR CFR: the Linear t-weight
+         * (it+1) must track global wall-progress, not a per-thread chunk index.
+         * Under schedule(static) thread 23 would stamp weight ≈ 23·T/24 onto the
+         * shared strat-sum from wall-time zero (while regrets are immature),
+         * incoherent across threads and silently killing Linear's acceleration.
+         * Coarse chunk amortizes the shared-counter atomic. (Vanilla mode 0
+         * ignores `it`, so it is unaffected either way.) */
+        #pragma omp for schedule(dynamic, 2048)
         for (int64_t it = 0; it < iterations; it++) {
             for (int trav = 0; trav < np; trav++) {
                 es_sample_hands(r, &rng, sampled);
