@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 _POKER_SOLVER = os.environ.get(
     "POKER_SOLVER_PATH",
 )
-_ES_DLL_NAME = "es_resolver_real.dll"
+# Bare name (no extension); c_solver resolves .dll on Windows / .so on Linux.
+_ES_DLL_NAME = "es_resolver_real"
 
 
 class CpuEsSolver:
