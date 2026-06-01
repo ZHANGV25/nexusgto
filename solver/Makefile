@@ -87,6 +87,35 @@ rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 $(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
 
+# ── CPU external-sampling ES re-solver (HYBRID 5p flop/turn path) ──
+# es_resolver: lightweight (table/joint oracles only) — validation harnesses.
+# es_resolver_real: links rollout + bps_reader + mccfr → adds the real-blueprint
+# oracle + the BPS loader symbols. The API's CpuEsSolver loads es_resolver_real.
+# On Windows, mccfr_cont_ev_table.c uses fsync() which MSYS2 ucrt64 does not
+# declare → shim it to _commit (io.h). On Linux fsync is native (unistd.h),
+# no shim needed. NOTE: the Linux .so build is unexercised as of 2026-06-01;
+# this target is the prod-deploy build recipe (validated on Windows only).
+ifeq ($(OS),Windows_NT)
+  ES_SHIM = -Dfsync=_commit -include io.h
+else
+  ES_SHIM =
+endif
+
+.PHONY: es_resolver es_resolver_real
+es_resolver: $(BUILD_DIR)/es_resolver$(SHLIB_EXT)
+es_resolver_real: $(BUILD_DIR)/es_resolver_real$(SHLIB_EXT)
+
+$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_resolver.h $(SRC_DIR)/es_oracles.c $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp -I$(SRC_DIR) \
+	    $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_oracles.c -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_oracles.c $(SRC_DIR)/es_real_oracle.c $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/es_resolver.h $(SRC_DIR)/rollout.h | $(BUILD_DIR)
+	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) -I$(SRC_DIR) \
+	    $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_oracles.c $(SRC_DIR)/es_real_oracle.c \
+	    $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_phase_r.c \
+	    -o $@ $(LDFLAGS)
+
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
 # Builds with nvcc; requires CUDA toolkit on PATH. Targets sm_75 (T4 on
 # g4dn) by default; override SS_GPU_ARCH=sm_86 for A10, sm_70 for V100.

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from typing import Optional
 
 import numpy as np
@@ -35,7 +36,19 @@ _REPO = os.path.dirname(os.path.dirname(_HERE))
 #   "es_resolver.dll"      — lightweight, table/joint oracles only (validation)
 #   "es_resolver_real.dll" — links rollout + bps_reader; adds the real oracle +
 #                            the BPS loader symbols (real-blueprint path / bench)
-_DLL_NAME = os.environ.get("ES_DLL", "es_resolver.dll")
+# Platform-aware shared-library extension. Windows builds .dll; Linux (the prod
+# EC2 target) builds .so. ES_DLL may be given with or without an extension; if
+# bare ("es_resolver_real"), the platform extension is appended. NOTE: the Linux
+# .so build is NOT yet exercised — the Windows build flags (-Dfsync=_commit
+# -include io.h) are Windows-only; Linux has fsync natively, so the Makefile/
+# build recipe needs a Linux variant before the prod (Linux) deploy. See
+# docs/CPU_ES_RESOLVER_BENCHMARK.md and the deploy note.
+_SHLIB_EXT = ".dll" if sys.platform == "win32" else ".so"
+_ES_DLL_ENV = os.environ.get("ES_DLL", "es_resolver")
+if _ES_DLL_ENV.endswith((".dll", ".so")):
+    _DLL_NAME = _ES_DLL_ENV
+else:
+    _DLL_NAME = _ES_DLL_ENV + _SHLIB_EXT
 _DLL_PATH = os.path.join(_REPO, "build", _DLL_NAME)
 
 
