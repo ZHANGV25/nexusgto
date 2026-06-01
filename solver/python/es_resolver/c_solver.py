@@ -31,20 +31,28 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
-_DLL_PATH = os.path.join(_REPO, "build", "es_resolver.dll")
+# ES_DLL selects which build to load:
+#   "es_resolver.dll"      — lightweight, table/joint oracles only (validation)
+#   "es_resolver_real.dll" — links rollout + bps_reader; adds the real oracle +
+#                            the BPS loader symbols (real-blueprint path / bench)
+_DLL_NAME = os.environ.get("ES_DLL", "es_resolver.dll")
+_DLL_PATH = os.path.join(_REPO, "build", _DLL_NAME)
 
 
 def _load_dll() -> ctypes.CDLL:
     if not os.path.exists(_DLL_PATH):
         raise FileNotFoundError(
-            f"es_resolver.dll not found at {_DLL_PATH}. Build it:\n"
-            "  gcc -O2 -Wall -Wextra -fopenmp -shared -Isrc "
-            "src/es_resolver.c src/es_oracles.c -o build/es_resolver.dll -lm"
+            f"{_DLL_NAME} not found at {_DLL_PATH}. Build it:\n"
+            "  gcc -O2 -Wall -Wextra -fopenmp -shared -static -static-libgcc -Isrc "
+            "src/es_resolver.c src/es_oracles.c -o build/es_resolver.dll -lm\n"
+            "  (real: add es_real_oracle.c rollout.c bps_reader.c card_abstraction.c "
+            "mccfr_*.c, -w -Dfsync=_commit -include io.h -o build/es_resolver_real.dll)"
         )
     return ctypes.CDLL(_DLL_PATH)
 
 
 _lib = _load_dll()
+_HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 
 # void* es_create(const SSTreeData*, ESLeafOracle, void* ctx, uint64_t seed)
 _lib.es_create.restype = ctypes.c_void_p
@@ -76,6 +84,34 @@ _lib.es_make_joint_oracle.restype = ctypes.c_void_p
 _lib.es_make_joint_oracle.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _lib.es_joint_oracle_fn.restype = ctypes.c_void_p
 _lib.es_free_oracle_ctx.argtypes = [ctypes.c_void_p]
+
+# real-blueprint rollout oracle (only in es_resolver_real.dll)
+ESRO_MAX_FLOP_HIST = 256  # = ROLLOUT_MAX_ACTION_HISTORY
+if _HAS_REAL:
+    _lib.es_make_real_oracle.restype = ctypes.c_void_p
+    _lib.es_make_real_oracle.argtypes = [
+        ctypes.c_void_p,   # bp (BPSReader*)
+        ctypes.c_void_p,   # tree (SSTreeData*)
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # street,stack,nroll,cache_k
+        ctypes.c_uint64,   # master_seed
+        ctypes.c_int,      # n_leaves
+        ctypes.c_int,      # max_h
+        ctypes.POINTER(ctypes.c_int),  # pot
+        ctypes.POINTER(ctypes.c_int),  # bets
+        ctypes.POINTER(ctypes.c_int),  # active
+        ctypes.POINTER(ctypes.c_int),  # hist_flat
+        ctypes.POINTER(ctypes.c_int),  # hist_len
+        ctypes.POINTER(ctypes.c_int),  # player_seats
+    ]
+    _lib.es_real_oracle_fn.restype = ctypes.c_void_p
+    _lib.es_real_oracle_stats.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+    _lib.es_real_oracle_stats2.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64)]
+    _lib.es_free_real_oracle.argtypes = [ctypes.c_void_p]
 
 
 class ESStats(ctypes.Structure):
@@ -133,6 +169,7 @@ class CSolver:
                  _keepalive=None):
         self._tree = tree
         self._oracle_ctx = oracle_ctx
+        self._real_oracle_ctx = None  # set by from_real_oracle (different free)
         self._keepalive = _keepalive  # numpy buffers the oracle borrows
         self._handle = _lib.es_create(
             ctypes.byref(tree), oracle_fn_ptr, oracle_ctx, ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF))
@@ -176,6 +213,53 @@ class CSolver:
         """Generic: bring your own C oracle fn-ptr + ctx (e.g. the real
         blueprint rollout oracle)."""
         return cls(tree, oracle_fn_ptr, oracle_ctx, seed=seed, _keepalive=keepalive)
+
+    @classmethod
+    def from_real_oracle(cls, tree, bp_handle, street: int, stack_chips: int,
+                         n_leaves: int, max_h: int, pot, bets, active, hist_flat,
+                         hist_len, player_seats, num_rollouts: int = 3,
+                         cache_k: int = 16, master_seed: int = 0xABCDEF,
+                         seed: int = 0) -> "CSolver":
+        """Real blueprint-rollout oracle (requires es_resolver_real.dll).
+        Leaf values are CACHED on first hit (strategy-independent), filled all-
+        hands averaged over cache_k bias samples × num_rollouts. Per-leaf state
+        arrays are int32 numpy, C-contiguous:
+          pot [n_leaves], bets/active [n_leaves*np], hist_flat [n_leaves*256],
+          hist_len [n_leaves], player_seats [np]. bp_handle = a BPSReader* as a
+          ctypes pointer/int. The C ctx owns COPIES of the arrays."""
+        if not _HAS_REAL:
+            raise RuntimeError("es_make_real_oracle not in this DLL; set ES_DLL=es_resolver_real.dll")
+        # keep arrays alive through the make call (C copies them)
+        ka = [np.ascontiguousarray(a, dtype=np.int32)
+              for a in (pot, bets, active, hist_flat, hist_len, player_seats)]
+        ctx = _lib.es_make_real_oracle(
+            ctypes.c_void_p(bp_handle), ctypes.byref(tree),
+            street, stack_chips, num_rollouts, cache_k,
+            ctypes.c_uint64(master_seed & 0xFFFFFFFFFFFFFFFF),
+            n_leaves, max_h,
+            ka[0].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[1].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[2].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[3].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[4].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[5].ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+        if not ctx:
+            raise RuntimeError("es_make_real_oracle returned NULL (OOM?)")
+        fn = _lib.es_real_oracle_fn()
+        s = cls(tree, fn, ctx, seed=seed, _keepalive=None)
+        s._real_oracle_ctx = ctx  # for stats + free
+        return s
+
+    def real_oracle_stats(self):
+        """(leaf_fills, cache_hits, rollout_sims, oracle_errors)."""
+        ctx = getattr(self, "_real_oracle_ctx", None)
+        if ctx is None:
+            return (0, 0, 0, 0)
+        fills = ctypes.c_uint64(0); hits = ctypes.c_uint64(0)
+        sims = ctypes.c_uint64(0); errs = ctypes.c_uint64(0)
+        _lib.es_real_oracle_stats2(ctx, ctypes.byref(fills), ctypes.byref(hits),
+                                   ctypes.byref(sims), ctypes.byref(errs))
+        return (fills.value, hits.value, sims.value, errs.value)
 
     # ── run ───────────────────────────────────────────────────────────────
     def run(self, iterations: int, num_threads: int = 1) -> None:
@@ -238,7 +322,11 @@ class CSolver:
             if getattr(self, "_handle", None):
                 _lib.es_free(self._handle)
                 self._handle = None
-            if getattr(self, "_oracle_ctx", None):
+            if getattr(self, "_real_oracle_ctx", None):
+                _lib.es_free_real_oracle(self._real_oracle_ctx)
+                self._real_oracle_ctx = None
+                self._oracle_ctx = None  # same ptr; don't double-free
+            elif getattr(self, "_oracle_ctx", None):
                 _lib.es_free_oracle_ctx(self._oracle_ctx)
                 self._oracle_ctx = None
         except Exception:

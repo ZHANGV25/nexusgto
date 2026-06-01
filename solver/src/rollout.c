@@ -1327,6 +1327,48 @@ BPS_EXPORT int32_t rollout_compute_leaf_value_c(
         out_value);
 }
 
+/* Single-hand entry WITH the skip_first_betting flag (subgame leaf path).
+ * Purely additive — mirrors rollout_compute_leaf_values_all_hands_c's flag.
+ * A depth-limited subgame leaf already represents end-of-leaf-street betting
+ * state (its game_action_history carries the closed flop_history); the rollout
+ * must NOT re-run that betting round (which would double-count chips and
+ * corrupt subsequent-street blueprint-query hashing). The ES re-solver oracle
+ * (es_real_oracle.c) calls this with skip_first_betting=1 whenever the leaf's
+ * flop_history is non-empty. See rollout.h:182-188. */
+BPS_EXPORT int32_t rollout_compute_leaf_value_skip_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    int32_t pot_chips,
+    const int32_t *active, int32_t num_players,
+    const int32_t *stacks,
+    const int32_t *bets,
+    const RolloutHandList *player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    const int32_t *bias_profile,
+    int32_t hero_player,
+    int32_t hero_hand_idx,
+    int32_t num_rollouts,
+    uint64_t master_seed,
+    int32_t leaf_idx_for_seed,
+    int32_t combo_for_seed,
+    int32_t skip_first_betting,
+    float *out_value
+) {
+    return rollout_compute_leaf_value_impl(
+        r, board, n_board_cards, street, pot_chips,
+        active, num_players, stacks, bets,
+        player_hands, acting_order, acting_order_len,
+        player_seats, game_action_history, gah_len,
+        bias_profile, hero_player, hero_hand_idx,
+        num_rollouts, master_seed,
+        leaf_idx_for_seed, combo_for_seed,
+        skip_first_betting,
+        out_value);
+}
+
 BPS_EXPORT int32_t rollout_compute_leaf_values_all_hands_c(
     const BPSReader *r,
     const int *board, int32_t n_board_cards,

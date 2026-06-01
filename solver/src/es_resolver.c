@@ -288,10 +288,10 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
  * rollout in the real path; a table lookup in validation). */
 static inline double es_leaf_value(ESResolver *r, const SSNode *nd,
                                    int traverser, const int *sampled,
-                                   ESStats *local) {
+                                   ESStats *local, uint64_t *rng) {
     local->leaf_rollouts++;
     return r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
-                     sampled[traverser], sampled, nd);
+                     sampled[traverser], sampled, nd, rng);
 }
 
 /* ── Traversal (mirrors es_solver.py _traverse exactly) ──────────────────────
@@ -317,7 +317,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
         return es_showdown_value(r, nd, traverser, sampled);
     }
     if (type == ES_T_LEAF) {
-        return es_leaf_value(r, nd, traverser, sampled, local);
+        return es_leaf_value(r, nd, traverser, sampled, local, rng);
     }
     /* CHANCE nodes are not present in depth-limited cont-strat subgames
      * (flop/turn → leaves; river → showdown). If one ever appears, sample one
@@ -467,7 +467,7 @@ static double es_forward_walk_uniform(ESResolver *r, int node_idx, int player,
     int type = nd->type;
     if (type == ES_T_LEAF) {
         return r->oracle(r->oracle_ctx, nd->leaf_idx, player,
-                         sampled[player], sampled, nd);
+                         sampled[player], sampled, nd, rng);
     }
     if (type == ES_T_FOLD) return es_fold_value(nd, player);
     if (type == ES_T_SHOWDOWN) return es_showdown_value(r, nd, player, sampled);

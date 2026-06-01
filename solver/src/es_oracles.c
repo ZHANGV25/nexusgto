@@ -32,8 +32,8 @@ typedef struct {
 
 static double es_oracle_table(void *vctx, int leaf_idx, int traverser,
                               int traverser_hand, const int *sampled_hands,
-                              const SSNode *leaf_node) {
-    (void)sampled_hands; (void)leaf_node;
+                              const SSNode *leaf_node, uint64_t *rng) {
+    (void)sampled_hands; (void)leaf_node; (void)rng;
     const ESTableCtx *c = (const ESTableCtx *)vctx;
     if (traverser_hand < 0) return 0.0;
     size_t idx = ((size_t)leaf_idx * c->np + traverser) * c->max_h + traverser_hand;
@@ -60,8 +60,8 @@ typedef struct {
 
 static double es_oracle_joint(void *vctx, int leaf_idx, int traverser,
                               int traverser_hand, const int *sampled_hands,
-                              const SSNode *leaf_node) {
-    (void)leaf_idx; (void)traverser_hand;
+                              const SSNode *leaf_node, uint64_t *rng) {
+    (void)leaf_idx; (void)traverser_hand; (void)rng;
     const ESJointCtx *c = (const ESJointCtx *)vctx;
     int h0 = sampled_hands[0];
     int h1 = sampled_hands[1];

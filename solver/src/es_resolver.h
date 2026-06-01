@@ -64,14 +64,23 @@ extern "C" {
  * traversal reaches the leaf.
  *
  * Mirrors es_solver.py's leaf_rollout_fn(leaf_idx, traverser, hand,
- * sampled_hands, leaf_node) -> float. */
+ * sampled_hands, leaf_node) -> float.
+ *
+ * `rng` is the CALLER's per-traversal RNG state (per-thread under Hogwild). A
+ * sampling oracle (the real blueprint rollout) MUST draw its cont-strat bias
+ * profile via this rng so the bias varies FRESH per call — the cont-strat
+ * chance node is then integrated across visits (matching real_oracle.py's
+ * fresh-per-call bias draw and the GPU SAMPLED mode). A deterministic oracle
+ * (table / joint-strength) ignores it. Advancing rng inside the oracle is
+ * fine (it is the traversal's own stream). */
 typedef double (*ESLeafOracle)(
     void *ctx,
     int leaf_idx,
     int traverser,
     int traverser_hand,
     const int *sampled_hands,
-    const SSNode *leaf_node
+    const SSNode *leaf_node,
+    uint64_t *rng
 );
 
 /* ── Solver handle (opaque) ──────────────────────────────────────────────
@@ -159,6 +168,31 @@ ES_EXPORT void *es_make_joint_oracle(const double *strength0, const double *stre
 ES_EXPORT ESLeafOracle es_joint_oracle_fn(void);
 
 ES_EXPORT void es_free_oracle_ctx(void *ctx);
+
+/* ── REAL blueprint-rollout oracle (es_real_oracle.c) ─────────────────────
+ * The production hot-path oracle: lazy rollout_compute_leaf_value_c per leaf
+ * hit. Per-leaf state is extracted ONCE in Python (extract_leaf_info_from_tree)
+ * and passed flat. `bp` is an opaque BPSReader* (declared void* here to avoid
+ * pulling bps_reader.h into this header). hist_flat is
+ * [n_leaves * ROLLOUT_MAX_ACTION_HISTORY (256)] row-major. Build with
+ * es_make_real_oracle, pass es_real_oracle_fn() as the oracle, free with
+ * es_free_real_oracle.
+ *
+ * Leaf values are CACHED on first hit (strategy-independent -> constant per
+ * solve): each reached leaf is filled once (all hands, cache_k bias-averaged)
+ * and reused. Still lazy (no global construct floor), exact in expectation. */
+ES_EXPORT void *es_make_real_oracle(
+    const void *bp, const SSTreeData *tree, int street, int stack_chips,
+    int num_rollouts, int cache_k, uint64_t master_seed,
+    int n_leaves, int max_h, const int *pot, const int *bets, const int *active,
+    const int *hist_flat, const int *hist_len, const int *player_seats);
+ES_EXPORT ESLeafOracle es_real_oracle_fn(void);
+ES_EXPORT void es_real_oracle_stats(void *ctx, uint64_t *calls,
+                                    uint64_t *sims, uint64_t *errors);
+ES_EXPORT void es_real_oracle_stats2(void *ctx, uint64_t *fills,
+                                     uint64_t *cache_hits, uint64_t *sims,
+                                     uint64_t *errors);
+ES_EXPORT void es_free_real_oracle(void *ctx);
 
 #ifdef __cplusplus
 }
