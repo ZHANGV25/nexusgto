@@ -100,6 +100,13 @@ ES_EXPORT ESResolver *es_create(
 
 ES_EXPORT void es_free(ESResolver *r);
 
+/* CFR variant: 0 = VANILLA (default; the validated reference fixed point),
+ * 1 = LINEAR CFR matching the GPU (strat-sum += t·σ, regrets ·= t/(t+1) per
+ * traverser-node visit). Linear converges to the same Nash faster — set it for
+ * an iso-quality iteration comparison against the GPU (which runs Linear).
+ * Set BEFORE es_run. */
+ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
+
 /* Run `iterations` ES iterations. Each iteration walks once per player as
  * traverser (matching es_solver.py iterate()). num_threads > 1 enables
  * Hogwild (iterations partitioned across threads; shared tables, racy adds).

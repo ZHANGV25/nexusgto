@@ -58,6 +58,8 @@ _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 _lib.es_create.restype = ctypes.c_void_p
 _lib.es_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 _lib.es_free.argtypes = [ctypes.c_void_p]
+if hasattr(_lib, "es_set_cfr_mode"):
+    _lib.es_set_cfr_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 # int es_run(void*, int64 iters, int num_threads)
 _lib.es_run.restype = ctypes.c_int
 _lib.es_run.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int]
@@ -260,6 +262,14 @@ class CSolver:
         _lib.es_real_oracle_stats2(ctx, ctypes.byref(fills), ctypes.byref(hits),
                                    ctypes.byref(sims), ctypes.byref(errs))
         return (fills.value, hits.value, sims.value, errs.value)
+
+    def set_cfr_mode(self, mode: int) -> None:
+        """0 = vanilla (validated reference), 1 = Linear CFR (matches the GPU).
+        Set before run()."""
+        if hasattr(_lib, "es_set_cfr_mode"):
+            _lib.es_set_cfr_mode(self._handle, int(mode))
+        elif mode == 1:
+            raise RuntimeError("es_set_cfr_mode not in this DLL (rebuild)")
 
     # ── run ───────────────────────────────────────────────────────────────
     def run(self, iterations: int, num_threads: int = 1) -> None:

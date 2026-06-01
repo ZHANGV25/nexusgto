@@ -78,6 +78,15 @@ struct ESResolver {
     void *oracle_ctx;
     uint64_t master_seed;
 
+    /* CFR variant. 0 = VANILLA (the validated reference fixed point — plain
+     * per-visit strat-sum, no regret discount). 1 = LINEAR CFR matching the GPU
+     * (street_solve.cu:1933-1943): strat-sum += t·σ, regrets ·= t/(t+1) per
+     * traverser-node visit. Linear converges to the SAME Nash but faster — the
+     * GPU runs Linear, so an iso-quality iteration comparison must give the C ES
+     * the same acceleration. Vanilla kept for the validation gates (matches
+     * es_solver.py, whose linear_cfr flag is dead). */
+    int cfr_mode;
+
     /* Per-decision-node dense storage, keyed (node, hand, action).
      * For node i:  regrets[off[i] + hand*na[i] + a]. Terminal/non-decision
      * nodes have off[i] = -1 and na[i] = 0. The hand axis uses the ACTING
@@ -151,6 +160,10 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->master_seed = seed ? seed : 0x9E3779B97F4A7C15ULL;
     if (es_build_offsets(r) != 0) { es_free(r); return NULL; }
     return r;
+}
+
+void es_set_cfr_mode(ESResolver *r, int mode) {
+    if (r) r->cfr_mode = (mode == 1) ? 1 : 0;
 }
 
 void es_free(ESResolver *r) {
@@ -303,7 +316,8 @@ static inline double es_leaf_value(ESResolver *r, const SSNode *nd,
  * Scratch: child_vals is stack-allocated per call frame; SS_MAX_ACTIONS bounds it.
  */
 static double es_traverse(ESResolver *r, int node_idx, int traverser,
-                          const int *sampled, uint64_t *rng, ESStats *local) {
+                          const int *sampled, uint64_t *rng, ESStats *local,
+                          int64_t iter) {
     const SSTreeData *t = r->tree;
     const SSNode *nd = &t->nodes[node_idx];
     int type = nd->type;
@@ -325,7 +339,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     if (type == ES_T_CHANCE) {
         int a = es_rng_int(rng, nd->num_children);
         int child = t->children[nd->first_child + a];
-        return es_traverse(r, child, traverser, sampled, rng, local);
+        return es_traverse(r, child, traverser, sampled, rng, local, iter);
     }
 
     /* DECISION node */
@@ -337,7 +351,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
         /* acting player has no assignable hand — pass through child 0 (rare;
          * matches es_solver.py). */
         int child = t->children[nd->first_child];
-        return es_traverse(r, child, traverser, sampled, rng, local);
+        return es_traverse(r, child, traverser, sampled, rng, local, iter);
     }
 
     int64_t off = r->node_off[node_idx];
@@ -354,20 +368,32 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
         double node_val = 0.0;
         for (int a = 0; a < na; a++) {
             int child = t->children[nd->first_child + a];
-            double cv = es_traverse(r, child, traverser, sampled, rng, local);
+            double cv = es_traverse(r, child, traverser, sampled, rng, local, iter);
             child_vals[a] = cv;
             node_val += sigma[a] * cv;
         }
-        /* Regret update (vanilla; no discount, no reach weight). */
         double *reg = &r->regrets[off + (int64_t)hand * na];
         double *ss = &r->strat_sum[off + (int64_t)hand * na];
-        for (int a = 0; a < na; a++) {
-            double nr = reg[a] + (child_vals[a] - node_val);
-            if (nr < ES_REGRET_FLOOR) nr = ES_REGRET_FLOOR;
-            reg[a] = nr;
-            /* Plain per-visit strat-sum accumulation (matches
-             * mccfr_blueprint.c:2037 + es_solver.py:341). */
-            ss[a] += sigma[a];
+        if (r->cfr_mode == 1) {
+            /* LINEAR CFR — matches the GPU (street_solve.cu:1933-1943):
+             * regret += residual, then regrets ·= t/(t+1) per visit;
+             * strat-sum += t·σ. Converges to the same Nash, faster. */
+            double d = (double)iter / ((double)iter + 1.0);
+            for (int a = 0; a < na; a++) {
+                double nr = reg[a] + (child_vals[a] - node_val);
+                if (nr < ES_REGRET_FLOOR) nr = ES_REGRET_FLOOR;
+                reg[a] = nr * d;
+                ss[a] += (double)iter * sigma[a];
+            }
+        } else {
+            /* VANILLA — the validated reference fixed point (no discount, no
+             * iter weight; matches mccfr_blueprint.c:2037 + es_solver.py:341). */
+            for (int a = 0; a < na; a++) {
+                double nr = reg[a] + (child_vals[a] - node_val);
+                if (nr < ES_REGRET_FLOOR) nr = ES_REGRET_FLOOR;
+                reg[a] = nr;
+                ss[a] += sigma[a];
+            }
         }
         return node_val;
     } else {
@@ -380,7 +406,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
             if (rd <= cum) { a = k; break; }
         }
         int child = t->children[nd->first_child + a];
-        return es_traverse(r, child, traverser, sampled, rng, local);
+        return es_traverse(r, child, traverser, sampled, rng, local, iter);
     }
 }
 
@@ -420,7 +446,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                 es_sample_hands(r, &rng, sampled);
                 if (sampled[trav] < 0) continue;   /* traverser unassignable */
                 local.traversals++;
-                es_traverse(r, 0, trav, sampled, &rng, &local);
+                es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
             }
         }
         es_merge_stats(&r->stats, &local);
@@ -448,7 +474,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                 es_sample_hands(r, &rng, sampled);
                 if (sampled[trav] < 0) continue;
                 local.traversals++;
-                es_traverse(r, 0, trav, sampled, &rng, &local);
+                es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
             }
         }
         #pragma omp critical
