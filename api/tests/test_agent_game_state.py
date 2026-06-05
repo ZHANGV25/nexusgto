@@ -156,3 +156,103 @@ def test_round_closes_on_bet_call_call_advances_street():
     assert st.street == 2  # turn
     assert st.facing_bet is False
     assert st.seat_of_slot[st.to_act_slot] == 1  # BB first on turn
+
+
+# ── Canonical flop chips (3a, VERIFIED convention) ───────────────────────
+#
+# The flop-entry pot/stacks are NOT free placeholders once the vocab prunes by
+# commitment — they must equal the trainer's canonical postflop chips for the
+# preflop line. VERIFIED against the blueprint σ̄ length along the full raise-war
+# line on both prefixes (the 0.7 smallest-preflop-open convention): 2p
+# pot=600/stacks 9725; 3p pot=875/stacks 9725. The old fixture 440/720 was
+# chip-INCONSISTENT and produced a wrong prune depth at the deepest node.
+
+from app.agent.game_state import canonical_flop_chips  # noqa: E402
+
+
+def test_canonical_flop_chips_2p():
+    pot, stacks = canonical_flop_chips([2, 0, 0, 0, 0, 1], ["BB", "UTG"])
+    assert pot == 600
+    assert stacks == (9725, 9725)  # slot order SB-first: BB, UTG
+
+
+def test_canonical_flop_chips_3p():
+    pot, stacks = canonical_flop_chips([2, 0, 0, 1, 0, 1], ["BB", "UTG", "BTN"])
+    assert pot == 875
+    assert stacks == (9725, 9725, 9725)  # BB, UTG, BTN
+
+
+def test_new_postflop_state_computes_canonical_chips_when_not_given():
+    # With pot/stacks omitted, the factory derives the verified convention.
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[],
+    )
+    assert st.pot == 875
+    assert st.stacks == (9725, 9725, 9725)
+
+
+# ── Real chip accounting in advance() (3a) ───────────────────────────────
+
+
+def test_advance_bet_uses_real_trainer_sizing():
+    # 3p flop root: pot=875, BB stack=9725, no-bet vocab [check, bet0.75].
+    # BB bets: ba = int(0.75*875) = 656. pot 875+656=1531, BB stack 9069,
+    # current_bet=656.
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[],
+    )
+    st = st.advance(1)  # BB bet
+    assert st.pot == 1531
+    assert st.stacks[0] == 9069  # BB (slot 0) stack reduced by the bet
+    assert st.current_bet == 656
+    assert st.street_bets[0] == 656
+
+
+def test_advance_call_decrements_stack_and_adds_to_pot():
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[],
+    )
+    st = st.advance(1)  # BB bet 656 -> pot 1531
+    # UTG (slot 1) faces to_call=656; calls (idx 1).
+    st = st.advance(1)
+    assert st.pot == 1531 + 656
+    assert st.stacks[1] == 9725 - 656  # UTG stack reduced by the call
+    assert st.street_bets[1] == 656
+
+
+def test_advance_pot_carries_stacks_persist_bets_reset_on_street_close():
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[10, 20, 30],
+    )
+    st = st.advance(1)  # BB bet 656
+    st = st.advance(1)  # UTG call 656
+    st = st.advance(1)  # BTN call 656 -> flop closes
+    assert st.street == 2  # turn
+    # pot carried forward; current-street bets reset; stacks persist.
+    assert st.pot == 875 + 656 * 3
+    assert st.current_bet == 0
+    assert st.street_bets == (0, 0, 0)
+    assert st.stacks == (9725 - 656, 9725 - 656, 9725 - 656)
+
+
+def test_num_legal_actions_chip_aware_on_committed_node():
+    # Drive a 2p line into a committed faced-bet node and assert the raise slot
+    # is pruned (num_legal_actions == 2), not the deep-stack 3. We use a raise
+    # war that exhausts the stack: BB bet, UTG raise, BB raise(cap), then UTG
+    # faces a near-all-in -> committed.
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[],
+    )
+    # 2p flop: pot=600, stacks 9725. BB bet, UTG raise, BB raise (cap=3 raises),
+    # UTG now faces a re-raise; by the cap raises_so_far==3 -> [fold,call] (2).
+    st = st.advance(1)  # BB bet
+    st = st.advance(2)  # UTG raise
+    st = st.advance(2)  # BB raise (3rd raise -> at cap)
+    # UTG faces, raises_this_street == 3 -> capped to [fold, call].
+    assert st.facing_bet is True
+    assert st.num_legal_actions() == 2

@@ -259,3 +259,79 @@ def _ci(card: str) -> int:
     ranks = "AKQJT98765432"
     so = ("c", "d", "h", "s")
     return (12 - ranks.index(card[0].upper())) * 4 + so.index(card[1].lower())
+
+
+# ── 3a oracle: committed line replayed to TERMINAL ───────────────────────
+#
+# After the stack-commitment fix, lines continue PAST commitment for the first
+# time (the bench used to stop at the crash). This walks a maxed raise war ALL
+# THE WAY to terminal and asserts the load-bearing invariant at EVERY present
+# node: GameState's chip-aware num_legal_actions() == the blueprint's stored σ̄
+# length. A residual chip-math error would surface here as a length mismatch
+# (the loud invariant), never a silent wrong-node serve.
+
+
+def _bucket_for(blueprint, board, street, hero):
+    bd = list(board)
+    if street == 1:
+        return blueprint.hand_to_bucket(bd[:3], *hero)
+    if street == 2:
+        return blueprint.hand_to_bucket_turn(bd[:4], *hero)
+    return blueprint.hand_to_bucket_river(bd[:5], *hero)
+
+
+def _walk_committed_to_terminal(blueprint, seats, prefix, board, hero, recipe):
+    """Walk `recipe` (clamped to the live vocab) to terminal; assert at every
+    present+trained node that num_legal_actions == σ̄ length. Returns node count.
+    """
+    st = new_postflop_state(seats=seats, preflop_prefix=prefix, board=board)
+    checked = 0
+    guard = 0
+    for _ in range(60):
+        if st.terminal:
+            break
+        guard += 1
+        n = st.num_legal_actions()
+        key = build_key(st)
+        bucket = _bucket_for(blueprint, st.board, key.street, hero)
+        strat = blueprint.get_strategy(
+            list(st.board), key.action_history, key.player, bucket,
+            street=key.street,
+        )
+        if strat is not None:
+            arr = np.asarray(strat, dtype=float)
+            if arr.sum() > 0:
+                # THE invariant: chip-aware vocab matches stored σ̄ length.
+                assert n == len(arr), (
+                    f"length mismatch at {key.as_tuple()}: num_legal={n}, "
+                    f"σ̄ len={len(arr)} (chip-commitment prune disagreement)"
+                )
+                checked += 1
+        # advance: clamp the recipe action to the live vocab (committed nodes
+        # may have pruned the raise the recipe wanted).
+        want = recipe[(guard - 1) % len(recipe)]
+        act = want if want < n else (n - 1)
+        st = st.advance(act)
+    return checked
+
+
+def test_oracle_committed_raise_war_3p_invariant_to_terminal(blueprint):
+    # The exact raise war that used to CRASH, now walked to terminal. Every
+    # present node must satisfy num_legal == σ̄ length (no crash, no mismatch).
+    board = [_ci("Ah"), _ci("Ks"), _ci("Td"), _ci("Qc"), _ci("2s")]
+    hero = (_ci("Qh"), _ci("Jh"))
+    recipe = [0, 0, 1, 2, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1]
+    checked = _walk_committed_to_terminal(
+        blueprint, ["BB", "UTG", "BTN"], [2, 0, 0, 1, 0, 1], board, hero, recipe,
+    )
+    assert checked >= 5  # multiple committed nodes verified, including the deep ones
+
+
+def test_oracle_committed_raise_war_2p_invariant_to_terminal(blueprint):
+    board = [_ci("Ah"), _ci("Ks"), _ci("Td"), _ci("Qc"), _ci("2s")]
+    hero = (_ci("Qh"), _ci("Jh"))
+    recipe = [1, 2, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1]
+    checked = _walk_committed_to_terminal(
+        blueprint, ["BB", "UTG"], [2, 0, 0, 0, 0, 1], board, hero, recipe,
+    )
+    assert checked >= 4

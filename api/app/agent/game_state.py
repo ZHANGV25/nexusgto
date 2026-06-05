@@ -31,7 +31,8 @@ from app.agent.action_vocab import (
     DEFAULT_ADD_EXPLICIT_ALLIN,
     DEFAULT_POSTFLOP_BET_SIZES,
     DEFAULT_SUBSEQUENT_BET_SIZES,
-    legal_categories,
+    legal_categories_chips,
+    raise_to_amount,
 )
 
 try:
@@ -51,6 +52,110 @@ STREET_FLOP = 1
 STREET_TURN = 2
 STREET_RIVER = 3
 _MAX_STREET = STREET_RIVER
+
+# Trainer chip convention (8.05B metadata, capture-verified). Load-bearing for
+# the stack-commitment vocab prune (3a): the flop-entry pot/stacks must equal
+# the trainer's canonical postflop chips, or the prune fires at the wrong nodes.
+SMALL_BLIND = 50
+BIG_BLIND = 100
+INITIAL_STACK = 10000
+# Preflop OPEN size = the smallest preflop bet size (tier 0, index 2 action).
+# Verified: with this convention the chip-aware vocab length matches the
+# blueprint σ̄ length at EVERY node along the raise-war line, both prefixes.
+PREFLOP_OPEN_FRACTION = 0.7
+
+# Preflop acting order (matches preflop_constructor.PREFLOP_ORDER / the trainer).
+_PREFLOP_ORDER = ("UTG", "MP", "CO", "BTN", "SB", "BB")
+
+
+class CanonicalChipsUnsupported(Exception):  # noqa: N818 - matches sibling naming
+    """The preflop line is outside the canonical single-open shape, so its
+    flop-entry pot/stacks cannot be derived from the verified convention.
+
+    v1 derives chips only for a single open + flat callers (the capture-verified
+    shape — see preflop_constructor). Anything else must pass explicit pot/stacks
+    that the caller has independently validated.
+    """
+
+
+def canonical_flop_chips(
+    preflop_prefix: List[int],
+    seats: List[str],
+) -> Tuple[int, Tuple[int, ...]]:
+    """Derive the flop-entry (pot, per-slot stacks) for a canonical preflop line.
+
+    Walks the preflop action sequence through the TRAINER's amount formula
+    (raise_to_amount) with the [50,100]/10000 convention and the 0.7 open, then
+    returns the pot and the per-slot (SB-first over `seats`) remaining stacks.
+
+    Only the canonical single-open shape is supported (one raise = the open,
+    then folds/flat-calls). VERIFIED: returns (600, (9725,9725)) for the 2p
+    line and (875, (9725,9725,9725)) for the 3p line, matching the blueprint
+    σ̄ length along the raise-war line.
+
+    Raises:
+        CanonicalChipsUnsupported: a non-canonical preflop shape (limp, 3bet+,
+            multiple raises) — chips can't be derived without new ground truth.
+    """
+    for s in seats:
+        if s not in FULL_SEAT:
+            raise ValueError(f"unknown position {s!r}")
+    live_seats = set(seats)
+
+    # Per-position street commitment (preflop). Blinds posted first.
+    bets: Dict[str, int] = {pos: 0 for pos in _PREFLOP_ORDER}
+    bets["SB"] = SMALL_BLIND
+    bets["BB"] = BIG_BLIND
+    pot = SMALL_BLIND + BIG_BLIND
+    current_bet = BIG_BLIND
+    raises_seen = 0
+
+    # The prefix is one index per preflop action in acting order UTG..BB,
+    # truncated after the last voluntary actor (folds inferred). We replay it.
+    idx = 0
+    n = len(preflop_prefix)
+    for pos in _PREFLOP_ORDER:
+        if idx >= n:
+            break
+        action = preflop_prefix[idx]
+        idx += 1
+        if action == 0:  # fold
+            continue
+        if action == 1:  # call (flat)
+            to_call = current_bet - bets[pos]
+            bets[pos] += to_call
+            pot += to_call
+        elif action == 2:  # raise — canonical: only the single open
+            if raises_seen >= 1:
+                raise CanonicalChipsUnsupported(
+                    "more than one preflop raise (3bet+/squeeze) — chips not "
+                    "capture-verified; pass explicit pot/stacks"
+                )
+            to_call = current_bet - bets[pos]
+            amt = raise_to_amount(
+                PREFLOP_OPEN_FRACTION, pot=pot, to_call=to_call,
+                stack=INITIAL_STACK - bets[pos],
+            )
+            bets[pos] += amt
+            pot += amt
+            current_bet = bets[pos]
+            raises_seen += 1
+        else:
+            raise CanonicalChipsUnsupported(
+                f"unsupported preflop action index {action}"
+            )
+
+    if raises_seen == 0:
+        raise CanonicalChipsUnsupported(
+            "no preflop raise (open-limp pot) — chips not capture-verified"
+        )
+
+    # Per-slot stacks, SB-first over the LIVE seats (matches new_postflop_state
+    # slot ordering). Each live seat invested bets[pos]; folded seats aren't at
+    # the flop. The pot already includes folded blinds (SB's dead 50, etc.).
+    order = sorted(live_seats, key=lambda s: FULL_SEAT[s])
+    stacks = tuple(INITIAL_STACK - bets[pos] for pos in order)
+    return pot, stacks
 
 
 @dataclass(frozen=True)
@@ -132,10 +237,27 @@ class GameState:
         NOT rollout's hardcoded (0.5,1.0) — the 8.05B trained with [0.75] so
         its no-bet node has 2 actions, not 3. The index ORDER + category
         semantics still match training (action_vocab mirrors the structure).
+
+        Chip-aware (3a): the count is also pruned by STACK COMMITMENT exactly
+        as the trainer's generate_actions does — a raise slot is dropped when
+        the raise-to amount can't exceed the call (committed) and collapsed to
+        one all-in when it reaches the stack. This is what makes num_legal
+        match the blueprint σ̄ length on committed lines (no mid-hand crash).
+        On deep stacks the prune never fires, so the set is identical to before.
         """
-        return legal_categories(
+        slot = self.to_act_slot
+        if slot is None:
+            # Terminal — no actor. Return empty (callers guard on terminal).
+            return []
+        pot = int(self.pot)
+        stack = int(self.stacks[slot]) if slot < len(self.stacks) else INITIAL_STACK
+        to_call = max(0, self.current_bet - self.street_bets[slot])
+        return legal_categories_chips(
             facing_bet=self.facing_bet,
             raises_so_far=self.raises_this_street,
+            pot=pot,
+            stack=stack,
+            to_call=to_call,
             postflop_bet_sizes=self.postflop_bet_sizes,
             subsequent_bet_sizes=self.subsequent_bet_sizes,
             add_explicit_allin=self.add_explicit_allin,
@@ -143,6 +265,48 @@ class GameState:
 
     def num_legal_actions(self) -> int:
         return len(self.legal_action_categories())
+
+    def _raise_amount_for(self, action_idx: int, slot: int) -> int:
+        """Chip INCREMENT for the raise at `action_idx`, bit-exact to the
+        trainer. action_idx indexes legal_action_categories(); the raise slots
+        come AFTER the non-raise slots (fold?/call). We re-derive the SURVIVING
+        raise amounts (same prune as the vocab) and pick the one at this
+        raise-position, so multi-size vocabs and the all-in dedup are handled.
+        """
+        pot = int(self.pot)
+        stack = int(self.stacks[slot])
+        to_call = max(0, self.current_bet - self.street_bets[slot])
+        sizes = (
+            self.subsequent_bet_sizes
+            if self.raises_this_street > 0 else self.postflop_bet_sizes
+        )
+        n_nonraise = (1 if self.facing_bet else 0) + 1  # fold? + check/call
+        raise_position = action_idx - n_nonraise
+        if raise_position < 0:
+            raise ValueError(
+                f"action_idx {action_idx} is not a raise (n_nonraise="
+                f"{n_nonraise})"
+            )
+        survivors: List[int] = []
+        added_allin = False
+        for frac in sizes:
+            ba = raise_to_amount(frac, pot=pot, to_call=to_call, stack=stack)
+            if ba <= to_call:
+                continue
+            if ba >= stack:
+                if added_allin:
+                    continue
+                added_allin = True
+            survivors.append(ba)
+        if self.add_explicit_allin and not added_allin and stack > to_call:
+            survivors.append(stack)
+        if raise_position >= len(survivors):
+            # Should be unreachable — the vocab and this share the prune logic.
+            raise ValueError(
+                f"raise position {raise_position} exceeds {len(survivors)} "
+                f"surviving raises (vocab/amount prune disagreement)"
+            )
+        return survivors[raise_position]
 
     def to_act_seat(self) -> Optional[int]:
         if self.to_act_slot is None:
@@ -172,6 +336,7 @@ class GameState:
         active = list(self.active)
         acted = list(self.acted)
         street_bets = list(self.street_bets)
+        stacks = list(self.stacks)
         current_bet = self.current_bet
         raises = self.raises_this_street
         pot = self.pot
@@ -181,13 +346,14 @@ class GameState:
         if cat == ActionCategory.FOLD:
             active[slot] = False
         elif cat == ActionCategory.CALL:
-            # CALL covers both "call a bet" and "check". For a real call,
-            # move chips to match the outstanding bet (tracked at chip level
-            # for pot accounting; exact sizing is the resolver's concern, not
-            # the key's — the key only needs the action index).
-            to_match = current_bet - street_bets[slot]
+            # CALL covers both "call a bet" and "check". For a real call, move
+            # REAL chips to match the outstanding bet (clamped to the stack) and
+            # decrement the stack — chip accounting is now load-bearing because
+            # the legal-action vocab prunes by commitment (3a).
+            to_match = min(current_bet - street_bets[slot], stacks[slot])
             if to_match > 0:
                 street_bets[slot] += to_match
+                stacks[slot] -= to_match
                 pot += to_match
         else:  # RAISE (covers bet and raise)
             # A bet/raise opens a new round. We do NOT reset other players'
@@ -195,13 +361,17 @@ class GameState:
             # _next_to_act makes everyone who hasn't matched owe action
             # automatically (capture-verified: forward-from-bettor order, the
             # blueprint MISSES rollout's scan-from-slot0 order).
+            #
+            # Use the trainer's REAL raise sizing (bit-exact to generate_actions
+            # via raise_to_amount), so pot/stack/to_call evolve correctly and
+            # the next node's vocab prunes at the right depth. `amt` is the chip
+            # INCREMENT added to this player's street bet.
+            amt = self._raise_amount_for(action_idx, slot)
+            street_bets[slot] += amt
+            stacks[slot] -= amt
+            pot += amt
+            current_bet = street_bets[slot]
             raises += 1
-            # Size is not needed for the key; advance current_bet by a
-            # nominal unit so facing_bet flips for the others. Pot/stack
-            # accounting for play uses real sizes via action_translation;
-            # GameState only needs the betting STRUCTURE correct.
-            current_bet = current_bet + 1
-            street_bets[slot] = current_bet
 
         new_history = self.postflop_history + (action_idx,)
 
@@ -220,6 +390,7 @@ class GameState:
                 active=tuple(active),
                 acted=tuple(acted),
                 street_bets=tuple(street_bets),
+                stacks=tuple(stacks),
                 current_bet=current_bet,
                 raises_this_street=raises,
                 pot=pot,
@@ -229,7 +400,7 @@ class GameState:
 
         # No next actor AND >1 player live => the betting round CLOSED.
         return self._close_round(
-            active=active, pot=pot, history=new_history,
+            active=active, stacks=stacks, pot=pot, history=new_history,
             closed_count=self.betting_round_closed_count + 1,
         )
 
@@ -268,17 +439,24 @@ class GameState:
     def _close_round(
         self,
         active: List[bool],
+        stacks: List[int],
         pot: int,
         history: Tuple[int, ...],
         closed_count: int,
     ) -> "GameState":
-        """Advance to the next street (or terminal if river closed)."""
+        """Advance to the next street (or terminal if river closed).
+
+        Stacks PERSIST across streets (chips removed this street stay removed);
+        only the current-street bets/acted/raises reset — mirrors the trainer's
+        street transition (pot carried, bets/has_acted/num_raises reset).
+        """
         next_street = self.street + 1
         if next_street > _MAX_STREET:
             # River betting closed -> terminal showdown.
             return replace(
                 self,
                 active=tuple(active),
+                stacks=tuple(stacks),
                 pot=pot,
                 postflop_history=history,
                 to_act_slot=None,
@@ -290,6 +468,7 @@ class GameState:
         return replace(
             self,
             active=tuple(active),
+            stacks=tuple(stacks),
             pot=pot,
             street=next_street,
             postflop_history=history,
@@ -315,8 +494,8 @@ def new_postflop_state(
     seats: List[str],
     preflop_prefix: List[int],
     board: List[int],
-    pot: int,
-    stacks: List[int],
+    pot: Optional[int] = None,
+    stacks: Optional[List[int]] = None,
     street: int = STREET_FLOP,
     postflop_bet_sizes: Tuple[float, ...] = DEFAULT_POSTFLOP_BET_SIZES,
     subsequent_bet_sizes: Tuple[float, ...] = DEFAULT_SUBSEQUENT_BET_SIZES,
@@ -328,13 +507,14 @@ def new_postflop_state(
     they're reordered SB-first into compact slots (the postflop acting order).
     `preflop_prefix` is the given preflop action-index sequence.
 
-    Stacks are aligned to `seats` BEFORE reordering: stacks[i] belongs to
-    seats[i]. They're permuted to slot order internally.
+    Chips (3a): if `pot`/`stacks` are omitted they are DERIVED from the verified
+    trainer convention via canonical_flop_chips (the correct flop-entry chips
+    for the canonical single-open line). Passing them explicitly is supported
+    for backward compatibility and non-canonical / non-flop entries — but note
+    the flop-entry pot/stacks are load-bearing for the commitment prune, so
+    prefer the derived path for canonical lines. `stacks` is aligned to `seats`
+    BEFORE reordering: stacks[i] belongs to seats[i]; permuted to slot order.
     """
-    if len(seats) != len(stacks):
-        raise ValueError(
-            f"seats ({len(seats)}) and stacks ({len(stacks)}) length mismatch"
-        )
     if len(seats) < 2:
         raise ValueError("need at least 2 players for a postflop state")
     for p in seats:
@@ -344,8 +524,27 @@ def new_postflop_state(
     # Order players SB-first by full seat => compact slot order.
     order = sorted(range(len(seats)), key=lambda i: FULL_SEAT[seats[i]])
     seat_of_slot = tuple(FULL_SEAT[seats[i]] for i in order)
-    slot_stacks = tuple(int(stacks[i]) for i in order)
     n = len(order)
+
+    if pot is None or stacks is None:
+        # Derive the verified canonical flop-entry chips. Only valid for a flop
+        # entry on the canonical single-open line.
+        if street != STREET_FLOP:
+            raise ValueError(
+                "pot/stacks must be given for a non-flop entry "
+                "(canonical chip derivation is flop-entry only)"
+            )
+        derived_pot, derived_slot_stacks = canonical_flop_chips(
+            list(preflop_prefix), list(seats)
+        )
+        pot = derived_pot
+        slot_stacks = derived_slot_stacks
+    else:
+        if len(seats) != len(stacks):
+            raise ValueError(
+                f"seats ({len(seats)}) and stacks ({len(stacks)}) length mismatch"
+            )
+        slot_stacks = tuple(int(stacks[i]) for i in order)
 
     return GameState(
         seat_of_slot=seat_of_slot,

@@ -185,26 +185,34 @@ def test_lookup_play_loop_never_touches_gpu(blueprint_path):
     assert "street_solver_gpu" not in sys.modules
 
 
-def test_deep_raise_war_node_fails_loud_at_deferred_boundary(blueprint_path):
-    # BOUNDARY (plan §6): a maxed flop raise war reaches a deep node where the
-    # blueprint stores a REDUCED action set (v1 models one bet size + does not
-    # track stack commitment, so its vocab can disagree there). v1 detects
-    # this and FAILS LOUD (the exact-length invariant) rather than mis-play.
-    # We do NOT claim a causal story (all-in/side-pot) — just that the
-    # boundary is detected, not silently mis-played.
+def test_deep_raise_war_node_now_serves_correct_length_mix(blueprint_path):
+    # 3a FIX (was test_deep_raise_war_node_fails_loud_at_deferred_boundary):
+    # the SAME maxed flop raise war that used to CRASH (ValueError: action-count
+    # mismatch) now plays cleanly. GameState tracks stack commitment, so its
+    # vocab prunes exactly like the trainer's generate_actions and num_legal
+    # matches the blueprint's stored σ̄ length at the committed turn root.
+    #
+    # CRITICAL: chips are DERIVED canonically (no fixture pot/stacks) — the old
+    # fixture 720/9660 was chip-inconsistent and mis-fired the prune. With the
+    # verified convention this node serves a correct-length mix, not a crash.
     src = LookupSource(ModeConfig(mode="LOOKUP", blueprint_path=blueprint_path))
     st = new_postflop_state(
         seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
         board=[_ci("Ah"), _ci("Ks"), _ci("Td"), _ci("Qc"), _ci("2s")],
-        pot=720, stacks=[9660, 9780, 9780],
-    )
+    )  # pot/stacks derived: pot=875, stacks 9725 each (verified convention)
     # Drive the raise war: BB chk, UTG chk, BTN bet, BB raise, UTG raise (cap),
-    # BTN call, then BB call -> flop closes -> TURN root with reduced vocab.
+    # BTN call, then BB call -> flop closes -> TURN root (formerly the crash).
     for idx in [0, 0, 1, 2, 2, 1, 1]:
         st = st.advance(idx)
     assert st.street == 2  # turn root after the warred flop closed
-    with pytest.raises(ValueError, match="action-count mismatch"):
-        src.get_mix(st, hero_cards=(_ci("Qh"), _ci("Jh")))
+    # No crash: the mix is served with the blueprint's exact length.
+    mix = src.get_mix(st, hero_cards=(_ci("Qh"), _ci("Jh")))
+    assert len(mix.freqs) == st.num_legal_actions()
+    # The committed all-in turn root: blueprint stored a single forced action
+    # ([1.0]); the chip-aware vocab agrees (1 legal action), so it is a HIT,
+    # not a uniform fallback.
+    assert st.num_legal_actions() == 1
+    assert mix.is_uniform_fallback is False
 
 
 def test_live_resolve_mode_rejected_for_act_without_solver():
