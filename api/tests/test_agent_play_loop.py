@@ -215,33 +215,35 @@ def test_deep_raise_war_node_now_serves_correct_length_mix(blueprint_path):
     assert mix.is_uniform_fallback is False
 
 
-def test_live_resolve_mode_rejected_for_act_without_solver():
-    # An agent in LIVE_RESOLVE without a primed solver should not silently
-    # produce LOOKUP play; get_mix raises (NotImplementedError surfaces).
+def test_live_resolve_requires_engine_or_blueprint():
+    # LIVE_RESOLVE must fail LOUD (not silently fall back to LOOKUP) when it has
+    # neither an injected CpuEsSolver nor a blueprint_path to build one.
     from app.agent.strategy_source import LiveResolveSource
-    agent = PokerAgent(src, ModeConfig(mode="LIVE_RESOLVE", seed=0))
-    st = new_postflop_state(
-        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
-        board=[], pot=440, stacks=[9780, 9780],
-    )
-    with pytest.raises(NotImplementedError):
-        agent.act(st, (_ci("Qh"), _ci("Jh")))
-
-
-    # SMOKE (plan §3.6 "+ smoke"): the LiveResolveSource adapter must actually
-    # (new_hand / on_villain_action / on_hero_action / get_strategy). We do NOT
-    # run a full GPU solve here (that path is GPU-gated and stays UNVERIFIED in
-    # CI); this proves the adapter constructs the real solver, the part that
-    # was otherwise only exercised in production.
-    from app.agent.strategy_source import LiveResolveSource
-
-    try:
-    except Exception:  # pragma: no cover
-
-    # blueprint_path=None -> solver-only construction (no 12GB BlueprintV2 load).
     src = LiveResolveSource(ModeConfig(mode="LIVE_RESOLVE", blueprint_path=None))
-    solver = src._ensure_solver()
-    assert solver is not None
-    for api in ("new_hand", "on_villain_action", "on_hero_action", "get_strategy"):
-    # Idempotent: second call returns the same instance.
-    assert src._ensure_solver() is solver
+    with pytest.raises(ValueError):
+        src._ensure_engine()
+
+
+def test_live_resolve_river_is_unsupported_without_solving():
+    # SMOKE: the adapter translation rejects river BEFORE constructing/calling
+    # any engine (the §6 side-pot gap is structural, not a solve failure). A
+    # fake engine that would explode if called proves get_mix never reaches it.
+    from app.agent.strategy_source import LiveResolveSource
+    from app.agent.live_resolve_adapter import LiveResolveUnsupported
+
+    class _ExplodingEngine:
+        def solve(self, **_kw):  # pragma: no cover - must never be called
+            raise AssertionError("engine.solve called on a river node")
+
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"), cpu_es_solver=_ExplodingEngine(),
+    )
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    for idx in [0, 0, 0, 0, 0, 0]:  # flop + turn check-throughs -> river root
+        st = st.advance(idx)
+    assert st.street == 3
+    with pytest.raises(LiveResolveUnsupported):
+        src.get_mix(st, (_ci("Ah"), _ci("Kh")))

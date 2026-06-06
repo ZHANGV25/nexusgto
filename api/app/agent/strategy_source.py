@@ -22,7 +22,19 @@ import numpy as np
 
 from app.agent.game_state import GameState
 from app.agent.key_builder import build_key
+from app.agent.live_resolve_adapter import LiveResolveUnsupported
 from app.agent.modes import ModeConfig
+
+# Re-export so callers can `from app.agent.strategy_source import
+# LiveResolveUnsupported` alongside LiveResolveSource (the public seam).
+__all__ = [
+    "ActionMix",
+    "StrategySource",
+    "LookupSource",
+    "OfflineLiftedSource",
+    "LiveResolveSource",
+    "LiveResolveUnsupported",
+]
 
 # Hero cards = (c0, c1) ints 0-51.
 HeroCards = Tuple[int, int]
@@ -243,35 +255,140 @@ class OfflineLiftedSource(StrategySource):
 
 
 class LiveResolveSource(StrategySource):
+    """Live per-decision CPU re-solve behind the StrategySource ABC (plan §3.6).
 
-    Build = WIRE + VERIFY, not write-from-scratch (plan §3.6). This is the
-    1-33s live-search ceiling; it is NOT sub-second and must be flagged
-    not-real-time in any UI. v1 provides the adapter + a smoke path; full
+    This is the NON-real-time ceiling — a real-time CFR re-solve, seconds per
+    decision (2p-flop ~3s, 3p-turn ~18s at a few hundred iters), NOT sub-second.
+    It must be flagged not-real-time in any UI. It is the ceiling MODE, not the
+    blueprint FLOOR (that is LookupSource).
 
-    single get_mix into a get_strategy call. Range narrowing across a full
-    hand is driven by the caller via on_villain_action/on_hero_action on the
-    underlying solver (exposed as `.solver`).
+    ENGINE (empirically validated GPU-free this session — see
+    docs/BENCHMARK_RESULTS.md §3c and app/agent/live_resolve_adapter.py): wraps
+    poker-solver's CpuEsSolver (CPU external-sampling ES) for flop/turn, 2p AND
+    3p, with real blueprint-grounded leaf values. River is the side-pot/showdown
+    named engine — has no GPU-free multi-street solve path (its solver_v2 CPU
+    fallback crashes building flop/turn trees), so LIVE_RESOLVE wraps CpuEsSolver
+    instead; that is the honest WIRE+VERIFY of the realtime pipeline GPU-free.
 
-    VERIFICATION STATUS (v1): construction + API-surface are smoke-tested
-    new_hand -> get_strategy SOLVE path is GPU-gated and remains UNVERIFIED in
-    loop is deferred (see get_mix below). LOOKUP is the verified v1 mode.
+    STATELESS per-call: each get_mix is an independent re-solve with ranges
+    rebuilt from the board (no cross-street narrowing — a documented v1
+    simplification). The 12GB blueprint load is one-time in the held engine.
     """
 
+    def __init__(
+        self, config: ModeConfig, cpu_es_solver=None, iterations: int = 200,
+        seed_ranges: bool = True, strategy_reader=None,
+    ) -> None:
         self._config = config
+        self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
+        self._iterations = int(iterations)
+        # In-distribution range seeding (advisor fix): seed the re-solve with the
+        # blueprint's preflop-σ̄ ranges so it doesn't over-bet vs a wide/weak
+        # uniform villain. Needs a blueprint strategy reader; when absent we fall
+        # back to uniform ranges (the over-bet caveat then applies — documented).
+        self._seed_ranges = bool(seed_ranges)
+        self._reader = strategy_reader  # reader.get_strategy(...) or None
 
-    def _ensure_solver(self):
-        if self.solver is not None:
-            return self.solver
+    def _ensure_engine(self):
+        if self._engine is not None:
+            return self._engine
+        if not self._config.blueprint_path:
+            raise ValueError(
+                "LiveResolveSource needs a blueprint_path (or an injected "
+                "cpu_es_solver) to construct the CpuEsSolver engine."
+            )
+        from app.services.cpu_es_solver import CpuEsSolver
+        self._engine = CpuEsSolver(self._config.blueprint_path)
+        return self._engine
+
+    def _get_strategy_reader(self, engine):
+        """A reader.get_strategy callable for preflop-σ̄ range seeding.
+
+        Priority: an injected strategy_reader, else the held engine's own
+        blueprint (CpuEsSolver._blueprint is a BPSReaderC with get_strategy).
+        Returns None if neither exposes get_strategy (→ uniform fallback).
+        """
+        if self._reader is not None and hasattr(self._reader, "get_strategy"):
+            return self._reader.get_strategy
+        bp = getattr(engine, "_blueprint", None)
+        if bp is not None and hasattr(bp, "get_strategy"):
+            return bp.get_strategy
+        return None
+
+    def _seat_range_dicts(self, state: GameState, engine):
+        """Per-slot in-distribution range weight dicts, or None (→ uniform)."""
+        get_strategy = self._get_strategy_reader(engine)
+        if get_strategy is None:
+            return None
         try:
-        except ImportError:  # pragma: no cover
-        # its own BlueprintV2. Pass None to run solver-only (caller wires the
-        # range state). Full construction is the caller's responsibility.
-        return self.solver
+            from app.agent.live_resolve_ranges import seat_range_weight_dicts
+            return seat_range_weight_dicts(
+                state.seat_of_slot, state.preflop_prefix, get_strategy,
+            )
+        except Exception:
+            # Range seeding is an OPTIONAL refinement; never let it break a
+            # solve. A failure here falls back to uniform ranges (documented).
+            return None
 
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
-        # LIVE_RESOLVE is non-sub-second and stateful; v1 wires the adapter
-        # and verifies construction. A full single-call get_mix needs the
-        raise NotImplementedError(
-            "LiveResolveSource is the non-real-time ceiling: drive the wrapped "
-            "on_hero_action / get_strategy. A single stateless get_mix is not "
+        from app.agent.live_resolve_adapter import (
+            build_solve_inputs,
+            hero_grid_row,
+            labels_to_index_freqs,
         )
+
+        engine = self._ensure_engine()
+
+        # Seed in-distribution ranges (preflop σ̄) when possible — removes the
+        # over-bet confound (uniform ranges make the re-solve model a wide/weak
+        # villain). Falls back to uniform on a non-canonical preflop line or
+        # without a strategy reader.
+        range_dicts = self._seat_range_dicts(state, engine) if self._seed_ranges else None
+
+        inputs = build_solve_inputs(state, range_weight_dicts=range_dicts)
+        #   raises LiveResolveUnsupported on terminal / river / mid-street re-entry.
+
+        # bet_sizes == the agent's blueprint vocab so the solver's action count
+        # matches state.num_legal_actions() 1:1 (clean label->index mapping).
+        bet_sizes = list(state.postflop_bet_sizes)
+        subsequent = list(state.subsequent_bet_sizes)
+        add_allin = bool(state.add_explicit_allin)
+
+        all_by_player = engine.solve(
+            board_strs=inputs["board_strs"],
+            board_ints=inputs["board_ints"],
+            player_ranges=inputs["player_ranges"],
+            positions_sorted=inputs["positions_sorted"],
+            player_seats=inputs["player_seats"],
+            pot_bb=inputs["pot_bb"],
+            stack_bb=inputs["stack_bb"],
+            bet_sizes=bet_sizes,
+            subsequent_bet_sizes=subsequent,
+            add_explicit_allin=add_allin,
+            game_action_indices=inputs["game_action_indices"],
+            iterations=self._iterations,
+            num_threads=0,
+        )
+
+        hero_idx = inputs["hero_player_idx"]
+        row = hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
+        strat = all_by_player.get(hero_idx, {}).get(row)
+        n_legal = int(inputs["n_legal"])
+
+        if not strat:
+            # The engine returned no strategy for the hero's hand (e.g. a
+            # never-visited / weight-0 row). Fall back to uniform-over-legal,
+            # flagged honestly — same Pluribus Algorithm-1 substitution LOOKUP
+            # uses on a miss.
+            return ActionMix.uniform(n_legal, is_fallback=True)
+
+        freqs = labels_to_index_freqs(
+            strat,
+            has_to_call=bool(inputs["has_to_call"]),
+            n_legal=n_legal,
+            bet_sizes=tuple(bet_sizes),
+            add_explicit_allin=add_allin,
+        )
+        if not freqs:
+            return ActionMix.uniform(n_legal, is_fallback=True)
+        return ActionMix(freqs)
