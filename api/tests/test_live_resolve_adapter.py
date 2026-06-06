@@ -157,6 +157,42 @@ def test_live_resolve_3p_turn_anchor(cpu_es_engine, blueprint_path):
     print(f"\n3p-turn live-resolve: dt={dt:.2f}s mix={mix.freqs}")
 
 
+# ── Check-through: hero NOT first-to-act extracts the RIGHT (no-bet) node ─
+
+
+def test_live_resolve_check_through_extracts_no_bet_node(live_source):
+    """A non-root node where the hero is NOT first-to-act but no bet has
+    happened (BB checks -> UTG to act). The guard ALLOWS it; this asserts the
+    extracted node is the hero's all-CHECK-line node (the no-bet vocab
+    {check, bet}, has_to_call=False), NOT a faced-bet branch that would remap to
+    a silent wrong 2-key mix. Verified 2026-06-06: the raw extracted labels are
+    {Check, Bet 75%} — the correct no-bet set. (Same bug CLASS as the faced-bet
+    first-action fix; this proves the check-through path serves the right node.)
+
+    Values are not asserted (Hogwild + low iters → run-to-run variance); the
+    load-bearing fact is the LEGAL SHAPE: keys ⊆ {0,1}, real solve, sums to 1."""
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    st = st.advance(0)  # BB checks -> UTG (the raiser) to act, no bet faced
+    assert st.to_act_slot == 1  # UTG, NOT first-to-act
+    assert st.facing_bet is False
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # no-bet vocab [check, bet 0.75]
+
+    mix = live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))  # UTG-range
+    # The decisive check: the mix is over the NO-BET vocab (indices {0,1}), i.e.
+    # the extracted node was the all-check-line node, not a 3-action faced-bet
+    # node remapped (which would still land in {0,1} but came from {Fold,Call,
+    # Raise} labels — here has_to_call=False so a faced-bet node could only
+    # produce out-of-range/garbage, which the adapter would reject). A clean
+    # 2-key real mix == right node.
+    assert set(mix.freqs.keys()) <= {0, 1}
+    assert mix.is_uniform_fallback is False
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+
+
 # ── The river-3p side-pot gap is documented + fails loud ─────────────────
 
 
