@@ -279,11 +279,19 @@ class LiveResolveSource(StrategySource):
         self, config: ModeConfig, cpu_es_solver=None, iterations: int = 200,
         seed_ranges: bool = True, strategy_reader=None,
         vec_mode: bool = False, readout: str = "avg", num_threads: int = 0,
+        num_rollouts: int = 3,
     ) -> None:
         self._config = config
         self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
         self._iterations = int(iterations)
         self._num_threads = int(num_threads)  # 0 = all cores
+        # Leaf-table rollouts per (leaf, bias). The 6p floor is leaf-sample-
+        # noise-dominated: nr=3 floors ~0.15%/pot and the per-spot strategy is
+        # noise-realization-driven (mean |dSigma| 0.40 across noise seeds);
+        # nr=10 floors ~0.10% (measured_logs/DISCRIMINATOR_2026-06-10.md).
+        # 6p playing-agent config should use >=10; default 3 preserves the
+        # validated 2p/3p analysis surface.
+        self._num_rollouts = int(num_rollouts)
         # vec_mode + readout="final" = the PLAYING-AGENT configuration
         # (vec-Linear-FINAL — the Gate-1-validated, EC2-measured config that
         # makes a 6p re-solve viable in tens of seconds at ~0.15%/pot:
@@ -380,6 +388,7 @@ class LiveResolveSource(StrategySource):
             game_action_indices=inputs["game_action_indices"],
             iterations=self._iterations,
             num_threads=self._num_threads,
+            num_rollouts=self._num_rollouts,
             vec_mode=1 if self._vec_mode else 0,
             readout=self._readout,
             hero_replay={
