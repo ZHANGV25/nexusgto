@@ -175,6 +175,20 @@ ES_EXPORT void es_reset_stats(ESResolver *r);
 
 ES_EXPORT const char *es_get_last_error(void);
 
+/* ── TEST-ONLY: side-pot showdown probes (validate_sidepot.py fuzz gate) ───
+ * Evaluate the shipped showdown code on a caller-described single showdown
+ * node with ONE fixed hand per player. board5: 5 card ints; hand_c0/hand_c1/
+ * active/bets: arrays of length np; pot in chips. Returns the traverser's NET
+ * value (gross award − own street bet); NAN on invalid arguments. The _vec
+ * variant drives the vectorized traverser's inline showdown block; the plain
+ * variant drives es_showdown_value (the scalar + forward-walk path). */
+ES_EXPORT double es_test_showdown_value(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser);
+ES_EXPORT double es_test_showdown_value_vec(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser);
+
 /* ── Deterministic validation oracles (es_oracles.c) ──────────────────────
  * Each make_* returns an opaque ctx to pass to es_create alongside the
  * matching *_fn() function pointer; free with es_free_oracle_ctx. */
