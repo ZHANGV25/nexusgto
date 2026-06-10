@@ -247,3 +247,68 @@ def test_live_resolve_river_is_unsupported_without_solving():
     assert st.street == 3
     with pytest.raises(LiveResolveUnsupported):
         src.get_mix(st, (_ci("Ah"), _ci("Kh")))
+
+
+# -- 6p LIVE_RESOLVE play along a real line (Lane A validation, 2026-06-10) --
+#
+# Drives PokerAgent through a REAL 6p flop line with the vec-Linear-FINAL
+# re-solve as the strategy source: scripted opponents bring the action to the
+# hero (BTN) FACING A BET; the agent samples its decision from a per-decision
+# 6p re-solve (street-entry reconstruction + in-tree replay of this street's
+# actions), the sampled action advances the state, and the scripted line
+# closes the street. This is play-validation of the live game loop, not an
+# exploitability number.
+
+
+def test_6p_live_resolve_plays_faced_bet_decision(blueprint_path):
+    pytest.importorskip("numpy")
+    from app.agent.strategy_source import LiveResolveSource
+
+    try:
+        from app.services.cpu_es_solver import CpuEsSolver
+        engine = CpuEsSolver(blueprint_path)
+    except Exception as e:
+        pytest.skip(f"CpuEsSolver unavailable: {e}")
+    if not engine.ready:
+        pytest.skip("CpuEsSolver not ready")
+
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path),
+        cpu_es_solver=engine, iterations=2000,
+        vec_mode=True, readout="final", num_threads=12,
+    )
+    agent = PokerAgent(source=src, config=ModeConfig(mode="LIVE_RESOLVE", seed=11))
+
+    st = new_postflop_state(
+        seats=["SB", "BB", "UTG", "MP", "CO", "BTN"],
+        preflop_prefix=[2, 1, 1, 1, 1, 1],
+        board=[_ci("Ah"), _ci("Kh"), _ci("2c")],
+    )
+    # Scripted line to the hero: SB chk, BB chk, UTG bets, MP folds, CO calls.
+    for idx in [0, 0, 1, 0, 1]:
+        st = st.advance(idx)
+    assert st.to_act_slot == 5  # BTN = hero, facing UTG's bet
+    n_legal = st.num_legal_actions()
+    assert n_legal == 3  # fold / call / raise
+
+    res = agent.act(st, hero_cards=(_ci("Ad"), _ci("Kd")))  # AKdd on AhKh2c
+    assert isinstance(res, SampledAction)
+    assert 0 <= res.action_idx < n_legal
+    assert res.mix.is_uniform_fallback is False  # a real re-solve, not a miss
+
+    # The sampled action ADVANCES the real game state (the loop closes).
+    st2 = st.advance(res.action_idx)
+    assert st2.postflop_history == st.postflop_history + (res.action_idx,)
+    # SB and BB checked BEFORE the bet, so they still owe action whatever the
+    # hero did -- forward-from-actor order wraps to SB next in all 3 cases.
+    assert st2.street == 1 and not st2.terminal
+    assert st2.to_act_slot == 0  # SB owes action against the outstanding bet
+    # Script the hand to street close: SB folds, BB folds; any remaining
+    # callers (only if the hero raised) flat-call.
+    st3 = st2.advance(0).advance(0)
+    guard = 0
+    while st3.street == 1 and not st3.terminal and guard < 6:
+        st3 = st3.advance(1)
+        guard += 1
+    assert st3.terminal or st3.street == 2  # flop closed -> turn (or hand over)
+    print(f"\n6p play-loop decision: mix={res.mix.freqs} sampled={res.action_idx}")

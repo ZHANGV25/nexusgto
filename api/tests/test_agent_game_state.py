@@ -256,3 +256,37 @@ def test_num_legal_actions_chip_aware_on_committed_node():
     # UTG faces, raises_this_street == 3 -> capped to [fold, call].
     assert st.facing_bet is True
     assert st.num_legal_actions() == 2
+
+
+# -- street_history: the per-street action tail for live-resolve node replay --
+
+
+def test_street_history_tracks_and_resets_on_street_close():
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[20, 30, 40],
+    )
+    assert st.street_history == ()
+    st = st.advance(1)  # BB bets
+    assert st.street_history == (1,)
+    assert st.postflop_history == (1,)
+    st = st.advance(1)  # UTG calls -> flop round closes -> turn root
+    assert st.street == 2
+    assert st.street_history == ()           # reset at street close
+    assert st.postflop_history == (1, 1)     # full tail preserved
+    st = st.advance(0)  # BB checks the turn
+    assert st.street_history == (0,)
+    assert st.postflop_history == (1, 1, 0)
+
+
+def test_street_history_is_postflop_history_suffix_mid_street():
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[20, 30, 40],
+    )
+    st = st.advance(0)  # BB check
+    st = st.advance(1)  # UTG bet
+    st = st.advance(2)  # BTN raise
+    assert st.street_history == (0, 1, 2)
+    n = len(st.street_history)
+    assert st.postflop_history[-n:] == st.street_history

@@ -174,6 +174,10 @@ class GameState:
         postflop_history: action indices taken across ALL postflop streets so
             far (one per action), in the order they were taken. This is the
             postflop tail appended to preflop_prefix to form action_history.
+        street_history: action indices taken on the CURRENT street only
+            (a suffix of postflop_history; reset when a betting round
+            closes). Live-resolve node replay reads this — it is tracked
+            here so callers never re-derive street segmentation by hand.
         to_act_slot: compact slot whose turn it is, or None if the hand/street
             is terminal (one player left or river betting complete).
         current_bet: chips the current outstanding bet requires (street-local).
@@ -193,6 +197,7 @@ class GameState:
     street: int
     preflop_prefix: Tuple[int, ...]
     postflop_history: Tuple[int, ...] = ()
+    street_history: Tuple[int, ...] = ()
     to_act_slot: Optional[int] = 0
     current_bet: int = 0
     street_bets: Tuple[int, ...] = ()
@@ -374,6 +379,7 @@ class GameState:
             raises += 1
 
         new_history = self.postflop_history + (action_idx,)
+        new_street_history = self.street_history + (action_idx,)
 
         # Determine next to act / round closure. Scan FORWARD from the slot
         # after the one that just acted (real-poker position order), which is
@@ -395,6 +401,7 @@ class GameState:
                 raises_this_street=raises,
                 pot=pot,
                 postflop_history=new_history,
+                street_history=new_street_history,
                 to_act_slot=(None if self._one_left(active) else next_slot),
             )
 
@@ -459,6 +466,7 @@ class GameState:
                 stacks=tuple(stacks),
                 pot=pot,
                 postflop_history=history,
+                street_history=(),
                 to_act_slot=None,
                 betting_round_closed_count=closed_count,
             )
@@ -472,6 +480,7 @@ class GameState:
             pot=pot,
             street=next_street,
             postflop_history=history,
+            street_history=(),
             to_act_slot=first,
             current_bet=0,
             street_bets=tuple([0] * n_slots),
@@ -555,6 +564,7 @@ def new_postflop_state(
         street=int(street),
         preflop_prefix=tuple(preflop_prefix),
         postflop_history=(),
+        street_history=(),
         to_act_slot=0,
         current_bet=0,
         street_bets=tuple([0] * n),

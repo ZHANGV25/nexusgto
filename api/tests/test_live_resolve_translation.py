@@ -129,25 +129,33 @@ def test_build_inputs_rejects_terminal():
         build_solve_inputs(st)
 
 
-def test_build_inputs_rejects_faced_bet_first_action():
-    # The bug the acted[hero] guard MISSED (advisor 2026-06-06): UTG faces BB's
-    # bet as its FIRST action this street — acted[UTG]=False but facing_bet=True.
-    # The first-decision-node read would serve the check-line node remapped as a
-    # no-fold {call,raise} mix. Must fail loud, NOT solve.
+def test_build_inputs_faced_bet_first_action_builds_replay():
+    # FORMERLY rejected (the v1 fail-loud guard). Now a mid-street entry is
+    # SERVED: the solve is posed from the street ROOT (chips rolled back) and
+    # this street's actions are returned for node replay inside the tree.
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d")],
     )
     st = st.advance(1)  # BB bets -> UTG faces a bet as its first action
     assert st.facing_bet is True
-    assert st.acted[st.to_act_slot] is False  # the guard the old check missed
-    with pytest.raises(LiveResolveUnsupported):
-        build_solve_inputs(st)
+    assert st.acted[st.to_act_slot] is False
+    inp = build_solve_inputs(st)
+    assert inp["street_actions"] == [1]      # the BB bet, to be replayed
+    assert inp["has_to_call"] is True
+    assert inp["n_legal"] == 3               # fold / call / raise
+    assert inp["hero_player_idx"] == 1       # UTG
+    # Chips are STREET-ENTRY chips: BB's bet rolled back out of pot/stacks.
+    assert abs(inp["pot_bb"] - 6.0) < 1e-9
+    assert abs(inp["stack_bb"] - 97.25) < 1e-9
+    # The leaf-rollout history must NOT include this street's actions (the
+    # solved tree adds them): preflop prefix only here.
+    assert inp["game_action_indices"] == [2, 0, 0, 0, 0, 1]
 
 
-def test_build_inputs_rejects_mid_street_reentry():
-    # After BB bets and UTG raises, BB faces the raise — post-raise re-entry,
-    # not the street-root first-decision node: reject.
+def test_build_inputs_mid_street_reentry_builds_replay():
+    # After BB bets and UTG raises, BB faces the raise — post-raise re-entry.
+    # FORMERLY rejected; now returns both actions for replay.
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d")],
@@ -156,8 +164,36 @@ def test_build_inputs_rejects_mid_street_reentry():
     st = st.advance(2)  # UTG raise -> back to BB, who already acted
     assert st.to_act_slot == 0  # BB
     assert st.acted[0] is True
-    with pytest.raises(LiveResolveUnsupported):
-        build_solve_inputs(st)
+    inp = build_solve_inputs(st)
+    assert inp["street_actions"] == [1, 2]
+    assert inp["has_to_call"] is True
+    assert inp["hero_player_idx"] == 0
+    # Street-entry chips again (both the bet and the raise rolled back).
+    assert abs(inp["pot_bb"] - 6.0) < 1e-9
+    assert abs(inp["stack_bb"] - 97.25) < 1e-9
+
+
+def test_build_inputs_excludes_prior_street_folder_includes_this_street_folder():
+    # 3p: BTN folds to a flop bet (this-street folder -> INCLUDED in the flop
+    # tree at the time, but by the TURN he's a prior-street folder -> EXCLUDED
+    # from the turn solve). BB + UTG continue.
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    # Flop: BB bets, UTG calls, BTN folds -> round closes -> turn root.
+    st_flop_faced = st.advance(1)         # BB bet; UTG to act
+    inp_flop = build_solve_inputs(st_flop_faced)
+    assert len(inp_flop["player_ranges"]) == 3   # all 3 in the flop tree
+    st_turn = st_flop_faced.advance(1).advance(0)  # UTG call, BTN fold -> turn
+    assert st_turn.street == 2
+    inp_turn = build_solve_inputs(st_turn)
+    # BTN (prior-street folder) is OUT of the turn solve.
+    assert inp_turn["positions_sorted"] == ["BB", "UTG"]
+    assert len(inp_turn["player_ranges"]) == 2
+    assert inp_turn["street_actions"] == []      # turn root
+    # Turn-entry pot includes the flop bet+call chips.
+    assert inp_turn["pot_bb"] > 6.0
 
 
 def test_build_inputs_allows_check_through_to_hero():

@@ -136,17 +136,41 @@ class CpuEsSolver:
         cache_k: int = 1,
         num_rollouts: int = 3,
         master_seed: int = 0xE5,
+        vec_mode: int = 0,
+        readout: str = "avg",
+        hero_replay: Optional[Dict[str, object]] = None,
     ) -> Dict[int, Dict[int, Dict[str, float]]]:
-        """Run a 5p flop/turn CPU-ES solve. Returns all_by_player:
+        """Run an N-player flop/turn CPU-ES solve. Returns all_by_player:
         {player_idx: {hand_idx: {action_label: freq}}} — the SAME structure the
         GPU provider's get_all_avg_strategies produces, so the provider's
         _build_response_strategies maps it identically.
 
         Builds the tree (CPU; GPU tree-builder, no GPU solve), constructs the
         leaf table (parallel batch = the GPU's exact construct floor, off-lock),
-        runs the C ES (Linear CFR, multi-thread Hogwild), extracts σ̄ at each
-        player's first decision node with the weight-0 filter the GPU applies.
+        runs the C ES (Linear CFR, multi-thread Hogwild), extracts each
+        player's strategy with the weight-0 filter the GPU applies.
+
+        vec_mode: 0 = scalar traverser (the validated 5p-display reference);
+            1 = vectorized traverser. vec-Linear is Gate-1-validated for the
+            FINAL-iterate readout ONLY (vec-Linear-AVERAGE is seed-unstable at
+            3+ players — VECTOR_TRAVERSER_DESIGN.md). Enforced below.
+        readout: "avg" = σ̄ (the frequency-display contract) or "final" =
+            final iterate (the playing-agent contract; what the EC2 wall-clock
+            gate measured: 6p ~0.15%/pot floor in ~22s solve at 96 cores).
+        hero_replay: optional {"player_idx": int, "street_actions": [int,...]}.
+            When given, that player's strategy is read at the node reached by
+            REPLAYING this street's action indices from the street root —
+            the mid-street / faced-bet entry the live game loop needs — not
+            at the first-BFS (no-bet) decision node. Fail-loud on any
+            replay mismatch (off-tree action / vocab drift).
         """
+        if vec_mode and readout != "final":
+            raise ValueError(
+                "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
+                "seed-unstable at 3+ players (Gate-1, VECTOR_TRAVERSER_DESIGN.md)"
+            )
+        if readout not in ("avg", "final"):
+            raise ValueError(f"readout must be 'avg' or 'final', got {readout!r}")
         if not self._ready:
             raise RuntimeError("CpuEsSolver not initialized")
         rc = self._rollout_c
@@ -190,21 +214,49 @@ class CpuEsSolver:
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
             cs = self._CSolver.from_table(gpu._tree, table, n_players, max_h, seed=1)
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
+            if vec_mode:
+                cs.set_vec_mode(1)
             t1 = time.time()
             cs.run(iterations, num_threads=num_threads)
             solve_s = time.time() - t1
+            read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
 
-            # ── Extract σ̄ → all_by_player, with the weight-0 / never-visited
-            #    filter the GPU's get_all_avg_strategies applies (freq>0.001;
-            #    skip uniform-default rows so out-of-range hands stay fold-100%
-            #    placeholders in _build_response_strategies). ──
+            # The hero's replayed node (mid-street entry), if requested.
+            hero_idx: Optional[int] = None
+            hero_node: Optional[int] = None
+            if hero_replay is not None and hero_replay.get("street_actions"):
+                hero_idx = int(hero_replay["player_idx"])  # type: ignore[arg-type]
+                hero_node = self._replay_street_node(
+                    tree, gpu._tree,
+                    list(hero_replay["street_actions"]),  # type: ignore[arg-type]
+                    n_players=n_players,
+                    bet_sizes=list(bet_sizes),
+                    subsequent_bet_sizes=list(subsequent_bet_sizes),
+                    add_explicit_allin=add_explicit_allin,
+                )
+                reached = tree.nodes[hero_node]
+                if reached.type != 0 or reached.player != hero_idx:
+                    raise ValueError(
+                        f"replayed street actions lead to node {hero_node} "
+                        f"(type={reached.type}, player={reached.player}) — not a "
+                        f"decision node owned by hero player {hero_idx}. The "
+                        "recorded street history does not match the solved tree."
+                    )
+
+            # ── Extract strategies → all_by_player, with the weight-0 /
+            #    never-visited filter the GPU's get_all_avg_strategies applies
+            #    (freq>0.001; skip uniform-default rows so out-of-range hands
+            #    stay fold-100% placeholders in _build_response_strategies). ──
             all_by_player: Dict[int, Dict[int, Dict[str, float]]] = {}
             for p_idx in range(n_players):
-                node_idx = self._first_decision_node_for(tree, p_idx)
+                if hero_idx is not None and p_idx == hero_idx:
+                    node_idx = hero_node
+                else:
+                    node_idx = self._first_decision_node_for(tree, p_idx)
                 raw: Dict[int, Dict[str, float]] = {}
                 if node_idx is not None:
                     labels = self._build_labels(gpu._tree, node_idx)
-                    sigma = cs.avg_strategy(node_idx)  # [nh, na] or None
+                    sigma = read_strategy(node_idx)  # [nh, na] or None
                     na = sigma.shape[1] if sigma is not None else 0
                     nh = len(player_ranges[p_idx])
                     for h in range(min(nh, sigma.shape[0] if sigma is not None else 0)):
@@ -238,3 +290,68 @@ class CpuEsSolver:
             if nd.type == 0 and nd.player == player_idx and nd.num_children > 0:
                 return ni
         return None
+
+    def _replay_street_node(
+        self,
+        tree,
+        gpu_tree,
+        street_actions: List[int],
+        *,
+        n_players: int,
+        bet_sizes: List[float],
+        subsequent_bet_sizes: List[float],
+        add_explicit_allin: bool,
+    ) -> int:
+        """Walk the solved tree from the street root through this street's
+        recorded agent action indices; return the reached node index.
+
+        At each decision node the tree's child LABELS are mapped to agent
+        action indices with the production _solver_label_to_action_index
+        (the same metadata-driven translation the response path uses), and
+        the child whose index equals the recorded action is taken. The size
+        vocab switches to subsequent_bet_sizes once a bet/raise has occurred
+        this street — mirroring GameState.legal_action_categories.
+
+        Fail-loud (ValueError) on: a non-decision node mid-replay, or a
+        recorded action matching zero or 2+ children (vocab drift / an
+        off-tree action — translation of off-tree sizes is out of scope).
+        """
+        from app.services.session_pipeline import _solver_label_to_action_index
+
+        ni = 0  # street root
+        raises_so_far = 0
+        for step, want_idx in enumerate(street_actions):
+            nd = tree.nodes[ni]
+            if nd.type != 0 or nd.num_children <= 0:
+                raise ValueError(
+                    f"street replay step {step}: node {ni} is not a decision "
+                    f"node (type={nd.type}) — recorded history does not match "
+                    "the solved tree"
+                )
+            labels = self._build_labels(gpu_tree, ni)
+            if len(labels) != nd.num_children:
+                raise ValueError(
+                    f"street replay step {step}: node {ni} has "
+                    f"{nd.num_children} children but {len(labels)} labels"
+                )
+            acting = nd.player
+            bets = [nd.bets[q] for q in range(n_players)]
+            has_to_call = max(bets) > bets[acting]
+            sizes = tuple(subsequent_bet_sizes if raises_so_far > 0 else bet_sizes)
+            matches = [
+                c for c, lab in enumerate(labels)
+                if _solver_label_to_action_index(
+                    lab, has_to_call, sizes, add_explicit_allin) == int(want_idx)
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"street replay step {step}: action index {want_idx} maps "
+                    f"to {len(matches)} children at node {ni} "
+                    f"(labels={labels}, has_to_call={has_to_call}, "
+                    f"sizes={sizes}) — vocab drift or off-tree action"
+                )
+            chosen = labels[matches[0]].lower()
+            if chosen.startswith(("bet", "raise")) or "all" in chosen:
+                raises_so_far += 1
+            ni = nd.children[matches[0]]
+        return ni

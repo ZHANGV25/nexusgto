@@ -212,3 +212,78 @@ def test_live_resolve_3p_river_raises_unsupported(live_source):
     assert st.street == 3  # river root
     with pytest.raises(LiveResolveUnsupported):
         live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Kh")))
+
+
+# -- 6p vec-Linear-FINAL: the playing-agent re-solve path (Lane A, 2026-06-10) --
+#
+# These exercise the NEW 6p path end-to-end through the live loop surface:
+# GameState -> build_solve_inputs (street-entry reconstruction + street
+# replay actions) -> CpuEsSolver.solve(vec_mode=1, readout="final",
+# hero_replay) -> label->index mix. vec-Linear-FINAL is the Gate-1-validated
+# EC2-measured config (6p ~0.15%/pot floor in ~22s solve @96 cores --
+# measured_logs/VEC_SPEEDUP_2026-06-10.md). Iteration counts here are SMALL:
+# these validate the PATH (correct node, legal mix), not solve quality.
+
+
+@pytest.fixture(scope="session")
+def live_source_6p(cpu_es_engine, blueprint_path):
+    from app.agent.strategy_source import LiveResolveSource
+    cfg = ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0)
+    return LiveResolveSource(
+        cfg, cpu_es_solver=cpu_es_engine, iterations=2000,
+        vec_mode=True, readout="final", num_threads=12,
+    )
+
+
+def _state_6p_flop():
+    # 6p single-open line: UTG opens 0.7x, everyone (incl. blinds) flat-calls.
+    # Canonical chips derived (single open + calls). Flop order is SB-first.
+    return new_postflop_state(
+        seats=["SB", "BB", "UTG", "MP", "CO", "BTN"],
+        preflop_prefix=[2, 1, 1, 1, 1, 1],
+        board=[_ci("Ah"), _ci("Kh"), _ci("2c")],
+    )
+
+
+def test_live_resolve_6p_checkline_vec_final(live_source_6p):
+    """6p flop, checked to CO (4 checks replayed): the hero's node is reached
+    by street replay; the mix is over the no-bet vocab and is a REAL solve."""
+    st = _state_6p_flop()
+    for idx in [0, 0, 0, 0]:  # SB, BB, UTG, MP check
+        st = st.advance(idx)
+    assert st.to_act_slot == 4  # CO
+    assert st.facing_bet is False
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # [check, bet 0.75]
+
+    t0 = time.time()
+    mix = live_source_6p.get_mix(st, hero_cards=(_ci("Qh"), _ci("Jh")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n6p check-line vec-final: dt={dt:.1f}s mix={mix.freqs}")
+
+
+def test_live_resolve_6p_faced_bet_vec_final(live_source_6p):
+    """6p flop FACED BET: SB/BB check, UTG bets, MP folds, CO calls, BTN to
+    act facing the bet. The replay walks check/check/bet/fold/call inside the
+    solved tree to BTN's faced-bet node -- the mix must be over the 3-action
+    {fold, call, raise} vocab (the node the old guard refused to serve)."""
+    st = _state_6p_flop()
+    for idx in [0, 0, 1, 0, 1]:  # SB chk, BB chk, UTG bet, MP fold, CO call
+        st = st.advance(idx)
+    assert st.to_act_slot == 5  # BTN
+    assert st.facing_bet is True
+    n_legal = st.num_legal_actions()
+    assert n_legal == 3  # [fold, call, raise]
+
+    t0 = time.time()
+    mix = live_source_6p.get_mix(st, hero_cards=(_ci("Ad"), _ci("Kd")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n6p faced-bet vec-final: dt={dt:.1f}s mix={mix.freqs}")

@@ -278,10 +278,21 @@ class LiveResolveSource(StrategySource):
     def __init__(
         self, config: ModeConfig, cpu_es_solver=None, iterations: int = 200,
         seed_ranges: bool = True, strategy_reader=None,
+        vec_mode: bool = False, readout: str = "avg", num_threads: int = 0,
     ) -> None:
         self._config = config
         self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
         self._iterations = int(iterations)
+        self._num_threads = int(num_threads)  # 0 = all cores
+        # vec_mode + readout="final" = the PLAYING-AGENT configuration
+        # (vec-Linear-FINAL — the Gate-1-validated, EC2-measured config that
+        # makes a 6p re-solve viable in tens of seconds at ~0.15%/pot:
+        # measured_logs/VEC_SPEEDUP_2026-06-10.md). The default (scalar, σ̄)
+        # is the historically validated 2p/3p analysis surface. CpuEsSolver
+        # rejects vec_mode without readout="final" (vec-Linear-AVERAGE is
+        # seed-unstable at 3+ players).
+        self._vec_mode = bool(vec_mode)
+        self._readout = str(readout)
         # In-distribution range seeding (advisor fix): seed the re-solve with the
         # blueprint's preflop-σ̄ ranges so it doesn't over-bet vs a wide/weak
         # uniform villain. Needs a blueprint strategy reader; when absent we fall
@@ -354,6 +365,7 @@ class LiveResolveSource(StrategySource):
         subsequent = list(state.subsequent_bet_sizes)
         add_allin = bool(state.add_explicit_allin)
 
+        hero_idx = inputs["hero_player_idx"]
         all_by_player = engine.solve(
             board_strs=inputs["board_strs"],
             board_ints=inputs["board_ints"],
@@ -367,10 +379,15 @@ class LiveResolveSource(StrategySource):
             add_explicit_allin=add_allin,
             game_action_indices=inputs["game_action_indices"],
             iterations=self._iterations,
-            num_threads=0,
+            num_threads=self._num_threads,
+            vec_mode=1 if self._vec_mode else 0,
+            readout=self._readout,
+            hero_replay={
+                "player_idx": hero_idx,
+                "street_actions": inputs["street_actions"],
+            },
         )
 
-        hero_idx = inputs["hero_player_idx"]
         row = hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
         strat = all_by_player.get(hero_idx, {}).get(row)
         n_legal = int(inputs["n_legal"])
@@ -382,11 +399,14 @@ class LiveResolveSource(StrategySource):
             # uses on a miss.
             return ActionMix.uniform(n_legal, is_fallback=True)
 
+        # The hero's node-local label set maps with the size vocab in force
+        # AT THAT NODE: subsequent sizes once this street has a bet/raise.
+        mix_sizes = subsequent if state.raises_this_street > 0 else bet_sizes
         freqs = labels_to_index_freqs(
             strat,
             has_to_call=bool(inputs["has_to_call"]),
             n_legal=n_legal,
-            bet_sizes=tuple(bet_sizes),
+            bet_sizes=tuple(mix_sizes),
             add_explicit_allin=add_allin,
         )
         if not freqs:

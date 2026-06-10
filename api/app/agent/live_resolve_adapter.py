@@ -26,13 +26,14 @@ SCOPE / SIMPLIFICATIONS (documented, honest):
     LiveResolveSource + live_resolve_ranges) — uniform ranges make the re-solve
     over-bet (the 3b confound). There is NO cross-street Bayesian narrowing —
     this is a per-street re-solve, not the full Pluribus narrowing ceiling.
-  - The hero strategy is read at the to-act player's FIRST (BFS) decision node —
-    the no-bet check-line node. That equals the CURRENT node only when no betting
-    has happened yet this street (a street ROOT, or a check-through to the hero).
-    A faced-bet first action or a post-raise re-entry is a DIFFERENT node, so we
-    fail loud (LiveResolveUnsupported) rather than serve the check-line strategy
-    remapped as a (wrong, no-fold) faced-bet mix. Guard: not facing_bet AND
-    raises_this_street == 0.
+  - MID-STREET ENTRY (faced bet / post-raise) is served by solving from the
+    STREET ROOT (chips/players reconstructed at street entry) and REPLAYING
+    this street's recorded actions (GameState.street_history) inside the
+    solved tree — CpuEsSolver's hero_replay reads the hero's strategy at the
+    reached node, with its correct (fold/call/raise) action set. The old
+    fail-loud guard (facing_bet or raises_this_street > 0) is GONE; what
+    remains fail-loud is an OFF-TREE action (a recorded action that matches
+    no tree child — bet-size translation is a later step) and river.
 """
 
 from __future__ import annotations
@@ -77,8 +78,16 @@ def build_solve_inputs(
     """Translate a GameState into the keyword inputs for CpuEsSolver.solve().
 
     Returns a dict with: board_strs, board_ints, positions_sorted, player_seats,
-    player_ranges, hero_player_idx, pot_bb, stack_bb, game_action_indices, plus
-    n_legal/has_to_call for the response mapping.
+    player_ranges, hero_player_idx, pot_bb, stack_bb, game_action_indices,
+    street_actions (this street's recorded action indices, for CpuEsSolver's
+    hero_replay; empty at a street root), plus n_legal/has_to_call for the
+    response mapping.
+
+    The solve is ALWAYS posed from the STREET ROOT: chips and the player set
+    are reconstructed at street entry (street_bets rolled back; players who
+    folded EARLIER streets excluded, players who folded THIS street included —
+    their fold lines are part of the street tree). A mid-street entry is then
+    a replay of street_actions inside the solved tree, not a different solve.
 
     range_weight_dicts: optional per-slot {hand_class_name: weight} (in
         compact-slot order, aligned to state.seat_of_slot). When given, each
@@ -87,7 +96,7 @@ def build_solve_inputs(
         None (or wrong length), the grid is uniform-on-legal.
 
     Raises:
-        LiveResolveUnsupported: terminal state, river, or a non-root re-entry.
+        LiveResolveUnsupported: terminal state or river.
     """
     if state.terminal:
         raise LiveResolveUnsupported("terminal GameState has no decision node")
@@ -97,54 +106,68 @@ def build_solve_inputs(
             "is the side-pot/showdown gap (§6) — deferred."
         )
 
-    # The to-act player's slot == its solver player_idx (player_ranges are built
-    # in slot order; player_seats = range(n)). The hero is whoever is to act.
     hero_slot = state.to_act_slot
     assert hero_slot is not None  # guarded by `terminal` above
 
-    # Fail loud unless the current node IS the hero's first decision node on this
-    # street. CpuEsSolver reads each player's FIRST (BFS) decision node — the
-    # no-bet check-line node. That equals the current node ONLY when no betting
-    # has happened yet this street (street root, or check-through to the hero).
-    # The correct condition is "no betting this street": NOT facing a bet AND no
-    # raises yet. A faced-bet first action (acted[hero]=False but facing_bet=True)
-    # would otherwise read the check-line node and remap its {Check,Bet} labels as
-    # {call,raise} — a silently wrong, no-fold mix. (acted[hero] alone misses it.)
-    if state.facing_bet or state.raises_this_street > 0:
+    # This street's recorded actions (empty at a street root / check-through
+    # is NOT empty — checks are actions and are replayed like any other).
+    street_actions = list(state.street_history)
+
+    # Players in the hand at street ENTRY: still active, or folded THIS street
+    # (active=False, acted=True — `acted` resets at street close, so a
+    # prior-street folder shows acted=False). This-street folders belong in
+    # the street tree; prior-street folders were never in it.
+    entry_slots = [
+        s for s in range(state.n_slots) if state.active[s] or state.acted[s]
+    ]
+    if hero_slot not in entry_slots:
         raise LiveResolveUnsupported(
-            "non-root node: live-resolve reads the street-root first-decision "
-            "node; a faced-bet / post-raise / mid-street re-entry is not that "
-            "node (would serve the wrong strategy). Out of v1 scope — fail loud."
+            "to-act player is not in the street-entry player set — "
+            "inconsistent GameState"
         )
+
+    # Chips at street ENTRY: roll the current street's bets back out.
+    pot_entry = int(state.pot) - sum(int(b) for b in state.street_bets)
+    entry_stacks = [
+        int(state.stacks[s]) + int(state.street_bets[s]) for s in entry_slots
+    ]
 
     board_ints = list(state.board)[: _STREET_BOARD_LEN[state.street]]
     board_strs = [_int_to_card(c) for c in board_ints]
 
-    # positions_sorted = seat names in compact-slot order (already SB-first).
-    positions_sorted = [SEAT_NAME[s] for s in state.seat_of_slot]
-    n = len(positions_sorted)
+    # positions_sorted = entry players' seat names in compact-slot order
+    # (already SB-first); solver player index == position in entry_slots.
+    positions_sorted = [SEAT_NAME[state.seat_of_slot[s]] for s in entry_slots]
+    n = len(entry_slots)
     player_seats = list(range(n))
+    hero_player_idx = entry_slots.index(hero_slot)
 
-    # 169 grid per player, blocked by the board (mirrors solve_cpu_es). Seeded
-    # in-distribution when range_weight_dicts is supplied (aligned to slot
-    # order), else uniform-on-legal. No cross-street narrowing in v1.
+    # 169 grid per entry player, blocked by the board (mirrors solve_cpu_es).
+    # Seeded in-distribution when range_weight_dicts is supplied (aligned to
+    # COMPACT SLOT order), else uniform-on-legal. No cross-street narrowing.
     blocked = set(board_ints)
     use_weights = (
         range_weight_dicts is not None
-        and len(range_weight_dicts) == n
+        and len(range_weight_dicts) == state.n_slots
     )
     player_ranges: List[List[Tuple[int, int, float]]] = []
-    for slot in range(n):
+    for slot in entry_slots:
         weights = range_weight_dicts[slot] if use_weights else None
         grid = _build_hand_grid_range(blocked, weights=weights)
         player_ranges.append([(r[0], r[1], r[2]) for r in grid])
 
     # Chips -> big blinds (CpuEsSolver scales bb by 100 internally).
-    pot_bb = float(state.pot) / BIG_BLIND
-    stack_bb = float(min(state.stacks)) / BIG_BLIND
+    pot_bb = float(pot_entry) / BIG_BLIND
+    stack_bb = float(min(entry_stacks)) / BIG_BLIND
 
+    # Action history UP TO street entry — the solved tree itself adds this
+    # street's actions, so they must NOT be in the leaf-rollout history too.
     key = build_key(state)
-    game_action_indices = list(key.action_history)
+    full_history = list(key.action_history)
+    n_street = len(street_actions)
+    game_action_indices = (
+        full_history[:-n_street] if n_street else full_history
+    )
 
     return {
         "board_strs": board_strs,
@@ -152,10 +175,11 @@ def build_solve_inputs(
         "positions_sorted": positions_sorted,
         "player_seats": player_seats,
         "player_ranges": player_ranges,
-        "hero_player_idx": hero_slot,
+        "hero_player_idx": hero_player_idx,
         "pot_bb": pot_bb,
         "stack_bb": stack_bb,
         "game_action_indices": game_action_indices,
+        "street_actions": street_actions,
         "n_legal": state.num_legal_actions(),
         "has_to_call": _has_to_call(state),
     }
