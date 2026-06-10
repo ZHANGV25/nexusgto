@@ -21,6 +21,7 @@ multi-size raise trees beyond POSTFLOP_MAX_RAISES are out of scope (plan §6).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
@@ -271,13 +272,12 @@ class GameState:
     def num_legal_actions(self) -> int:
         return len(self.legal_action_categories())
 
-    def _raise_amount_for(self, action_idx: int, slot: int) -> int:
-        """Chip INCREMENT for the raise at `action_idx`, bit-exact to the
-        trainer. action_idx indexes legal_action_categories(); the raise slots
-        come AFTER the non-raise slots (fold?/call). We re-derive the SURVIVING
-        raise amounts (same prune as the vocab) and pick the one at this
-        raise-position, so multi-size vocabs and the all-in dedup are handled.
-        """
+    def _surviving_raise_amounts(self, slot: int) -> List[int]:
+        """The canonical raise INCREMENTS available to `slot` at this node,
+        bit-exact to the trainer's generate_actions prune (drop raises that
+        don't exceed the call; clamp+dedup at the stack; optional explicit
+        all-in last). Position i here == raise slot i of
+        legal_action_categories()."""
         pot = int(self.pot)
         stack = int(self.stacks[slot])
         to_call = max(0, self.current_bet - self.street_bets[slot])
@@ -285,13 +285,6 @@ class GameState:
             self.subsequent_bet_sizes
             if self.raises_this_street > 0 else self.postflop_bet_sizes
         )
-        n_nonraise = (1 if self.facing_bet else 0) + 1  # fold? + check/call
-        raise_position = action_idx - n_nonraise
-        if raise_position < 0:
-            raise ValueError(
-                f"action_idx {action_idx} is not a raise (n_nonraise="
-                f"{n_nonraise})"
-            )
         survivors: List[int] = []
         added_allin = False
         for frac in sizes:
@@ -305,6 +298,20 @@ class GameState:
             survivors.append(ba)
         if self.add_explicit_allin and not added_allin and stack > to_call:
             survivors.append(stack)
+        return survivors
+
+    def _raise_amount_for(self, action_idx: int, slot: int) -> int:
+        """Chip INCREMENT for the raise at `action_idx`, bit-exact to the
+        trainer. action_idx indexes legal_action_categories(); the raise slots
+        come AFTER the non-raise slots (fold?/call)."""
+        n_nonraise = (1 if self.facing_bet else 0) + 1  # fold? + check/call
+        raise_position = action_idx - n_nonraise
+        if raise_position < 0:
+            raise ValueError(
+                f"action_idx {action_idx} is not a raise (n_nonraise="
+                f"{n_nonraise})"
+            )
+        survivors = self._surviving_raise_amounts(slot)
         if raise_position >= len(survivors):
             # Should be unreachable — the vocab and this share the prune logic.
             raise ValueError(
@@ -378,12 +385,32 @@ class GameState:
             current_bet = street_bets[slot]
             raises += 1
 
+        return self._after_action(
+            slot=slot, action_idx=action_idx, active=active, acted=acted,
+            street_bets=street_bets, stacks=stacks, current_bet=current_bet,
+            raises=raises, pot=pot,
+        )
+
+    def _after_action(
+        self,
+        *,
+        slot: int,
+        action_idx: int,
+        active: List[bool],
+        acted: List[bool],
+        street_bets: List[int],
+        stacks: List[int],
+        current_bet: int,
+        raises: int,
+        pot: int,
+    ) -> "GameState":
+        """Shared post-action tail for advance()/advance_observed():
+        record the action index in both histories, find the next actor
+        (forward-from-actor — the order the blueprint encodes), or close
+        the round / terminate."""
         new_history = self.postflop_history + (action_idx,)
         new_street_history = self.street_history + (action_idx,)
 
-        # Determine next to act / round closure. Scan FORWARD from the slot
-        # after the one that just acted (real-poker position order), which is
-        # what the blueprint encodes.
         next_slot = self._next_to_act(
             active, acted, street_bets, current_bet, start_after=slot,
         )
@@ -409,6 +436,138 @@ class GameState:
         return self._close_round(
             active=active, stacks=stacks, pot=pot, history=new_history,
             closed_count=self.betting_round_closed_count + 1,
+        )
+
+    def advance_observed(
+        self, action: str, amount: Optional[int] = None,
+    ) -> "ObservedAdvance":
+        """Apply an OBSERVED (real-table, possibly off-tree) action.
+
+        The split that makes a lookup/replay agent playable against humans:
+        the HISTORIES record the SNAPPED on-tree action index (so blueprint
+        keys and the live-resolve street replay stay on-tree), while the
+        CHIP STATE applies the REAL amount (so pot odds, stack-commitment
+        prunes and street-entry reconstruction stay faithful to the table).
+        The residual divergence — the solved tree's canonical in-street
+        amounts vs the real ones — is the standard action-abstraction gap
+        (Pluribus closed it with live search; a lookup/replay agent accepts
+        it and snaps).
+
+        Args:
+            action: "fold" | "check" | "call" | "raise" | "allin".
+            amount: for "raise": the actor's chip INCREMENT this action
+                (chips added on top of their current street bet — a bet of
+                500 into a 600 pot, or a raise BY 1200 over the call).
+                Ignored for the other actions ("allin" derives from stack).
+
+        Snapping: the increment maps to the NEAREST surviving canonical
+        raise (relative/log distance) from the same prune the vocab uses —
+        position i == raise slot i of legal_action_categories(). An
+        increment that doesn't exceed the call (under-raise / short
+        all-in-call) is applied as a CALL.
+
+        Raises:
+            ValueError: terminal state; "fold"/"check" inconsistent with
+                facing_bet; a raise with no amount; or a raise at a node
+                whose vocab has no raise slot (commitment-pruned).
+        """
+        if self.to_act_slot is None:
+            raise ValueError("Cannot advance a terminal state")
+        if action not in ("fold", "check", "call", "raise", "allin"):
+            raise ValueError(f"unknown observed action {action!r}")
+
+        slot = self.to_act_slot
+        facing = self.facing_bet
+        to_call = max(0, self.current_bet - self.street_bets[slot])
+
+        active = list(self.active)
+        acted = list(self.acted)
+        street_bets = list(self.street_bets)
+        stacks = list(self.stacks)
+        current_bet = self.current_bet
+        raises = self.raises_this_street
+        pot = self.pot
+        acted[slot] = True
+
+        n_nonraise = (1 if facing else 0) + 1
+
+        def _apply_call() -> int:
+            """Match the outstanding bet (clamped to stack). Returns chips."""
+            chips = min(to_call, stacks[slot])
+            if chips > 0:
+                street_bets[slot] += chips
+                stacks[slot] -= chips
+                pot_add[0] = chips
+            return chips
+
+        pot_add = [0]
+
+        if action == "fold":
+            if not facing:
+                raise ValueError(
+                    "observed FOLD with nothing to call — not a legal node "
+                    "transition (open-folds are not in the trainer vocab)"
+                )
+            active[slot] = False
+            idx, off_tree, applied = 0, False, 0
+        elif action == "check":
+            if facing:
+                raise ValueError(
+                    "observed CHECK while facing a bet — inconsistent input"
+                )
+            idx, off_tree, applied = 0, False, 0
+        elif action == "call":
+            # "call" with no bet outstanding is a check (some feeds say it).
+            applied = _apply_call() if facing else 0
+            idx, off_tree = (1 if facing else 0), False
+        else:
+            # raise / allin — possibly off-tree.
+            if action == "allin":
+                increment = stacks[slot]
+            else:
+                if amount is None or int(amount) <= 0:
+                    raise ValueError("observed RAISE requires a chip amount")
+                increment = min(int(amount), stacks[slot])
+            if increment <= to_call:
+                # Under-raise / short all-in-call: representable on-tree only
+                # as a CALL. A legal under-raise is an all-in (stack ==
+                # increment), so _apply_call's min(to_call, stack) puts in
+                # exactly the real chips; a malformed feed normalizes to a
+                # full call.
+                _apply_call()
+                applied = pot_add[0]
+                idx, off_tree = (1 if facing else 0), increment != to_call
+            else:
+                survivors = self._surviving_raise_amounts(slot)
+                if not survivors:
+                    raise ValueError(
+                        "observed raise at a node whose vocab has no raise "
+                        "slot (stack-commitment prune) — cannot represent "
+                        "on-tree"
+                    )
+                position = min(
+                    range(len(survivors)),
+                    key=lambda i: abs(math.log(increment / survivors[i])),
+                )
+                off_tree = survivors[position] != increment
+                idx = n_nonraise + position
+                street_bets[slot] += increment
+                stacks[slot] -= increment
+                pot_add[0] = increment
+                current_bet = max(current_bet, street_bets[slot])
+                raises += 1
+                applied = increment
+
+        pot += pot_add[0]
+
+        next_state = self._after_action(
+            slot=slot, action_idx=idx, active=active, acted=acted,
+            street_bets=street_bets, stacks=stacks, current_bet=current_bet,
+            raises=raises, pot=pot,
+        )
+        return ObservedAdvance(
+            state=next_state, action_idx=idx, off_tree=off_tree,
+            applied_amount=applied,
         )
 
     # ── Internal betting mechanics (mirror rollout._simulate_one) ────────
@@ -494,6 +653,24 @@ class GameState:
             if active[s]:
                 return s
         return None
+
+
+@dataclass(frozen=True)
+class ObservedAdvance:
+    """Result of GameState.advance_observed (real-table action applied).
+
+    state: the next GameState (REAL chips applied).
+    action_idx: the SNAPPED on-tree action index recorded in the histories
+        (what blueprint keys and the live-resolve street replay consume).
+    off_tree: True when the observed chips didn't match the canonical
+        on-tree amount (the abstraction-gap flag, for logging/analysis).
+    applied_amount: real chips the actor added this action.
+    """
+
+    state: GameState
+    action_idx: int
+    off_tree: bool
+    applied_amount: int
 
 
 # ── Factory ───────────────────────────────────────────────────────────────

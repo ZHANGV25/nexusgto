@@ -312,3 +312,112 @@ def test_6p_live_resolve_plays_faced_bet_decision(blueprint_path):
         guard += 1
     assert st3.terminal or st3.street == 2  # flop closed -> turn (or hand over)
     print(f"\n6p play-loop decision: mix={res.mix.freqs} sampled={res.action_idx}")
+
+
+# -- FULL 6p hand: off-tree opponent bet + hybrid live/lookup (2026-06-10) --
+#
+# The closest-to-real-play test in the suite: a 6p hand played to TERMINAL
+# where an opponent bets an OFF-TREE size (applied with real chips via
+# advance_observed, snapped on-tree in the histories), the hero decides via
+# HybridSource -- vec-Linear-final live re-solves on flop/turn, blueprint
+# LOOKUP at river (the side-pot gap) -- and every decision advances the
+# real state. Asserts the hand completes and every hero mix is legal.
+
+
+def test_6p_full_hand_off_tree_bet_hybrid(blueprint_path):
+    pytest.importorskip("numpy")
+    from app.agent.strategy_source import (
+        HybridSource, LiveResolveSource, LookupSource,
+    )
+
+    try:
+        from app.services.cpu_es_solver import CpuEsSolver
+        engine = CpuEsSolver(blueprint_path)
+    except Exception as e:
+        pytest.skip(f"CpuEsSolver unavailable: {e}")
+    if not engine.ready:
+        pytest.skip("CpuEsSolver not ready")
+
+    live = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path),
+        cpu_es_solver=engine, iterations=2000,
+        vec_mode=True, readout="final", num_threads=12,
+    )
+    lookup = LookupSource(
+        ModeConfig(mode="LOOKUP", blueprint_path=blueprint_path))
+    agent = PokerAgent(source=HybridSource(live, lookup),
+                       config=ModeConfig(mode="LIVE_RESOLVE", seed=17))
+
+    hero = (_ci("Ad"), _ci("Kd"))
+    st = new_postflop_state(
+        seats=["SB", "BB", "UTG", "MP", "CO", "BTN"],
+        preflop_prefix=[2, 1, 1, 1, 1, 1],
+        board=[_ci("Ah"), _ci("Kh"), _ci("2c"), _ci("Qc"), _ci("2s")],
+    )  # pot 875, all six live; hero = BTN (slot 5)
+
+    hero_mixes = []
+
+    def hero_act():
+        nonlocal st
+        res = agent.act(st, hero)
+        hero_mixes.append(res)
+        st = st.advance(res.action_idx)
+        return res
+
+    # FLOP: SB chk, BB chk, UTG bets OFF-TREE 600 into 875 (canonical 656),
+    # MP folds, CO calls (real chips). Then the hero faces the bet.
+    st = st.advance_observed("check").state
+    st = st.advance_observed("check").state
+    obs = st.advance_observed("raise", amount=600)
+    assert obs.off_tree is True and obs.action_idx == 1
+    st = obs.state
+    st = st.advance_observed("fold").state
+    st = st.advance_observed("call").state
+    assert st.to_act_slot == 5 and st.facing_bet
+    assert st.pot == 875 + 600 + 600                  # REAL chips in the pot
+    res = hero_act()
+    # AdKd = top two on AhKh2c: a sane final-iterate never folds here. This
+    # doubles as a play-quality canary on the off-tree faced-bet node.
+    assert res.action_idx in (1, 2), f"hero folded top-two?! mix={res.mix.freqs}"
+    # Close the flop: SB/BB fold; any remaining callers flat-call.
+    st = st.advance_observed("fold").state
+    st = st.advance_observed("fold").state
+    guard = 0
+    while st.street == 1 and not st.terminal and guard < 4:
+        st = st.advance_observed("call").state
+        guard += 1
+    assert st.street == 2 and not st.terminal
+
+    # TURN (UTG, CO, hero left): checks to the hero, hero decides (live).
+    while st.to_act_slot != 5 and not st.terminal and st.street == 2:
+        st = st.advance_observed("check").state
+    if st.street == 2 and not st.terminal:
+        hero_act()
+        guard = 0
+        while st.street == 2 and not st.terminal and guard < 4:
+            st = st.advance_observed("call" if st.facing_bet else "check").state
+            guard += 1
+    assert st.terminal or st.street == 3
+
+    # RIVER: checks to the hero; the hero''s mix comes from LOOKUP via the
+    # hybrid fallback (live raises LiveResolveUnsupported on river).
+    while not st.terminal and st.to_act_slot != 5 and st.street == 3:
+        st = st.advance_observed("check").state
+    if not st.terminal and st.street == 3:
+        hero_act()
+        guard = 0
+        while not st.terminal and guard < 4:
+            st = st.advance_observed("call" if st.facing_bet else "check").state
+            guard += 1
+
+    assert st.terminal or st.betting_round_closed_count >= 3
+    assert len(hero_mixes) >= 2                       # flop + turn at minimum
+    for r in hero_mixes:
+        assert abs(sum(r.mix.freqs.values()) - 1.0) < 1e-9
+    # Flop + turn decisions are LIVE re-solves -- never the uniform-miss
+    # placeholder (river lookup MAY be a flagged uniform fallback: 6p river
+    # blueprint coverage is sparse, and that honesty flag is the contract).
+    assert hero_mixes[0].mix.is_uniform_fallback is False
+    assert hero_mixes[1].mix.is_uniform_fallback is False
+    print(f"\n6p full hand: {len(hero_mixes)} hero decisions, "
+          f"mixes={[r.mix.freqs for r in hero_mixes]}, terminal={st.terminal}")

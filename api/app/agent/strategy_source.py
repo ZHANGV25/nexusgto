@@ -33,6 +33,7 @@ __all__ = [
     "LookupSource",
     "OfflineLiftedSource",
     "LiveResolveSource",
+    "HybridSource",
     "LiveResolveUnsupported",
 ]
 
@@ -421,3 +422,32 @@ class LiveResolveSource(StrategySource):
         if not freqs:
             return ActionMix.uniform(n_legal, is_fallback=True)
         return ActionMix(freqs)
+
+
+# ── HYBRID (full-hand playability: live where supported, lookup elsewhere) ─
+
+
+class HybridSource(StrategySource):
+    """LIVE_RESOLVE where it's supported, blueprint LOOKUP where it isn't.
+
+    The composition that makes a FULL HAND playable end-to-end: flop/turn
+    decisions go to the live re-solve (the quality ceiling — for 6p, the
+    vec-Linear-final path), while RIVER — CpuEsSolver's documented side-pot/
+    showdown gap — falls back to the blueprint σ̄ lookup (the floor that the
+    2p/3p full-hand play tests validated). Without this, a LIVE_RESOLVE hand
+    cannot finish: river raises LiveResolveUnsupported.
+
+    Only the DOCUMENTED unsupported surface falls back (the
+    LiveResolveUnsupported exception type). Real solver errors — vocab
+    drift, replay mismatches, engine failures — still raise (fail loud).
+    """
+
+    def __init__(self, live: StrategySource, lookup: StrategySource) -> None:
+        self._live = live
+        self._lookup = lookup
+
+    def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
+        try:
+            return self._live.get_mix(state, hero_cards)
+        except LiveResolveUnsupported:
+            return self._lookup.get_mix(state, hero_cards)
