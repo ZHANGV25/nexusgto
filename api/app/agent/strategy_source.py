@@ -15,10 +15,13 @@ All three feed the SAME sampling loop in agent.py.
 from __future__ import annotations
 
 import abc
+import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from app.agent.game_state import GameState
 from app.agent.key_builder import build_key
@@ -154,11 +157,28 @@ class LookupSource(StrategySource):
         if arr.sum() <= 0.0:
             return self._on_miss(n_legal)
 
-        # Exact-length invariant: the GameState's vocab must agree with the
-        # blueprint's stored σ̄ length. A mismatch is a vocab bug (wrong
-        # blueprint / wrong action-size config), NOT something to silently
-        # truncate or pad — surface it. v1's validated lines never reach this.
-        if len(arr) != n_legal:
+        # Length reconciliation. The blueprint stored the node's action set
+        # under CANONICAL trainer chips; the state's n_legal uses REAL chips
+        # (advance_observed applies real amounts). A real bet that
+        # commitment-prunes the vocab drops RAISE slots only — and the
+        # trainer orders actions [fold][check/call][raises asc], so the
+        # stored σ̄ is PREFIX-aligned with the pruned legal set: project by
+        # truncating the tail and renormalizing (review 2026-06-10; without
+        # this, a covering bet/all-in on the hero crashed the hand). A
+        # SHORTER stored σ̄ remains a vocab BUG — fail loud.
+        if len(arr) > n_legal:
+            n_nonraise = (1 if state.facing_bet else 0) + 1
+            if n_legal < n_nonraise:
+                raise ValueError(
+                    f"action-count mismatch at {key.as_tuple()}: blueprint "
+                    f"stores {len(arr)} actions but n_legal={n_legal} < "
+                    f"non-raise slots {n_nonraise} — not a raise-tail prune."
+                )
+            arr = arr[:n_legal]
+            if arr.sum() <= 0.0:
+                # All stored mass was on the pruned raise slots.
+                return self._on_miss(n_legal)
+        elif len(arr) < n_legal:
             raise ValueError(
                 f"action-count mismatch at {key.as_tuple()}: blueprint stores "
                 f"{len(arr)} actions but GameState vocab says {n_legal}. The "
@@ -375,28 +395,43 @@ class LiveResolveSource(StrategySource):
         add_allin = bool(state.add_explicit_allin)
 
         hero_idx = inputs["hero_player_idx"]
-        all_by_player = engine.solve(
-            board_strs=inputs["board_strs"],
-            board_ints=inputs["board_ints"],
-            player_ranges=inputs["player_ranges"],
-            positions_sorted=inputs["positions_sorted"],
-            player_seats=inputs["player_seats"],
-            pot_bb=inputs["pot_bb"],
-            stack_bb=inputs["stack_bb"],
-            bet_sizes=bet_sizes,
-            subsequent_bet_sizes=subsequent,
-            add_explicit_allin=add_allin,
-            game_action_indices=inputs["game_action_indices"],
-            iterations=self._iterations,
-            num_threads=self._num_threads,
-            num_rollouts=self._num_rollouts,
-            vec_mode=1 if self._vec_mode else 0,
-            readout=self._readout,
-            hero_replay={
-                "player_idx": hero_idx,
-                "street_actions": inputs["street_actions"],
-            },
-        )
+        try:
+            all_by_player = engine.solve(
+                board_strs=inputs["board_strs"],
+                board_ints=inputs["board_ints"],
+                player_ranges=inputs["player_ranges"],
+                positions_sorted=inputs["positions_sorted"],
+                player_seats=inputs["player_seats"],
+                pot_bb=inputs["pot_bb"],
+                stack_bb=inputs["stack_bb"],
+                bet_sizes=bet_sizes,
+                subsequent_bet_sizes=subsequent,
+                add_explicit_allin=add_allin,
+                game_action_indices=inputs["game_action_indices"],
+                iterations=self._iterations,
+                num_threads=self._num_threads,
+                num_rollouts=self._num_rollouts,
+                vec_mode=1 if self._vec_mode else 0,
+                readout=self._readout,
+                hero_replay={
+                    "player_idx": hero_idx,
+                    "street_actions": inputs["street_actions"],
+                    "expected_actions": inputs["n_legal"],
+                },
+            )
+        except Exception as e:
+            # Known abstraction-surface limits (tree raise cap, real-chips
+            # action-set divergence, unvalidated vocab shape) are surfaced
+            # by the engine as ReplayUnsupported -> convert to the
+            # documented LiveResolveUnsupported so HybridSource falls back
+            # to LOOKUP. Anything else (real solver errors, vocab drift)
+            # propagates loud. (Name fallback covers injected fake engines
+            # that define their own ReplayUnsupported.)
+            from app.services.cpu_es_solver import ReplayUnsupported
+            if isinstance(e, ReplayUnsupported) or \
+                    type(e).__name__ == "ReplayUnsupported":
+                raise LiveResolveUnsupported(str(e)) from e
+            raise
 
         row = hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
         strat = all_by_player.get(hero_idx, {}).get(row)
@@ -449,5 +484,8 @@ class HybridSource(StrategySource):
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
         try:
             return self._live.get_mix(state, hero_cards)
-        except LiveResolveUnsupported:
+        except LiveResolveUnsupported as e:
+            # Observability: the fallback is by design, but a live-resolve
+            # surface regression would otherwise be invisible in play.
+            logger.info("HybridSource: live unsupported -> LOOKUP (%s)", e)
             return self._lookup.get_mix(state, hero_cards)

@@ -71,7 +71,9 @@ def test_labels_to_index_zero_freq_dropped():
 def test_labels_to_index_out_of_range_raises():
     # An "All-in" with no explicit-allin slot maps to len(sizes)+1 (=2 here when
     # facing) which is in-range; force an out-of-range by giving n_legal=1.
-    with pytest.raises(LiveResolveUnsupported):
+    # A label outside the legal set is a vocab BUG -> ValueError (fail loud,
+    # never the lookup-fallback type — review 2026-06-10).
+    with pytest.raises(ValueError):
         labels_to_index_freqs(
             {"Bet 75%": 1.0}, has_to_call=False, n_legal=1,
             bet_sizes=(0.75,), add_explicit_allin=False,
@@ -94,8 +96,10 @@ def test_hero_grid_row_matches_by_class():
 
 
 def test_hero_grid_row_no_class_raises():
+    # A missing class row is a range-construction BUG (the hero's combo can
+    # never be board-blocked) -> ValueError, never the lookup-fallback type.
     grid = [[(_ci("As"), _ci("Ks"), 1.0)]]  # only AKs in the grid
-    with pytest.raises(LiveResolveUnsupported):
+    with pytest.raises(ValueError):
         hero_grid_row(grid, 0, (_ci("2c"), _ci("7d")))  # 72o not present
 
 
@@ -176,10 +180,11 @@ def test_build_inputs_mid_street_reentry_builds_replay():
 def test_build_inputs_excludes_prior_street_folder_includes_this_street_folder():
     # 3p: BTN folds to a flop bet (this-street folder -> INCLUDED in the flop
     # tree at the time, but by the TURN he's a prior-street folder -> EXCLUDED
-    # from the turn solve). BB + UTG continue.
+    # from the turn solve). BB + UTG continue. Board carries the turn card so
+    # the turn-entry solve passes the board-length guard.
     st = new_postflop_state(
         seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
-        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h")],
     )
     # Flop: BB bets, UTG calls, BTN folds -> round closes -> turn root.
     st_flop_faced = st.advance(1)         # BB bet; UTG to act
@@ -194,6 +199,39 @@ def test_build_inputs_excludes_prior_street_folder_includes_this_street_folder()
     assert inp_turn["street_actions"] == []      # turn root
     # Turn-entry pot includes the flop bet+call chips.
     assert inp_turn["pot_bb"] > 6.0
+
+
+def test_build_inputs_this_street_folder_does_not_cap_effective_stack():
+    # A SHORT stack that folds this street stays IN the tree (fold line is
+    # replayed) but must NOT set the solve's effective stack (review
+    # 2026-06-10: min over entry players let a dead 20bb stack shrink a
+    # ~97bb confrontation, silently).
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+        pot=875, stacks=[9725, 9725, 2000],   # BTN short
+    )
+    st = st.advance(0)                  # BB checks
+    st = st.advance(1)                  # UTG bets
+    st = st.advance_observed("fold").state  # short BTN folds -> BB to act
+    assert st.to_act_slot == 0 and st.facing_bet
+    inp = build_solve_inputs(st)
+    assert len(inp["player_ranges"]) == 3       # folder IS in the tree
+    assert abs(inp["stack_bb"] - 97.25) < 1e-9  # ... but doesn't cap stacks
+
+
+def test_build_inputs_rejects_street_board_mismatch():
+    # A turn-street state whose board still has only 3 cards would silently
+    # solve the WRONG street — must fail loud (the driver forgot to inject
+    # the dealt card).
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    st = st.advance(0).advance(0)  # flop checks through -> turn root
+    assert st.street == 2 and len(st.board) == 3
+    with pytest.raises(ValueError):
+        build_solve_inputs(st)
 
 
 def test_build_inputs_allows_check_through_to_hero():

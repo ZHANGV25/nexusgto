@@ -412,7 +412,7 @@ class GameState:
         new_street_history = self.street_history + (action_idx,)
 
         next_slot = self._next_to_act(
-            active, acted, street_bets, current_bet, start_after=slot,
+            active, acted, street_bets, current_bet, stacks, start_after=slot,
         )
 
         if next_slot is not None or self._one_left(active):
@@ -537,6 +537,23 @@ class GameState:
                 _apply_call()
                 applied = pot_add[0]
                 idx, off_tree = (1 if facing else 0), increment != to_call
+            elif len(self.legal_action_categories()) <= n_nonraise:
+                # Raise-CAP / commitment-pruned node: the trainer vocab here
+                # is [fold?, call] only (POSTFLOP_MAX_RAISES reached, or no
+                # canonical raise survives), so a further real raise has NO
+                # on-tree representation (review 2026-06-10: recording a
+                # phantom raise index corrupts every later blueprint key and
+                # crashes the street replay). Record the CALL — the only
+                # on-tree continuation — while applying the REAL chips, and
+                # keep raises_this_street at the cap so the remaining
+                # players' [fold, call] vocab stays consistent; the unmatched
+                # bet re-opens action for them via the street_bets predicate.
+                street_bets[slot] += increment
+                stacks[slot] -= increment
+                pot_add[0] = increment
+                current_bet = max(current_bet, street_bets[slot])
+                applied = increment
+                idx, off_tree = (1 if facing else 0), True
             else:
                 survivors = self._surviving_raise_amounts(slot)
                 if not survivors:
@@ -581,24 +598,37 @@ class GameState:
         acted: List[bool],
         street_bets: List[int],
         current_bet: int,
+        stacks: List[int],
         start_after: int,
     ) -> Optional[int]:
         """Next slot that still owes an action, scanning FORWARD from
         `start_after` (i.e. starting at start_after+1, wrapping around).
 
         A slot owes action if it is active AND (hasn't acted yet OR hasn't
-        matched the current bet). Forward-from-last-actor is the order the
-        blueprint encodes (capture-verified) — after a bet, action proceeds
-        in position order from the aggressor and only then wraps back to
-        already-checked players. Returns None when no one owes action (round
-        complete).
+        matched the current bet AND can still put in chips). The stack
+        condition is the rollout-reference all-in guard (rollout.py
+        `if stacks[p] <= 0: continue`): a SHORT all-in caller cannot match
+        the bet and owes nothing more — without this the round never closes
+        and the state desyncs from the table (review 2026-06-10). NOTE the
+        guard applies only to the unmatched-bet clause: an all-in player who
+        has NOT acted this street still gets their (forced) turn — the
+        trainer keeps all-in players in the rotation and those forced action
+        indices are part of trained blueprint keys (pinned by
+        test_deep_raise_war_node_now_serves_correct_length_mix).
+
+        Forward-from-last-actor is the order the blueprint encodes
+        (capture-verified) — after a bet, action proceeds in position order
+        from the aggressor and only then wraps back to already-checked
+        players. Returns None when no one owes action (round complete).
         """
         n = self.n_slots
         for step in range(1, n + 1):
             s = (start_after + step) % n
             if not active[s]:
                 continue
-            if (not acted[s]) or (street_bets[s] < current_bet):
+            if not acted[s]:
+                return s
+            if street_bets[s] < current_bet and stacks[s] > 0:
                 return s
         return None
 

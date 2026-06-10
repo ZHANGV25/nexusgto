@@ -121,15 +121,31 @@ def build_solve_inputs(
         s for s in range(state.n_slots) if state.active[s] or state.acted[s]
     ]
     if hero_slot not in entry_slots:
-        raise LiveResolveUnsupported(
+        # A bug condition (the to-act player must be in the hand), NOT a
+        # documented unsupported surface — fail loud, never lookup-fallback.
+        raise ValueError(
             "to-act player is not in the street-entry player set — "
             "inconsistent GameState"
+        )
+    if len(state.board) < _STREET_BOARD_LEN[state.street]:
+        raise ValueError(
+            f"GameState street={state.street} needs >= "
+            f"{_STREET_BOARD_LEN[state.street]} board cards but has "
+            f"{len(state.board)} — the driver must supply the dealt card(s) "
+            "(rebuild the state with the extended board) before a re-solve, "
+            "or the solve silently runs the WRONG street."
         )
 
     # Chips at street ENTRY: roll the current street's bets back out.
     pot_entry = int(state.pot) - sum(int(b) for b in state.street_bets)
-    entry_stacks = [
-        int(state.stacks[s]) + int(state.street_bets[s]) for s in entry_slots
+    # Effective stack for the SOLVE: min over players still CONTESTING
+    # (active). A this-street folder stays IN the tree (their fold line is
+    # replayed) but must not cap the live players' stack depth — a short
+    # stack that folded would otherwise silently shrink the whole solved
+    # game (review 2026-06-10).
+    contesting_stacks = [
+        int(state.stacks[s]) + int(state.street_bets[s])
+        for s in entry_slots if state.active[s]
     ]
 
     board_ints = list(state.board)[: _STREET_BOARD_LEN[state.street]]
@@ -158,7 +174,7 @@ def build_solve_inputs(
 
     # Chips -> big blinds (CpuEsSolver scales bb by 100 internally).
     pot_bb = float(pot_entry) / BIG_BLIND
-    stack_bb = float(min(entry_stacks)) / BIG_BLIND
+    stack_bb = float(min(contesting_stacks)) / BIG_BLIND
 
     # Action history UP TO street entry — the solved tree itself adds this
     # street's actions, so they must NOT be in the leaf-rollout history too.
@@ -200,8 +216,10 @@ def hero_grid_row(player_ranges: Sequence, hero_player_idx: int,
     for i, (g0, g1, _w) in enumerate(grid):
         if _class_key(g0, g1) == target:
             return i
-    raise LiveResolveUnsupported(
-        f"hero hand ({c0},{c1}) maps to no grid class (board-blocked?)"
+    # The hero's own combo can never be board-blocked, so a missing class
+    # row is a range-construction BUG — fail loud, never lookup-fallback.
+    raise ValueError(
+        f"hero hand ({c0},{c1}) maps to no grid class — corrupted range grid"
     )
 
 
@@ -226,8 +244,11 @@ def labels_to_index_freqs(
     label rounding, e.g. "Bet 74%"/"Bet 76%" both snapping to the 0.75 slot).
 
     Raises:
-        LiveResolveUnsupported: a label maps outside [0, n_legal) — a vocab
-            mismatch (wrong bet_sizes), surfaced loud rather than dropped.
+        ValueError: a label maps outside [0, n_legal) — a vocab BUG (wrong
+            bet_sizes), which must fail loud, never lookup-fallback. (The
+            legitimate tree-vs-vocab action-count divergences are routed to
+            the lookup fallback EARLIER, via the solver's expected_actions
+            check — by the time labels are mapped, counts must agree.)
     """
     out: Dict[int, float] = {}
     for label, freq in strat.items():
@@ -238,7 +259,7 @@ def labels_to_index_freqs(
             label, has_to_call, bet_sizes, add_explicit_allin
         )
         if not (0 <= idx < n_legal):
-            raise LiveResolveUnsupported(
+            raise ValueError(
                 f"solver label {label!r} -> index {idx} outside legal "
                 f"[0,{n_legal}); the solver bet_sizes must match the agent vocab."
             )

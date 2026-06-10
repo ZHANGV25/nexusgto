@@ -353,7 +353,9 @@ def test_6p_full_hand_off_tree_bet_hybrid(blueprint_path):
         seats=["SB", "BB", "UTG", "MP", "CO", "BTN"],
         preflop_prefix=[2, 1, 1, 1, 1, 1],
         board=[_ci("Ah"), _ci("Kh"), _ci("2c"), _ci("Qc"), _ci("2s")],
-    )  # pot 875, all six live; hero = BTN (slot 5)
+    )  # canonical 6p single-open entry: pot 1650, all six live; hero = BTN
+    entry_pot = st.pot
+    assert entry_pot == 1650  # 6×275 open/calls incl. blinds (derived)
 
     hero_mixes = []
 
@@ -374,7 +376,7 @@ def test_6p_full_hand_off_tree_bet_hybrid(blueprint_path):
     st = st.advance_observed("fold").state
     st = st.advance_observed("call").state
     assert st.to_act_slot == 5 and st.facing_bet
-    assert st.pot == 875 + 600 + 600                  # REAL chips in the pot
+    assert st.pot == entry_pot + 600 + 600            # REAL chips in the pot
     res = hero_act()
     # AdKd = top two on AhKh2c: a sane final-iterate never folds here. This
     # doubles as a play-quality canary on the off-tree faced-bet node.

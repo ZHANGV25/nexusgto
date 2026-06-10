@@ -32,6 +32,21 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+class ReplayUnsupported(Exception):
+    """The solved tree cannot faithfully represent this mid-street entry.
+
+    Raised (instead of ValueError) for KNOWN abstraction-surface limits —
+    the multiway raise cap (the tree caps street raises at
+    SS_MULTIWAY_MAX_RAISES=2 while the agent/trainer vocab allows 3), an
+    action-count divergence between the reached node and the agent's legal
+    set (real-chips commitment prune vs canonical tree chips), or an
+    unvalidated vocab shape (multi-size / explicit-allin) on the replay
+    path. LiveResolveSource converts this to LiveResolveUnsupported so the
+    hybrid source falls back to blueprint LOOKUP for the decision (the
+    blueprint vocab covers these lines). Genuine drift/bugs stay ValueError
+    and fail loud."""
+
 # poker-solver locations (the provider side-loads python/ onto sys.path at init;
 # we resolve the DLL + python dir from the same env the provider uses).
 _POKER_SOLVER = os.environ.get(
@@ -225,6 +240,23 @@ class CpuEsSolver:
             hero_idx: Optional[int] = None
             hero_node: Optional[int] = None
             if hero_replay is not None and hero_replay.get("street_actions"):
+                # The replay path is validated for the single-size,
+                # no-explicit-allin vocab only (the 8.05B shape). With
+                # multi-size / explicit-allin vocabs the agent's surviving-
+                # raise count can silently diverge from the tree's child
+                # count (different all-in baselines) and the structural
+                # check cannot distinguish raise children — route to the
+                # lookup fallback rather than risk a wrong-node read
+                # (review 2026-06-10).
+                if (add_explicit_allin or len(bet_sizes) > 1
+                        or len(subsequent_bet_sizes) > 1):
+                    raise ReplayUnsupported(
+                        "street replay is validated only for single-size, "
+                        "no-explicit-allin vocabs (got bet_sizes="
+                        f"{list(bet_sizes)}, subsequent="
+                        f"{list(subsequent_bet_sizes)}, allin="
+                        f"{add_explicit_allin})"
+                    )
                 hero_idx = int(hero_replay["player_idx"])  # type: ignore[arg-type]
                 hero_node = self._replay_street_node(
                     tree,
@@ -238,6 +270,19 @@ class CpuEsSolver:
                         f"(type={reached.type}, player={reached.player}) — not a "
                         f"decision node owned by hero player {hero_idx}. The "
                         "recorded street history does not match the solved tree."
+                    )
+                expected = hero_replay.get("expected_actions")
+                if expected is not None and reached.num_children != int(expected):  # type: ignore[arg-type]
+                    # The tree's action set at the hero's node differs from
+                    # the agent's legal set: either the multiway raise cap
+                    # (tree capped at 2 raises, vocab allows a 3rd — the mix
+                    # would silently lack it) or a real-chips commitment
+                    # prune the canonical tree chips don't have. Both are
+                    # KNOWN abstraction limits -> lookup fallback.
+                    raise ReplayUnsupported(
+                        f"hero node has {reached.num_children} tree actions "
+                        f"but the agent's legal set has {expected} — the "
+                        "solved tree cannot represent this decision"
                     )
 
             # ── Extract strategies → all_by_player, with the weight-0 /
@@ -331,16 +376,29 @@ class CpuEsSolver:
                     "the solved tree"
                 )
             want = int(want_idx)
+            actor = nd.player
+            mx = max(nd.bets[q] for q in range(n_players))
+            to_call = mx - nd.bets[actor]
+            n_nonraise = 2 if to_call > 0 else 1
             if not (0 <= want < nd.num_children):
+                if nd.num_children == n_nonraise and want >= n_nonraise:
+                    # The recorded action is a RAISE but this tree node has
+                    # no raise children: the tree's raise cap
+                    # (SS_MULTIWAY_MAX_RAISES=2 multiway vs the agent/trainer
+                    # cap of 3) — a known abstraction limit, NOT drift.
+                    # Surface as ReplayUnsupported so the hybrid falls back
+                    # to LOOKUP, whose vocab covers the 3rd raise.
+                    raise ReplayUnsupported(
+                        f"street replay step {step}: recorded raise (index "
+                        f"{want}) at a raise-capped tree node {ni} "
+                        f"({nd.num_children} children) — tree raise cap is "
+                        "below the agent vocab's"
+                    )
                 raise ValueError(
                     f"street replay step {step}: action index {want} out of "
                     f"range [0,{nd.num_children}) at node {ni} — vocab drift "
                     "or off-tree action"
                 )
-            actor = nd.player
-            mx = max(nd.bets[q] for q in range(n_players))
-            to_call = mx - nd.bets[actor]
-            n_nonraise = 2 if to_call > 0 else 1
             child = tree.nodes[nd.children[want]]
             if to_call > 0 and want == 0:
                 # fold: actor leaves the hand, chips unchanged.
@@ -371,22 +429,29 @@ class CpuEsSolver:
 
     def _node_action_labels(self, tree, node_idx: int, n_players: int) -> List[str]:
         """Synthesize correct action labels for a decision node from the
-        tree's own chip/active deltas — the exact INVERSE of the tree
-        builder's amount formulas (ss_tree_builder.c:321-326).
+        tree's own chip/active deltas — the exact inverse of the tree
+        BUILDER's STORAGE convention.
 
         The production _build_labels_at_node is chip-amount-only and labels
         faced-bet nodes wrongly (a fold reads "Check", a call reads as a
         pot-fraction "Raise") — fine for the display path, which only reads
-        street roots, but wrong for a replayed mid-street node. These
-        synthesized labels round-trip exactly through
-        _solver_label_to_action_index with the node-correct size vocab.
+        street roots, but wrong for a replayed mid-street node.
+
+        Builder convention (review 2026-06-10 — NOT the trainer's): at a
+        faced-bet node ss_tree_builder.c:326 computes bet_amount = to_call +
+        size*(pot+to_call) and :340 STORES the child level as
+        mx + bet_amount (on top of the max bet, not the actor's own bet), so
+        the child's delta vs the actor's bet = 2*to_call + size*(pot+to_call)
+        and size = (delta - 2*to_call)/(pot + to_call). The all-in clamp is
+        applied to bet_amount (= delta - to_call) against the CONSTANT
+        street-entry effective stack (:328).
         """
         nd = tree.nodes[node_idx]
         actor = nd.player
         mx = max(nd.bets[q] for q in range(n_players))
         to_call = mx - nd.bets[actor]
         pot = float(nd.pot)
-        remaining = int(tree.effective_stack) - int(nd.bets[actor])
+        stack = int(tree.effective_stack)
         labels: List[str] = []
         for c in range(nd.num_children):
             ch = tree.nodes[nd.children[c]]
@@ -397,11 +462,12 @@ class CpuEsSolver:
                 labels.append("Call" if to_call > 0 else "Check")
                 continue
             delta = int(ch.bets[actor]) - int(nd.bets[actor])
-            if delta >= remaining:
+            bet_amount = delta - to_call  # the builder's clamped quantity
+            if bet_amount >= stack:
                 labels.append("All-in")
                 continue
             if to_call > 0:
-                frac = (delta - to_call) / max(pot + to_call, 1.0)
+                frac = (delta - 2 * to_call) / max(pot + to_call, 1.0)
                 labels.append(f"Raise {int(round(frac * 100))}%")
             else:
                 frac = delta / max(pot, 1.0)
