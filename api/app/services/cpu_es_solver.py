@@ -227,12 +227,9 @@ class CpuEsSolver:
             if hero_replay is not None and hero_replay.get("street_actions"):
                 hero_idx = int(hero_replay["player_idx"])  # type: ignore[arg-type]
                 hero_node = self._replay_street_node(
-                    tree, gpu._tree,
+                    tree,
                     list(hero_replay["street_actions"]),  # type: ignore[arg-type]
                     n_players=n_players,
-                    bet_sizes=list(bet_sizes),
-                    subsequent_bet_sizes=list(subsequent_bet_sizes),
-                    add_explicit_allin=add_explicit_allin,
                 )
                 reached = tree.nodes[hero_node]
                 if reached.type != 0 or reached.player != hero_idx:
@@ -255,7 +252,13 @@ class CpuEsSolver:
                     node_idx = self._first_decision_node_for(tree, p_idx)
                 raw: Dict[int, Dict[str, float]] = {}
                 if node_idx is not None:
-                    labels = self._build_labels(gpu._tree, node_idx)
+                    if hero_idx is not None and p_idx == hero_idx:
+                        # Replayed (possibly faced-bet) node: synthesize
+                        # labels from the tree's own chip deltas —
+                        # _build_labels is wrong off the street root.
+                        labels = self._node_action_labels(tree, node_idx, n_players)
+                    else:
+                        labels = self._build_labels(gpu._tree, node_idx)
                     sigma = read_strategy(node_idx)  # [nh, na] or None
                     na = sigma.shape[1] if sigma is not None else 0
                     nh = len(player_ranges[p_idx])
@@ -294,32 +297,31 @@ class CpuEsSolver:
     def _replay_street_node(
         self,
         tree,
-        gpu_tree,
         street_actions: List[int],
         *,
         n_players: int,
-        bet_sizes: List[float],
-        subsequent_bet_sizes: List[float],
-        add_explicit_allin: bool,
     ) -> int:
         """Walk the solved tree from the street root through this street's
         recorded agent action indices; return the reached node index.
 
-        At each decision node the tree's child LABELS are mapped to agent
-        action indices with the production _solver_label_to_action_index
-        (the same metadata-driven translation the response path uses), and
-        the child whose index equals the recorded action is taken. The size
-        vocab switches to subsequent_bet_sizes once a bet/raise has occurred
-        this street — mirroring GameState.legal_action_categories.
+        The tree builder (poker-solver src/ss_tree_builder.c:272-370) emits
+        children in the TRAINER's action order — [fold iff facing a bet]
+        [check/call][raises in size order][explicit all-in last] — which is
+        the SAME convention the agent's action indices use
+        (legal_categories_chips / _solver_label_to_action_index). So the
+        recorded agent index IS the child index. Each step is STRUCTURALLY
+        verified against the child's chips/active state (fold → actor
+        inactive; check/call → actor matched the max bet; raise → actor
+        exceeds it) so a convention drift fails loud instead of silently
+        walking the wrong line. (Do NOT map via _build_labels_at_node here:
+        its labels are chip-amount-only and wrong at faced-bet nodes —
+        found empirically 2026-06-10.)
 
-        Fail-loud (ValueError) on: a non-decision node mid-replay, or a
-        recorded action matching zero or 2+ children (vocab drift / an
-        off-tree action — translation of off-tree sizes is out of scope).
+        Fail-loud (ValueError) on: a non-decision node mid-replay, an
+        out-of-range action index (off-tree action — bet-size translation
+        is out of scope), or a structural-verification mismatch.
         """
-        from app.services.session_pipeline import _solver_label_to_action_index
-
         ni = 0  # street root
-        raises_so_far = 0
         for step, want_idx in enumerate(street_actions):
             nd = tree.nodes[ni]
             if nd.type != 0 or nd.num_children <= 0:
@@ -328,30 +330,80 @@ class CpuEsSolver:
                     f"node (type={nd.type}) — recorded history does not match "
                     "the solved tree"
                 )
-            labels = self._build_labels(gpu_tree, ni)
-            if len(labels) != nd.num_children:
+            want = int(want_idx)
+            if not (0 <= want < nd.num_children):
                 raise ValueError(
-                    f"street replay step {step}: node {ni} has "
-                    f"{nd.num_children} children but {len(labels)} labels"
+                    f"street replay step {step}: action index {want} out of "
+                    f"range [0,{nd.num_children}) at node {ni} — vocab drift "
+                    "or off-tree action"
                 )
-            acting = nd.player
-            bets = [nd.bets[q] for q in range(n_players)]
-            has_to_call = max(bets) > bets[acting]
-            sizes = tuple(subsequent_bet_sizes if raises_so_far > 0 else bet_sizes)
-            matches = [
-                c for c, lab in enumerate(labels)
-                if _solver_label_to_action_index(
-                    lab, has_to_call, sizes, add_explicit_allin) == int(want_idx)
-            ]
-            if len(matches) != 1:
-                raise ValueError(
-                    f"street replay step {step}: action index {want_idx} maps "
-                    f"to {len(matches)} children at node {ni} "
-                    f"(labels={labels}, has_to_call={has_to_call}, "
-                    f"sizes={sizes}) — vocab drift or off-tree action"
-                )
-            chosen = labels[matches[0]].lower()
-            if chosen.startswith(("bet", "raise")) or "all" in chosen:
-                raises_so_far += 1
-            ni = nd.children[matches[0]]
+            actor = nd.player
+            mx = max(nd.bets[q] for q in range(n_players))
+            to_call = mx - nd.bets[actor]
+            n_nonraise = 2 if to_call > 0 else 1
+            child = tree.nodes[nd.children[want]]
+            if to_call > 0 and want == 0:
+                # fold: actor leaves the hand, chips unchanged.
+                if child.active[actor] or child.bets[actor] != nd.bets[actor]:
+                    raise ValueError(
+                        f"street replay step {step}: child {want} of node {ni} "
+                        "does not look like a FOLD — tree child-order "
+                        "convention drift (fail loud)"
+                    )
+            elif want == n_nonraise - 1:
+                # check/call: actor matches the outstanding max bet.
+                if not child.active[actor] or child.bets[actor] != mx:
+                    raise ValueError(
+                        f"street replay step {step}: child {want} of node {ni} "
+                        "does not look like a CHECK/CALL — tree child-order "
+                        "convention drift (fail loud)"
+                    )
+            else:
+                # bet/raise: actor exceeds the prior max bet.
+                if not child.active[actor] or child.bets[actor] <= mx:
+                    raise ValueError(
+                        f"street replay step {step}: child {want} of node {ni} "
+                        "does not look like a BET/RAISE — tree child-order "
+                        "convention drift (fail loud)"
+                    )
+            ni = nd.children[want]
         return ni
+
+    def _node_action_labels(self, tree, node_idx: int, n_players: int) -> List[str]:
+        """Synthesize correct action labels for a decision node from the
+        tree's own chip/active deltas — the exact INVERSE of the tree
+        builder's amount formulas (ss_tree_builder.c:321-326).
+
+        The production _build_labels_at_node is chip-amount-only and labels
+        faced-bet nodes wrongly (a fold reads "Check", a call reads as a
+        pot-fraction "Raise") — fine for the display path, which only reads
+        street roots, but wrong for a replayed mid-street node. These
+        synthesized labels round-trip exactly through
+        _solver_label_to_action_index with the node-correct size vocab.
+        """
+        nd = tree.nodes[node_idx]
+        actor = nd.player
+        mx = max(nd.bets[q] for q in range(n_players))
+        to_call = mx - nd.bets[actor]
+        pot = float(nd.pot)
+        remaining = int(tree.effective_stack) - int(nd.bets[actor])
+        labels: List[str] = []
+        for c in range(nd.num_children):
+            ch = tree.nodes[nd.children[c]]
+            if to_call > 0 and c == 0:
+                labels.append("Fold")
+                continue
+            if c == (1 if to_call > 0 else 0):
+                labels.append("Call" if to_call > 0 else "Check")
+                continue
+            delta = int(ch.bets[actor]) - int(nd.bets[actor])
+            if delta >= remaining:
+                labels.append("All-in")
+                continue
+            if to_call > 0:
+                frac = (delta - to_call) / max(pot + to_call, 1.0)
+                labels.append(f"Raise {int(round(frac * 100))}%")
+            else:
+                frac = delta / max(pot, 1.0)
+                labels.append(f"Bet {int(round(frac * 100))}%")
+        return labels
