@@ -22,6 +22,7 @@ multi-size raise trees beyond POSTFLOP_MAX_RAISES are out of scope (plan §6).
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
@@ -79,6 +80,34 @@ class CanonicalChipsUnsupported(Exception):  # noqa: N818 - matches sibling nami
     """
 
 
+def preflop_raise_amount_f32(
+    frac: float, pot: int, to_call: int, stack: int,
+) -> int:
+    """Preflop raise INCREMENT, bit-exact to the trainer's FLOAT32 arithmetic.
+
+    The trainer (mccfr_blueprint.c generate_actions) computes
+    `ba = to_call + (int)(bet_sizes[i] * (pot + to_call))` with bet_sizes[i]
+    a C float (float32). Python doubles DIVERGE on some preflop nodes:
+    (int)(0.7f * 700) == 490 in C but int(0.7 * 700) == 489 in doubles —
+    the cold-3-bet vs-UTG-open node (capture-verified against the literal
+    bp_generate_actions C function, poker-solver
+    scripts/probe_preflop_shapes.py, 2026-06-10). float32(0.7) has 24
+    significant bits, so its product with a chip count (< 2^20) is exact in
+    a double; rounding that product back to float32 reproduces the C single
+    multiply (mulss) bit-exactly.
+
+    Postflop sizes (0.75, 1.0) are exactly representable in binary, so the
+    double-based raise_to_amount never diverges postflop and stays unchanged.
+    """
+    f = struct.unpack("f", struct.pack("f", float(frac)))[0]
+    base = pot if to_call == 0 else pot + to_call
+    prod = int(struct.unpack("f", struct.pack("f", f * base))[0])
+    ba = prod if to_call == 0 else to_call + prod
+    if ba >= stack:
+        ba = stack
+    return ba
+
+
 def canonical_flop_chips(
     preflop_prefix: List[int],
     seats: List[str],
@@ -86,17 +115,26 @@ def canonical_flop_chips(
     """Derive the flop-entry (pot, per-slot stacks) for a canonical preflop line.
 
     Walks the preflop action sequence through the TRAINER's amount formula
-    (raise_to_amount) with the [50,100]/10000 convention and the 0.7 open, then
+    (preflop_raise_amount_f32 — float32, bit-exact to bp_generate_actions)
+    with the [50,100]/10000 convention and the 0.7 (smallest) size, then
     returns the pot and the per-slot (SB-first over `seats`) remaining stacks.
 
-    Only the canonical single-open shape is supported (one raise = the open,
-    then folds/flat-calls). VERIFIED: returns (600, (9725,9725)) for the 2p
-    line and (875, (9725,9725,9725)) for the 3p line, matching the blueprint
-    σ̄ length along the raise-war line.
+    Supported (capture-verified) shapes:
+      * single open + flat callers — VERIFIED (600, (9725,9725)) 2p and
+        (875, (9725,9725,9725)) 3p, matching the blueprint σ̄ length along
+        the raise-war line (2026-06-04).
+      * 3-bet HEADS-UP: open → 3-bet (smallest, index 2) → folds back →
+        opener calls. VERIFIED 2026-06-10 against the literal trainer C
+        amounts (bp_generate_actions walk, all 15 opener/3-bettor pairs) +
+        blueprint σ̄-length walks to the river all-in clamp: e.g.
+        BTN-open/BB-3bet → (1440, (9305, 9305)); UTG-open/BTN-3bet →
+        (1680, (9235, 9235)). Evidence: poker-solver
+        scripts/preflop_shapes_captured.json.
 
     Raises:
-        CanonicalChipsUnsupported: a non-canonical preflop shape (limp, 3bet+,
-            multiple raises) — chips can't be derived without new ground truth.
+        CanonicalChipsUnsupported: a non-canonical preflop shape (limp, 4bet+,
+            non-smallest raise index, 3-bet pot that isn't heads-up) — chips
+            can't be derived without new ground truth.
     """
     for s in seats:
         if s not in FULL_SEAT:
@@ -110,46 +148,80 @@ def canonical_flop_chips(
     pot = SMALL_BLIND + BIG_BLIND
     current_bet = BIG_BLIND
     raises_seen = 0
+    folded: set = set()
+    acted: set = set()
 
-    # The prefix is one index per preflop action in acting order UTG..BB,
-    # truncated after the last voluntary actor (folds inferred). We replay it.
+    # The prefix is one index per preflop action taken, in the trainer's
+    # owing-action order: a first orbit UTG..BB, then wrapping back to anyone
+    # who hasn't matched the current bet (the opener facing a 3-bet). It may
+    # be truncated after the last voluntary actor (single-open shape).
     idx = 0
     n = len(preflop_prefix)
-    for pos in _PREFLOP_ORDER:
+    for _orbit in range(3):  # 2 raises close within two orbits; 3rd is a guard
         if idx >= n:
             break
-        action = preflop_prefix[idx]
-        idx += 1
-        if action == 0:  # fold
-            continue
-        if action == 1:  # call (flat)
-            to_call = current_bet - bets[pos]
-            bets[pos] += to_call
-            pot += to_call
-        elif action == 2:  # raise — canonical: only the single open
-            if raises_seen >= 1:
-                raise CanonicalChipsUnsupported(
-                    "more than one preflop raise (3bet+/squeeze) — chips not "
-                    "capture-verified; pass explicit pot/stacks"
+        for pos in _PREFLOP_ORDER:
+            if idx >= n:
+                break
+            if pos in folded:
+                continue
+            owes = (pos not in acted) or (bets[pos] < current_bet)
+            if not owes:
+                continue
+            action = preflop_prefix[idx]
+            idx += 1
+            acted.add(pos)
+            if action == 0:  # fold
+                folded.add(pos)
+                continue
+            if action == 1:  # call (flat / close the 3-bet pot)
+                to_call = current_bet - bets[pos]
+                bets[pos] += to_call
+                pot += to_call
+            elif action == 2:  # raise — smallest size (open / 3-bet)
+                if raises_seen >= 2:
+                    raise CanonicalChipsUnsupported(
+                        "more than two preflop raises (4bet+) — chips not "
+                        "capture-verified; pass explicit pot/stacks"
+                    )
+                to_call = current_bet - bets[pos]
+                amt = preflop_raise_amount_f32(
+                    PREFLOP_OPEN_FRACTION, pot=pot, to_call=to_call,
+                    stack=INITIAL_STACK - bets[pos],
                 )
-            to_call = current_bet - bets[pos]
-            amt = raise_to_amount(
-                PREFLOP_OPEN_FRACTION, pot=pot, to_call=to_call,
-                stack=INITIAL_STACK - bets[pos],
-            )
-            bets[pos] += amt
-            pot += amt
-            current_bet = bets[pos]
-            raises_seen += 1
-        else:
-            raise CanonicalChipsUnsupported(
-                f"unsupported preflop action index {action}"
-            )
+                bets[pos] += amt
+                pot += amt
+                current_bet = bets[pos]
+                raises_seen += 1
+            else:
+                raise CanonicalChipsUnsupported(
+                    f"unsupported preflop action index {action} (only the "
+                    f"smallest raise size = index 2 is capture-verified)"
+                )
 
     if raises_seen == 0:
         raise CanonicalChipsUnsupported(
             "no preflop raise (open-limp pot) — chips not capture-verified"
         )
+    if raises_seen == 2:
+        # 3-bet pots are capture-verified HEADS-UP only (opener vs 3-bettor,
+        # everyone else folded, opener's call closing the round).
+        replay_live = {
+            pos for pos in _PREFLOP_ORDER
+            if pos not in folded and pos in acted
+        }
+        if len(replay_live) != 2 or any(
+            bets[pos] != current_bet for pos in replay_live
+        ):
+            raise CanonicalChipsUnsupported(
+                "3-bet pot that is not a closed heads-up line (squeeze/"
+                "multiway/unclosed) — chips not capture-verified"
+            )
+        if replay_live != live_seats:
+            raise ValueError(
+                f"seats {sorted(live_seats)} do not match the live players "
+                f"of the replayed 3-bet line {sorted(replay_live)}"
+            )
 
     # Per-slot stacks, SB-first over the LIVE seats (matches new_postflop_state
     # slot ordering). Each live seat invested bets[pos]; folded seats aren't at
