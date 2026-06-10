@@ -107,6 +107,21 @@ ES_EXPORT void es_free(ESResolver *r);
  * Set BEFORE es_run. */
 ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
 
+/* Traverser vectorization: 0 = SCALAR (default; the validated reference — one
+ * walk updates one traverser hand), 1 = VECTORIZED (one walk down a single
+ * opponent-sampled path updates ALL traverser hands; lower variance ⇒ fewer
+ * iters for the same exploitability; IDENTICAL fixed point). Card-conflicting
+ * traverser hands are skipped per walk (the unbiased card-removal estimator).
+ * Set BEFORE es_run. Gate 1 (VECTOR_TRAVERSER_DESIGN.md): vec must reach the
+ * SAME exploitability as scalar on a 2p/3p spot with OVERLAPPING ranges. */
+ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
+
+/* DEBUG: per-node traverser-visit counter (single-thread localization of the
+ * vec reachability bug). Enable BEFORE es_run; read with es_get_visit_count
+ * (returns -1 if disabled / bad index). Zero overhead when not enabled. */
+ES_EXPORT void es_enable_visit_counter(ESResolver *r);
+ES_EXPORT int64_t es_get_visit_count(const ESResolver *r, int node_idx);
+
 /* Run `iterations` ES iterations. Each iteration walks once per player as
  * traverser (matching es_solver.py iterate()). num_threads > 1 enables
  * Hogwild (iterations partitioned across threads; shared tables, racy adds).
