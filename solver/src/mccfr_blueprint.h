@@ -847,6 +847,34 @@ BP_EXPORT int bp_compute_flop_bucket_for_test(const BPSolver *s,
                                                 int player,
                                                 int hand_idx);
 
+/**
+ * Phase R Step 12 — test wrapper for the cont_ev boundary SLOT-KEY
+ * helper (bp_boundary_slot_hand_index). The production call site keys
+ * cont_ev_table slots by the traverser's CANONICAL FULL-DECK PAIR INDEX
+ * in [0, 1326) — computed from the sampled hand's actual cards (sort
+ * c0 < c1; c0*51 - c0*(c0-1)/2 + c1 - c0 - 1) — matching the consumer
+ * (rollout.c rollout_hand_index_for_flop) and the BPR5 verifier. It
+ * never consults the texture cache (the Step 11 bug keyed slots with
+ * [0,200) texture buckets the consumer never queries).
+ *
+ * Args:
+ *   s        — initialized BPSolver (hands[player] populated).
+ *   board    — 3 dealt flop cards (raw).
+ *   player   — player whose sampled hand is keyed.
+ *   hand_idx — index into s->hands[player] (the per-player hand list),
+ *              NOT a full-deck pair index (they coincide only under
+ *              bp_init_unified's full-1326 deal).
+ *
+ * Returns:
+ *   ≥0 — canonical full-deck pair index in [0, 1326).
+ *   -1 — out-of-range index, malformed cards, or hand blocked by the
+ *        flop (slot would be skipped; EV still computed).
+ */
+BP_EXPORT int bp_boundary_slot_hand_index_for_test(const BPSolver *s,
+                                                   const int *board,
+                                                   int player,
+                                                   int hand_idx);
+
 #ifdef __cplusplus
 }
 #endif

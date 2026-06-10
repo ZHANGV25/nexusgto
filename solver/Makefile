@@ -321,6 +321,23 @@ $(BUILD_DIR)/test_bpr5_roundtrip: tests/test_bpr5_roundtrip.c \
 test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
 	./$(BUILD_DIR)/test_bpr5_roundtrip
 
+# ── Phase R Step 12: cont_ev boundary slot-key encoding pin ──
+# Asserts the call-site key is the consumer's canonical full-deck pair
+# index (rollout_hand_index_for_flop encoding), NOT a texture bucket and
+# NOT the raw per-player hand-list index. Deterministic, <1s.
+$(BUILD_DIR)/test_cont_ev_key: tests/test_cont_ev_key.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_ev_key.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
+	./$(BUILD_DIR)/test_cont_ev_key
+
 # ── Phase R Block B.1+B.2: end-to-end save → load → query parity ──
 # 5K-iter trainer drive with prob=1.0; capture one populated slot's
 # (ev_sum, ev_count); save+load; query via bp_query_boundary_ev; assert

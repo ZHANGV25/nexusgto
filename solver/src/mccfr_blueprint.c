@@ -1173,6 +1173,65 @@ static int compute_boundary_flop_bucket(const BPSolver *s,
     return s->texture_bucket_cache[found * BP_MAX_HANDS + hand_idx];
 }
 
+/* Phase R Step 12 (2026-06-10) — cont_ev boundary SLOT KEY.
+ *
+ * The cont_ev_table slot key is the traverser's CANONICAL FULL-DECK PAIR
+ * INDEX in [0, 1326), computed from the sampled hand's actual cards:
+ * sort c0 < c1, then c0*51 - c0*(c0-1)/2 + c1 - c0 - 1. This is the
+ * encoding the CONSUMER queries (rollout.c rollout_hand_index_for_flop)
+ * and the verifier accepts (tools/phase_r_probe_analysis/
+ * verify_bpr5_roundtrip.c) — the Step-10 artifact is keyed this way.
+ *
+ * It is deliberately NOT compute_boundary_flop_bucket(): that returns
+ * flop-TEXTURE buckets in [0, 200), which the consumer never queries —
+ * fresh walks would MISS every slot with bucket >= 200 and SILENTLY
+ * COLLIDE with real hand indices < 200. And it is deliberately NOT the
+ * raw ts->sampled_hands[player] index: that equals the canonical pair
+ * index only under bp_init_unified's full-1326 deal (mccfr_blueprint.c
+ * ~:2790 enumerates c0<c1 in exactly the canonical order); bp_init_ex
+ * subgame/test fixtures carry arbitrary hand subsets where the local
+ * index diverges. Deriving from the cards is correct in both.
+ *
+ * Returns -1 ("skip slot accumulation; EV still computed" — the caller's
+ * existing guard semantics) for: no flop yet, out-of-range hand index,
+ * malformed cards, or a hand blocked by the flop (mirrors the consumer's
+ * rollout_hand_index_for_flop guard, which fail-louds on blocked). */
+static int bp_boundary_slot_hand_index(const BPSolver *s,
+                                       const TraversalState *ts,
+                                       int player) {
+    if (ts->num_board < 3) return -1;
+    int hand_idx = ts->sampled_hands[player];
+    if (hand_idx < 0 || hand_idx >= s->num_hands[player]) return -1;
+    int c0 = s->hands[player][hand_idx][0];
+    int c1 = s->hands[player][hand_idx][1];
+    if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52 || c0 == c1) return -1;
+    for (int b = 0; b < 3; b++) {
+        if (ts->board[b] == c0 || ts->board[b] == c1) return -1;
+    }
+    if (c0 > c1) { int t = c0; c0 = c1; c1 = t; }
+    return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
+}
+
+/* Public test wrapper for bp_boundary_slot_hand_index — see header.
+ * Builds a synthetic TraversalState the same way the bucket wrapper
+ * below does. hand_idx here is an index into s->hands[player] (the
+ * solver's per-player hand list), NOT a full-deck pair index. */
+int bp_boundary_slot_hand_index_for_test(const BPSolver *s,
+                                         const int *board,
+                                         int player,
+                                         int hand_idx) {
+    if (!s || !board || player < 0 || player >= BP_MAX_PLAYERS) return -1;
+    if (hand_idx < 0 || hand_idx >= BP_MAX_HANDS) return -1;
+    TraversalState ts;
+    memset(&ts, 0, sizeof(ts));
+    ts.board[0] = board[0];
+    ts.board[1] = board[1];
+    ts.board[2] = board[2];
+    ts.num_board = 3;
+    ts.sampled_hands[player] = hand_idx;
+    return bp_boundary_slot_hand_index(s, &ts, player);
+}
+
 /* Public test wrapper — see header for contract. Builds a synthetic
  * TraversalState with just the board + sampled_hands[player] populated,
  * then delegates to compute_boundary_flop_bucket(). Production code
@@ -1420,16 +1479,17 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             uint64_t boundary_action_hash = compute_action_hash(
                 ts->action_history, ts->history_len);
 
-            /* Phase R Step 11 fix: compute the flop bucket directly from
-             * texture_bucket_cache, bypassing both ts->flop_cache (which
-             * Step 10's 1B retrain showed was effectively NULL/uncomputed
-             * at the dispatch point — 100% of saved slots had bucket == hand_idx)
-             * and bucket_map[1][p][h] (identity-initialized; never overridden
-             * by bp_set_buckets() for postflop streets in the unified driver,
-             * so it returns hand_idx too). The helper canonicalizes ts->board
-             * and reads texture_bucket_cache[tex][hand_idx] — the same lookup
-             * the parent's flop-deal block uses at the top of round_done. */
-            int trav_bucket = compute_boundary_flop_bucket(
+            /* Phase R Step 12 KEY FIX (2026-06-10): the slot key is the
+             * traverser's canonical full-deck PAIR INDEX in [0, 1326) —
+             * matching the consumer (rollout.c rollout_hand_index_for_flop)
+             * and the verifier (verify_bpr5_roundtrip.c), and matching the
+             * Step-10 artifact's empirical keying (gate-0, 84% of slot
+             * buckets >= 200). The Step 11 texture-bucket lookup
+             * (compute_boundary_flop_bucket, [0,200)) wrote a key the
+             * consumer never queries: fresh walks would MISS all slots and
+             * SILENTLY COLLIDE for hand_idx < 200. -1 keeps the existing
+             * "skip slot accumulation" guard semantics. */
+            int trav_bucket = bp_boundary_slot_hand_index(
                 s, ts, ts->traverser);
 
             BPContEVEntry *cb_slot = NULL;
