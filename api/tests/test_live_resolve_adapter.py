@@ -134,9 +134,12 @@ def test_live_resolve_3p_turn_anchor(cpu_es_engine, blueprint_path):
         ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
         cpu_es_solver=cpu_es_engine, iterations=600,
     )
+    # NOTE (review 2026-06-10): the board must carry the TURN card — with a
+    # 3-card board this anchor was silently solving a FLOP (the exact
+    # wrong-street bug the new board-length guard now rejects).
     st = new_postflop_state(
         seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
-        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h")],
     )
     # Walk the flop check-through to the turn root: BB chk, UTG chk, BTN chk.
     for idx in [0, 0, 0]:
