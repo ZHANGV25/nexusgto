@@ -108,9 +108,17 @@ int main(void) {
     /* ── Load via reader path ───────────────────────────────────── */
     BPSReader r;
     memset(&r, 0, sizeof(r));
-    /* Per feedback_phase3_postflop_bucket_lookup_blocker.md: phase3's
-     * texture_cache.bin uses the boost (legacy) mixer. */
-    int n_reader = bps_load_texture_cache(&r, cache_path(), 1);
+    /* Mixer: splitmix64 (use_legacy=0). The canonical
+     * stores splitmix64 flop hashes — byte-verified 2026-06-11 (key[0] =
+     * splitmix64 hash of canonical flop [51,50,49]). The previous
+     * use_legacy=1 here targeted the RETIRED boost-keyed cache; against
+     * the splitmix file it made EVERY bps_hand_to_bucket query return -1
+     * (reader_miss=100%) and this test passed VACUOUSLY because
+     * divergent==0 was trivially satisfied. The byte_equal>0 floor check
+     * below guards against that failure mode recurring. Override the
+     * fixture path via BPS_TEXTURE_CACHE; a boost-keyed fixture would
+     * now fail loudly instead of silently passing. */
+    int n_reader = bps_load_texture_cache(&r, cache_path(), 0);
     if (n_reader <= 0) {
         printf("[FAIL] bps_load_texture_cache failed; check %s\n", cache_path());
         free(s.texture_bucket_cache);
@@ -279,6 +287,26 @@ int main(void) {
                (long long)reader_neg);
         failed++;
     } else {
+        passed++;
+    }
+
+    /* (5) Non-vacuous-pass guard (added 2026-06-11). With a mixer
+     * mismatch between the loaded cache's stored hashes and the reader's
+     * query-time mixer, EVERY lookup returns -1: reader_miss=100%,
+     * divergent=0, and criteria (2)-(4) pass trivially — exactly how the
+     * boost/splitmix swap slipped through before. Require that the large
+     * majority of covered queries actually byte-match. The 90% floor
+     * (not 100%) tolerates the documented open ~1% paired-board
+     * flushdraw miss class without masking a wholesale mixer mismatch. */
+    if (total == 0 || byte_equal * 10 < total * 9) {
+        printf("[FAIL] byte_equal=%lld of %lld (<90%%) — vacuous-pass "
+               "guard: lookups are missing wholesale (mixer mismatch "
+               "between cache keys and reader query hashing?)\n",
+               (long long)byte_equal, (long long)total);
+        failed++;
+    } else {
+        printf("[PASS] byte_equal=%lld of %lld (>=90%% non-vacuous floor)\n",
+               (long long)byte_equal, (long long)total);
         passed++;
     }
 
