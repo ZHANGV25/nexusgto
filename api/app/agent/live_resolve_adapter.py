@@ -9,11 +9,12 @@ ENGINE CHOICE (empirically validated — docs/BENCHMARK_RESULTS.md §3c):
     real blueprint-grounded leaf values off the GPU lock; N-player generic, so
     it serves 2p AND 3p (the "5p only" in postflop_provider is a routing policy,
     not an engine limit). 2p-flop ~3s, 3p-turn ~18s at a few hundred iters.
-  - river        → NOT served here. CpuEsSolver raises on river (showdowns,
-    side-pot splitting that lives only in the C trainer). 2p river COULD use
-    solver_v2's StreetSolver, but 3p river is the §6 side-pot gap. v1 surfaces
-    river as LiveResolveUnsupported (fail loud), keeping 2p/3p flop+turn as the
-    verified surface; river live-solve is deferred.
+  - river        → CpuEsSolver too (2026-06-11). River trees terminate in
+    exact showdown/fold terminals settled natively by the C ES
+    (es_showdown_value — side-pot validated, poker-solver
+    validate_sidepot.py: 100k-case fuzz < 1e-9 + the nh>1 vectorized gate);
+    the leaf-table construct stage is bypassed fail-loud inside CpuEsSolver.
+    The old §6 "river is the side-pot gap" rejection is GONE.
 
 solve path (solver_v2 StreetSolver) crashes building multi-street trees for
 flop/turn (infoset-cap NULL deref; verified exit 127). It works for river only.
@@ -33,7 +34,8 @@ SCOPE / SIMPLIFICATIONS (documented, honest):
     reached node, with its correct (fold/call/raise) action set. The old
     fail-loud guard (facing_bet or raises_this_street > 0) is GONE; what
     remains fail-loud is an OFF-TREE action (a recorded action that matches
-    no tree child — bet-size translation is a later step) and river.
+    no tree child — bet-size translation is a later step) and a terminal /
+    non-postflop state.
 """
 
 from __future__ import annotations
@@ -54,15 +56,17 @@ from app.services.session_pipeline import _solver_label_to_action_index
 class LiveResolveUnsupported(Exception):  # noqa: N818 - sibling-naming convention
     """The live re-solve cannot serve this node GPU-free in v1 scope.
 
-    Raised for: river (showdown / side-pot splitting not available here), a
-    terminal state, or a mid-street re-entry whose current node isn't the
-    to-act player's first decision node. Fail loud — never serve a wrong node.
+    Raised for: a non-postflop street (the engine serves flop/turn/river), a
+    terminal state, or a KNOWN abstraction-surface limit surfaced by the
+    engine as ReplayUnsupported (tree raise cap, action-count divergence,
+    unvalidated vocab shape) and converted by LiveResolveSource. Fail loud —
+    never serve a wrong node.
     """
 
 
 # Street ints (1=flop,2=turn,3=river) -> CpuEsSolver street name / board length.
-_STREET_NAME = {1: "flop", 2: "turn"}
-_STREET_BOARD_LEN = {1: 3, 2: 4}
+_STREET_NAME = {1: "flop", 2: "turn", 3: "river"}
+_STREET_BOARD_LEN = {1: 3, 2: 4, 3: 5}
 
 
 def _has_to_call(state: GameState) -> bool:
@@ -96,14 +100,13 @@ def build_solve_inputs(
         None (or wrong length), the grid is uniform-on-legal.
 
     Raises:
-        LiveResolveUnsupported: terminal state or river.
+        LiveResolveUnsupported: terminal state or a non-postflop street.
     """
     if state.terminal:
         raise LiveResolveUnsupported("terminal GameState has no decision node")
     if state.street not in _STREET_NAME:
         raise LiveResolveUnsupported(
-            f"live-resolve serves flop/turn only (street={state.street}); river "
-            "is the side-pot/showdown gap (§6) — deferred."
+            f"live-resolve serves flop/turn/river only (street={state.street})"
         )
 
     hero_slot = state.to_act_slot

@@ -11,7 +11,8 @@ and the per-decision latency is MEASURED (expected seconds, NOT sub-second).
 EMPIRICAL BASIS (recon this session, docs/BENCHMARK_RESULTS.md §3c): the wired
 own CPU fallback (solver_v2) crashes on multi-street trees no-GPU; CpuEsSolver
 builds real blueprint-grounded leaf values (2p-flop table 99.9% nonzero, 3p-turn
-98.6% nonzero, 0 coverage substitutions). River-3p hits the side-pot gap (§6).
+98.6% nonzero, 0 coverage substitutions). RIVER (2026-06-11) is served via
+exact showdown terminals (side-pot validated) — no leaf table at all.
 
 These tests load a ~12GB blueprint through es_resolver_real.dll (session-scoped,
 once) and SKIP cleanly if it's absent — like the LOOKUP oracle tests.
@@ -196,25 +197,61 @@ def test_live_resolve_check_through_extracts_no_bet_node(live_source):
     assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
 
 
-# ── The river-3p side-pot gap is documented + fails loud ─────────────────
+# ── RIVER is SERVED (2026-06-11): exact showdown terminals, no leaf table ─
 
 
-def test_live_resolve_3p_river_raises_unsupported(live_source):
-    """3p RIVER is the side-pot / all-in gap (§6): the engine can't settle
-    multiway showdowns (no Python side-pot logic). get_mix must fail LOUD with
-    a clear, documented error — never serve a wrong-pot strategy silently."""
-    from app.agent.strategy_source import LiveResolveUnsupported
-
+def test_live_resolve_3p_river_serves_mix(live_source):
+    """3p RIVER — the old §6 side-pot gap — is now served: the river tree
+    terminates in showdown/fold terminals settled natively by the C ES
+    (es_showdown_value, side-pot validated incl. the nh>1 vec gate), and
+    CpuEsSolver bypasses the leaf-table construct fail-loud. The mix must be
+    a legal-shape REAL solve (structural anchor, like the 3p turn anchor)."""
     st = new_postflop_state(
         seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
-        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h"), _ci("3c")],
     )
     # Walk flop check-through -> turn, turn check-through -> river root.
     for idx in [0, 0, 0, 0, 0, 0]:
         st = st.advance(idx)
     assert st.street == 3  # river root
-    with pytest.raises(LiveResolveUnsupported):
-        live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Kh")))
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # river root, no bet faced
+
+    t0 = time.time()
+    mix = live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert len(mix.freqs) >= 1
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False  # a REAL solve, not the miss fallback
+    # River skips the leaf-table construct -> should be FASTER than flop/turn.
+    assert dt < 120.0
+    print(f"\n3p-river live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+
+
+def test_live_resolve_2p_river_faced_bet_replay(live_source):
+    """2p river FACED BET: BB bets the river, UTG faces it — the street
+    replay walks the bet inside the solved RIVER tree to UTG's 3-action
+    {fold, call, raise} node. Proves hero_replay works on the new street."""
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h"), _ci("3c")],
+    )
+    # flop check-check -> turn check-check -> river: BB bets (idx 1).
+    for idx in [0, 0, 0, 0, 1]:
+        st = st.advance(idx)
+    assert st.street == 3
+    assert st.to_act_slot == 1  # UTG
+    assert st.facing_bet is True
+    n_legal = st.num_legal_actions()
+    assert n_legal == 3  # [fold, call, raise]
+
+    mix = live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n2p-river faced-bet live-resolve: mix={mix.freqs}")
 
 
 # -- 6p vec-Linear-FINAL: the playing-agent re-solve path (Lane A, 2026-06-10) --

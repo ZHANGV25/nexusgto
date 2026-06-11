@@ -33,6 +33,24 @@ BLUEPRINT_QUALITY_NOTE = (
     "live search"
 )
 
+# RIVER live re-solve provenance (2026-06-11). River trees terminate in exact
+# showdown/fold terminals (no depth-limit leaves), so the flop/turn leaf-table
+# machinery — and with it num_rollouts and the leaf-sampling noise the
+# measured floors below characterize — does not apply. NO river exploitability
+# floor has been measured, and citing a flop/turn floor for a river solve
+# would over-claim quality, so river answers carry floor=None + this note.
+RIVER_QUALITY_NOTE = (
+    "river live re-solve: exact showdown terminals (side-pot settlement "
+    "validated against an exact reference; poker-solver validate_sidepot.py "
+    "fuzz < 1e-9), no depth-limit leaves so num_rollouts has no effect and "
+    "there is no leaf-sampling noise; no measured exploitability floor "
+    "exists for this configuration (the flop/turn floors do not apply)"
+)
+RIVER_QUALITY_SOURCE = (
+    "poker-solver python/es_resolver/validate_sidepot.py (showdown "
+    "settlement gate); no measured river exploitability floor"
+)
+
 # Self-consistent exploitability floors, %/pot/player, keyed by the FULL
 # measured configuration (n_players, num_rollouts, vec_mode, readout).
 # ONLY exactly-measured arms appear here; a floor is cited only when the
@@ -167,10 +185,15 @@ def measured_floor_for(
     vec_mode: bool,
     readout: str,
     iterations: int,
+    street: Optional[str] = None,
 ) -> Optional[float]:
     """The exactly-measured floor for this FULL config, or None (never
     estimated, never cross-config). None when the iteration budget is below
-    the measured rung."""
+    the measured rung. None on RIVER unconditionally: every measured arm is
+    a flop/turn leaf-table configuration and no river floor has been
+    measured (see RIVER_QUALITY_NOTE)."""
+    if street == "river":
+        return None
     if iterations < FLOOR_MIN_ITERATIONS:
         return None
     return MEASURED_FLOORS_PCT_POT.get(

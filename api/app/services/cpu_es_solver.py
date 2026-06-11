@@ -1,4 +1,4 @@
-"""CPU external-sampling ES re-solver — production engine for 5p flop/turn.
+"""CPU external-sampling ES re-solver — production engine for postflop streets.
 
 The HYBRID architecture (see docs/MULTIWAY_5_6P_DECISION_MEMO.md): 2-3p (+4p
 flop/turn) stay on the GPU; 5p flop/turn move here — a CPU external-sampling
@@ -15,11 +15,15 @@ construction to a different DLL and feed it a cross-DLL BPSReader* handle. A
 dedicated `rollout_c` module instance (via importlib) keeps the construct binding
 isolated.
 
-SCOPE (validated regime only): 5p FLOP/TURN — cont-strat depth-limited leaf-table
-terminals, the regime every quality gate was measured on. 5p RIVER is NOT served
-here (its terminals are showdowns; es_showdown_value is single-pot chop validated
-only at 2p, vs the GPU's side-pot showdown — wrong for 5-way unequal all-ins).
-River stays GPU-async. 6p stays GPU-async until its iso-quality T is measured.
+SCOPE: FLOP/TURN — cont-strat depth-limited leaf-table terminals, the regime
+every quality gate was measured on — and RIVER (2026-06-11). A river tree
+terminates in SHOWDOWN/FOLD terminals only (StreetSolverGPU disables cont-strat
+leaves at is_river), and the C ES settles showdowns natively via
+es_showdown_value — side-pot validated against an exact Python reference
+(poker-solver validate_sidepot.py: literal units + 100k-case fuzz < 1e-9 +
+bit-exact single-pot regression + the nh>1 vectorized gate). River solves skip
+the leaf-table construct entirely (no depth-limit leaves -> num_rollouts has no
+effect, no leaf-sampling noise); the bypass is fail-loud (see solve()).
 """
 from __future__ import annotations
 
@@ -29,6 +33,8 @@ import os
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +161,7 @@ class CpuEsSolver:
         readout: str = "avg",
         hero_replay: Optional[Dict[str, object]] = None,
     ) -> Dict[int, Dict[int, Dict[str, float]]]:
-        """Run an N-player flop/turn CPU-ES solve. Returns all_by_player:
+        """Run an N-player flop/turn/river CPU-ES solve. Returns all_by_player:
         {player_idx: {hand_idx: {action_label: freq}}} — the SAME structure the
         GPU provider's get_all_avg_strategies produces, so the provider's
         _build_response_strategies maps it identically.
@@ -164,6 +170,11 @@ class CpuEsSolver:
         leaf table (parallel batch = the GPU's exact construct floor, off-lock),
         runs the C ES (Linear CFR, multi-thread Hogwild), extracts each
         player's strategy with the weight-0 filter the GPU applies.
+
+        RIVER: terminals are exact showdown/fold (no depth-limit leaves), so
+        the leaf-table construct is skipped (fail-loud bypass below) and
+        num_rollouts / cache_k / master_seed have NO effect on the solve —
+        there is no leaf-sampling noise on river.
 
         vec_mode: 0 = scalar traverser (the validated 5p-display reference);
             1 = vectorized traverser. vec-Linear is Gate-1-validated for the
@@ -192,9 +203,12 @@ class CpuEsSolver:
         n_players = len(player_ranges)
         scale = 100.0
         stack_chips = int(round(stack_bb * scale))
-        street = "flop" if len(board_strs) == 3 else ("turn" if len(board_strs) == 4 else "river")
-        if street == "river":
-            raise ValueError("CpuEsSolver does not serve river (showdowns) — route to GPU-async")
+        if len(board_strs) not in (3, 4, 5):
+            raise ValueError(
+                f"board must be 3 (flop), 4 (turn) or 5 (river) cards, got "
+                f"{len(board_strs)}"
+            )
+        street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
 
         # ── Build the tree (CPU tree-builder; no GPU solve / no leaf_value_fn) ──
         gpu = self._StreetSolverGPU(
@@ -207,24 +221,48 @@ class CpuEsSolver:
         try:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
-            leaf_infos = self._extract_leaf_info(gpu._tree, num_players=n_players)
-            if not leaf_infos:
-                raise RuntimeError("no leaf infos extracted from tree")
+            if street == "river":
+                # RIVER: the tree terminates in SHOWDOWN/FOLD terminals only
+                # (the builder disables cont-strat leaves at is_river:
+                # street_solver_gpu.py use_cs) and the C ES settles showdowns
+                # natively (es_showdown_value — side-pot validated, see module
+                # docstring). There is NO leaf table to construct; the
+                # zero-leaf table below makes the table oracle exist but be
+                # provably unreachable. FAIL-LOUD: a depth-limit leaf in a
+                # river tree would read garbage from the empty table, so its
+                # presence is a hard error, not a warning.
+                n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
+                n_leaves = int(gpu._tree.num_leaves)
+                if n_leaf_nodes != 0 or n_leaves != 0:
+                    raise RuntimeError(
+                        f"river tree has {n_leaf_nodes} leaf nodes / "
+                        f"{n_leaves} leaves — river terminals must all be "
+                        "showdown/fold (builder contract violated; refusing "
+                        "to solve with an empty leaf table)"
+                    )
+                table = np.zeros((0, n_players, max_h), dtype=np.float32)
+                construct_s = 0.0
+            else:
+                leaf_infos = self._extract_leaf_info(
+                    gpu._tree, num_players=n_players)
+                if not leaf_infos:
+                    raise RuntimeError("no leaf infos extracted from tree")
 
-            # ── Construct the leaf table (parallel batch, off-lock) ──
-            t0 = time.time()
-            table = rc.compute_subgame_leaf_values_sampled_c(
-                leaf_infos=leaf_infos, board=board_ints, street=street,
-                player_hands=player_ranges, active=[True] * n_players,
-                acting_order=list(range(n_players)), player_seats=list(player_seats),
-                game_action_history=list(game_action_indices or []),
-                blueprint=self._blueprint,
-                starting_pot_chips=int(round(pot_bb * scale)),
-                stack_chips=stack_chips, max_hands=max_h,
-                num_rollouts=num_rollouts, num_samples_k=cache_k,
-                master_seed=master_seed,
-            )
-            construct_s = time.time() - t0
+                # ── Construct the leaf table (parallel batch, off-lock) ──
+                t0 = time.time()
+                table = rc.compute_subgame_leaf_values_sampled_c(
+                    leaf_infos=leaf_infos, board=board_ints, street=street,
+                    player_hands=player_ranges, active=[True] * n_players,
+                    acting_order=list(range(n_players)),
+                    player_seats=list(player_seats),
+                    game_action_history=list(game_action_indices or []),
+                    blueprint=self._blueprint,
+                    starting_pot_chips=int(round(pot_bb * scale)),
+                    stack_chips=stack_chips, max_hands=max_h,
+                    num_rollouts=num_rollouts, num_samples_k=cache_k,
+                    master_seed=master_seed,
+                )
+                construct_s = time.time() - t0
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
             cs = self._CSolver.from_table(gpu._tree, table, n_players, max_h, seed=1)
