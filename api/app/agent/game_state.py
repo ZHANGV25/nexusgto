@@ -77,12 +77,13 @@ _PREFLOP_ORDER = ("UTG", "MP", "CO", "BTN", "SB", "BB")
 
 
 class CanonicalChipsUnsupported(Exception):  # noqa: N818 - matches sibling naming
-    """The preflop line is outside the canonical single-open shape, so its
+    """The preflop line is outside the canonical verified shapes, so its
     flop-entry pot/stacks cannot be derived from the verified convention.
 
-    v1 derives chips only for a single open + flat callers (the capture-verified
-    shape — see preflop_constructor). Anything else must pass explicit pot/stacks
-    that the caller has independently validated.
+    Chips derive only for the capture-verified shapes (see
+    canonical_flop_chips: single open + flat callers; 3-bet HU; limp-check
+    pots). Anything else must pass explicit pot/stacks that the caller has
+    independently validated.
     """
 
 
@@ -139,11 +140,21 @@ def canonical_flop_chips(
         for BTN-open/BB-3bet → (1800, (9125, 9125)); wider 1.0x pair
         coverage pending the Lane-C probe (serving is gated upstream).
         Evidence: poker-solver scripts/preflop_shapes_captured.json.
+      * LIMP-CHECK pots (no raise; the BB's check — index 0 at the
+        BB-option node — closes the round). Pure blind arithmetic, pinned
+        to the 2026-06-11 trainer walks (limp_shapes_captured.json):
+        UTG-limp/BTN-limp → (250, (9900, 9900)); SB-complete →
+        (200, (9900, 9900)); the root-captured 3-way walks UTG+BTN →
+        (350, (9900,)*3) and UTG+SB → (300, (9900,)*3). SERVING is
+        restricted to the three verified HU lines upstream
+        (preflop_constructor only emits those); this layer derives chips
+        for any closed limp-check prefix.
 
     Raises:
-        CanonicalChipsUnsupported: a non-canonical preflop shape (limp, 4bet+,
-            a 1.0x open, an out-of-vocab raise index, 3-bet pot that isn't
-            heads-up) — chips can't be derived without new ground truth.
+        CanonicalChipsUnsupported: a non-canonical preflop shape (limp-raise,
+            4bet+, a 1.0x open, an out-of-vocab raise index, 3-bet pot that
+            isn't heads-up, an unclosed limped pot) — chips can't be derived
+            without new ground truth.
     """
     for s in seats:
         if s not in FULL_SEAT:
@@ -159,6 +170,7 @@ def canonical_flop_chips(
     raises_seen = 0
     folded: set = set()
     acted: set = set()
+    bb_checked = False
 
     # The prefix is one index per preflop action taken, in the trainer's
     # owing-action order: a first orbit UTG..BB, then wrapping back to anyone
@@ -180,10 +192,22 @@ def canonical_flop_chips(
             action = preflop_prefix[idx]
             idx += 1
             acted.add(pos)
+            if bets[pos] == current_bet:
+                # NOTHING TO CALL: the BB-option node of a limped pot (the
+                # only preflop node with to_call == 0 — every other actor
+                # faces at least the blind). Trainer layout (capture-verified
+                # 2026-06-11): [check, 0.7x raise, 1.0x raise], check_idx=0.
+                if action == 0:  # check — closes the limped pot
+                    bb_checked = True
+                    continue
+                raise CanonicalChipsUnsupported(
+                    f"raise index {action} at the BB-option node (a "
+                    f"limp-RAISE pot) — chips not capture-verified"
+                )
             if action == 0:  # fold
                 folded.add(pos)
                 continue
-            if action == 1:  # call (flat / close the 3-bet pot)
+            if action == 1:  # call (limp / flat / close the 3-bet pot)
                 to_call = current_bet - bets[pos]
                 bets[pos] += to_call
                 pot += to_call
@@ -221,9 +245,30 @@ def canonical_flop_chips(
                 )
 
     if raises_seen == 0:
-        raise CanonicalChipsUnsupported(
-            "no preflop raise (open-limp pot) — chips not capture-verified"
-        )
+        # LIMP-CHECK pot: valid only when the BB's check CLOSED the round
+        # with every action consumed and >= 2 live players all matched to
+        # the blind (capture-pinned chips, limp_shapes_captured.json).
+        if not bb_checked or idx != n:
+            raise CanonicalChipsUnsupported(
+                "limped pot without the BB's check closing the round "
+                "(unclosed / overlong prefix) — chips not capture-verified"
+            )
+        replay_live = {
+            pos for pos in _PREFLOP_ORDER
+            if pos not in folded and pos in acted
+        }
+        if len(replay_live) < 2 or any(
+            bets[pos] != current_bet for pos in replay_live
+        ):
+            raise CanonicalChipsUnsupported(
+                "limped pot with fewer than 2 live players (or an unmatched "
+                "blind) — no flop entry exists"
+            )
+        if replay_live != live_seats:
+            raise ValueError(
+                f"seats {sorted(live_seats)} do not match the live players "
+                f"of the replayed limp-check line {sorted(replay_live)}"
+            )
     if raises_seen == 2:
         # 3-bet pots are capture-verified HEADS-UP only (opener vs 3-bettor,
         # everyone else folded, opener's call closing the round).
@@ -889,7 +934,8 @@ def new_postflop_state(
 
     Chips (3a): if `pot`/`stacks` are omitted they are DERIVED from the verified
     trainer convention via canonical_flop_chips (the correct flop-entry chips
-    for the canonical single-open line). Passing them explicitly is supported
+    for the canonical single-open, 3-bet HU and limp-check lines). Passing
+    them explicitly is supported
     for backward compatibility and non-canonical / non-flop entries — but note
     the flop-entry pot/stacks are load-bearing for the commitment prune, so
     prefer the derived path for canonical lines. `stacks` is aligned to `seats`
@@ -907,8 +953,8 @@ def new_postflop_state(
     n = len(order)
 
     if pot is None or stacks is None:
-        # Derive the verified canonical flop-entry chips. Only valid for a flop
-        # entry on the canonical single-open line.
+        # Derive the verified canonical flop-entry chips. Only valid for a
+        # flop entry on a verified canonical preflop line.
         if street != STREET_FLOP:
             raise ValueError(
                 "pot/stacks must be given for a non-flop entry "
