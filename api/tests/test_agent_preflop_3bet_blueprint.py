@@ -205,14 +205,100 @@ def test_sz1_constructed_line_matches_capture_and_hits_trained(blueprint, pair):
     )
 
 
+def _replay_captured_preflop_nodes(blueprint, w, prefix, hero=None):
+    """Replay the capture's PREFLOP trainer nodes with the AGENT's own chip
+    primitives, asserting at EVERY node (review 2026-06-11 — the test
+    previously ignored w['nodes'] entirely):
+      * the accumulated agent prefix == the trainer's prefix_before;
+      * agent-derived pot / to_call / stack == the trainer-C literals;
+      * the agent's float32 raise amount for EVERY raise slot == the
+        trainer-C amount (incl. the f32-divergent nodes, py_double_amounts);
+      * blueprint sigma-bar PRESENT at the node key with length == the
+        trainer na (per-node na signature).
+    hero default AsAd (class AA) — GOLDEN across the capture.
+    """
+    from app.agent.game_state import (
+        BIG_BLIND,
+        INITIAL_STACK,
+        SMALL_BLIND,
+        preflop_raise_amount_f32,
+    )
+    from app.agent.preflop_range import hand_class_169
+
+    if hero is None:
+        hero = (_ci("As"), _ci("Ad"))
+    hero_cls = hand_class_169(*hero)
+    bets = {pos: 0 for pos in
+            ("UTG", "MP", "CO", "BTN", "SB", "BB")}
+    bets["SB"], bets["BB"] = SMALL_BLIND, BIG_BLIND
+    pot = SMALL_BLIND + BIG_BLIND
+    current_bet = BIG_BLIND
+
+    for i, node in enumerate(w["nodes"]):
+        pos = node["pos"]
+        assert list(node["prefix_before"]) == list(prefix[:i]), (
+            f"node {i} ({pos}): trainer prefix_before {node['prefix_before']}"
+            f" != constructed {prefix[:i]}"
+        )
+        to_call = current_bet - bets[pos]
+        stack = INITIAL_STACK - bets[pos]
+        assert (node["pot"], node["to_call"], node["stack"]) == (
+            pot, to_call, stack,
+        ), f"node {i} ({pos}): agent chips diverge from trainer C"
+        # Every raise slot: agent f32 increment == trainer C literal.
+        for a in node["actions"]:
+            if a["type"] == 3:
+                frac = node["tier_sizes"][a["bet_idx"]]
+                got = preflop_raise_amount_f32(
+                    frac, pot=pot, to_call=to_call, stack=stack,
+                )
+                assert got == a["amount"], (
+                    f"node {i} ({pos}) raise {frac}x: agent f32 {got} != "
+                    f"trainer C {a['amount']} (doubles would give "
+                    f"{node['py_double_amounts']})"
+                )
+        # Blueprint sigma at the preflop key: present, trainer-na length.
+        strat = blueprint.get_strategy(
+            [], list(node["prefix_before"]), node["player"], hero_cls,
+            street=0,
+        )
+        assert strat is not None, (
+            f"preflop MISS at node {i} ({pos}, prefix_before="
+            f"{node['prefix_before']}, player={node['player']})"
+        )
+        assert len(np.asarray(strat, dtype=float)) == node["na"], (
+            f"node {i} ({pos}): stored sigma length "
+            f"{len(np.asarray(strat))} != trainer na {node['na']}"
+        )
+        # Apply the trainer's chosen action to the agent-side chips.
+        chosen = node["actions"][node["chosen_idx"]]
+        if chosen["type"] == 2:  # call
+            bets[pos] += to_call
+            pot += to_call
+        elif chosen["type"] == 3:  # raise (increment)
+            assert chosen["amount"] == node["chosen_amount"]
+            bets[pos] += chosen["amount"]
+            pot += chosen["amount"]
+            current_bet = bets[pos]
+        # type 0 = fold: chips unchanged.
+
+    # The walk must land exactly on the captured flop entry.
+    assert pot == w["flop_pot"]
+    live_stacks = [INITIAL_STACK - bets[s] for s in w["live_seats"]]
+    assert live_stacks == list(w["flop_stacks"])
+
+
 @pytest.mark.parametrize("pair", _SZ1_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}")
 def test_sz1_betline_to_terminal(blueprint, pair):
     # The 1.0x chip path's na signature: replay bet-call to the river all-in
     # clamp asserting state-vs-stored sigma length at EVERY node (the bigger
     # 3-bet shifts the commitment prune — exactly what sz0 chips would get
-    # wrong).
+    # wrong). PLUS (review 2026-06-11) the captured PREFLOP nodes are now
+    # replayed too: per-node na / pot / to_call / f32 amounts against the
+    # agent-constructed state, not just the flop summary.
     w = _sz1_walk_or_skip(pair)
     prefix = build_preflop_prefix(_threebet_line(*pair), threebet_size_idx=1)
+    _replay_captured_preflop_nodes(blueprint, w, prefix)
     lengths, st = _replay_assert(
         blueprint, list(w["live_seats"]), prefix, [1, 1, 1, 1, 1, 1],
     )
