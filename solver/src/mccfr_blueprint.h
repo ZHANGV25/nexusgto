@@ -333,6 +333,31 @@ typedef struct {
      *
      * Default 0 (legacy CFR with regret + strategy_sum updates). */
     int boundary_ev_only;
+
+    /* Lane A Step 2026-06-11 — all-biases boundary accumulation.
+     *
+     * When set (via BP_CONT_EV_ALL_BIASES=1 at solver init, honored ONLY
+     * together with BP_BOUNDARY_EV_ONLY=1), every HEADS boundary visit
+     * runs BP_CONT_EV_NUM_BIASES independent rollouts — one per
+     * traverser bias, each with a freshly sampled opponent-bias tuple
+     * and a fresh turn deal — and accumulates each rollout's EV into its
+     * bias's ev_sum/ev_count entry. 4x rollout cost per visit, 4x
+     * coupon-collector coverage win (every visited slot becomes all-4-
+     * bias immediately).
+     *
+     * Per-bias estimates keep EXACTLY the sampled-bias path's
+     * conditional distribution: the bias only reweights the acting
+     * player's frozen-σ̄ action sampling inside the rollout (read-only
+     * descend, no regret/strategy_sum writes), and ev_sum[b] is keyed
+     * per bias, so forcing a deterministic sweep over b changes nothing
+     * about each bias's estimator. The boundary's RETURN value becomes
+     * the mean over the 4 rollouts — unbiased for the same expectation
+     * but a different per-sample distribution, which is why the flag is
+     * refused (warn + ignore) without boundary_ev_only=1: in normal
+     * training the returned value feeds upstream regret updates.
+     *
+     * Default 0 (single sampled bias per visit — legacy behavior). */
+    int cont_ev_all_biases;
 } BPSolver;
 
 /* ── Public API ──────────────────────────────────────────────────────── */

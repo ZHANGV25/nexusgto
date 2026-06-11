@@ -1408,6 +1408,32 @@ static float eval_showdown_n(BPSolver *s, const int *board,
     return trav_winnings - (float)invested[traverser];
 }
 
+/* Lane A 2026-06-11: read BP_CONT_EV_ALL_BIASES at init, forcing the
+ * pairing with BP_BOUNDARY_EV_ONLY=1. Without EV-only mode the boundary
+ * return value feeds upstream regret updates, and the all-biases mean
+ * would change the per-sample distribution of those updates — refuse
+ * (warn + ignore) rather than silently altering training semantics.
+ * Called from both bp_init_ex and bp_init_unified AFTER boundary_ev_only
+ * is set. */
+static void bp_init_cont_ev_all_biases_from_env(BPSolver *s) {
+    const char *e = getenv("BP_CONT_EV_ALL_BIASES");
+    int requested = (e && e[0] == '1') ? 1 : 0;
+    if (requested && !s->boundary_ev_only) {
+        fprintf(stderr,
+                "[BP] WARNING: BP_CONT_EV_ALL_BIASES=1 requires "
+                "BP_BOUNDARY_EV_ONLY=1 (the boundary return value feeds "
+                "regret updates in normal training). Flag IGNORED.\n");
+        requested = 0;
+    }
+    s->cont_ev_all_biases = requested;
+    if (s->cont_ev_all_biases) {
+        fprintf(stderr,
+                "[BP] BP_CONT_EV_ALL_BIASES=1: every HEADS boundary visit "
+                "accumulates all %d biases (4x rollouts per visit).\n",
+                BP_CONT_EV_NUM_BIASES);
+    }
+}
+
 /* ── Main traversal ──────────────────────────────────────────────── */
 
 static float traverse(TraversalState *ts, int acting_order_idx,
@@ -1514,59 +1540,97 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             for (int c = 0; c < 52; c++) if (!blocked2[c]) valid2[nv2++] = c;
             if (nv2 == 0) return 0.0f;
 
-            TraversalState next = *ts;
-            memset(next.bets, 0, sizeof(next.bets));
-            memset(next.has_acted, 0, sizeof(next.has_acted));
-            next.num_raises = 0;
-            for (int p = 0; p < BP_MAX_PLAYERS; p++)
-                next.cont_bias_per_player[p] = bias_tuple[p];
+            /* Lane A 2026-06-11 — BP_CONT_EV_ALL_BIASES: sweep ALL
+             * traverser biases at this visit instead of the one sampled
+             * above. Each sweep iteration is a fully independent rollout
+             * (fresh opponent-bias tuple, fresh turn deal), so each
+             * bias's ev_sum/ev_count entry receives an estimate with
+             * exactly the same conditional distribution as the legacy
+             * sampled-bias path — the bias index is forced, not biased.
+             * Only worth 4x the rollout cost when the slot exists; with
+             * no slot the extra rollouts would accumulate nowhere.
+             * With the flag OFF this loop runs once and is byte-
+             * identical (RNG stream + float math) to the legacy path. */
+            int n_rollouts = (s->cont_ev_all_biases && cb_slot != NULL)
+                ? BP_CONT_EV_NUM_BIASES : 1;
 
-            /* Deal turn card; canonicalize via the existing suit_map. */
-            int dealt = valid2[rng_int(ts->rng, nv2)];
-            next.board[next.num_board++] = dealt;
-            if (next.num_canon_board < 5) {
-                int rank = dealt >> 2, suit = dealt & 3;
-                int canon_suit = (next.suit_map[suit] >= 0)
-                    ? next.suit_map[suit] : suit;
-                next.canon_board[next.num_canon_board++] =
-                    rank * 4 + canon_suit;
-            }
-
-            /* Pre-compute turn bucket cache (mirrors line 1397-1410 of
-             * the legacy turn-deal path). */
-            if (s->turn_centroids_k > 0) {
-                for (int p = 0; p < NP; p++) {
-                    next.turn_bucket[p] = -1;
-                    if (!next.active[p]) continue;
-                    int ph[1][2];
-                    ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
-                    ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
-                    float feat[1][3];
-                    ca_compute_features(next.board, 4,
-                                         (const int(*)[2])ph, 1, 200, feat);
-                    next.turn_bucket[p] = ca_nearest_centroid(
-                        feat[0],
-                        (const float(*)[3])s->turn_centroids,
-                        s->turn_centroids_k);
+            float ev_total = 0.0f;
+            for (int ri = 0; ri < n_rollouts; ri++) {
+                if (ri > 0) {
+                    /* Fresh iid-uniform opponent biases for this
+                     * rollout (the traverser's entry is overwritten
+                     * below; sampling it anyway keeps the loop body
+                     * uniform and costs one rng_int). */
+                    for (int p = 0; p < NP; p++) {
+                        if (ts->active[p])
+                            bias_tuple[p] =
+                                rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
+                    }
                 }
+                if (n_rollouts == BP_CONT_EV_NUM_BIASES) {
+                    trav_bias = ri;
+                    bias_tuple[ts->traverser] = ri;
+                }
+
+                TraversalState next = *ts;
+                memset(next.bets, 0, sizeof(next.bets));
+                memset(next.has_acted, 0, sizeof(next.has_acted));
+                next.num_raises = 0;
+                for (int p = 0; p < BP_MAX_PLAYERS; p++)
+                    next.cont_bias_per_player[p] = bias_tuple[p];
+
+                /* Deal turn card; canonicalize via the existing suit_map. */
+                int dealt = valid2[rng_int(ts->rng, nv2)];
+                next.board[next.num_board++] = dealt;
+                if (next.num_canon_board < 5) {
+                    int rank = dealt >> 2, suit = dealt & 3;
+                    int canon_suit = (next.suit_map[suit] >= 0)
+                        ? next.suit_map[suit] : suit;
+                    next.canon_board[next.num_canon_board++] =
+                        rank * 4 + canon_suit;
+                }
+
+                /* Pre-compute turn bucket cache (mirrors line 1397-1410 of
+                 * the legacy turn-deal path). */
+                if (s->turn_centroids_k > 0) {
+                    for (int p = 0; p < NP; p++) {
+                        next.turn_bucket[p] = -1;
+                        if (!next.active[p]) continue;
+                        int ph[1][2];
+                        ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
+                        ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
+                        float feat[1][3];
+                        ca_compute_features(next.board, 4,
+                                             (const int(*)[2])ph, 1, 200, feat);
+                        next.turn_bucket[p] = ca_nearest_centroid(
+                            feat[0],
+                            (const float(*)[3])s->turn_centroids,
+                            s->turn_centroids_k);
+                    }
+                }
+
+                float boundary_ev = traverse(&next, 0,
+                                              acting_order, num_in_order);
+
+                /* Accumulate to slot. ev_sum uses the atomic float add to
+                 * tolerate Hogwild concurrency; ev_count uses a relaxed
+                 * fetch_add. The Linear-CFR discount is applied to ev_sum
+                 * at the periodic discount tick (see bp_solve), NOT per-
+                 * visit — matches the trainer's regret-update convention. */
+                if (cb_slot != NULL) {
+                    bp_cont_ev_atomic_add_f32(&cb_slot->ev_sum[trav_bias],
+                                               boundary_ev);
+                    __atomic_fetch_add(&cb_slot->ev_count[trav_bias], 1,
+                                        __ATOMIC_RELAXED);
+                }
+                ev_total += boundary_ev;
             }
 
-            float boundary_ev = traverse(&next, 0,
-                                          acting_order, num_in_order);
-
-            /* Accumulate to slot. ev_sum uses the atomic float add to
-             * tolerate Hogwild concurrency; ev_count uses a relaxed
-             * fetch_add. The Linear-CFR discount is applied to ev_sum
-             * at the periodic discount tick (see bp_solve), NOT per-
-             * visit — matches the trainer's regret-update convention. */
-            if (cb_slot != NULL) {
-                bp_cont_ev_atomic_add_f32(&cb_slot->ev_sum[trav_bias],
-                                           boundary_ev);
-                __atomic_fetch_add(&cb_slot->ev_count[trav_bias], 1,
-                                    __ATOMIC_RELAXED);
-            }
-
-            return boundary_ev;
+            /* Mean over the sweep (single-rollout mode: the rollout EV
+             * itself). Upstream consumers of this value are inert in
+             * boundary_ev_only mode — the all-biases flag is refused at
+             * init without it. */
+            return ev_total / (float)n_rollouts;
         }
 
         /* Build blocked set: board cards + all active players' cards */
@@ -2819,6 +2883,7 @@ int bp_init_ex(BPSolver *s, int num_players,
                     "updates SKIPPED; cont_ev_table accumulation kept.\n");
         }
     }
+    bp_init_cont_ev_all_biases_from_env(s);
 
     return 0;
 }
@@ -2906,6 +2971,7 @@ int bp_init_unified(BPSolver *s, int num_players,
                     "updates SKIPPED; cont_ev_table accumulation kept.\n");
         }
     }
+    bp_init_cont_ev_all_biases_from_env(s);
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
