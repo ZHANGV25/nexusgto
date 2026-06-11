@@ -285,8 +285,8 @@ class LiveResolveSource(StrategySource):
 
     ENGINE (empirically validated GPU-free this session — see
     docs/BENCHMARK_RESULTS.md §3c and app/agent/live_resolve_adapter.py): wraps
-    poker-solver's CpuEsSolver (CPU external-sampling ES) for flop/turn, 2p AND
-    3p, with real blueprint-grounded leaf values. River is the side-pot/showdown
+    poker-solver's CpuEsSolver (CPU external-sampling ES) for flop, turn AND
+    river (2026-06-11: river showdown terminals settle natively in the
     named engine — has no GPU-free multi-street solve path (its solver_v2 CPU
     fallback crashes building flop/turn trees), so LIVE_RESOLVE wraps CpuEsSolver
     instead; that is the honest WIRE+VERIFY of the realtime pipeline GPU-free.
@@ -465,12 +465,13 @@ class LiveResolveSource(StrategySource):
 class HybridSource(StrategySource):
     """LIVE_RESOLVE where it's supported, blueprint LOOKUP where it isn't.
 
-    The composition that makes a FULL HAND playable end-to-end: flop/turn
-    decisions go to the live re-solve (the quality ceiling — for 6p, the
-    vec-Linear-final path), while RIVER — CpuEsSolver's documented side-pot/
-    showdown gap — falls back to the blueprint σ̄ lookup (the floor that the
-    2p/3p full-hand play tests validated). Without this, a LIVE_RESOLVE hand
-    cannot finish: river raises LiveResolveUnsupported.
+    The composition that makes a FULL HAND playable end-to-end: flop, turn
+    and (since 2026-06-11) river decisions go to the live re-solve (the
+    quality ceiling — for 6p, the vec-Linear-final path; river settles
+    showdowns natively), while the remaining unsupported surface (raise-capped
+    trees, action-count divergence, unsupported preflop shapes) falls back to
+    the blueprint σ̄ lookup (the floor the 2p/3p full-hand play tests
+    validated).
 
     Only the DOCUMENTED unsupported surface falls back (the
     LiveResolveUnsupported exception type). Real solver errors — vocab
