@@ -12,15 +12,29 @@ This module computes per-seat 169-class weight dicts ({hand_class_name: weight})
 suitable for postflop_provider._build_hand_grid_range(blocked, weights=...). It
 reuses the 3b machinery (build_seat_range_weights / the preflop_range 169 map).
 
-SCOPE (v1): the CANONICAL single-open line only (one preflop raise = the open,
-then flat callers / folds — the capture-verified shape). The raiser gets its
-raise-range weights; each flat-caller gets its call-range weights. Non-canonical
-preflop shapes return None (caller falls back to uniform — documented).
+SCOPE (2026-06-11, review fix — was single-open only): every preflop shape the
+engine SERVES is now range-parsed:
+  * CANONICAL SINGLE-OPEN (one raise + flat callers): raiser gets its
+    raise-range weights, each flat-caller its call-range weights (the original
+    validated v1 behavior, unchanged — including the "any raise" [2,3]
+    convention mirrored from 3b's RangeDealer).
+  * 3-BET HEADS-UP (open -> 3-bet idx 2 or 3 -> folds -> opener calls): the
+    3-bettor gets P(its EXACT 3-bet index | class) at the vs-open node; the
+    opener gets the chain-rule PRODUCT P(open idx 2 | class) x P(call | class)
+    at its two decision nodes (the blueprint HAS sigma-bar at both — the
+    vs-open and 3-bet-response nodes are capture-verified present + trained,
+    preflop_shapes_captured.json 2026-06-10).
+  * HU LIMP-CHECK (one limper -> folds -> BB checks): the limper gets
+    P(call | class); the BB gets P(check | class) — the check is INDEX 0 at
+    the BB-option node (trainer layout [check, 0.7x, 1.0x], capture-verified
+    limp_shapes_captured.json 2026-06-11).
+Anything else returns None (caller falls back to uniform — and the engine
+provider DISCLOSES uniform seeding in the response quality note).
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -71,12 +85,12 @@ def _weights_array_to_name_dict(weights: np.ndarray) -> Dict[str, float]:
 def _parse_canonical_preflop(
     preflop_prefix: Sequence[int],
 ) -> Optional[Dict[str, str]]:
-    """Classify each LIVE seat as 'raiser' or 'caller' on the canonical line.
+    """Classify each LIVE seat as 'raiser' or 'caller' on the SINGLE-OPEN line.
 
     Replays the prefix in UTG-first order. Returns {seat_name: role} for live
-    (non-folded) seats, or None if the line is non-canonical (no raise, or a
-    3bet+/limp), in which case range seeding is unsupported and the caller falls
-    back to uniform.
+    (non-folded) seats, or None if the line is not a single open (no raise, or
+    a 3bet+/limp shape — those are handled by _parse_preflop_decisions, which
+    this feeds for the single-open case).
     """
     roles: Dict[str, str] = {}
     raises_seen = 0
@@ -103,6 +117,110 @@ def _parse_canonical_preflop(
     return roles
 
 
+# One range-defining decision: (action_history up to the node, the action
+# index/indices the seat actually took there). A seat with several decisions
+# (the 3-bet opener: open, then call) gets the chain-rule PRODUCT of its
+# per-decision P(action | class) weights.
+SeatDecision = Tuple[List[int], Tuple[int, ...]]
+
+
+def _single_open_decisions(
+    preflop_prefix: Sequence[int],
+) -> Optional[Dict[str, List[SeatDecision]]]:
+    """Single-open decisions — EXACTLY the original v1 behavior (raiser =
+    'any raise' [2,3], callers = [1], history = prefix up to the seat)."""
+    roles = _parse_canonical_preflop(preflop_prefix)
+    if roles is None:
+        return None
+    out: Dict[str, List[SeatDecision]] = {}
+    for name, role in roles.items():
+        history = _prefix_up_to(preflop_prefix, name)
+        idxs = _RAISE_INDICES if role == "raiser" else _CALL_INDICES
+        out[name] = [(history, tuple(idxs))]
+    return out
+
+
+def _threebet_hu_decisions(
+    preflop_prefix: Sequence[int],
+) -> Optional[Dict[str, List[SeatDecision]]]:
+    """3-bet HU decisions (open -> 3-bet -> folds -> opener calls, length 7).
+
+    Node histories are pinned by the trainer capture (BTN-open/BB-3bet sz1
+    walk, preflop_shapes_captured.json): the opener decides at
+    prefix[:opener] (open, index 2) and again at prefix[:6] (the closing
+    call, index 1, facing the 3-bet); the 3-bettor decides at prefix[:tb]
+    with its EXACT index (2 = 0.7x, 3 = 1.0x — size-specific, unlike the
+    single-open 'any raise' convention, because the prefix records which
+    size was served).
+    """
+    prefix = list(preflop_prefix)
+    if len(prefix) != 7 or prefix[6] != 1:
+        return None
+    raise_is = [i for i, a in enumerate(prefix[:6]) if a in (2, 3)]
+    if len(raise_is) != 2:
+        return None
+    opener_i, tb_i = raise_is
+    if prefix[opener_i] != 2:
+        return None  # a 1.0x OPEN is not a served/verified shape
+    if any(prefix[i] != 0 for i in range(6) if i not in raise_is):
+        return None  # a caller in a 3-bet pot = squeeze — not served
+    opener = _PREFLOP_ORDER[opener_i]
+    threebettor = _PREFLOP_ORDER[tb_i]
+    return {
+        opener: [
+            (prefix[:opener_i], (2,)),
+            (prefix[:6], (1,)),  # closing call, facing the 3-bet
+        ],
+        threebettor: [(prefix[:tb_i], (int(prefix[tb_i]),))],
+    }
+
+
+def _limp_check_decisions(
+    preflop_prefix: Sequence[int],
+) -> Optional[Dict[str, List[SeatDecision]]]:
+    """HU limp-check decisions (one limper -> folds -> BB checks, length 6).
+
+    The BB's check is INDEX 0 at the BB-option node — the trainer layout
+    there is [check, 0.7x, 1.0x] (capture-verified limp_shapes_captured.json
+    2026-06-11), so P(check | class) is sigma[0], NOT the facing-bet call
+    index.
+    """
+    prefix = list(preflop_prefix)
+    if len(prefix) != 6 or any(a not in (0, 1) for a in prefix):
+        return None
+    if prefix[5] != 0:
+        return None  # the BB slot must be the option CHECK
+    limper_is = [i for i, a in enumerate(prefix[:5]) if a == 1]
+    if len(limper_is) != 1:
+        return None  # multi-limper pots are not served (root-captured only)
+    i = limper_is[0]
+    return {
+        _PREFLOP_ORDER[i]: [(prefix[:i], (1,))],
+        "BB": [(prefix[:5], (0,))],
+    }
+
+
+def _parse_preflop_decisions(
+    preflop_prefix: Sequence[int],
+) -> Optional[Dict[str, List[SeatDecision]]]:
+    """Per-LIVE-seat range-defining decisions for every SERVED preflop shape.
+
+    Returns {seat_name: [(history, action_indices), ...]} or None when the
+    shape is not range-parsed (caller falls back to uniform, disclosed).
+    """
+    prefix = list(preflop_prefix)
+    if not prefix or any(a not in (0, 1, 2, 3) for a in prefix):
+        return None
+    n_raises = sum(1 for a in prefix[:6] if a in (2, 3))
+    if n_raises == 0:
+        return _limp_check_decisions(prefix)
+    if n_raises == 1:
+        return _single_open_decisions(prefix)
+    if n_raises == 2:
+        return _threebet_hu_decisions(prefix)
+    return None
+
+
 def seat_range_weight_dicts(
     seats_in_slot_order: Sequence[int],
     preflop_prefix: Sequence[int],
@@ -115,34 +233,28 @@ def seat_range_weight_dicts(
     preflop_prefix: the preflop action-index sequence (UTG-first).
     get_strategy: reader.get_strategy(board, action_history, player, bucket, street).
 
-    Returns None for a non-canonical preflop line (caller uses uniform).
+    A seat's weight is the chain-rule product of P(taken action | class) over
+    its decision nodes (one node for openers/callers/limpers; two for the
+    3-bet opener: open x closing call).
+
+    Returns None for a preflop line outside the parsed shapes (caller uses
+    uniform — disclosed in the provider's quality note).
     """
-    roles = _parse_canonical_preflop(preflop_prefix)
-    if roles is None:
+    decisions = _parse_preflop_decisions(preflop_prefix)
+    if decisions is None:
         return None
 
-    # The action_history PREFIX up to each seat's decision is the full prefix
-    # with that seat's own action (and everything after) removed. For the
-    # canonical line the raiser opens facing the blinds (prefix up to it) and a
-    # caller calls facing the open. We use build_seat_range_weights with the
-    # standard 3b construction: raiser at action_history=[] is the opener only
-    # when it is UTG; to stay faithful we pass the prefix UP TO each seat.
     out: List[Dict[str, float]] = []
     for full_seat in seats_in_slot_order:
         name = SEAT_NAME[full_seat]
-        role = roles.get(name)
-        if role is None:
+        seat_decisions = decisions.get(name)
+        if seat_decisions is None:
             return None  # a live seat we couldn't classify — bail to uniform
-        history_up_to = _prefix_up_to(preflop_prefix, name)
-        if role == "raiser":
-            w = build_seat_range_weights(
-                get_strategy, action_history=history_up_to,
-                player=full_seat, action_indices=list(_RAISE_INDICES),
-            )
-        else:  # caller
-            w = build_seat_range_weights(
-                get_strategy, action_history=history_up_to,
-                player=full_seat, action_indices=list(_CALL_INDICES),
+        w = np.ones(169, dtype=np.float64)
+        for history, action_indices in seat_decisions:
+            w = w * build_seat_range_weights(
+                get_strategy, action_history=list(history),
+                player=full_seat, action_indices=list(action_indices),
             )
         if float(np.asarray(w).sum()) <= 0.0:
             return None  # empty range read — fall back to uniform, fail-safe

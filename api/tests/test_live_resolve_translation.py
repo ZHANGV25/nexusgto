@@ -19,7 +19,9 @@ from app.agent.live_resolve_adapter import (
 )
 from app.agent.live_resolve_ranges import (
     _parse_canonical_preflop,
+    _parse_preflop_decisions,
     _prefix_up_to,
+    seat_range_weight_dicts,
 )
 
 
@@ -294,3 +296,168 @@ def test_prefix_up_to():
     assert _prefix_up_to([2, 0, 0, 0, 0, 1], "BB") == [2, 0, 0, 0, 0]
     # The UTG raiser acts first: empty history.
     assert _prefix_up_to([2, 0, 0, 0, 0, 1], "UTG") == []
+
+
+# ── range-seeding decision parsing for the SERVED shapes (2026-06-11) ─────
+# Node histories below are pinned to the trainer captures
+# (preflop_shapes_captured.json sz1 walk node prefix_before values;
+# limp_shapes_captured.json BB-option node check_idx=0).
+
+
+def test_parse_decisions_single_open_unchanged():
+    # The original v1 behavior: raiser = 'any raise' (2,3), callers = (1,).
+    d = _parse_preflop_decisions([2, 0, 0, 1, 0, 1])
+    assert d == {
+        "UTG": [([], (2, 3))],
+        "BTN": [([2, 0, 0], (1,))],
+        "BB": [([2, 0, 0, 1, 0], (1,))],
+    }
+
+
+def test_parse_decisions_threebet_hu_sz1():
+    # BTN-open / BB-3-bet 1.0x: [0,0,0,2,0,3,1]. Capture-pinned histories:
+    # open at [0,0,0]; 3-bet (EXACT index 3) at [0,0,0,2,0]; the opener's
+    # closing call at the full first orbit [0,0,0,2,0,3].
+    d = _parse_preflop_decisions([0, 0, 0, 2, 0, 3, 1])
+    assert d == {
+        "BTN": [([0, 0, 0], (2,)), ([0, 0, 0, 2, 0, 3], (1,))],
+        "BB": [([0, 0, 0, 2, 0], (3,))],
+    }
+
+
+def test_parse_decisions_threebet_hu_sz0_with_folds_after():
+    # UTG-open / BTN-3-bet 0.7x (folds between AND after the 3-bettor).
+    d = _parse_preflop_decisions([2, 0, 0, 2, 0, 0, 1])
+    assert d == {
+        "UTG": [([], (2,)), ([2, 0, 0, 2, 0, 0], (1,))],
+        "BTN": [([2, 0, 0], (2,))],
+    }
+
+
+def test_parse_decisions_limp_lines():
+    # UTG-limp: the BB's check is INDEX 0 at the BB-option node (layout
+    # [check, 0.7x, 1.0x] — NOT the facing-bet call index 1).
+    assert _parse_preflop_decisions([1, 0, 0, 0, 0, 0]) == {
+        "UTG": [([], (1,))],
+        "BB": [([1, 0, 0, 0, 0], (0,))],
+    }
+    # SB-complete.
+    assert _parse_preflop_decisions([0, 0, 0, 0, 1, 0]) == {
+        "SB": [([0, 0, 0, 0], (1,))],
+        "BB": [([0, 0, 0, 0, 1], (0,))],
+    }
+
+
+def test_parse_decisions_unparsed_shapes_return_none():
+    assert _parse_preflop_decisions([2, 0, 0, 2, 0, 0, 2, 1]) is None  # 4-bet
+    assert _parse_preflop_decisions([2, 1, 0, 0, 0, 2, 1, 1]) is None  # squeeze
+    assert _parse_preflop_decisions([1, 0, 0, 1, 0, 0]) is None  # multi-limp
+    assert _parse_preflop_decisions([3, 0, 0, 0, 0, 1]) is None  # 1.0x open
+    assert _parse_preflop_decisions([0, 0, 0, 3, 0, 2, 1]) is None  # 1.0x open
+    assert _parse_preflop_decisions([]) is None
+    assert _parse_preflop_decisions([0, 0, 0, 2, 0, 3]) is None  # unclosed
+
+
+def test_seat_range_weights_threebet_chain_rule_product():
+    """The 3-bet opener's range = P(open | class) x P(call | class) — the
+    chain rule over its TWO decision nodes; the 3-bettor uses its EXACT
+    3-bet index. Fake sigma-bar pins the queried (history, player) nodes."""
+
+    def get_strategy(board, history, player, bucket, street):
+        assert board == [] and street == 0
+        if history == [0, 0, 0] and player == 5:        # BTN open node
+            return [0.2, 0.3, 0.5, 0.0]                 # P(idx2) = 0.5
+        if history == [0, 0, 0, 2, 0] and player == 1:  # BB vs-open node
+            return [0.5, 0.3, 0.0, 0.2]                 # P(idx3) = 0.2
+        if history == [0, 0, 0, 2, 0, 3] and player == 5:  # BTN vs-3-bet
+            return [0.4, 0.3, 0.3]                      # P(call=idx1) = 0.3
+        raise AssertionError(f"unexpected node {history} p{player}")
+
+    # Slot order SB-first for live ["BB", "BTN"]: BB (seat 1), BTN (seat 5).
+    out = seat_range_weight_dicts([1, 5], [0, 0, 0, 2, 0, 3, 1], get_strategy)
+    assert out is not None
+    bb, btn = out
+    assert abs(bb["AA"] - 0.2) < 1e-12
+    assert abs(btn["AA"] - 0.5 * 0.3) < 1e-12
+
+
+def test_seat_range_weights_limp_check_uses_bb_check_index_0():
+    def get_strategy(board, history, player, bucket, street):
+        if history == [] and player == 2:               # UTG limp node
+            return [0.3, 0.6, 0.1, 0.0]                 # P(call=idx1) = 0.6
+        if history == [1, 0, 0, 0, 0] and player == 1:  # BB-option node
+            return [0.7, 0.2, 0.1]                      # P(check=idx0) = 0.7
+        raise AssertionError(f"unexpected node {history} p{player}")
+
+    out = seat_range_weight_dicts([1, 2], [1, 0, 0, 0, 0, 0], get_strategy)
+    assert out is not None
+    bb, utg = out
+    assert abs(bb["AA"] - 0.7) < 1e-12
+    assert abs(utg["AA"] - 0.6) < 1e-12
+
+
+def test_seat_range_weights_unparsed_shape_returns_none():
+    def get_strategy(*a):  # pragma: no cover - must not be queried
+        raise AssertionError("no sigma read for an unparsed shape")
+
+    assert seat_range_weight_dicts(
+        [1, 5], [0, 0, 0, 2, 0, 2, 2, 1], get_strategy,  # 4-bet
+    ) is None
+
+
+# ── LiveResolveSource RECORDS its range-seeding mode (disclosure) ──────────
+
+
+class _AnyRowDict(dict):
+    """all_by_player[player].get(row) -> the same labels for ANY row."""
+
+    def __init__(self, labels):
+        super().__init__()
+        self._labels = labels
+
+    def get(self, key, default=None):
+        return self._labels
+
+
+class _FakeEsEngine:
+    def solve(self, **kwargs):
+        labels = {"Check": 0.7, "Bet 75%": 0.3}
+        return {0: _AnyRowDict(labels), 1: _AnyRowDict(labels)}
+
+
+def test_live_resolve_source_records_uniform_seeding_without_reader():
+    from app.agent.strategy_source import LiveResolveSource
+    from app.agent.modes import ModeConfig
+
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"), cpu_es_solver=_FakeEsEngine(),
+    )
+    assert src.last_range_seeding is None
+    mix = src.get_mix(st, (_ci("Ah"), _ci("Kh")))
+    # No strategy reader -> seeding impossible -> uniform, RECORDED.
+    assert src.last_range_seeding == "uniform"
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+
+
+def test_live_resolve_source_records_blueprint_seeding_with_reader():
+    from app.agent.strategy_source import LiveResolveSource
+    from app.agent.modes import ModeConfig
+
+    class _Reader:
+        def get_strategy(self, board, history, player, bucket, street):
+            return [0.25, 0.25, 0.25, 0.25]
+
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"), cpu_es_solver=_FakeEsEngine(),
+        strategy_reader=_Reader(),
+    )
+    src.get_mix(st, (_ci("Ah"), _ci("Kh")))
+    assert src.last_range_seeding == "blueprint_preflop_sigma"

@@ -328,6 +328,13 @@ class LiveResolveSource(StrategySource):
         # back to uniform ranges (the over-bet caveat then applies — documented).
         self._seed_ranges = bool(seed_ranges)
         self._reader = strategy_reader  # reader.get_strategy(...) or None
+        # RECORDED per call (call-local, like RecordingHybridSource): how the
+        # last get_mix seeded its ranges — "blueprint_preflop_sigma" or
+        # "uniform". The engine provider reads this to DISCLOSE uniform
+        # seeding in the response quality note (review 2026-06-11: silent
+        # uniform seeding on unparsed preflop shapes was an unflagged
+        # quality compromise).
+        self.last_range_seeding: Optional[str] = None
 
     def _ensure_engine(self):
         if self._engine is not None:
@@ -367,7 +374,14 @@ class LiveResolveSource(StrategySource):
             )
         except Exception:
             # Range seeding is an OPTIONAL refinement; never let it break a
-            # solve. A failure here falls back to uniform ranges (documented).
+            # solve. A failure here falls back to uniform ranges — but NEVER
+            # silently (review 2026-06-11): the fallback is disclosed in the
+            # provider quality note and the cause is logged here.
+            logger.warning(
+                "LiveResolveSource: range seeding FAILED for prefix %s — "
+                "falling back to UNIFORM ranges",
+                list(state.preflop_prefix), exc_info=True,
+            )
             return None
 
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
@@ -381,9 +395,12 @@ class LiveResolveSource(StrategySource):
 
         # Seed in-distribution ranges (preflop σ̄) when possible — removes the
         # over-bet confound (uniform ranges make the re-solve model a wide/weak
-        # villain). Falls back to uniform on a non-canonical preflop line or
-        # without a strategy reader.
+        # villain). Falls back to uniform on an unparsed preflop line or
+        # without a strategy reader — RECORDED so the provider can disclose it.
         range_dicts = self._seat_range_dicts(state, engine) if self._seed_ranges else None
+        self.last_range_seeding = (
+            "blueprint_preflop_sigma" if range_dicts is not None else "uniform"
+        )
 
         inputs = build_solve_inputs(state, range_weight_dicts=range_dicts)
         #   raises LiveResolveUnsupported on terminal / river / mid-street re-entry.
