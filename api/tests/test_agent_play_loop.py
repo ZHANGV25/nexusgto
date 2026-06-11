@@ -224,16 +224,18 @@ def test_live_resolve_requires_engine_or_blueprint():
         src._ensure_engine()
 
 
-def test_live_resolve_river_is_unsupported_without_solving():
-    # SMOKE: the adapter translation rejects river BEFORE constructing/calling
-    # any engine (the §6 side-pot gap is structural, not a solve failure). A
-    # fake engine that would explode if called proves get_mix never reaches it.
+def test_live_resolve_river_without_dealt_cards_fails_loud():
+    # SMOKE: river is SERVED since 2026-06-11, but a river state whose board
+    # was never extended past the flop must fail LOUD (ValueError at the
+    # board-length guard) BEFORE constructing/calling any engine — never a
+    # silent wrong-street solve and never a lookup-fallback (this is a driver
+    # bug, not a documented unsupported surface). A fake engine that would
+    # explode if called proves get_mix never reaches it.
     from app.agent.strategy_source import LiveResolveSource
-    from app.agent.live_resolve_adapter import LiveResolveUnsupported
 
     class _ExplodingEngine:
         def solve(self, **_kw):  # pragma: no cover - must never be called
-            raise AssertionError("engine.solve called on a river node")
+            raise AssertionError("engine.solve called on a short-board river")
 
     src = LiveResolveSource(
         ModeConfig(mode="LIVE_RESOLVE"), cpu_es_solver=_ExplodingEngine(),
@@ -245,7 +247,7 @@ def test_live_resolve_river_is_unsupported_without_solving():
     for idx in [0, 0, 0, 0, 0, 0]:  # flop + turn check-throughs -> river root
         st = st.advance(idx)
     assert st.street == 3
-    with pytest.raises(LiveResolveUnsupported):
+    with pytest.raises(ValueError, match="board cards"):
         src.get_mix(st, (_ci("Ah"), _ci("Kh")))
 
 
