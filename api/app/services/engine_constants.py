@@ -33,15 +33,27 @@ BLUEPRINT_QUALITY_NOTE = (
     "live search"
 )
 
-# Self-consistent exploitability floors, %/pot/player, keyed by
-# (n_players, num_rollouts). ONLY exactly-measured combos appear here.
-MEASURED_FLOORS_PCT_POT: Dict[Tuple[int, int], float] = {
-    (6, 3): 0.144,
-    (6, 10): 0.089,
-    (6, 20): 0.095,
-    (6, 30): 0.073,
-    (5, 3): 0.122,  # 5p ship quality (CPU_ES_RESOLVER_BENCHMARK.md)
+# Self-consistent exploitability floors, %/pot/player, keyed by the FULL
+# measured configuration (n_players, num_rollouts, vec_mode, readout).
+# ONLY exactly-measured arms appear here; a floor is cited only when the
+# running config matches the arm AND the iteration budget reaches the
+# measured rung (review 2026-06-10: citing the 50M-rung floor for a
+# 50k-iteration solve, or a scalar/avg number for a vec/final run,
+# over-claims quality).
+#
+# 6p arms: NR_LADDER_2026-06-10.md (replicated by NR_LADDER_REWEIGHT).
+# 5p vec-final arms: RAISE_CAP_2026-06-10.md (cap=2 rows, same protocol).
+MEASURED_FLOORS_PCT_POT: Dict[Tuple[int, int, bool, str], float] = {
+    (6, 3, True, "final"): 0.144,
+    (6, 10, True, "final"): 0.089,
+    (6, 20, True, "final"): 0.095,
+    (6, 30, True, "final"): 0.073,
+    (5, 3, True, "final"): 0.133,
+    (5, 10, True, "final"): 0.076,
 }
+# The floors above are the best rung of a 5/20/50M-iteration ladder; below
+# the 20M rung the floor is not established for that arm.
+FLOOR_MIN_ITERATIONS = 20_000_000
 
 # The product's numeric quality bar (%/pot/player), anchored on 5p nr=3 ship
 # quality (DISCRIMINATOR_2026-06-10.md caveat applies across nr).
@@ -86,13 +98,22 @@ DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     5: LiveSolveConfig(
         iterations=5_000_000, num_rollouts=10, vec_mode=True, readout="final",
         note=(
-            "5p: measured 0.122%/pot at nr=3 (~75s); nr=10 floor not exactly "
-            "measured (leaf noise shrinks with nr per DISCRIMINATOR)"
+            "5p vec-final nr=10 floor 0.076%/pot measured at the 50M rung "
+            "(RAISE_CAP_2026-06-10.md); floors describe AGGREGATE "
+            "exploitability, not per-spot mix reproducibility"
         ),
     ),
     6: LiveSolveConfig(
         iterations=5_000_000, num_rollouts=10, vec_mode=True, readout="final",
-        note="6p nr=10 floor 0.089%/pot measured; ~65s cold at 96-192 cores",
+        note=(
+            "6p vec-final nr=10 floor 0.089%/pot measured (~65s cold at "
+            "96-192 cores). CAVEAT: the final-iterate readout serves "
+            "near-pure per-spot mixes, and the per-spot mix varies with "
+            "leaf-construct noise (reach-weighted |dSigma| 0.345 across "
+            "noise seeds at nr=10 — NR_LADDER_REWEIGHT_2026-06-10.md); the "
+            "floor describes aggregate exploitability, not per-spot "
+            "reproducibility"
+        ),
     ),
 }
 
@@ -139,6 +160,19 @@ def live_config_for(
     )
 
 
-def measured_floor_for(n_players: int, num_rollouts: int) -> Optional[float]:
-    """The exactly-measured floor for this combo, or None (never estimated)."""
-    return MEASURED_FLOORS_PCT_POT.get((n_players, num_rollouts))
+def measured_floor_for(
+    n_players: int,
+    num_rollouts: int,
+    *,
+    vec_mode: bool,
+    readout: str,
+    iterations: int,
+) -> Optional[float]:
+    """The exactly-measured floor for this FULL config, or None (never
+    estimated, never cross-config). None when the iteration budget is below
+    the measured rung."""
+    if iterations < FLOOR_MIN_ITERATIONS:
+        return None
+    return MEASURED_FLOORS_PCT_POT.get(
+        (n_players, num_rollouts, vec_mode, readout)
+    )

@@ -600,6 +600,19 @@ class GameState:
                 if amount is None or int(amount) <= 0:
                     raise ValueError("observed RAISE requires a chip amount")
                 increment = min(int(amount), stacks[slot])
+            if increment <= 0:
+                # The actor has NO chips left in the served canonical game
+                # (e.g. a deeper-than-100bb table whose real player still has
+                # chips after the canonical stack went all-in). Recording the
+                # observed bet as a 0-chip CHECK with off_tree=False served a
+                # silently wrong node (review 2026-06-10). Fail loud; the API
+                # maps this ValueError to a 422.
+                raise ValueError(
+                    f"observed {action} by a player with no remaining chips "
+                    "in the canonical 100bb game — the described action "
+                    "cannot exist in the served blueprint game (off-depth "
+                    "table state)"
+                )
             if increment <= to_call:
                 # Under-raise / short all-in-call: representable on-tree only
                 # as a CALL. A legal under-raise is an all-in (stack ==
