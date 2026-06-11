@@ -19,10 +19,17 @@ capture-verified shapes:
      trained σ̄ at every flop-root key with wrong-seat / truncated /
      extended / out-of-vocab-index discriminators MISSING. Evidence:
      poker-solver scripts/preflop_shapes_captured.json (+ the EC2-gated
-     oracle replay tests). v1 maps EVERY 3-bet to index 2 — the SMALLEST
-     (0.7x) trainer size, tier 1 of PREFLOP_TIERS {0:[0.7,1.0], 1:[0.7,1.0],
-     2:[1.0]} — the same smallest-size convention the open uses; the 1.0x
-     3-bet (index 3) is trained in the blueprint but not wired here.
+     oracle replay tests). The 3-bet SIZE is parametrized
+     (threebet_size_idx): 0 → the SMALLEST (0.7x) trainer size = action
+     index 2 (the verified default, same smallest-size convention the open
+     uses); 1 → the 1.0x size = action index 3 (vs-open node layout
+     [fold=0, call=1, 3bet-0.7x=2, 3bet-1.0x=3], na=4 — tier 1 of
+     PREFLOP_TIERS {0:[0.7,1.0], 1:[0.7,1.0], 2:[1.0]}). The index-3 path
+     is capture-verified for BTN-open/BB-3bet (2026-06-10: root GOLDEN,
+     discriminators MISS, σ̄-length walks clean) and is being widened to 5
+     pairs by the Lane-C probe; SERVING it is gated at the translation
+     layer (engine_translation.THREEBET_LARGE_SIZE_ENABLED) until those
+     probes return clean.
 
 Anything beyond — limps, squeezes (callers + 3-bet), 4-bet+, multiway 3-bet
 pots — is NOT capture-verified and raises PreflopConstructionUnsupported
@@ -55,6 +62,10 @@ _FOLD = 0
 _CALL = 1
 _RAISE = 2
 
+# Valid 3-bet size indices: 0 → 0.7x (action index 2), 1 → 1.0x (action
+# index 3). Mirrors PREFLOP_TIERS tier 1 == [0.7, 1.0].
+THREEBET_SIZE_INDICES = (0, 1)
+
 
 class PreflopConstructionUnsupported(Exception):  # noqa: N818 - matches sibling PreflopNodeNotFound naming
     """The preflop line is outside the capture-verified shapes.
@@ -82,7 +93,9 @@ class PreflopAction:
     amount: float = 0.0
 
 
-def build_preflop_prefix(actions: List[PreflopAction]) -> List[int]:
+def build_preflop_prefix(
+    actions: List[PreflopAction], *, threebet_size_idx: int = 0,
+) -> List[int]:
     """Construct the preflop action-index prefix for `actions`.
 
     `actions` is the ordered list of VOLUNTARY actions (raises/calls);
@@ -90,13 +103,25 @@ def build_preflop_prefix(actions: List[PreflopAction]) -> List[int]:
     is the preflop portion of action_history (one index per action taken,
     including inferred folds).
 
+    `threebet_size_idx` selects the 3-bet's trainer size on the 3-bet HU
+    shape: 0 → 0.7x (action index 2, the verified default), 1 → 1.0x
+    (action index 3). It applies ONLY to the 3-bet; the open is always the
+    smallest size.
+
     Raises:
-        ValueError: empty list, or an unknown position.
+        ValueError: empty list, an unknown position, an out-of-range
+            threebet_size_idx, or a nonzero threebet_size_idx on a line
+            without a 3-bet.
         PreflopConstructionUnsupported: a non-capture-verified shape (limp,
             squeeze, 4bet+, out-of-order action).
     """
     if not actions:
         raise ValueError("actions must be non-empty")
+    if threebet_size_idx not in THREEBET_SIZE_INDICES:
+        raise ValueError(
+            f"threebet_size_idx {threebet_size_idx!r} not in "
+            f"{THREEBET_SIZE_INDICES} (0 = 0.7x, 1 = 1.0x)"
+        )
     for a in actions:
         if a.position not in _ORDER_SET:
             raise ValueError(
@@ -110,9 +135,14 @@ def build_preflop_prefix(actions: List[PreflopAction]) -> List[int]:
             "capture-verified)"
         )
     if len(raisers) == 1:
+        if threebet_size_idx != 0:
+            raise ValueError(
+                "threebet_size_idx given but the line has no 3-bet "
+                "(single-open shape)"
+            )
         return _single_open_prefix(actions)
     if len(raisers) == 2:
-        return _threebet_hu_prefix(actions, raisers)
+        return _threebet_hu_prefix(actions, raisers, threebet_size_idx)
     raise PreflopConstructionUnsupported(
         "more than two raises (4bet+) is not capture-verified"
     )
@@ -179,15 +209,20 @@ def _single_open_prefix(actions: List[PreflopAction]) -> List[int]:
 
 
 def _threebet_hu_prefix(
-    actions: List[PreflopAction], raisers: List[PreflopAction],
+    actions: List[PreflopAction],
+    raisers: List[PreflopAction],
+    threebet_size_idx: int = 0,
 ) -> List[int]:
     """open → 3-bet → folds back → opener calls, heads-up to the flop.
 
     The emitted prefix is always length 7: one index per seat in the first
     orbit (UTG..BB — folds for everyone but the opener and the 3-bettor),
     then the opener's closing call. Capture-verified for all 15
-    (opener, 3-bettor) pairs — e.g. BTN-open/BB-3bet → [0,0,0,2,0,2,1],
-    UTG-open/BTN-3bet → [2,0,0,2,0,0,1].
+    (opener, 3-bettor) pairs at the smallest size — e.g. BTN-open/BB-3bet →
+    [0,0,0,2,0,2,1], UTG-open/BTN-3bet → [2,0,0,2,0,0,1]. With
+    threebet_size_idx=1 the 3-bettor's slot emits index 3 (the 1.0x size):
+    BTN-open/BB-3bet → [0,0,0,2,0,3,1] (capture-verified 2026-06-10; wider
+    pair coverage pending the Lane-C probe).
     """
     opener, threebettor = raisers[0].position, raisers[1].position
     if opener == threebettor:
@@ -244,8 +279,10 @@ def _threebet_hu_prefix(
     # Emission: full first orbit + the opener's closing call (length 7).
     prefix = []
     for pos in PREFLOP_ORDER:
-        if pos == opener or pos == threebettor:
+        if pos == opener:
             prefix.append(_RAISE)
+        elif pos == threebettor:
+            prefix.append(_RAISE + threebet_size_idx)
         else:
             prefix.append(_FOLD)
     prefix.append(_CALL)

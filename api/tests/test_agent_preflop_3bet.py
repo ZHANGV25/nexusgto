@@ -223,10 +223,23 @@ def test_chips_fourbet_prefix_unsupported():
         canonical_flop_chips([2, 0, 0, 2, 0, 0, 2, 1], ["UTG", "BTN"])
 
 
-def test_chips_non_smallest_raise_index_unsupported():
-    # Index 3 = the 1.0x size: trained in the blueprint but not wired in v1.
+def test_chips_index3_threebet_now_supported_capture_pinned():
+    # Index 3 = the 1.0x 3-BET: WIRED 2026-06-11 (Lane C). Capture-pinned to
+    # the 2026-06-10 trainer-C walk (preflop_shapes_captured.json BTN-BB
+    # sz1: flop_pot 1800, stacks 9125/9125). Serving stays gated in
+    # engine_translation until the widened probes land; the chips layer is
+    # verified by this artifact. Full sz1 coverage in
+    # tests/test_agent_preflop_threebet_size.py.
+    assert canonical_flop_chips([0, 0, 0, 2, 0, 3, 1], ["BB", "BTN"]) == (
+        1800, (9125, 9125),
+    )
+
+
+def test_chips_index3_open_unsupported():
+    # Index 3 at the OPEN (a 1.0x open) is NOT capture-verified — only the
+    # 0.7x open and the {0.7x, 1.0x} 3-bet are.
     with pytest.raises(CanonicalChipsUnsupported):
-        canonical_flop_chips([0, 0, 0, 2, 0, 3, 1], ["BB", "BTN"])
+        canonical_flop_chips([0, 0, 0, 3, 0, 2, 1], ["BB", "BTN"])
 
 
 def test_chips_multiway_3bet_pot_unsupported():

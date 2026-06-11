@@ -65,6 +65,12 @@ INITIAL_STACK = 10000
 # Verified: with this convention the chip-aware vocab length matches the
 # blueprint σ̄ length at EVERY node along the raise-war line, both prefixes.
 PREFLOP_OPEN_FRACTION = 0.7
+# The LARGE 3-bet size (tier 1, index 3 action = 1.0x). Chips for the
+# index-3 3-bet are capture-verified for BTN-open/BB-3bet (2026-06-10,
+# preflop_shapes_captured.json: pot 1800, stacks 9125/9125, σ̄-length walks
+# clean); wider pair coverage runs in the Lane-C probe. SERVING the 1.0x
+# path is gated in engine_translation until those probes return.
+PREFLOP_THREEBET_LARGE_FRACTION = 1.0
 
 # Preflop acting order (matches preflop_constructor.PREFLOP_ORDER / the trainer).
 _PREFLOP_ORDER = ("UTG", "MP", "CO", "BTN", "SB", "BB")
@@ -116,25 +122,28 @@ def canonical_flop_chips(
 
     Walks the preflop action sequence through the TRAINER's amount formula
     (preflop_raise_amount_f32 — float32, bit-exact to bp_generate_actions)
-    with the [50,100]/10000 convention and the 0.7 (smallest) size, then
-    returns the pot and the per-slot (SB-first over `seats`) remaining stacks.
+    with the [50,100]/10000 convention — the 0.7 (smallest) size for raise
+    index 2, the 1.0x size for the index-3 3-bet — then returns the pot and
+    the per-slot (SB-first over `seats`) remaining stacks.
 
     Supported (capture-verified) shapes:
       * single open + flat callers — VERIFIED (600, (9725,9725)) 2p and
         (875, (9725,9725,9725)) 3p, matching the blueprint σ̄ length along
         the raise-war line (2026-06-04).
-      * 3-bet HEADS-UP: open → 3-bet (smallest, index 2) → folds back →
-        opener calls. VERIFIED 2026-06-10 against the literal trainer C
-        amounts (bp_generate_actions walk, all 15 opener/3-bettor pairs) +
-        blueprint σ̄-length walks to the river all-in clamp: e.g.
-        BTN-open/BB-3bet → (1440, (9305, 9305)); UTG-open/BTN-3bet →
-        (1680, (9235, 9235)). Evidence: poker-solver
-        scripts/preflop_shapes_captured.json.
+      * 3-bet HEADS-UP: open → 3-bet (index 2 = 0.7x OR index 3 = 1.0x) →
+        folds back → opener calls. The 0.7x path VERIFIED 2026-06-10
+        against the literal trainer C amounts (bp_generate_actions walk,
+        all 15 opener/3-bettor pairs) + blueprint σ̄-length walks to the
+        river all-in clamp: e.g. BTN-open/BB-3bet → (1440, (9305, 9305));
+        UTG-open/BTN-3bet → (1680, (9235, 9235)). The 1.0x path verified
+        for BTN-open/BB-3bet → (1800, (9125, 9125)); wider 1.0x pair
+        coverage pending the Lane-C probe (serving is gated upstream).
+        Evidence: poker-solver scripts/preflop_shapes_captured.json.
 
     Raises:
         CanonicalChipsUnsupported: a non-canonical preflop shape (limp, 4bet+,
-            non-smallest raise index, 3-bet pot that isn't heads-up) — chips
-            can't be derived without new ground truth.
+            a 1.0x open, an out-of-vocab raise index, 3-bet pot that isn't
+            heads-up) — chips can't be derived without new ground truth.
     """
     for s in seats:
         if s not in FULL_SEAT:
@@ -178,15 +187,26 @@ def canonical_flop_chips(
                 to_call = current_bet - bets[pos]
                 bets[pos] += to_call
                 pot += to_call
-            elif action == 2:  # raise — smallest size (open / 3-bet)
+            elif action in (2, 3):  # raise — 0.7x (idx 2) or 1.0x (idx 3)
                 if raises_seen >= 2:
                     raise CanonicalChipsUnsupported(
                         "more than two preflop raises (4bet+) — chips not "
                         "capture-verified; pass explicit pot/stacks"
                     )
+                if action == 3 and raises_seen == 0:
+                    # Index 3 at the OPEN = a 1.0x open — NOT capture-verified
+                    # (only the 0.7x open and the {0.7x, 1.0x} 3-bet are).
+                    raise CanonicalChipsUnsupported(
+                        "1.0x OPEN (index 3 at the first raise) — chips not "
+                        "capture-verified; only the smallest (0.7x) open is"
+                    )
+                frac = (
+                    PREFLOP_OPEN_FRACTION if action == 2
+                    else PREFLOP_THREEBET_LARGE_FRACTION
+                )
                 to_call = current_bet - bets[pos]
                 amt = preflop_raise_amount_f32(
-                    PREFLOP_OPEN_FRACTION, pot=pot, to_call=to_call,
+                    frac, pot=pot, to_call=to_call,
                     stack=INITIAL_STACK - bets[pos],
                 )
                 bets[pos] += amt
@@ -195,8 +215,9 @@ def canonical_flop_chips(
                 raises_seen += 1
             else:
                 raise CanonicalChipsUnsupported(
-                    f"unsupported preflop action index {action} (only the "
-                    f"smallest raise size = index 2 is capture-verified)"
+                    f"unsupported preflop action index {action} (raise "
+                    f"indices 2 = 0.7x and 3 = 1.0x-3-bet are the "
+                    f"capture-verified vocabulary)"
                 )
 
     if raises_seen == 0:
@@ -229,6 +250,64 @@ def canonical_flop_chips(
     order = sorted(live_seats, key=lambda s: FULL_SEAT[s])
     stacks = tuple(INITIAL_STACK - bets[pos] for pos in order)
     return pot, stacks
+
+
+def canonical_threebet_increments(
+    opener: str, threebettor: str,
+) -> Tuple[int, int]:
+    """The trainer's canonical 3-bet chip INCREMENTS (0.7x, 1.0x) at the
+    3-bettor's vs-open node for this (opener, 3-bettor) pair.
+
+    Replays the canonical heads-up 3-bet first orbit — blinds posted, folds
+    to the opener, the 0.7x f32 open, folds to the 3-bettor — and evaluates
+    both tier-1 sizes through preflop_raise_amount_f32 (bit-exact to
+    bp_generate_actions). These are the candidates the engine-translation
+    layer snaps a caller's 3-bet amount onto. E.g. BTN-open/BB-3bet →
+    (595, 775); UTG-open/BTN-3bet (cold) → (765, 975).
+
+    Raises:
+        ValueError: unknown position, opener == threebettor, or a
+            3-bettor seated BEFORE the opener (limp-reraise shape — not a
+            vs-open node).
+    """
+    for s in (opener, threebettor):
+        if s not in FULL_SEAT:
+            raise ValueError(f"unknown position {s!r}")
+    oi = _PREFLOP_ORDER.index(opener)
+    ti = _PREFLOP_ORDER.index(threebettor)
+    if ti <= oi:
+        raise ValueError(
+            f"3-bettor {threebettor} does not act after the opener {opener} "
+            f"in the canonical orbit (limp-reraise shape)"
+        )
+
+    bets: Dict[str, int] = {pos: 0 for pos in _PREFLOP_ORDER}
+    bets["SB"] = SMALL_BLIND
+    bets["BB"] = BIG_BLIND
+    pot = SMALL_BLIND + BIG_BLIND
+    current_bet = BIG_BLIND
+
+    open_amt = preflop_raise_amount_f32(
+        PREFLOP_OPEN_FRACTION,
+        pot=pot,
+        to_call=current_bet - bets[opener],
+        stack=INITIAL_STACK - bets[opener],
+    )
+    bets[opener] += open_amt
+    pot += open_amt
+    current_bet = bets[opener]
+
+    to_call = current_bet - bets[threebettor]
+    stack = INITIAL_STACK - bets[threebettor]
+    return (
+        preflop_raise_amount_f32(
+            PREFLOP_OPEN_FRACTION, pot=pot, to_call=to_call, stack=stack,
+        ),
+        preflop_raise_amount_f32(
+            PREFLOP_THREEBET_LARGE_FRACTION, pot=pot, to_call=to_call,
+            stack=stack,
+        ),
+    )
 
 
 @dataclass(frozen=True)

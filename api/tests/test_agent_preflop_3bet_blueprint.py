@@ -17,6 +17,11 @@ tests/test_agent_preflop_3bet.py).
 
 from __future__ import annotations
 
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -133,6 +138,86 @@ def test_all_15_pairs_flop_root_hits_trained(blueprint, pair):
     assert np.abs(arr - uniform).max() > 0.05, (
         f"untrained sigma at {key.as_tuple()} for {pair}: {arr}"
     )
+
+
+# ── 1.0x 3-bet (index 3): artifact-gated oracle replay (Lane C) ───────────
+#
+# Ground truth comes from preflop_shapes_captured.json in the poker-solver
+# checkout (the Lane-C probe APPENDS threebet_size_idx=1 walks for these
+# pairs). Each test SKIPS until the artifact has the index-1 walk for its
+# pair — they turn red/green honestly the moment the EC2 capture lands.
+# BTN-BB was already captured clean 2026-06-10, so it runs today.
+
+_SZ1_PAIRS = [("BTN", "BB"), ("UTG", "BB"), ("BTN", "SB"),
+              ("SB", "BB"), ("UTG", "BTN")]
+
+
+@lru_cache(maxsize=1)
+def _sz1_walks():
+    ps_path = Path(os.environ.get(
+        "POKER_SOLVER_PATH",
+        str(Path(__file__).resolve().parent.parent.parent / "poker-solver"),
+    ))
+    artifact = ps_path / "scripts" / "preflop_shapes_captured.json"
+    if not artifact.exists():
+        return {}
+    data = json.loads(artifact.read_text())
+    return {
+        (w["opener"], w["threebettor"]): w
+        for w in data.get("trainer_walks", [])
+        if w.get("threebet_size_idx") == 1
+    }
+
+
+def _sz1_walk_or_skip(pair):
+    w = _sz1_walks().get(pair)
+    if w is None:
+        pytest.skip(
+            f"no threebet_size_idx=1 capture for {pair} in "
+            f"preflop_shapes_captured.json yet (Lane-C probe pending)"
+        )
+    return w
+
+
+@pytest.mark.parametrize("pair", _SZ1_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}")
+def test_sz1_constructed_line_matches_capture_and_hits_trained(blueprint, pair):
+    w = _sz1_walk_or_skip(pair)
+    prefix = build_preflop_prefix(_threebet_line(*pair), threebet_size_idx=1)
+    assert prefix == w["prefix"], "constructed prefix != trainer-C capture"
+    live = list(w["live_seats"])
+    st = new_postflop_state(seats=live, preflop_prefix=prefix, board=BOARD[:3])
+    # Derived f32 chips must equal the literal trainer-C chips.
+    assert (st.pot, list(st.stacks)) == (w["flop_pot"], w["flop_stacks"])
+    key = build_key(st)
+    hero = (_ci("As"), _ci("Ad"))
+    bucket = _bucket(blueprint, st.board, key.street, hero)
+    strat = blueprint.get_strategy(
+        list(st.board), key.action_history, key.player, bucket, street=1,
+    )
+    assert strat is not None, f"MISS at {key.as_tuple()} for sz1 {pair}"
+    arr = np.asarray(strat, dtype=float)
+    assert arr.sum() > 0
+    assert st.num_legal_actions() == len(arr)
+    arr = arr / arr.sum()
+    uniform = np.full(len(arr), 1.0 / len(arr))
+    assert np.abs(arr - uniform).max() > 0.05, (
+        f"untrained sigma at {key.as_tuple()} for sz1 {pair}: {arr}"
+    )
+
+
+@pytest.mark.parametrize("pair", _SZ1_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}")
+def test_sz1_betline_to_terminal(blueprint, pair):
+    # The 1.0x chip path's na signature: replay bet-call to the river all-in
+    # clamp asserting state-vs-stored sigma length at EVERY node (the bigger
+    # 3-bet shifts the commitment prune — exactly what sz0 chips would get
+    # wrong).
+    w = _sz1_walk_or_skip(pair)
+    prefix = build_preflop_prefix(_threebet_line(*pair), threebet_size_idx=1)
+    lengths, st = _replay_assert(
+        blueprint, list(w["live_seats"]), prefix, [1, 1, 1, 1, 1, 1],
+    )
+    assert st.terminal
+    assert len(lengths) == 6
 
 
 # ── Canary: the wrong seat at the flop root must MISS ─────────────────────
