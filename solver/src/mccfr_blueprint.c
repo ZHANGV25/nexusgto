@@ -556,6 +556,21 @@ void *bp_get_cont_ev_table_ptr(BPSolver *s) {
     return (void *)&s->cont_ev_table;
 }
 
+/* Lane A post-review 2026-06-11 — cont_ev_table saturation observability.
+ * bp_cont_ev_find_or_create returns NULL at the probe cap and bumps
+ * cont_ev_table.insertion_failures, but (unlike the info table, whose
+ * failures ship via bp_get_table_stats and are checked by every driver)
+ * there was NO exported getter: a saturated table silently stops creating
+ * slots and flattens the coverage curve, confounding the A1→A2
+ * extrapolation. Additive ABI — new symbol only, no struct/layout change.
+ * Relaxed atomic load, safe to call concurrently with bp_solve.
+ * Returns -1 if s is NULL. */
+int64_t bp_get_cont_ev_insertion_failures(const BPSolver *s) {
+    if (!s) return -1;
+    return __atomic_load_n(&s->cont_ev_table.insertion_failures,
+                           __ATOMIC_RELAXED);
+}
+
 /* Round n up to the next prime. Used by info_table_init to ensure the
  * modulo operation in slot derivation produces uniform distribution.
  *

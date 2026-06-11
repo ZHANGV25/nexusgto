@@ -565,6 +565,22 @@ BP_EXPORT uint64_t bp_compute_action_hash(const int *actions, int num_actions);
  */
 BP_EXPORT void *bp_get_cont_ev_table_ptr(BPSolver *s);
 
+/**
+ * Lane A post-review 2026-06-11 — cont_ev_table saturation observability.
+ *
+ * Lifetime count of bp_cont_ev_find_or_create calls that exhausted the
+ * probe cap and returned NULL (slot creation silently skipped). Must be
+ * 0 for a trustworthy coverage curve: nonzero means the cont_ev_table
+ * saturated and new boundary slots are being DROPPED, which flattens
+ * slot growth and confounds coverage extrapolation. Walk drivers must
+ * poll this per chunk and abort on nonzero (run_boundary_ev_walk.py
+ * does).
+ *
+ * Relaxed atomic load; safe to call concurrently with bp_solve.
+ * Returns -1 if `s` is NULL. Additive ABI: new symbol only.
+ */
+BP_EXPORT int64_t bp_get_cont_ev_insertion_failures(const BPSolver *s);
+
 /* Phase R Block B.3 (Step 6) — exposed wrapper for the static
  * generate_actions inside mccfr_blueprint.c. Mirrors the production
  * action-emission contract byte-for-byte (same indices, same
