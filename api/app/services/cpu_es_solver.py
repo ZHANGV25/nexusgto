@@ -62,6 +62,16 @@ _POKER_SOLVER = os.environ.get(
 _ES_DLL_NAME = "es_resolver_real"
 
 
+def _a3_cont_ev_enabled() -> bool:
+    """A3 EXPERIMENT flag — DEFAULT OFF. When unset/0 the cont_ev boundary
+    consumer is never loaded or enabled and this engine behaves byte-identically
+    to the shipped path (the now-green E2E contract). Enable ONLY on the A3
+    measurement box via NEXUS_A3_CONT_EV=1 + NEXUS_A3_CEV_PATH=<...>.cev.
+    See docs/A3_CONT_EV_CONSUMER_BRIEF.md."""
+    v = os.environ.get("NEXUS_A3_CONT_EV", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -78,6 +88,8 @@ class CpuEsSolver:
         self._extract_leaf_info = None
         self._build_labels = None
         self._StreetSolverGPU = None
+        self._cev_holder = None  # A3: kept alive iff NEXUS_A3_CONT_EV=1
+        self._last_cont_ev_stats = None  # A3: {hits, attempts} from last solve
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -132,7 +144,60 @@ class CpuEsSolver:
         self._build_labels = _build_labels_at_node
         self._snapshot_tree = snapshot_tree
         self._extract_leaf_info = extract_leaf_info_from_tree
+
+        # ── A3 (default OFF): load the cont_ev boundary table THROUGH es_lib ──
+        # The table pointer must be valid in the SAME DLL that runs the construct
+        # rollouts (es_resolver_real), so we bind bp_cont_ev_load_standalone on
+        # self._es_lib — NOT via rollout_c.load_cont_ev_table_standalone, which
+        # uses _find_blueprint_lib() (the separate mccfr_blueprint.so → a pointer
+        # the es_resolver_real consumer cannot read). es_resolver_real compiles
+        # mccfr_cont_ev_table.c, so it exports the loader + shares the struct.
+        self._cev_holder = None
+        if _a3_cont_ev_enabled():
+            self._load_cont_ev_table(rc, es_lib)
+
         self._ready = True
+
+    def _load_cont_ev_table(self, rc, es_lib) -> None:
+        """A3: load the standalone .cev artifact through es_resolver_real and
+        hand its pointer to the isolated rollout consumer. Fail-loud — if the
+        flag is on, a missing/unloadable artifact is an error, never a silent
+        skip (the experiment must not run against a half-wired engine)."""
+        import ctypes
+
+        cev_path = os.environ.get("NEXUS_A3_CEV_PATH", "")
+        if not cev_path or not os.path.exists(cev_path):
+            raise RuntimeError(
+                f"NEXUS_A3_CONT_EV=1 but NEXUS_A3_CEV_PATH is missing/not found: "
+                f"{cev_path!r}"
+            )
+        # Reuse rollout_c's struct mirror so the layout matches the C side
+        # exactly (drift here scrambles every slot — see rollout_c.py).
+        table = rc._BPContEVTableStandalone()
+        ctypes.memset(ctypes.byref(table), 0, ctypes.sizeof(table))
+        es_lib.bp_cont_ev_load_standalone.argtypes = [ctypes.c_void_p,
+                                                      ctypes.c_char_p]
+        es_lib.bp_cont_ev_load_standalone.restype = ctypes.c_int
+        t0 = time.time()
+        rcode = es_lib.bp_cont_ev_load_standalone(
+            ctypes.byref(table), cev_path.encode("utf-8"))
+        if rcode != 0:
+            raise RuntimeError(
+                f"bp_cont_ev_load_standalone({cev_path}) failed rc={rcode} "
+                f"(bad magic/version/checksum/truncation)")
+        n_slots = int(table.num_entries)
+        if n_slots == 0:
+            raise RuntimeError(
+                f"cont_ev artifact {cev_path} loaded 0 slots — empty-state save")
+        # Keep the struct alive for the solver's lifetime (the pointer the
+        # consumer reads lives inside it).
+        self._cev_holder = table
+        table_ptr = ctypes.addressof(table)
+        rc.set_rollout_cont_ev_table(table_ptr)
+        logger.info(
+            "CpuEsSolver A3: cont_ev table loaded through %s in %.1fs "
+            "(%d slots) — boundary consumer ARMED (default-off flag is ON)",
+            _ES_DLL_NAME, time.time() - t0, n_slots)
 
     @property
     def ready(self) -> bool:
@@ -248,20 +313,50 @@ class CpuEsSolver:
                 if not leaf_infos:
                     raise RuntimeError("no leaf infos extracted from tree")
 
+                # ── A3 (default OFF): arm the cont_ev boundary consumer for
+                # THIS construct iff the flag is on, the table is loaded, and
+                # this is a flop multiway spot (the consumer's own predicate).
+                # When off, none of these globals are touched. ──
+                a3_armed = (
+                    self._cev_holder is not None
+                    and street == "flop"
+                    and n_players >= 3
+                )
+                if a3_armed:
+                    rc.reset_cont_ev_boundary_hit_count()
+                    rc.set_use_cont_ev_at_flop_boundary(True)
+
                 # ── Construct the leaf table (parallel batch, off-lock) ──
                 t0 = time.time()
-                table = rc.compute_subgame_leaf_values_sampled_c(
-                    leaf_infos=leaf_infos, board=board_ints, street=street,
-                    player_hands=player_ranges, active=[True] * n_players,
-                    acting_order=list(range(n_players)),
-                    player_seats=list(player_seats),
-                    game_action_history=list(game_action_indices or []),
-                    blueprint=self._blueprint,
-                    starting_pot_chips=int(round(pot_bb * scale)),
-                    stack_chips=stack_chips, max_hands=max_h,
-                    num_rollouts=num_rollouts, num_samples_k=cache_k,
-                    master_seed=master_seed,
-                )
+                try:
+                    table = rc.compute_subgame_leaf_values_sampled_c(
+                        leaf_infos=leaf_infos, board=board_ints, street=street,
+                        player_hands=player_ranges, active=[True] * n_players,
+                        acting_order=list(range(n_players)),
+                        player_seats=list(player_seats),
+                        game_action_history=list(game_action_indices or []),
+                        blueprint=self._blueprint,
+                        starting_pot_chips=int(round(pot_bb * scale)),
+                        stack_chips=stack_chips, max_hands=max_h,
+                        num_rollouts=num_rollouts, num_samples_k=cache_k,
+                        master_seed=master_seed,
+                    )
+                finally:
+                    if a3_armed:
+                        # Disable the global flag so it can't leak into other
+                        # solves, then snapshot the counters for this solve.
+                        rc.set_use_cont_ev_at_flop_boundary(False)
+                        hits = rc.get_cont_ev_boundary_hit_count()
+                        attempts = rc.get_cont_ev_boundary_attempt_count()
+                        self._last_cont_ev_stats = {
+                            "hits": int(hits),
+                            "attempts": int(attempts),
+                            "hit_rate": (hits / attempts) if attempts else 0.0,
+                        }
+                        logger.info(
+                            "CpuEsSolver A3: cont_ev boundary hits=%d attempts=%d "
+                            "hit_rate=%.4f", hits, attempts,
+                            self._last_cont_ev_stats["hit_rate"])
                 construct_s = time.time() - t0
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
