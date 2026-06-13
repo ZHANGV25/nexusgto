@@ -78,9 +78,15 @@ SS_EXPORT int ss_build_tree2(
     int active[SS_MAX_PLAYERS] = {0};
     for (int i = 0; i < num_players; i++) active[i] = 1;
 
+    /* Per-player street-entry stacks (chip-convention §2 fix). The API takes a
+     * single effective_stack, so every seat enters with it; the builder derives
+     * each actor's remaining as stacks[p] - bets[p]. Public ABI unchanged. */
+    int stacks[SS_MAX_PLAYERS] = {0};
+    for (int i = 0; i < num_players; i++) stacks[i] = effective_stack;
+
     build_street_tree_n(&tb, is_river, num_players,
                         acting_order, num_players,
-                        0, starting_pot, effective_stack,
+                        0, starting_pot, stacks,
                         bets, has_acted, active,
                         0,
                         bet_sizes_first, num_bet_sizes_first,

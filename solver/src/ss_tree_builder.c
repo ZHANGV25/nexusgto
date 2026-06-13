@@ -161,7 +161,7 @@ static int round_complete(const int *bets, const int *active, const int *has_act
 int build_street_tree_n(
     SSTreeBuilder *tb, int is_river, int num_players,
     const int *acting_order, int num_in_order,
-    int current_order_idx, int pot, int stack,
+    int current_order_idx, int pot, const int *stacks,
     int *bets, int *has_acted, int *active,
     int num_raises,
     const float *bet_sizes_first, int num_bet_sizes_first,
@@ -204,7 +204,7 @@ int build_street_tree_n(
         if (should_extend_via_chance(tb, num_board, is_river)) {
             return build_chance_node(tb, num_players,
                                      acting_order, num_in_order,
-                                     pot, stack, active,
+                                     pot, stacks, active,
                                      bet_sizes_first, num_bet_sizes_first,
                                      bet_sizes_subsequent, num_bet_sizes_subsequent,
                                      add_explicit_allin,
@@ -240,7 +240,7 @@ int build_street_tree_n(
         }
         return build_street_tree_n(tb, is_river, num_players,
                                     acting_order, num_in_order,
-                                    next_idx, pot, stack,
+                                    next_idx, pot, stacks,
                                     bets, has_acted, active,
                                     num_raises,
                                     bet_sizes_first, num_bet_sizes_first,
@@ -261,6 +261,13 @@ int build_street_tree_n(
     int to_call = mx - bets[acting_player];
     if (to_call < 0) to_call = 0;
 
+    /* rem = the acting player's REMAINING chips this street (street-entry stack
+     * minus what they've already committed). Used to cap calls AND raises at
+     * the actor's real all-in, instead of the constant street-entry `stack`
+     * the builder used before (§2 stack-tracking fix, see the memo). */
+    int rem = stacks[acting_player] - bets[acting_player];
+    if (rem < 0) rem = 0;
+
     int temp_children[16];
     int nc = 0;
 
@@ -276,7 +283,7 @@ int build_street_tree_n(
 
         int fold_child = build_street_tree_n(tb, is_river, num_players,
                                               acting_order, num_in_order,
-                                              next_order, pot, stack,
+                                              next_order, pot, stacks,
                                               bets, has_acted, new_active,
                                               num_raises,
                                               bet_sizes_first, num_bet_sizes_first,
@@ -292,13 +299,18 @@ int build_street_tree_n(
         int new_has_acted[SS_MAX_PLAYERS];
         memcpy(new_bets, bets, num_players * sizeof(int));
         memcpy(new_has_acted, has_acted, num_players * sizeof(int));
-        new_bets[acting_player] = mx;
+        /* Stack-cap the call: a short stack calls all-in for `rem`, not the
+         * full to_call (the trainer caps calls, rollout.c:473/492). When
+         * rem >= to_call this is identical to the old behaviour
+         * (bets[actor]+to_call == mx, pot+to_call). */
+        int call_amt = to_call < rem ? to_call : rem;
+        new_bets[acting_player] = bets[acting_player] + call_amt;
         new_has_acted[acting_player] = 1;
-        int new_pot = pot + to_call;
+        int new_pot = pot + call_amt;
 
         int call_child = build_street_tree_n(tb, is_river, num_players,
                                               acting_order, num_in_order,
-                                              next_order, new_pot, stack,
+                                              next_order, new_pot, stacks,
                                               new_bets, new_has_acted, active,
                                               num_raises,
                                               bet_sizes_first, num_bet_sizes_first,
@@ -325,10 +337,10 @@ int build_street_tree_n(
             else
                 bet_amount = to_call + (int)(bet_sizes[i] * (pot + to_call));
 
-            if (bet_amount >= stack) bet_amount = stack;
+            if (bet_amount >= rem) bet_amount = rem;
             if (bet_amount <= to_call) continue;
 
-            if (bet_amount >= stack) {
+            if (bet_amount >= rem) {
                 if (added_allin) continue;
                 added_allin = 1;
             }
@@ -337,16 +349,21 @@ int build_street_tree_n(
             int new_has_acted[SS_MAX_PLAYERS];
             memcpy(new_bets, bets, num_players * sizeof(int));
             memcpy(new_has_acted, has_acted, num_players * sizeof(int));
-            new_bets[acting_player] = mx + bet_amount;
+            /* CHIP-CONVENTION FIX (docs/SS_TREE_BUILDER_CHIP_CONVENTION_FINDING.md):
+             * bet_amount is the trainer's chips-ADDED (already includes to_call,
+             * line 326). The trainer ADDS it to the actor's running total
+             * (rollout.c:968 bets[p]+=amt), so the level is bets[actor]+amt, NOT
+             * mx+amt — the old form overcounted by to_call (=mx-bets[actor]) and
+             * inflated the next player's to_call. */
+            new_bets[acting_player] = bets[acting_player] + bet_amount;
             new_has_acted[acting_player] = 1;
             for (int p = 0; p < num_players; p++)
                 if (p != acting_player && active[p]) new_has_acted[p] = 0;
             int new_pot = pot + bet_amount;
-            int new_stack = stack;
 
             int raise_child = build_street_tree_n(tb, is_river, num_players,
                                                    acting_order, num_in_order,
-                                                   next_order, new_pot, new_stack,
+                                                   next_order, new_pot, stacks,
                                                    new_bets, new_has_acted, active,
                                                    num_raises + 1,
                                                    bet_sizes_first, num_bet_sizes_first,
@@ -356,13 +373,15 @@ int build_street_tree_n(
             temp_children[nc++] = raise_child;
         }
 
-        if (add_explicit_allin && !added_allin && stack > to_call && nc < 14) {
-            int ba = stack;
+        if (add_explicit_allin && !added_allin && rem > to_call && nc < 14) {
+            /* Explicit all-in = the actor's REMAINING stack this street, added
+             * to their own running total (chip-convention fix, as above). */
+            int ba = rem;
             int new_bets[SS_MAX_PLAYERS];
             int new_has_acted[SS_MAX_PLAYERS];
             memcpy(new_bets, bets, num_players * sizeof(int));
             memcpy(new_has_acted, has_acted, num_players * sizeof(int));
-            new_bets[acting_player] = mx + ba;
+            new_bets[acting_player] = bets[acting_player] + ba;
             new_has_acted[acting_player] = 1;
             for (int p = 0; p < num_players; p++)
                 if (p != acting_player && active[p]) new_has_acted[p] = 0;
@@ -370,7 +389,7 @@ int build_street_tree_n(
 
             int ai_child = build_street_tree_n(tb, is_river, num_players,
                                                 acting_order, num_in_order,
-                                                next_order, new_pot, stack,
+                                                next_order, new_pot, stacks,
                                                 new_bets, new_has_acted, active,
                                                 num_raises + 1,
                                                 bet_sizes_first, num_bet_sizes_first,
@@ -392,7 +411,7 @@ int build_street_tree_n(
 int build_chance_node(
     SSTreeBuilder *tb, int num_players,
     const int *acting_order, int num_in_order,
-    int pot, int stack,
+    int pot, const int *stacks,
     const int *active,
     const float *bet_sizes_first, int num_bet_sizes_first,
     const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
@@ -437,7 +456,7 @@ int build_chance_node(
         int child = build_street_tree_n(
             tb, new_is_river, num_players,
             acting_order, num_in_order,
-            new_first_order_idx, pot, stack,
+            new_first_order_idx, pot, stacks,
             new_bets, new_has_acted, child_active,
             0,
             bet_sizes_first, num_bet_sizes_first,
