@@ -287,28 +287,33 @@ class CpuEsSolver:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
 
-            # IN-TREE CHANCE NODE GATE (2026-06-14). The C ES traversal handles
-            # in-tree chance nodes only with a DEFENSIVE STUB (es_resolver.c:
-            # 554-561, "CHANCE nodes are not present in depth-limited cont-strat
-            # subgames ... should not fire") that samples one runout child with
-            # NO reach / strat-sum accounting. That assumption holds for every
-            # validated config (3p+ flop/turn -> cont-strat LEAF; river ->
-            # showdown). But the OP3 depth rule extends a HEADS-UP (2p) flop/turn
-            # tree through a chance node to the next street
+            # IN-TREE CHANCE NODE GATE (2026-06-14). Historically the C ES
+            # traversal STUBBED in-tree chance nodes (es_resolver.c, "should not
+            # fire") — it sampled one runout child with a per-CALL RNG and NO
+            # per-iteration discipline. The OP3 depth rule extends a HEADS-UP
+            # (2p) flop/turn tree THROUGH a chance node to the next street
             # (ss_tree_builder.c should_extend_via_chance -> orig_num_players==2)
-            # -> the stub fires -> the returned sigma-bar is DEGENERATE (pure
-            # 0/1 per-hand strategies uncorrelated with hand strength;
-            # EC2-measured 2026-06-14). Until the ES solver gains correct in-tree
-            # chance-node handling, refuse rather than serve a wrong answer:
-            # ReplayUnsupported routes the hybrid to the (correct) blueprint
-            # LOOKUP with honest tier=lookup_fallback provenance. 3p+ solves
-            # build no chance node and are unaffected.
-            if int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0:
+            # -> the stub fired -> a DEGENERATE pure sigma-bar (EC2-measured
+            # 2026-06-14). The gate routed 2p chance-node solves to the blueprint
+            # LOOKUP (tier=lookup_fallback, honest provenance) instead.
+            #
+            # The chance-node MCCFR fix (poker-solver es_chance_sampled_child,
+            # GPU-bit-exact per-iter card sampling) makes 2p solves CORRECT. The
+            # gate stays ON BY DEFAULT until that fix is GPU-validated end-to-end
+            # in production; set NEXUS_ALLOW_CHANCE_SOLVE=1 to let 2p chance-node
+            # trees solve live (the validation path, and — once green — the way
+            # to flip the default). Fail-loud opt-in: when the flag is off we
+            # refuse rather than risk a wrong answer; 3p+ solves build no chance
+            # node and are unaffected either way.
+            _allow_chance = os.environ.get(
+                "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
+            if (not _allow_chance
+                    and int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0):
                 raise ReplayUnsupported(
                     "live re-solve tree contains an in-tree chance node (the "
-                    "heads-up turn-extension); the CPU-ES traversal does not yet "
-                    "solve chance nodes correctly, so this decision is served "
-                    "from the blueprint lookup instead of a degenerate solve"
+                    "heads-up turn-extension); chance-node solving is gated off "
+                    "(set NEXUS_ALLOW_CHANCE_SOLVE=1 once GPU-validated), so this "
+                    "decision is served from the blueprint lookup instead"
                 )
 
             if street == "river":
