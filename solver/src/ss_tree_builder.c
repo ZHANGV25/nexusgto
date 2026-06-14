@@ -204,7 +204,7 @@ int build_street_tree_n(
         if (should_extend_via_chance(tb, num_board, is_river)) {
             return build_chance_node(tb, num_players,
                                      acting_order, num_in_order,
-                                     pot, stacks, active,
+                                     pot, stacks, bets, active,
                                      bet_sizes_first, num_bet_sizes_first,
                                      bet_sizes_subsequent, num_bet_sizes_subsequent,
                                      add_explicit_allin,
@@ -411,7 +411,7 @@ int build_street_tree_n(
 int build_chance_node(
     SSTreeBuilder *tb, int num_players,
     const int *acting_order, int num_in_order,
-    int pot, const int *stacks,
+    int pot, const int *stacks, const int *entry_bets,
     const int *active,
     const float *bet_sizes_first, int num_bet_sizes_first,
     const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
@@ -423,6 +423,24 @@ int build_chance_node(
     tb->nodes[cidx].pot = pot;
     set_node_board(&tb->nodes[cidx], board, num_board);
     set_node_active(&tb->nodes[cidx], active, num_players);
+
+    /* Cross-street stack carryover (2026-06-14, HU over-bet fix). On the
+     * NEXT street `bets` reset to 0, so the all-in clamp downstream reads
+     * `rem = next_stacks[p] - 0`. If we passed the unchanged street-ENTRY
+     * `stacks` through, each player would regain their full entry stack on
+     * the next street as if the just-closed street's bets cost nothing —
+     * inflating effective stacks, which rewards aggression and makes the HU
+     * flop solve OVER-BET (measured: QJs/AhKsTd converged to bet 1.0 vs the
+     * blueprint's check 0.96; 3p was unaffected because multiway flop roots
+     * terminate at the leaf and never extend through this chance node). The
+     * cross-street separately"). Decrement each player's stack by what they
+     * committed this street so the next street starts from the true
+     * remaining stack. Pot already includes those chips. */
+    int next_stacks[SS_MAX_PLAYERS];
+    for (int i = 0; i < num_players; i++) {
+        next_stacks[i] = stacks[i] - (entry_bets ? entry_bets[i] : 0);
+        if (next_stacks[i] < 0) next_stacks[i] = 0;  /* defensive: all-in */
+    }
 
     int on_board[52] = {0};
     for (int i = 0; i < num_board; i++) {
@@ -456,7 +474,7 @@ int build_chance_node(
         int child = build_street_tree_n(
             tb, new_is_river, num_players,
             acting_order, num_in_order,
-            new_first_order_idx, pot, stacks,
+            new_first_order_idx, pot, next_stacks,
             new_bets, new_has_acted, child_active,
             0,
             bet_sizes_first, num_bet_sizes_first,

@@ -76,7 +76,7 @@ int build_street_tree_n(
 int build_chance_node(
     SSTreeBuilder *tb, int num_players,
     const int *acting_order, int num_in_order,
-    int pot, const int *stacks,
+    int pot, const int *stacks, const int *entry_bets,
     const int *active,
     const float *bet_sizes_first, int num_bet_sizes_first,
     const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,

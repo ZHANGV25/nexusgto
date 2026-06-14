@@ -68,6 +68,62 @@ static inline double es_rng_double(uint64_t *state) {
     return (double)(es_rng_next(state) >> 11) * (1.0 / 9007199254740992.0);
 }
 
+/* ── Chance-node MCCFR sampler (GPU-BIT-EXACT) ────────────────────────────────
+ *
+ * In-tree SS_NODE_CHANCE nodes (the OP3 §4 depth-rule HU flop/turn extension —
+ * deal the next street explicitly) must be solved as MCCFR external sampling
+ * over the card outcomes: at each CFR iteration, sample EXACTLY ONE child per
+ * chance node, SHARED across the whole iteration's traversal, and propagate
+ * regret/strat-sum updates only down that one sampled trajectory. No regret is
+ * accumulated AT the chance node (it is not a decision); its value is just the
+ * value of the sampled child (a single-outcome estimator of E_card[V(child)]).
+ *
+ * The GPU reference (street_solve.cu) draws this per-iter sample host-side via
+ * ss_redraw_chance_samples_host: splitmix64(master_seed ^ iter·K1 ^ c·K2)
+ * % num_children, where `c` is the chance node's chance_node_idx and `iter`
+ * runs 1..max_iterations. We reproduce that recurrence and seed mix EXACTLY so
+ * a single-thread CPU-ES walk over the SAME tree draws the IDENTICAL card per
+ * (chance node, iter) — the prerequisite for the GPU bit-exact validation gate.
+ *
+ * This is computed ON DEMAND at the chance node (a pure function of
+ * (master_seed, iter, chance_node_idx)) rather than from a shared per-iter
+ * buffer. That is deliberate and load-bearing for two reasons:
+ *   (1) Correctness within one CFR walk. The scalar traverser EXPLORES ALL of
+ *       the traverser's actions, so a chance node deeper in the tree can be
+ *       reached via several action paths inside a SINGLE es_traverse call. A
+ *       per-call RNG (the old stub) would draw a DIFFERENT card on each of
+ *       those visits, making child_vals[a] incomparable across actions and
+ *       corrupting the regret — exactly the degenerate-pure-strategy bug.
+ *       Keying the draw by (iter, chance_node_idx) makes every visit within an
+ *       iteration return the same card. ✔
+ *   (2) Hogwild-safety. Under multi-thread, different threads run different
+ *       `iter` values concurrently; a single shared buffer could not hold a
+ *       per-iter sample for each in-flight iteration. A stateless pure function
+ *       of the thread's own `iter` has no shared mutable state and no race.
+ *
+ * The constants and recurrence are duplicated from street_solve.cu (the host
+ * splitmix64 + the seed mix in ss_redraw_chance_samples_host). They MUST stay
+ * byte-identical to the GPU — the bit-exact gate (tests) is the tripwire if
+ * either side drifts.
+ */
+static inline uint64_t es_splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+/* The sampled child INDEX (0..num_children) for chance node `chance_node_idx`
+ * at CFR iteration `iter` (1-based, matching the GPU loop). num_children must
+ * be > 0. Bit-identical to ss_redraw_chance_samples_host(). */
+static inline int es_chance_sampled_child(uint64_t master_seed, int chance_node_idx,
+                                          int num_children, int64_t iter) {
+    uint64_t s = es_splitmix64(
+        master_seed ^ ((uint64_t)iter * 0x9E3779B97F4A7C15ULL)
+                    ^ ((uint64_t)chance_node_idx * 0xBF58476D1CE4E5B9ULL));
+    return (int)(s % (uint64_t)num_children);
+}
+
 /* ── Resolver state ──────────────────────────────────────────────────────── */
 struct ESResolver {
     const SSTreeData *tree;
@@ -551,11 +607,22 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     if (type == ES_T_LEAF) {
         return es_leaf_value(r, nd, traverser, sampled, local, rng);
     }
-    /* CHANCE nodes are not present in depth-limited cont-strat subgames
-     * (flop/turn → leaves; river → showdown). If one ever appears, sample one
-     * child uniformly to keep the walk finite (defensive; should not fire). */
+    /* CHANCE node (OP3 §4 HU flop/turn extension — deal the next street).
+     * MCCFR external sampling: descend the ONE child sampled for this CFR
+     * iteration (shared across the whole walk, GPU-bit-exact via
+     * es_chance_sampled_child). The chance node's value is the value of that
+     * sampled child — a single-outcome estimator of E_card[V(child)]. NO regret
+     * is accumulated here (it is not a decision node), matching the GPU CFV
+     * kernel (street_solve.cu:1880-1894: cfv[chance] = cfv[sampled_child]).
+     * Keying the draw by (iter, chance_node_idx) — NOT a per-call RNG — is what
+     * makes the deep HU solve correct: every visit to this chance node within
+     * one iteration returns the same card, so the traverser's child_vals across
+     * its actions are comparable and the regret is coherent. */
     if (type == ES_T_CHANCE) {
-        int a = es_rng_int(rng, nd->num_children);
+        int nc = nd->num_children;
+        if (nc <= 0) return 0.0;  /* defensive: empty chance node */
+        int a = es_chance_sampled_child(r->master_seed, nd->chance_node_idx,
+                                        nc, iter);
         int child = t->children[nd->first_child + a];
         return es_traverse(r, child, traverser, sampled, rng, local, iter);
     }
@@ -737,7 +804,18 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         return;
     }
     if (type == ES_T_CHANCE) {
-        int a = es_rng_int(rng, nd->num_children);
+        /* MCCFR external sampling — descend the ONE child sampled for this CFR
+         * iteration (GPU-bit-exact, shared across the walk). Same discipline as
+         * the scalar traverser: per-(iter, chance_node_idx) draw, NOT a per-call
+         * RNG, so the per-hand child_vals the traverser combines upstream are
+         * computed over a single coherent runout. No regret accumulated here. */
+        int nc = nd->num_children;
+        if (nc <= 0) {
+            for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+            return;
+        }
+        int a = es_chance_sampled_child(r->master_seed, nd->chance_node_idx,
+                                        nc, iter);
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
                         iter, out_vals);
@@ -1003,6 +1081,12 @@ int es_avg_strategy(const ESResolver *r, int node_idx, double *out, int out_cap)
     }
     int64_t off = r->node_off[node_idx];
     int na = r->node_na[node_idx];
+    /* CHANCE nodes (and all non-decision nodes) have node_off = -1 — they hold
+     * NO strategy. This is correct, not a missing case: a chance node is a
+     * card-deal, not a player decision. The strategy of interest lives at the
+     * DECISION nodes the traversers reach DOWNSTREAM of the sampled chance
+     * outcome; their strat_sum is accumulated normally by the fixed traversers.
+     * Reading a chance node's "strategy" is a caller bug → fail loud. */
     if (off < 0 || na <= 0) { es_set_error("node %d not a decision node", node_idx); return -1; }
     int acting = r->tree->nodes[node_idx].player;
     int nh = r->tree->num_hands[acting];
