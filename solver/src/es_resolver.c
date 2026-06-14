@@ -536,9 +536,22 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
     double my_bet = (double)nd->bets[traverser];
     if (!nd->active_players[traverser]) return -my_bet;
 
-    /* board must be 5 cards at a river showdown. */
+    /* board must be 5 cards at a river showdown. Use the NODE's board, not the
+     * subgame-root tree board: under the OP3 HU flop/turn extension the showdown
+     * is reached THROUGH in-tree chance nodes that dealt the turn+river, so the
+     * runout lives in nd->board_cards (the builder fills it as cards are dealt —
+     * street_solve.cuh: "the child's SSNode.board_cards already reflect the
+     * dealt card"). t->board has only the subgame-root cards (3 at a flop root),
+     * so t->board[3]/[4] would be garbage. For a RIVER subgame root nd->board ==
+     * t->board (5 cards) so this is identical to the old behavior there. */
     int board[5];
-    for (int b = 0; b < 5; b++) board[b] = t->board[b];
+    if (nd->num_board == 5) {
+        for (int b = 0; b < 5; b++) board[b] = nd->board_cards[b];
+    } else {
+        /* Defensive: a showdown with <5 board cards should not occur; fall back
+         * to the tree board (historical behavior) rather than read garbage. */
+        for (int b = 0; b < 5; b++) board[b] = t->board[b];
+    }
 
     uint32_t strength[SS_MAX_PLAYERS];
     int live[SS_MAX_PLAYERS]; int nlive = 0;
@@ -549,6 +562,13 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
         if (hi < 0) return 0.0;       /* unassignable — skip (caller upstream) */
         int c0 = t->hands[p][hi][0];
         int c1 = t->hands[p][hi][1];
+        /* A sampled hand that collides with the (5-card runout) board is an
+         * impossible world — under the OP3 chance extension the turn/river were
+         * dealt after this hand was sampled. Mirror the GPU `blocked` exclusion;
+         * with single-hand sampling the whole showdown is undefined, so return
+         * the neutral 0 (this world contributes nothing this iter). */
+        for (int b = 0; b < 5; b++)
+            if (c0 == board[b] || c1 == board[b]) return 0.0;
         int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
         uint32_t s = eval7(cards);
         strength[p] = s;
@@ -749,9 +769,23 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : -my_bet;
             return;
         }
+        /* NODE board (the runout dealt through in-tree chance nodes), not the
+         * subgame-root t->board — see es_showdown_value for the rationale. */
         int board[5];
-        for (int b = 0; b < 5; b++) board[b] = t->board[b];
-        /* opponents' strengths + count of live opponents (traverser excluded). */
+        if (nd->num_board == 5) {
+            for (int b = 0; b < 5; b++) board[b] = nd->board_cards[b];
+        } else {
+            for (int b = 0; b < 5; b++) board[b] = t->board[b];
+        }
+        /* opponents' strengths + count of live opponents (traverser excluded).
+         * A sampled opponent hand that COLLIDES with the (now 5-card runout)
+         * board is an impossible world — under the OP3 chance extension the turn/
+         * river were dealt AFTER the hand was sampled, so a collision can happen
+         * even though the root-board sampler didn't reserve those cards. Mirror
+         * the GPU showdown kernel (street_solve.cu:123 `blocked`): exclude the
+         * conflicting hand. With single-opponent sampling a board-conflicting
+         * opponent hand makes the whole walk's showdown undefined, so return the
+         * neutral 0 (this world contributes nothing this iter). */
         uint32_t opp_strength[SS_MAX_PLAYERS];
         int opp_live[SS_MAX_PLAYERS]; int n_opp_live = 0;
         for (int p = 0; p < np; p++) {
@@ -759,6 +793,10 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             int hi = opp_sampled[p];
             if (hi < 0) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
             int c0 = t->hands[p][hi][0], c1 = t->hands[p][hi][1];
+            int conflict = 0;
+            for (int b = 0; b < 5; b++)
+                if (c0 == board[b] || c1 == board[b]) { conflict = 1; break; }
+            if (conflict) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
             opp_strength[p] = eval7(cards);
             opp_live[n_opp_live++] = p;
@@ -767,6 +805,12 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         for (int h = 0; h < nh; h++) {
             if (dead[h]) { out_vals[h] = 0.0; continue; }
             int c0 = t->hands[traverser][h][0], c1 = t->hands[traverser][h][1];
+            /* Traverser hand colliding with the runout board: impossible world,
+             * contributes 0 (GPU `blocked`). */
+            int tconf = 0;
+            for (int b = 0; b < 5; b++)
+                if (c0 == board[b] || c1 == board[b]) { tconf = 1; break; }
+            if (tconf) { out_vals[h] = 0.0; continue; }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
             uint32_t hs = eval7(cards);
             if (single_pot) {
