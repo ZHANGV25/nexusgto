@@ -275,6 +275,11 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     if hasattr(lib, "rollout_reset_cont_ev_boundary_hit_count"):
         lib.rollout_reset_cont_ev_boundary_hit_count.argtypes = []
         lib.rollout_reset_cont_ev_boundary_hit_count.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_boundary_attempt_count"):
+        lib.rollout_get_cont_ev_boundary_attempt_count.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_boundary_attempt_count.restype = None
 
     lib.rollout_leaf_info_sizeof.argtypes = []
     lib.rollout_leaf_info_sizeof.restype = ctypes.c_int32
@@ -857,10 +862,25 @@ def get_cont_ev_boundary_hit_count() -> int:
 
 
 def reset_cont_ev_boundary_hit_count() -> None:
+    """Reset BOTH the hit and attempt counters for the current thread."""
     lib = _lib()
     if not hasattr(lib, "rollout_reset_cont_ev_boundary_hit_count"):
         return
     lib.rollout_reset_cont_ev_boundary_hit_count()
+
+
+def get_cont_ev_boundary_attempt_count() -> int:
+    """Number of flop-boundary query ATTEMPTS in the current thread (the
+    hit-rate denominator). Counts every time the predicate fired, including
+    attempts that then MISS/fail loud — so hit_rate = hits / attempts.
+    Reset alongside the hit count via reset_cont_ev_boundary_hit_count.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_boundary_attempt_count"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_boundary_attempt_count(ctypes.byref(out))
+    return int(out.value)
 
 
 # ── BPR5 trailer loader (mccfr_blueprint.so) ────────────────────────────

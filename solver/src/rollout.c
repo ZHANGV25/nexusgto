@@ -93,11 +93,20 @@ static inline int32_t rollout_rand_weighted(
 static const BPContEVTable *g_rollout_cont_ev_table = NULL;
 static int g_rollout_use_cont_ev_at_flop_boundary = 0;
 
-#if defined(_MSC_VER)
-static __declspec(thread) uint64_t g_rollout_cont_ev_boundary_hits = 0;
-#else
-static _Thread_local uint64_t g_rollout_cont_ev_boundary_hits = 0;
-#endif
+/* PROCESS-GLOBAL atomic counters (NOT thread-local). The construct runs the
+ * rollouts under `#pragma omp parallel for`, so a per-thread counter is
+ * invisible to the parent thread that reads it from Python afterward (each
+ * OMP worker has its own _Thread_local copy; the parent's stays 0). The
+ * earlier per-thread design note in this file ("sum across the parent
+ * thread") does not hold for OMP workers — these must be shared + atomically
+ * updated. hits = successful all-4-bias short-circuits; attempts = every time
+ * the flop-boundary predicate fired (the hit-rate denominator).
+ *
+ * Updated via __atomic builtins (gcc/clang) / Interlocked-style fallback so
+ * concurrent worker increments don't race; read with a plain relaxed load
+ * from the parent after the omp region joins. */
+static volatile uint64_t g_rollout_cont_ev_boundary_hits = 0;
+static volatile uint64_t g_rollout_cont_ev_boundary_attempts = 0;
 
 BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t) {
     g_rollout_cont_ev_table = t;
@@ -116,11 +125,21 @@ BPS_EXPORT int rollout_get_use_cont_ev_at_flop_boundary(void) {
 }
 
 BPS_EXPORT void rollout_get_cont_ev_boundary_hit_count(uint64_t *out_hits) {
-    if (out_hits) *out_hits = g_rollout_cont_ev_boundary_hits;
+    if (out_hits)
+        *out_hits = __atomic_load_n(&g_rollout_cont_ev_boundary_hits,
+                                    __ATOMIC_RELAXED);
 }
 
 BPS_EXPORT void rollout_reset_cont_ev_boundary_hit_count(void) {
-    g_rollout_cont_ev_boundary_hits = 0;
+    __atomic_store_n(&g_rollout_cont_ev_boundary_hits, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rollout_cont_ev_boundary_attempts, 0, __ATOMIC_RELAXED);
+}
+
+/* A3: total flop-boundary query attempts (the hit-rate denominator). */
+BPS_EXPORT void rollout_get_cont_ev_boundary_attempt_count(uint64_t *out_attempts) {
+    if (out_attempts)
+        *out_attempts = __atomic_load_n(&g_rollout_cont_ev_boundary_attempts,
+                                        __ATOMIC_RELAXED);
 }
 
 /* Mirror of bps_reader.c::hand_index_for (static there).
@@ -1040,6 +1059,10 @@ street_closed:
             && active[hero_player]
             && has_sample[hero_player]
             && n_board >= 3) {
+            /* A3: count this query ATTEMPT before the lookup, so the hit-rate
+             * denominator includes MISS/EMPTY_BIAS/hand-index failures. */
+            __atomic_add_fetch(&g_rollout_cont_ev_boundary_attempts, 1,
+                               __ATOMIC_RELAXED);
             uint64_t bah = bp_compute_action_hash(game_history, gah_len);
             int hidx = rollout_hand_index_for_flop(
                 board,
@@ -1081,7 +1104,8 @@ street_closed:
             /* All 4 biases OK — uniform mean integrates over the
              * producer's MCCFR-uniform bias sampling distribution. */
             *out_payoff = ev_acc / (float)n_ok;
-            g_rollout_cont_ev_boundary_hits++;
+            __atomic_add_fetch(&g_rollout_cont_ev_boundary_hits, 1,
+                               __ATOMIC_RELAXED);
             return 0;
         }
 

@@ -556,6 +556,21 @@ void *bp_get_cont_ev_table_ptr(BPSolver *s) {
     return (void *)&s->cont_ev_table;
 }
 
+/* Lane A post-review 2026-06-11 — cont_ev_table saturation observability.
+ * bp_cont_ev_find_or_create returns NULL at the probe cap and bumps
+ * cont_ev_table.insertion_failures, but (unlike the info table, whose
+ * failures ship via bp_get_table_stats and are checked by every driver)
+ * there was NO exported getter: a saturated table silently stops creating
+ * slots and flattens the coverage curve, confounding the A1→A2
+ * extrapolation. Additive ABI — new symbol only, no struct/layout change.
+ * Relaxed atomic load, safe to call concurrently with bp_solve.
+ * Returns -1 if s is NULL. */
+int64_t bp_get_cont_ev_insertion_failures(const BPSolver *s) {
+    if (!s) return -1;
+    return __atomic_load_n(&s->cont_ev_table.insertion_failures,
+                           __ATOMIC_RELAXED);
+}
+
 /* Round n up to the next prime. Used by info_table_init to ensure the
  * modulo operation in slot derivation produces uniform distribution.
  *
@@ -1173,6 +1188,65 @@ static int compute_boundary_flop_bucket(const BPSolver *s,
     return s->texture_bucket_cache[found * BP_MAX_HANDS + hand_idx];
 }
 
+/* Phase R Step 12 (2026-06-10) — cont_ev boundary SLOT KEY.
+ *
+ * The cont_ev_table slot key is the traverser's CANONICAL FULL-DECK PAIR
+ * INDEX in [0, 1326), computed from the sampled hand's actual cards:
+ * sort c0 < c1, then c0*51 - c0*(c0-1)/2 + c1 - c0 - 1. This is the
+ * encoding the CONSUMER queries (rollout.c rollout_hand_index_for_flop)
+ * and the verifier accepts (tools/phase_r_probe_analysis/
+ * verify_bpr5_roundtrip.c) — the Step-10 artifact is keyed this way.
+ *
+ * It is deliberately NOT compute_boundary_flop_bucket(): that returns
+ * flop-TEXTURE buckets in [0, 200), which the consumer never queries —
+ * fresh walks would MISS every slot with bucket >= 200 and SILENTLY
+ * COLLIDE with real hand indices < 200. And it is deliberately NOT the
+ * raw ts->sampled_hands[player] index: that equals the canonical pair
+ * index only under bp_init_unified's full-1326 deal (mccfr_blueprint.c
+ * ~:2790 enumerates c0<c1 in exactly the canonical order); bp_init_ex
+ * subgame/test fixtures carry arbitrary hand subsets where the local
+ * index diverges. Deriving from the cards is correct in both.
+ *
+ * Returns -1 ("skip slot accumulation; EV still computed" — the caller's
+ * existing guard semantics) for: no flop yet, out-of-range hand index,
+ * malformed cards, or a hand blocked by the flop (mirrors the consumer's
+ * rollout_hand_index_for_flop guard, which fail-louds on blocked). */
+static int bp_boundary_slot_hand_index(const BPSolver *s,
+                                       const TraversalState *ts,
+                                       int player) {
+    if (ts->num_board < 3) return -1;
+    int hand_idx = ts->sampled_hands[player];
+    if (hand_idx < 0 || hand_idx >= s->num_hands[player]) return -1;
+    int c0 = s->hands[player][hand_idx][0];
+    int c1 = s->hands[player][hand_idx][1];
+    if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52 || c0 == c1) return -1;
+    for (int b = 0; b < 3; b++) {
+        if (ts->board[b] == c0 || ts->board[b] == c1) return -1;
+    }
+    if (c0 > c1) { int t = c0; c0 = c1; c1 = t; }
+    return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
+}
+
+/* Public test wrapper for bp_boundary_slot_hand_index — see header.
+ * Builds a synthetic TraversalState the same way the bucket wrapper
+ * below does. hand_idx here is an index into s->hands[player] (the
+ * solver's per-player hand list), NOT a full-deck pair index. */
+int bp_boundary_slot_hand_index_for_test(const BPSolver *s,
+                                         const int *board,
+                                         int player,
+                                         int hand_idx) {
+    if (!s || !board || player < 0 || player >= BP_MAX_PLAYERS) return -1;
+    if (hand_idx < 0 || hand_idx >= BP_MAX_HANDS) return -1;
+    TraversalState ts;
+    memset(&ts, 0, sizeof(ts));
+    ts.board[0] = board[0];
+    ts.board[1] = board[1];
+    ts.board[2] = board[2];
+    ts.num_board = 3;
+    ts.sampled_hands[player] = hand_idx;
+    return bp_boundary_slot_hand_index(s, &ts, player);
+}
+
 /* Public test wrapper — see header for contract. Builds a synthetic
  * TraversalState with just the board + sampled_hands[player] populated,
  * then delegates to compute_boundary_flop_bucket(). Production code
@@ -1349,6 +1423,32 @@ static float eval_showdown_n(BPSolver *s, const int *board,
     return trav_winnings - (float)invested[traverser];
 }
 
+/* Lane A 2026-06-11: read BP_CONT_EV_ALL_BIASES at init, forcing the
+ * pairing with BP_BOUNDARY_EV_ONLY=1. Without EV-only mode the boundary
+ * return value feeds upstream regret updates, and the all-biases mean
+ * would change the per-sample distribution of those updates — refuse
+ * (warn + ignore) rather than silently altering training semantics.
+ * Called from both bp_init_ex and bp_init_unified AFTER boundary_ev_only
+ * is set. */
+static void bp_init_cont_ev_all_biases_from_env(BPSolver *s) {
+    const char *e = getenv("BP_CONT_EV_ALL_BIASES");
+    int requested = (e && e[0] == '1') ? 1 : 0;
+    if (requested && !s->boundary_ev_only) {
+        fprintf(stderr,
+                "[BP] WARNING: BP_CONT_EV_ALL_BIASES=1 requires "
+                "BP_BOUNDARY_EV_ONLY=1 (the boundary return value feeds "
+                "regret updates in normal training). Flag IGNORED.\n");
+        requested = 0;
+    }
+    s->cont_ev_all_biases = requested;
+    if (s->cont_ev_all_biases) {
+        fprintf(stderr,
+                "[BP] BP_CONT_EV_ALL_BIASES=1: every HEADS boundary visit "
+                "accumulates all %d biases (4x rollouts per visit).\n",
+                BP_CONT_EV_NUM_BIASES);
+    }
+}
+
 /* ── Main traversal ──────────────────────────────────────────────── */
 
 static float traverse(TraversalState *ts, int acting_order_idx,
@@ -1420,16 +1520,17 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             uint64_t boundary_action_hash = compute_action_hash(
                 ts->action_history, ts->history_len);
 
-            /* Phase R Step 11 fix: compute the flop bucket directly from
-             * texture_bucket_cache, bypassing both ts->flop_cache (which
-             * Step 10's 1B retrain showed was effectively NULL/uncomputed
-             * at the dispatch point — 100% of saved slots had bucket == hand_idx)
-             * and bucket_map[1][p][h] (identity-initialized; never overridden
-             * by bp_set_buckets() for postflop streets in the unified driver,
-             * so it returns hand_idx too). The helper canonicalizes ts->board
-             * and reads texture_bucket_cache[tex][hand_idx] — the same lookup
-             * the parent's flop-deal block uses at the top of round_done. */
-            int trav_bucket = compute_boundary_flop_bucket(
+            /* Phase R Step 12 KEY FIX (2026-06-10): the slot key is the
+             * traverser's canonical full-deck PAIR INDEX in [0, 1326) —
+             * matching the consumer (rollout.c rollout_hand_index_for_flop)
+             * and the verifier (verify_bpr5_roundtrip.c), and matching the
+             * Step-10 artifact's empirical keying (gate-0, 84% of slot
+             * buckets >= 200). The Step 11 texture-bucket lookup
+             * (compute_boundary_flop_bucket, [0,200)) wrote a key the
+             * consumer never queries: fresh walks would MISS all slots and
+             * SILENTLY COLLIDE for hand_idx < 200. -1 keeps the existing
+             * "skip slot accumulation" guard semantics. */
+            int trav_bucket = bp_boundary_slot_hand_index(
                 s, ts, ts->traverser);
 
             BPContEVEntry *cb_slot = NULL;
@@ -1454,59 +1555,97 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             for (int c = 0; c < 52; c++) if (!blocked2[c]) valid2[nv2++] = c;
             if (nv2 == 0) return 0.0f;
 
-            TraversalState next = *ts;
-            memset(next.bets, 0, sizeof(next.bets));
-            memset(next.has_acted, 0, sizeof(next.has_acted));
-            next.num_raises = 0;
-            for (int p = 0; p < BP_MAX_PLAYERS; p++)
-                next.cont_bias_per_player[p] = bias_tuple[p];
+            /* Lane A 2026-06-11 — BP_CONT_EV_ALL_BIASES: sweep ALL
+             * traverser biases at this visit instead of the one sampled
+             * above. Each sweep iteration is a fully independent rollout
+             * (fresh opponent-bias tuple, fresh turn deal), so each
+             * bias's ev_sum/ev_count entry receives an estimate with
+             * exactly the same conditional distribution as the legacy
+             * sampled-bias path — the bias index is forced, not biased.
+             * Only worth 4x the rollout cost when the slot exists; with
+             * no slot the extra rollouts would accumulate nowhere.
+             * With the flag OFF this loop runs once and is byte-
+             * identical (RNG stream + float math) to the legacy path. */
+            int n_rollouts = (s->cont_ev_all_biases && cb_slot != NULL)
+                ? BP_CONT_EV_NUM_BIASES : 1;
 
-            /* Deal turn card; canonicalize via the existing suit_map. */
-            int dealt = valid2[rng_int(ts->rng, nv2)];
-            next.board[next.num_board++] = dealt;
-            if (next.num_canon_board < 5) {
-                int rank = dealt >> 2, suit = dealt & 3;
-                int canon_suit = (next.suit_map[suit] >= 0)
-                    ? next.suit_map[suit] : suit;
-                next.canon_board[next.num_canon_board++] =
-                    rank * 4 + canon_suit;
-            }
-
-            /* Pre-compute turn bucket cache (mirrors line 1397-1410 of
-             * the legacy turn-deal path). */
-            if (s->turn_centroids_k > 0) {
-                for (int p = 0; p < NP; p++) {
-                    next.turn_bucket[p] = -1;
-                    if (!next.active[p]) continue;
-                    int ph[1][2];
-                    ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
-                    ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
-                    float feat[1][3];
-                    ca_compute_features(next.board, 4,
-                                         (const int(*)[2])ph, 1, 200, feat);
-                    next.turn_bucket[p] = ca_nearest_centroid(
-                        feat[0],
-                        (const float(*)[3])s->turn_centroids,
-                        s->turn_centroids_k);
+            float ev_total = 0.0f;
+            for (int ri = 0; ri < n_rollouts; ri++) {
+                if (ri > 0) {
+                    /* Fresh iid-uniform opponent biases for this
+                     * rollout (the traverser's entry is overwritten
+                     * below; sampling it anyway keeps the loop body
+                     * uniform and costs one rng_int). */
+                    for (int p = 0; p < NP; p++) {
+                        if (ts->active[p])
+                            bias_tuple[p] =
+                                rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
+                    }
                 }
+                if (n_rollouts == BP_CONT_EV_NUM_BIASES) {
+                    trav_bias = ri;
+                    bias_tuple[ts->traverser] = ri;
+                }
+
+                TraversalState next = *ts;
+                memset(next.bets, 0, sizeof(next.bets));
+                memset(next.has_acted, 0, sizeof(next.has_acted));
+                next.num_raises = 0;
+                for (int p = 0; p < BP_MAX_PLAYERS; p++)
+                    next.cont_bias_per_player[p] = bias_tuple[p];
+
+                /* Deal turn card; canonicalize via the existing suit_map. */
+                int dealt = valid2[rng_int(ts->rng, nv2)];
+                next.board[next.num_board++] = dealt;
+                if (next.num_canon_board < 5) {
+                    int rank = dealt >> 2, suit = dealt & 3;
+                    int canon_suit = (next.suit_map[suit] >= 0)
+                        ? next.suit_map[suit] : suit;
+                    next.canon_board[next.num_canon_board++] =
+                        rank * 4 + canon_suit;
+                }
+
+                /* Pre-compute turn bucket cache (mirrors line 1397-1410 of
+                 * the legacy turn-deal path). */
+                if (s->turn_centroids_k > 0) {
+                    for (int p = 0; p < NP; p++) {
+                        next.turn_bucket[p] = -1;
+                        if (!next.active[p]) continue;
+                        int ph[1][2];
+                        ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
+                        ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
+                        float feat[1][3];
+                        ca_compute_features(next.board, 4,
+                                             (const int(*)[2])ph, 1, 200, feat);
+                        next.turn_bucket[p] = ca_nearest_centroid(
+                            feat[0],
+                            (const float(*)[3])s->turn_centroids,
+                            s->turn_centroids_k);
+                    }
+                }
+
+                float boundary_ev = traverse(&next, 0,
+                                              acting_order, num_in_order);
+
+                /* Accumulate to slot. ev_sum uses the atomic float add to
+                 * tolerate Hogwild concurrency; ev_count uses a relaxed
+                 * fetch_add. The Linear-CFR discount is applied to ev_sum
+                 * at the periodic discount tick (see bp_solve), NOT per-
+                 * visit — matches the trainer's regret-update convention. */
+                if (cb_slot != NULL) {
+                    bp_cont_ev_atomic_add_f32(&cb_slot->ev_sum[trav_bias],
+                                               boundary_ev);
+                    __atomic_fetch_add(&cb_slot->ev_count[trav_bias], 1,
+                                        __ATOMIC_RELAXED);
+                }
+                ev_total += boundary_ev;
             }
 
-            float boundary_ev = traverse(&next, 0,
-                                          acting_order, num_in_order);
-
-            /* Accumulate to slot. ev_sum uses the atomic float add to
-             * tolerate Hogwild concurrency; ev_count uses a relaxed
-             * fetch_add. The Linear-CFR discount is applied to ev_sum
-             * at the periodic discount tick (see bp_solve), NOT per-
-             * visit — matches the trainer's regret-update convention. */
-            if (cb_slot != NULL) {
-                bp_cont_ev_atomic_add_f32(&cb_slot->ev_sum[trav_bias],
-                                           boundary_ev);
-                __atomic_fetch_add(&cb_slot->ev_count[trav_bias], 1,
-                                    __ATOMIC_RELAXED);
-            }
-
-            return boundary_ev;
+            /* Mean over the sweep (single-rollout mode: the rollout EV
+             * itself). Upstream consumers of this value are inert in
+             * boundary_ev_only mode — the all-biases flag is refused at
+             * init without it. */
+            return ev_total / (float)n_rollouts;
         }
 
         /* Build blocked set: board cards + all active players' cards */
@@ -2759,6 +2898,7 @@ int bp_init_ex(BPSolver *s, int num_players,
                     "updates SKIPPED; cont_ev_table accumulation kept.\n");
         }
     }
+    bp_init_cont_ev_all_biases_from_env(s);
 
     return 0;
 }
@@ -2846,6 +2986,7 @@ int bp_init_unified(BPSolver *s, int num_players,
                     "updates SKIPPED; cont_ev_table accumulation kept.\n");
         }
     }
+    bp_init_cont_ev_all_biases_from_env(s);
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;

@@ -73,6 +73,12 @@ _lib.es_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ct
 _lib.es_free.argtypes = [ctypes.c_void_p]
 if hasattr(_lib, "es_set_cfr_mode"):
     _lib.es_set_cfr_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_set_vec_mode"):
+    _lib.es_set_vec_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_enable_visit_counter"):
+    _lib.es_enable_visit_counter.argtypes = [ctypes.c_void_p]
+    _lib.es_get_visit_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _lib.es_get_visit_count.restype = ctypes.c_int64
 # int es_run(void*, int64 iters, int num_threads)
 _lib.es_run.restype = ctypes.c_int
 _lib.es_run.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int]
@@ -283,6 +289,25 @@ class CSolver:
             _lib.es_set_cfr_mode(self._handle, int(mode))
         elif mode == 1:
             raise RuntimeError("es_set_cfr_mode not in this DLL (rebuild)")
+
+    def set_vec_mode(self, mode: int) -> None:
+        """0 = scalar (validated reference), 1 = vectorized traverser (all
+        traverser hands per walk; same fixed point, lower variance). Set before
+        run(). Raises if the DLL predates the feature and mode==1."""
+        if hasattr(_lib, "es_set_vec_mode"):
+            _lib.es_set_vec_mode(self._handle, int(mode))
+        elif mode == 1:
+            raise RuntimeError("es_set_vec_mode not in this DLL (rebuild)")
+
+    def enable_visit_counter(self) -> None:
+        """DEBUG: count per-node traverser visits. Call before run()."""
+        if hasattr(_lib, "es_enable_visit_counter"):
+            _lib.es_enable_visit_counter(self._handle)
+        else:
+            raise RuntimeError("es_enable_visit_counter not in this DLL (rebuild)")
+
+    def visit_count(self, node_idx: int) -> int:
+        return int(_lib.es_get_visit_count(self._handle, int(node_idx)))
 
     # ── run ───────────────────────────────────────────────────────────────
     def run(self, iterations: int, num_threads: int = 1) -> None:

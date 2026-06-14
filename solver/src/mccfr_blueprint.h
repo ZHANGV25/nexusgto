@@ -333,6 +333,31 @@ typedef struct {
      *
      * Default 0 (legacy CFR with regret + strategy_sum updates). */
     int boundary_ev_only;
+
+    /* Lane A Step 2026-06-11 — all-biases boundary accumulation.
+     *
+     * When set (via BP_CONT_EV_ALL_BIASES=1 at solver init, honored ONLY
+     * together with BP_BOUNDARY_EV_ONLY=1), every HEADS boundary visit
+     * runs BP_CONT_EV_NUM_BIASES independent rollouts — one per
+     * traverser bias, each with a freshly sampled opponent-bias tuple
+     * and a fresh turn deal — and accumulates each rollout's EV into its
+     * bias's ev_sum/ev_count entry. 4x rollout cost per visit, 4x
+     * coupon-collector coverage win (every visited slot becomes all-4-
+     * bias immediately).
+     *
+     * Per-bias estimates keep EXACTLY the sampled-bias path's
+     * conditional distribution: the bias only reweights the acting
+     * player's frozen-σ̄ action sampling inside the rollout (read-only
+     * descend, no regret/strategy_sum writes), and ev_sum[b] is keyed
+     * per bias, so forcing a deterministic sweep over b changes nothing
+     * about each bias's estimator. The boundary's RETURN value becomes
+     * the mean over the 4 rollouts — unbiased for the same expectation
+     * but a different per-sample distribution, which is why the flag is
+     * refused (warn + ignore) without boundary_ev_only=1: in normal
+     * training the returned value feeds upstream regret updates.
+     *
+     * Default 0 (single sampled bias per visit — legacy behavior). */
+    int cont_ev_all_biases;
 } BPSolver;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -539,6 +564,22 @@ BP_EXPORT uint64_t bp_compute_action_hash(const int *actions, int num_actions);
  * bp_cont_ev_count via the returned pointer to detect emptiness).
  */
 BP_EXPORT void *bp_get_cont_ev_table_ptr(BPSolver *s);
+
+/**
+ * Lane A post-review 2026-06-11 — cont_ev_table saturation observability.
+ *
+ * Lifetime count of bp_cont_ev_find_or_create calls that exhausted the
+ * probe cap and returned NULL (slot creation silently skipped). Must be
+ * 0 for a trustworthy coverage curve: nonzero means the cont_ev_table
+ * saturated and new boundary slots are being DROPPED, which flattens
+ * slot growth and confounds coverage extrapolation. Walk drivers must
+ * poll this per chunk and abort on nonzero (run_boundary_ev_walk.py
+ * does).
+ *
+ * Relaxed atomic load; safe to call concurrently with bp_solve.
+ * Returns -1 if `s` is NULL. Additive ABI: new symbol only.
+ */
+BP_EXPORT int64_t bp_get_cont_ev_insertion_failures(const BPSolver *s);
 
 /* Phase R Block B.3 (Step 6) — exposed wrapper for the static
  * generate_actions inside mccfr_blueprint.c. Mirrors the production
@@ -846,6 +887,34 @@ BP_EXPORT int bp_compute_flop_bucket_for_test(const BPSolver *s,
                                                 const int *board,
                                                 int player,
                                                 int hand_idx);
+
+/**
+ * Phase R Step 12 — test wrapper for the cont_ev boundary SLOT-KEY
+ * helper (bp_boundary_slot_hand_index). The production call site keys
+ * cont_ev_table slots by the traverser's CANONICAL FULL-DECK PAIR INDEX
+ * in [0, 1326) — computed from the sampled hand's actual cards (sort
+ * c0 < c1; c0*51 - c0*(c0-1)/2 + c1 - c0 - 1) — matching the consumer
+ * (rollout.c rollout_hand_index_for_flop) and the BPR5 verifier. It
+ * never consults the texture cache (the Step 11 bug keyed slots with
+ * [0,200) texture buckets the consumer never queries).
+ *
+ * Args:
+ *   s        — initialized BPSolver (hands[player] populated).
+ *   board    — 3 dealt flop cards (raw).
+ *   player   — player whose sampled hand is keyed.
+ *   hand_idx — index into s->hands[player] (the per-player hand list),
+ *              NOT a full-deck pair index (they coincide only under
+ *              bp_init_unified's full-1326 deal).
+ *
+ * Returns:
+ *   ≥0 — canonical full-deck pair index in [0, 1326).
+ *   -1 — out-of-range index, malformed cards, or hand blocked by the
+ *        flop (slot would be skipped; EV still computed).
+ */
+BP_EXPORT int bp_boundary_slot_hand_index_for_test(const BPSolver *s,
+                                                   const int *board,
+                                                   int player,
+                                                   int hand_idx);
 
 #ifdef __cplusplus
 }

@@ -59,10 +59,13 @@ void stb_init(SSTreeBuilder *tb);
  * subsequent → falls back to first (matches trainer behavior at
  * mccfr_blueprint.c:1598 when s->num_subsequent_bet_sizes == 0).
  */
+/* `stacks` is a per-player array of street-ENTRY stacks (length num_players);
+ * the actor's remaining this street is stacks[p] - bets[p]. Replaces the old
+ * scalar `stack` (chip-convention §2 fix). */
 int build_street_tree_n(
     SSTreeBuilder *tb, int is_river, int num_players,
     const int *acting_order, int num_in_order,
-    int current_order_idx, int pot, int stack,
+    int current_order_idx, int pot, const int *stacks,
     int *bets, int *has_acted, int *active,
     int num_raises,
     const float *bet_sizes_first, int num_bet_sizes_first,
@@ -73,7 +76,7 @@ int build_street_tree_n(
 int build_chance_node(
     SSTreeBuilder *tb, int num_players,
     const int *acting_order, int num_in_order,
-    int pot, int stack,
+    int pot, const int *stacks,
     const int *active,
     const float *bet_sizes_first, int num_bet_sizes_first,
     const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,

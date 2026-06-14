@@ -107,6 +107,21 @@ ES_EXPORT void es_free(ESResolver *r);
  * Set BEFORE es_run. */
 ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
 
+/* Traverser vectorization: 0 = SCALAR (default; the validated reference — one
+ * walk updates one traverser hand), 1 = VECTORIZED (one walk down a single
+ * opponent-sampled path updates ALL traverser hands; lower variance ⇒ fewer
+ * iters for the same exploitability; IDENTICAL fixed point). Card-conflicting
+ * traverser hands are skipped per walk (the unbiased card-removal estimator).
+ * Set BEFORE es_run. Gate 1 (VECTOR_TRAVERSER_DESIGN.md): vec must reach the
+ * SAME exploitability as scalar on a 2p/3p spot with OVERLAPPING ranges. */
+ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
+
+/* DEBUG: per-node traverser-visit counter (single-thread localization of the
+ * vec reachability bug). Enable BEFORE es_run; read with es_get_visit_count
+ * (returns -1 if disabled / bad index). Zero overhead when not enabled. */
+ES_EXPORT void es_enable_visit_counter(ESResolver *r);
+ES_EXPORT int64_t es_get_visit_count(const ESResolver *r, int node_idx);
+
 /* Run `iterations` ES iterations. Each iteration walks once per player as
  * traverser (matching es_solver.py iterate()). num_threads > 1 enables
  * Hogwild (iterations partitioned across threads; shared tables, racy adds).
@@ -159,6 +174,20 @@ ES_EXPORT void es_get_stats(const ESResolver *r, ESStats *out);
 ES_EXPORT void es_reset_stats(ESResolver *r);
 
 ES_EXPORT const char *es_get_last_error(void);
+
+/* ── TEST-ONLY: side-pot showdown probes (validate_sidepot.py fuzz gate) ───
+ * Evaluate the shipped showdown code on a caller-described single showdown
+ * node with ONE fixed hand per player. board5: 5 card ints; hand_c0/hand_c1/
+ * active/bets: arrays of length np; pot in chips. Returns the traverser's NET
+ * value (gross award − own street bet); NAN on invalid arguments. The _vec
+ * variant drives the vectorized traverser's inline showdown block; the plain
+ * variant drives es_showdown_value (the scalar + forward-walk path). */
+ES_EXPORT double es_test_showdown_value(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser);
+ES_EXPORT double es_test_showdown_value_vec(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser);
 
 /* ── Deterministic validation oracles (es_oracles.c) ──────────────────────
  * Each make_* returns an opaque ctx to pass to es_create alongside the

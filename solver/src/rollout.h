@@ -396,6 +396,12 @@ BPS_EXPORT int  rollout_get_use_cont_ev_at_flop_boundary(void);
 BPS_EXPORT void rollout_get_cont_ev_boundary_hit_count(uint64_t *out_hits);
 BPS_EXPORT void rollout_reset_cont_ev_boundary_hit_count(void);
 
+/* A3 hit-rate denominator: number of times the flop-boundary predicate fired
+ * and a table query was ATTEMPTED. Incremented before the lookup, so a MISS
+ * (which fails loud) still counts here but not in the hit count. The reset
+ * above clears both counters. hit_rate = hits / attempts. */
+BPS_EXPORT void rollout_get_cont_ev_boundary_attempt_count(uint64_t *out_attempts);
+
 /* ── Bucket-miss tolerance gate ─────────────────────────────────────── */
 
 /* When enabled, a hand_to_bucket failure no longer aborts the rollout.

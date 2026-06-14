@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve street_solve_joint subgame_preflop
+.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve street_solve_joint street_solve_cpu subgame_preflop
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -125,9 +125,9 @@ NVCC ?= nvcc
 SS_GPU_ARCH ?= sm_75
 street_solve: $(BUILD_DIR)/street_solve$(SHLIB_EXT)
 
-$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h | $(BUILD_DIR)
+$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h $(SRC_DIR)/ss_tree_api.c | $(BUILD_DIR)
 	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -I$(SRC_DIR) \
-	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c -o $@
+	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_api.c -o $@
 
 # JOINT-mode variant for the nexusgto-api Phase 5.1 diagnostic
 # (docs/OP4_CONT_STRAT_MARGINAL_PLAN.md). Same sources, compiled with
@@ -138,9 +138,26 @@ $(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR
 # stay on SAMPLED.
 street_solve_joint: $(BUILD_DIR)/street_solve_joint$(SHLIB_EXT)
 
-$(BUILD_DIR)/street_solve_joint$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h | $(BUILD_DIR)
+$(BUILD_DIR)/street_solve_joint$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h $(SRC_DIR)/ss_tree_api.c | $(BUILD_DIR)
 	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -DSS_CONT_STRAT_MODE=0 -I$(SRC_DIR) \
-	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c -o $@
+	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_api.c -o $@
+
+# ── Street solve (CPU-only — tree builder, NO GPU solve) ──
+# gcc build of just the tree-build API (ss_tree_api.c + ss_tree_builder.c) plus
+# an abort-stub for ss_solve_gpu (ss_cpu_stub.c). Produced as street_solve.so so
+# python/street_solver_gpu.py loads it by its default name on a no-GPU box. The
+# CPU-ES re-solver uses StreetSolverGPU ONLY as a tree builder (leaf_value_fn=
+# None, then CSolver.run does the solve) — so this .so is sufficient for the
+# multiway measurement + CPU-ES path. ss_solve_gpu aborts loudly if ever called
+# (never fabricate a solve). Build with: make street_solve_cpu
+# (Outputs build/street_solve_cpu.so; deploy by copying it to build/street_solve.so
+#  on the no-GPU box so the default loader name resolves.)
+CC ?= gcc
+street_solve_cpu: $(BUILD_DIR)/street_solve_cpu$(SHLIB_EXT)
+
+$(BUILD_DIR)/street_solve_cpu$(SHLIB_EXT): $(SRC_DIR)/ss_tree_api.c $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_cpu_stub.c $(SRC_DIR)/ss_tree_builder.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) -O2 -shared -fPIC -I$(SRC_DIR) \
+	    $(SRC_DIR)/ss_tree_api.c $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_cpu_stub.c -o $@
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
@@ -303,6 +320,23 @@ $(BUILD_DIR)/test_bpr5_roundtrip: tests/test_bpr5_roundtrip.c \
 
 test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
 	./$(BUILD_DIR)/test_bpr5_roundtrip
+
+# ── Phase R Step 12: cont_ev boundary slot-key encoding pin ──
+# Asserts the call-site key is the consumer's canonical full-deck pair
+# index (rollout_hand_index_for_flop encoding), NOT a texture bucket and
+# NOT the raw per-player hand-list index. Deterministic, <1s.
+$(BUILD_DIR)/test_cont_ev_key: tests/test_cont_ev_key.c \
+        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
+        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_ev_key.c \
+	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
+	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS)
+
+test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
+	./$(BUILD_DIR)/test_cont_ev_key
 
 # ── Phase R Block B.1+B.2: end-to-end save → load → query parity ──
 # 5K-iter trainer drive with prob=1.0; capture one populated slot's

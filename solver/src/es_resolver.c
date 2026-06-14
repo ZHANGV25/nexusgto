@@ -87,6 +87,16 @@ struct ESResolver {
      * es_solver.py, whose linear_cfr flag is dead). */
     int cfr_mode;
 
+    /* Traverser vectorization. 0 = SCALAR (the validated reference: one walk
+     * updates exactly one traverser hand = sampled[traverser]). 1 = VECTORIZED:
+     * one walk down a single opponent-sampled path updates ALL traverser hands
+     * at once (shared tree traversal, per-hand regret-match + update + leaf).
+     * Lower variance ⇒ fewer iters for the same exploitability. The fixed point
+     * is IDENTICAL — Gate 1 (es_resolver.c design doc) asserts same exploitability
+     * as scalar on a validated 2p/3p spot WITH OVERLAPPING ranges (so the
+     * dead-hand card-conflict skip is exercised). Set BEFORE es_run. */
+    int vec_traverser;
+
     /* Per-decision-node dense storage, keyed (node, hand, action).
      * For node i:  regrets[off[i] + hand*na[i] + a]. Terminal/non-decision
      * nodes have off[i] = -1 and na[i] = 0. The hand axis uses the ACTING
@@ -102,6 +112,12 @@ struct ESResolver {
      * Python reference's stats); the validated metric is convergence, not
      * exact counts. */
     ESStats stats;
+
+    /* DEBUG: per-node traverser-visit counter (incremented when acting==traverser
+     * at a decision node). Allocated lazily by es_enable_visit_counter; NULL =
+     * off (zero overhead). Used to localize the vec reachability bug — find the
+     * first node on a path where vec's count diverges from scalar. */
+    int64_t *visit_count;   /* [num_nodes] or NULL */
 };
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
@@ -166,12 +182,28 @@ void es_set_cfr_mode(ESResolver *r, int mode) {
     if (r) r->cfr_mode = (mode == 1) ? 1 : 0;
 }
 
+void es_set_vec_mode(ESResolver *r, int mode) {
+    if (r) r->vec_traverser = (mode == 1) ? 1 : 0;
+}
+
+/* DEBUG visit counter (single-thread localization only). */
+void es_enable_visit_counter(ESResolver *r) {
+    if (!r) return;
+    free(r->visit_count);
+    r->visit_count = (int64_t *)calloc((size_t)r->num_nodes, sizeof(int64_t));
+}
+int64_t es_get_visit_count(const ESResolver *r, int node_idx) {
+    if (!r || !r->visit_count || node_idx < 0 || node_idx >= r->num_nodes) return -1;
+    return r->visit_count[node_idx];
+}
+
 void es_free(ESResolver *r) {
     if (!r) return;
     free(r->node_off);
     free(r->node_na);
     free(r->regrets);
     free(r->strat_sum);
+    free(r->visit_count);
     free(r);
 }
 
@@ -245,6 +277,60 @@ static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
     }
 }
 
+/* ── Opponent-only hand sampling (VEC mode) ───────────────────────────────────
+ * Identical reservoir logic to es_sample_hands but SKIPS the `skip` (traverser)
+ * slot — so the traverser's cards are NEVER reserved out of the opponents' pool.
+ *
+ * WHY this matters (the 3p vec-fixed-point bug, 2026-06-10): the scalar path
+ * samples ALL players including the traverser, removing the traverser's 2 cards
+ * from the deck before later opponents draw. In VEC mode the traverser hand is
+ * NOT fixed (we enumerate all of them), so reserving a spurious traverser hand
+ * biases the opponent distribution each enumerated hand sees — opponents can no
+ * longer hold the (spuriously-removed) traverser cards, missing those worlds.
+ * The dead-mask is the correct per-hand card-removal conditioner ONLY IF the
+ * base opponent draw is board+inter-opponent (NOT traverser-conditioned). This
+ * compounds with opponent count (≈0 at 2p one-opponent, large at 3p+) — the
+ * exact 2p-pass / 3p-fail signature. chosen[skip] is left = -1. */
+static void es_sample_opponents(ESResolver *r, uint64_t *rng, int skip,
+                                int *chosen) {
+    const SSTreeData *t = r->tree;
+    int np = r->np;
+
+    uint64_t used = 0;
+    for (int b = 0; b < t->num_board; b++) used |= (1ULL << t->board[b]);
+    for (int p = 0; p < np; p++) chosen[p] = -1;
+
+    /* randomized order over OPPONENTS only (skip excluded) */
+    int order[SS_MAX_PLAYERS]; int no = 0;
+    for (int p = 0; p < np; p++) if (p != skip) order[no++] = p;
+    for (int i = 0; i < no; i++) {
+        int j = i + es_rng_int(rng, no - i);
+        int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    }
+
+    for (int oi = 0; oi < no; oi++) {
+        int p = order[oi];
+        int nh = t->num_hands[p];
+        double total_w = 0.0;
+        int pick = -1;
+        for (int h = 0; h < nh; h++) {
+            float w = t->weights[p][h];
+            if (w <= 0.0f) continue;
+            int c0 = t->hands[p][h][0];
+            int c1 = t->hands[p][h][1];
+            if ((used >> c0) & 1ULL) continue;
+            if ((used >> c1) & 1ULL) continue;
+            total_w += (double)w;
+            if (es_rng_double(rng) * total_w < (double)w) pick = h;
+        }
+        if (pick >= 0) {
+            chosen[p] = pick;
+            used |= (1ULL << t->hands[p][pick][0]);
+            used |= (1ULL << t->hands[p][pick][1]);
+        }
+    }
+}
+
 /* ── Terminal values (match es_solver.py) ────────────────────────────────── */
 
 /* FOLD terminal: the sole remaining active player (node.player) wins the pot.
@@ -256,8 +342,137 @@ static inline double es_fold_value(const SSNode *nd, int traverser) {
     return -my_bet;
 }
 
-/* SHOWDOWN terminal (river): single-pot chop (no side pots — matches the
- * Python reference _showdown_value / rollout compute_showdown_payoff). */
+/* ── SHOWDOWN terminal (river): multiway side-pot layering ────────────────────
+ *
+ * REPRESENTABLE-SCOPE NOTE (2026-06-10, Lane 3). SSNode carries only
+ * per-THIS-STREET bets (SSNode.bets[]) plus a lump `pot` that folds in all
+ * prior-street money. Consequences:
+ *
+ *   1. EXACTLY representable: side pots layered by THIS-street contribution
+ *      caps. The lump entry pot is common money every street-entry contestant
+ *      has equal claim to — true because the builder zeroes bets[] at every
+ *      street entry (subgame root: ss_tree_api.c:76; chance-node street
+ *      transition: ss_tree_builder.c:432) with all entrants active and an
+ *      equal shared `effective_stack`.
+ *   2. NOT representable: side pots from PRIOR-street unequal all-ins (the
+ *      per-player prior contributions are unrecoverable from the lump pot).
+ *      Out of scope — the river LOOKUP fallback remains for those spots.
+ *   3. The CURRENT builder cannot even emit a showdown with unequal ACTIVE
+ *      street bets: round_complete (ss_tree_builder.c:146-155) requires
+ *      bets[p] == max for every active player, there is no per-player stack
+ *      state (`stack` is constant down the street, ss_tree_builder.c:345), a
+ *      call always equalizes to max (ss_tree_builder.c:295), and a folder's
+ *      street bet is strictly < the final max (you fold facing a bet; max
+ *      never decreases). So on every REACHABLE node today the single-pot
+ *      award is exact, and es_showdown_is_single_pot routes those nodes
+ *      through the historical code BIT-EXACTLY (the regression gate). The
+ *      layered path below makes this function correct for any in-scope SSNode
+ *      (per-player stacks / unequal mid-street seeding / off-tree all-in
+ *      translation — the playing-agent work that lands next).
+ *   4. ACCOUNTING CAVEAT (pre-existing, reported not fixed): on a
+ *      raise-over-bet the builder sets new_bets = mx + bet_amount where
+ *      bet_amount already contains to_call (ss_tree_builder.c:340), while the
+ *      trainer does bets[ap] += amount (mccfr_blueprint.c:1981) and BOTH add
+ *      only bet_amount to the pot. The builder's bets[] therefore exceed its
+ *      own pot increments by to_call per raise-over-bet, so pot − Σ bets is
+ *      NOT exactly the entry pot. The layered award is constructed to
+ *      distribute EXACTLY nd->pot regardless (slack lands in the base layer),
+ *      preserving the system invariant Σ_p award_p == nd->pot.
+ *
+ * CONVENTIONS (shared with the Python exact reference validate_sidepot.py):
+ *   - Levels = distinct ACTIVE street-bet values, ascending.
+ *   - Contribution per player (active or folded) = min(bets[p], top level);
+ *     folded money below a level boundary is dead money in that layer.
+ *   - Base layer = nd->pot − Σ contributions (entry pot + folder excess above
+ *     the top active level + builder accounting slack), awarded with the
+ *     bottom layer (same eligibility: every showdown-active player).
+ *   - Layer (prev, L] eligible = active players with bets[p] >= L; best
+ *     eligible hand(s) split the layer by double division (ties chop, the
+ *     existing convention).
+ */
+
+/* TRUE iff the single-pot chop is exact at this node: all ACTIVE street bets
+ * equal and no FOLDED street bet above that level. Every showdown the current
+ * builder emits satisfies this (see scope note) — those nodes stay BIT-EXACT
+ * to the historical single-pot behavior. */
+static int es_showdown_is_single_pot(const SSNode *nd, int np) {
+    int amin = -1, amax = -1, fmax = 0;
+    for (int p = 0; p < np; p++) {
+        int b = nd->bets[p];
+        if (nd->active_players[p]) {
+            if (amin < 0 || b < amin) amin = b;
+            if (b > amax) amax = b;
+        } else {
+            if (b > fmax) fmax = b;
+        }
+    }
+    if (amax < 0) return 1;           /* no actives — caller handled upstream */
+    return (amin == amax) && (fmax <= amax);
+}
+
+/* GROSS layered award to `target` (before subtracting target's own street
+ * bet). strength[p] must be valid for every ACTIVE p; `target` must be
+ * active. Total award across players == nd->pot exactly (in exact arith). */
+static double es_layered_award(const SSNode *nd, int np,
+                               const uint32_t *strength, int target) {
+    /* Distinct ACTIVE bet levels, ascending (insertion sort; np <= 6). */
+    int levels[SS_MAX_PLAYERS]; int nlev = 0;
+    for (int p = 0; p < np; p++) {
+        if (!nd->active_players[p]) continue;
+        int b = nd->bets[p];
+        int j = 0;
+        while (j < nlev && levels[j] < b) j++;
+        if (j < nlev && levels[j] == b) continue;
+        for (int k = nlev; k > j; k--) levels[k] = levels[k - 1];
+        levels[j] = b; nlev++;
+    }
+    if (nlev == 0) return 0.0;        /* no active players */
+    int top = levels[nlev - 1];
+
+    /* Contributions capped at the top active level; the remainder of the pot
+     * (entry pot + folder excess + accounting slack) is the base layer. */
+    int contrib[SS_MAX_PLAYERS];
+    double base = (double)nd->pot;
+    for (int p = 0; p < np; p++) {
+        int c = nd->bets[p];
+        if (c > top) c = top;
+        if (c < 0) c = 0;
+        contrib[p] = c;
+        base -= (double)c;
+    }
+
+    double award = 0.0;
+    int prev = 0;
+    for (int j = 0; j < nlev; j++) {
+        int L = levels[j];
+        double layer = (j == 0) ? base : 0.0;
+        for (int p = 0; p < np; p++) {
+            int c = contrib[p];
+            int lo = (c < prev) ? c : prev;
+            int hi = (c < L) ? c : L;
+            if (hi > lo) layer += (double)(hi - lo);
+        }
+        /* Best eligible hand(s) split this layer. */
+        uint32_t best = 0; int nwin = 0; int target_in = 0;
+        for (int p = 0; p < np; p++) {
+            if (!nd->active_players[p] || nd->bets[p] < L) continue;
+            uint32_t s = strength[p];
+            if (nwin == 0 || s > best) {
+                best = s; nwin = 1; target_in = (p == target);
+            } else if (s == best) {
+                nwin++;
+                if (p == target) target_in = 1;
+            }
+        }
+        if (nwin > 0 && target_in) award += layer / (double)nwin;
+        prev = L;
+    }
+    return award;
+}
+
+/* SHOWDOWN terminal (river). Single-pot fast path (bit-exact historical
+ * behavior, exact for every node the current builder can emit) + layered
+ * side-pot path for uneven this-street all-in contributions (scope above). */
 static double es_showdown_value(ESResolver *r, const SSNode *nd,
                                 int traverser, const int *sampled) {
     const SSTreeData *t = r->tree;
@@ -284,17 +499,20 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
         live[nlive++] = p;
         if (s > best) best = s;
     }
-    int nwin = 0;
-    int trav_wins = 0;
-    for (int k = 0; k < nlive; k++) {
-        int p = live[k];
-        if (strength[p] == best) {
-            nwin++;
-            if (p == traverser) trav_wins = 1;
+    if (es_showdown_is_single_pot(nd, np)) {
+        int nwin = 0;
+        int trav_wins = 0;
+        for (int k = 0; k < nlive; k++) {
+            int p = live[k];
+            if (strength[p] == best) {
+                nwin++;
+                if (p == traverser) trav_wins = 1;
+            }
         }
+        if (trav_wins) return (double)nd->pot / (double)nwin - my_bet;
+        return -my_bet;
     }
-    if (trav_wins) return (double)nd->pot / (double)nwin - my_bet;
-    return -my_bet;
+    return es_layered_award(nd, np, strength, traverser) - my_bet;
 }
 
 /* LEAF: lazy betting-leaf value via the caller oracle (one sampled-opponent
@@ -363,6 +581,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     }
 
     if (acting == traverser) {
+        if (r->visit_count) r->visit_count[node_idx]++;
         /* Explore ALL actions. */
         double child_vals[SS_MAX_ACTIONS];
         double node_val = 0.0;
@@ -410,6 +629,212 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     }
 }
 
+/* ── Vectorized traverser ────────────────────────────────────────────────────
+ *
+ * One walk down a SINGLE opponent-sampled path updates ALL traverser hands at
+ * once. The opponents' path (hand + sampled action) does NOT depend on the
+ * traverser's hand, so the tree traversal is SHARED across hands; only the
+ * traverser's per-hand regret-match / value / update differ. This amortizes the
+ * tree-walk overhead across all nh traverser hands and is the textbook
+ * external-sampling variance reduction (fewer iters for the same exploitability).
+ *
+ * Returns per-hand traverser values into out_vals[0..nh) (nh = the traverser's
+ * hand count). `dead[h]` (precomputed once per walk) marks traverser hands that
+ * share a card with the board or an opponent's sampled hand — those worlds are
+ * impossible, so the hand gets NO update this walk and a neutral 0 value (it
+ * never enters a regret/strat-sum or showdown/leaf computation). This dead-hand
+ * skip is BOTH crash-avoidance (no duplicate cards into eval7) AND the unbiased
+ * estimator (a hand is only updated in card-removal-compatible worlds).
+ *
+ * `iter` weight: advances by 1 per vectorized walk (NOT by nh) — one vec-walk is
+ * one CFR round over all traverser infosets; each hand still receives exactly
+ * ONE regret update per walk (see VECTOR_TRAVERSER_DESIGN.md Gate 2, settled).
+ */
+static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
+                            const int *opp_sampled, const int *dead,
+                            uint64_t *rng, ESStats *local, int64_t iter,
+                            double *out_vals) {
+    const SSTreeData *t = r->tree;
+    const SSNode *nd = &t->nodes[node_idx];
+    int type = nd->type;
+    int nh = t->num_hands[traverser];
+
+    if (type == ES_T_FOLD) {
+        /* Hand-independent for the traverser: net = (pot - my_bet) if traverser
+         * is the winner (== nd->player), else -my_bet. Broadcast (dead hands get
+         * 0 — they don't exist in this world). */
+        local->fold_terminals++;
+        double v = es_fold_value(nd, traverser);
+        for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : v;
+        return;
+    }
+    if (type == ES_T_SHOWDOWN) {
+        /* Per-hand showdown: traverser's hand h vs opponents' FIXED sampled
+         * hands. eval7 the traverser side per live hand; opponents are constant
+         * for this walk so precompute their strengths once.
+         * Single-pot fast path (bit-exact historical behavior; exact on every
+         * node the current builder emits) + layered side-pot path for uneven
+         * this-street all-ins — see the scope note above es_layered_award. */
+        local->showdown_terminals++;
+        int np = r->np;
+        double my_bet = (double)nd->bets[traverser];
+        if (!nd->active_players[traverser]) {
+            for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : -my_bet;
+            return;
+        }
+        int board[5];
+        for (int b = 0; b < 5; b++) board[b] = t->board[b];
+        /* opponents' strengths + count of live opponents (traverser excluded). */
+        uint32_t opp_strength[SS_MAX_PLAYERS];
+        int opp_live[SS_MAX_PLAYERS]; int n_opp_live = 0;
+        for (int p = 0; p < np; p++) {
+            if (p == traverser || !nd->active_players[p]) continue;
+            int hi = opp_sampled[p];
+            if (hi < 0) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
+            int c0 = t->hands[p][hi][0], c1 = t->hands[p][hi][1];
+            int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
+            opp_strength[p] = eval7(cards);
+            opp_live[n_opp_live++] = p;
+        }
+        int single_pot = es_showdown_is_single_pot(nd, np);
+        for (int h = 0; h < nh; h++) {
+            if (dead[h]) { out_vals[h] = 0.0; continue; }
+            int c0 = t->hands[traverser][h][0], c1 = t->hands[traverser][h][1];
+            int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
+            uint32_t hs = eval7(cards);
+            if (single_pot) {
+                int nwin = 1; int trav_best = 1;   /* traverser counts itself */
+                for (int k = 0; k < n_opp_live; k++) {
+                    uint32_t os = opp_strength[opp_live[k]];
+                    if (os > hs) { trav_best = 0; break; }
+                    if (os == hs) nwin++;
+                }
+                out_vals[h] = trav_best ? ((double)nd->pot / (double)nwin - my_bet)
+                                        : -my_bet;
+            } else {
+                uint32_t strength[SS_MAX_PLAYERS];
+                for (int k = 0; k < n_opp_live; k++)
+                    strength[opp_live[k]] = opp_strength[opp_live[k]];
+                strength[traverser] = hs;
+                out_vals[h] = es_layered_award(nd, np, strength, traverser)
+                              - my_bet;
+            }
+        }
+        return;
+    }
+    if (type == ES_T_LEAF) {
+        /* Per-hand oracle: set sampled[traverser] = hand h's slot, read the
+         * opponents' fixed sampled hands. Dead hands skipped. */
+        int sampled[SS_MAX_PLAYERS];
+        for (int p = 0; p < r->np; p++) sampled[p] = opp_sampled[p];
+        for (int h = 0; h < nh; h++) {
+            if (dead[h]) { out_vals[h] = 0.0; continue; }
+            sampled[traverser] = h;
+            local->leaf_rollouts++;
+            out_vals[h] = r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
+                                    h, sampled, nd, rng);
+        }
+        return;
+    }
+    if (type == ES_T_CHANCE) {
+        int a = es_rng_int(rng, nd->num_children);
+        int child = t->children[nd->first_child + a];
+        es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
+                        iter, out_vals);
+        return;
+    }
+
+    /* DECISION node */
+    local->decision_visits++;
+    int acting = nd->player;
+    int na = nd->num_children;
+
+    if (acting != traverser) {
+        /* Opponent: sample ONE action from THEIR sampled hand's strategy, then
+         * recurse ONCE — the returned per-hand vector passes through unchanged
+         * (opponent's choice is independent of the traverser's hand). */
+        int ohand = opp_sampled[acting];
+        if (ohand < 0) {
+            int child = t->children[nd->first_child];
+            es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
+                            iter, out_vals);
+            return;
+        }
+        int64_t off = r->node_off[node_idx];
+        double sigma[SS_MAX_ACTIONS];
+        es_regret_match(&r->regrets[off + (int64_t)ohand * na], na, sigma);
+        double rd = es_rng_double(rng);
+        double cum = 0.0; int a = na - 1;
+        for (int k = 0; k < na; k++) { cum += sigma[k]; if (rd <= cum) { a = k; break; } }
+        int child = t->children[nd->first_child + a];
+        es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
+                        iter, out_vals);
+        return;
+    }
+
+    /* TRAVERSER decision node: explore ALL actions for ALL hands. One shared
+     * recursion per action (the opp path doesn't depend on the traverser hand);
+     * then per-hand regret-match + combine + update. */
+    if (r->visit_count) r->visit_count[node_idx]++;
+    int64_t off = r->node_off[node_idx];
+    /* child_vals[a][h] — na*nh doubles, depth-bounded stack (na<=8, nh<=200). */
+    double child_vals[SS_MAX_ACTIONS][SS_MAX_HANDS];
+    for (int a = 0; a < na; a++) {
+        int child = t->children[nd->first_child + a];
+        es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
+                        iter, child_vals[a]);
+    }
+    double d = (double)iter / ((double)iter + 1.0);
+    for (int h = 0; h < nh; h++) {
+        if (dead[h]) { out_vals[h] = 0.0; continue; }
+        double sigma[SS_MAX_ACTIONS];
+        double *reg = &r->regrets[off + (int64_t)h * na];
+        double *ss = &r->strat_sum[off + (int64_t)h * na];
+        es_regret_match(reg, na, sigma);
+        double node_val = 0.0;
+        for (int a = 0; a < na; a++) node_val += sigma[a] * child_vals[a][h];
+        if (r->cfr_mode == 1) {
+            for (int a = 0; a < na; a++) {
+                double nr = reg[a] + (child_vals[a][h] - node_val);
+                if (nr < ES_REGRET_FLOOR) nr = ES_REGRET_FLOOR;
+                reg[a] = nr * d;
+                ss[a] += (double)iter * sigma[a];
+            }
+        } else {
+            for (int a = 0; a < na; a++) {
+                double nr = reg[a] + (child_vals[a][h] - node_val);
+                if (nr < ES_REGRET_FLOOR) nr = ES_REGRET_FLOOR;
+                reg[a] = nr;
+                ss[a] += sigma[a];
+            }
+        }
+        out_vals[h] = node_val;
+    }
+}
+
+/* Build the dead-hand mask for a vec walk: traverser hand h is dead if either
+ * card collides with the board or any opponent's sampled hand. */
+static void es_build_dead_mask(ESResolver *r, int traverser,
+                               const int *opp_sampled, int *dead) {
+    const SSTreeData *t = r->tree;
+    int nh = t->num_hands[traverser];
+    uint64_t used = 0;
+    for (int b = 0; b < t->num_board; b++) used |= (1ULL << t->board[b]);
+    for (int p = 0; p < r->np; p++) {
+        if (p == traverser) continue;
+        int hi = opp_sampled[p];
+        if (hi < 0) continue;
+        used |= (1ULL << t->hands[p][hi][0]);
+        used |= (1ULL << t->hands[p][hi][1]);
+    }
+    for (int h = 0; h < nh; h++) {
+        int c0 = t->hands[traverser][h][0];
+        int c1 = t->hands[traverser][h][1];
+        dead[h] = (((used >> c0) & 1ULL) || ((used >> c1) & 1ULL)
+                   || t->weights[traverser][h] <= 0.0f) ? 1 : 0;
+    }
+}
+
 /* ── Stats merge (atomic-free; called under critical or single-thread) ─────── */
 static inline void es_merge_stats(ESStats *dst, const ESStats *src) {
     dst->traversals += src->traversals;
@@ -417,6 +842,23 @@ static inline void es_merge_stats(ESStats *dst, const ESStats *src) {
     dst->fold_terminals += src->fold_terminals;
     dst->showdown_terminals += src->showdown_terminals;
     dst->decision_visits += src->decision_visits;
+}
+
+/* One vec-mode traverser pass: sample OPPONENTS ONLY (the traverser's cards must
+ * NOT be reserved — see es_sample_opponents), build the per-hand dead mask, then
+ * walk once covering ALL of `trav`'s hands. */
+static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
+                               ESStats *local, int64_t iter) {
+    int sampled[SS_MAX_PLAYERS];
+    int dead[SS_MAX_HANDS];
+    double out_vals[SS_MAX_HANDS];
+#ifdef ES_VEC_OPP_SAMPLER
+    es_sample_opponents(r, rng, trav, sampled);   /* EXPERIMENTAL: don't-reserve-trav (UNVALIDATED) */
+#else
+    es_sample_hands(r, rng, sampled);             /* VALIDATED sampler (default) */
+#endif
+    es_build_dead_mask(r, trav, sampled, dead);
+    es_traverse_vec(r, 0, trav, sampled, dead, rng, local, iter, out_vals);
 }
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
@@ -443,10 +885,17 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         int sampled[SS_MAX_PLAYERS];
         for (int64_t it = 0; it < iterations; it++) {
             for (int trav = 0; trav < np; trav++) {
-                es_sample_hands(r, &rng, sampled);
-                if (sampled[trav] < 0) continue;   /* traverser unassignable */
-                local.traversals++;
-                es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+                if (r->vec_traverser) {
+                    /* vec mode walks ALL traverser hands; es_vec_pass samples
+                     * OPPONENTS ONLY (traverser cards not reserved). */
+                    local.traversals++;
+                    es_vec_pass(r, trav, &rng, &local, it + 1);
+                } else {
+                    es_sample_hands(r, &rng, sampled);
+                    if (sampled[trav] < 0) continue;   /* traverser unassignable */
+                    local.traversals++;
+                    es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+                }
             }
         }
         es_merge_stats(&r->stats, &local);
@@ -480,10 +929,15 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         #pragma omp for schedule(dynamic, 2048)
         for (int64_t it = 0; it < iterations; it++) {
             for (int trav = 0; trav < np; trav++) {
-                es_sample_hands(r, &rng, sampled);
-                if (sampled[trav] < 0) continue;
-                local.traversals++;
-                es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+                if (r->vec_traverser) {
+                    local.traversals++;
+                    es_vec_pass(r, trav, &rng, &local, it + 1);
+                } else {
+                    es_sample_hands(r, &rng, sampled);
+                    if (sampled[trav] < 0) continue;
+                    local.traversals++;
+                    es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+                }
             }
         }
         #pragma omp critical
@@ -593,4 +1047,82 @@ void es_get_stats(const ESResolver *r, ESStats *out) {
 }
 void es_reset_stats(ESResolver *r) {
     if (r) memset(&r->stats, 0, sizeof(r->stats));
+}
+
+/* ── TEST-ONLY exports — side-pot showdown validation (validate_sidepot.py) ──
+ *
+ * Drive the REAL showdown code on a caller-described single showdown node with
+ * one fixed hand per player (so `sampled` / `opp_sampled` are all index 0).
+ * Returns the traverser's NET value (award − own street bet). NAN on invalid
+ * arguments. These exist so the ≥100k-case Python fuzz gate can hit both the
+ * scalar path (es_showdown_value) and the vectorized path (the inline showdown
+ * block in es_traverse_vec) byte-for-byte as shipped — no reimplementation. */
+
+static void es_test_build_ctx(SSTreeData *td, SSNode *node, ESResolver *tmp,
+                              int np, const int *board5,
+                              const int *hand_c0, const int *hand_c1,
+                              const int *active, const int *bets, int pot) {
+    memset(td, 0, sizeof(*td));
+    td->num_players = np;
+    for (int b = 0; b < 5; b++) td->board[b] = board5[b];
+    td->num_board = 5;
+    for (int p = 0; p < np; p++) {
+        td->num_hands[p] = 1;
+        td->hands[p][0][0] = hand_c0[p];
+        td->hands[p][0][1] = hand_c1[p];
+        td->weights[p][0] = 1.0f;
+    }
+    memset(node, 0, sizeof(*node));
+    node->type = ES_T_SHOWDOWN;
+    node->player = -1;
+    node->leaf_idx = -1;
+    node->fold_player = -1;
+    node->pot = pot;
+    node->num_board = 5;
+    for (int b = 0; b < 5; b++) node->board_cards[b] = board5[b];
+    for (int p = 0; p < np; p++) {
+        node->bets[p] = bets[p];
+        node->active_players[p] = active[p] ? 1 : 0;
+        if (active[p]) node->num_players++;
+    }
+    td->nodes = node;
+    td->num_nodes = 1;
+    memset(tmp, 0, sizeof(*tmp));
+    tmp->tree = td;
+    tmp->np = np;
+    tmp->num_nodes = 1;
+}
+
+ES_EXPORT double es_test_showdown_value(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser)
+{
+    if (np < 2 || np > SS_MAX_PLAYERS || traverser < 0 || traverser >= np)
+        return NAN;
+    SSTreeData td; SSNode node; ESResolver tmp;
+    es_test_build_ctx(&td, &node, &tmp, np, board5, hand_c0, hand_c1,
+                      active, bets, pot);
+    int sampled[SS_MAX_PLAYERS];
+    for (int p = 0; p < np; p++) sampled[p] = 0;
+    return es_showdown_value(&tmp, &node, traverser, sampled);
+}
+
+ES_EXPORT double es_test_showdown_value_vec(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser)
+{
+    if (np < 2 || np > SS_MAX_PLAYERS || traverser < 0 || traverser >= np)
+        return NAN;
+    SSTreeData td; SSNode node; ESResolver tmp;
+    es_test_build_ctx(&td, &node, &tmp, np, board5, hand_c0, hand_c1,
+                      active, bets, pot);
+    int opp_sampled[SS_MAX_PLAYERS];
+    for (int p = 0; p < np; p++) opp_sampled[p] = 0;
+    int dead[1] = { 0 };
+    double out_vals[1] = { 0.0 };
+    uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    ESStats local; memset(&local, 0, sizeof(local));
+    es_traverse_vec(&tmp, 0, traverser, opp_sampled, dead, &rng, &local,
+                    1, out_vals);
+    return out_vals[0];
 }
