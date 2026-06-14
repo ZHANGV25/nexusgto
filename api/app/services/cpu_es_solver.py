@@ -392,6 +392,25 @@ class CpuEsSolver:
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
             cs = self._CSolver.from_table(gpu._tree, table, n_players, max_h, seed=1)
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
+
+            # In-tree CHANCE handling. A 2p flop/turn tree extends through a chance
+            # node (OP3 turn-extension). Single-card-per-iter sampling is high-
+            # variance + cross-line-incoherent -> degenerate/oscillating solve
+            # (EC2 2026-06-14). For a CORRECT chance solve: ENUMERATE the card
+            # outcomes (zero chance-variance, the GPU's full-reach equivalent),
+            # ENUMERATE opponent actions (full CFR — removes opp-action sampling
+            # variance; only tractable at small player counts), and use the VEC
+            # traverser (updates all traverser hands per walk -> no traverser-hand
+            # sampling variance). Residual variance = opp-hand sampling only.
+            # 3p+ has no chance node so leave its (validated) sampling untouched —
+            # opponent enumeration would blow up at high N anyway.
+            tree_has_chance = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
+            if tree_has_chance and hasattr(cs, "set_chance_mode"):
+                cs.set_chance_mode(1)   # enumerate card outcomes (correct)
+                if n_players <= 3 and hasattr(cs, "set_opp_mode"):
+                    cs.set_opp_mode(1)  # full CFR over opponent actions (2-3p)
+                    cs.set_vec_mode(1)  # all traverser hands per walk
+                    vec_mode = 1        # force vec for the readout below
             if vec_mode:
                 cs.set_vec_mode(1)
             t1 = time.time()
