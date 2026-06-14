@@ -68,6 +68,18 @@ static inline double es_rng_double(uint64_t *state) {
     return (double)(es_rng_next(state) >> 11) * (1.0 / 9007199254740992.0);
 }
 
+/* DIAGNOSTIC ONLY (2026-06-14): ES_NO_CONFLICT_SKIP=1 disables the showdown
+ * runout-conflict `return 0.0` guard, to A/B whether that value-injection is the
+ * deep-HU over-bet cause. Cached on first read; remove once the bug is settled. */
+static int es_no_conflict_skip(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ES_NO_CONFLICT_SKIP");
+        v = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+    }
+    return v;
+}
+
 /* ── Chance-node MCCFR sampler (GPU-BIT-EXACT) ────────────────────────────────
  *
  * In-tree SS_NODE_CHANCE nodes (the OP3 §4 depth-rule HU flop/turn extension —
@@ -122,6 +134,33 @@ static inline int es_chance_sampled_child(uint64_t master_seed, int chance_node_
         master_seed ^ ((uint64_t)iter * 0x9E3779B97F4A7C15ULL)
                     ^ ((uint64_t)chance_node_idx * 0xBF58476D1CE4E5B9ULL));
     return (int)(s % (uint64_t)num_children);
+}
+
+/* DIAGNOSTIC (2026-06-14): ES_CHANCE_KEY_BY_STREET=1 keys the chance sample by
+ * the STREET (num_board) instead of the tree-node-position chance_node_idx, so
+ * ALL chance nodes dealing the same street draw the SAME physical card per CFR
+ * iteration. This makes the runout COHERENT across betting lines — the turn p0
+ * sees after CHECK is the same turn it sees after BET — which is required for
+ * external-sampling regret to compare commensurate continuations. (The default
+ * per-node key matches the GPU's draw, but the GPU is full-reach and integrates
+ * over all outcomes, so its per-node independence is harmless there; external
+ * sampling compares SINGLE samples, so it needs cross-line coherence.) The
+ * candidate cards are identical across same-street nodes here (the builder
+ * excludes only the board, and all lines share the subgame board), so keying by
+ * street yields the same child index = the same card. */
+static int es_chance_key_by_street(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ES_CHANCE_KEY_BY_STREET");
+        v = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+    }
+    return v;
+}
+static inline int es_chance_sampled_child_keyed(uint64_t master_seed,
+                                                int chance_node_idx, int street_key,
+                                                int num_children, int64_t iter) {
+    int key = es_chance_key_by_street() ? street_key : chance_node_idx;
+    return es_chance_sampled_child(master_seed, key, num_children, iter);
 }
 
 /* ── Resolver state ──────────────────────────────────────────────────────── */
@@ -567,8 +606,9 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
          * dealt after this hand was sampled. Mirror the GPU `blocked` exclusion;
          * with single-hand sampling the whole showdown is undefined, so return
          * the neutral 0 (this world contributes nothing this iter). */
-        for (int b = 0; b < 5; b++)
-            if (c0 == board[b] || c1 == board[b]) return 0.0;
+        if (!es_no_conflict_skip())
+            for (int b = 0; b < 5; b++)
+                if (c0 == board[b] || c1 == board[b]) return 0.0;
         int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
         uint32_t s = eval7(cards);
         strength[p] = s;
@@ -641,8 +681,8 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     if (type == ES_T_CHANCE) {
         int nc = nd->num_children;
         if (nc <= 0) return 0.0;  /* defensive: empty chance node */
-        int a = es_chance_sampled_child(r->master_seed, nd->chance_node_idx,
-                                        nc, iter);
+        int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
+                                              nd->num_board, nc, iter);
         int child = t->children[nd->first_child + a];
         return es_traverse(r, child, traverser, sampled, rng, local, iter);
     }
@@ -794,8 +834,9 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             if (hi < 0) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
             int c0 = t->hands[p][hi][0], c1 = t->hands[p][hi][1];
             int conflict = 0;
-            for (int b = 0; b < 5; b++)
-                if (c0 == board[b] || c1 == board[b]) { conflict = 1; break; }
+            if (!es_no_conflict_skip())
+                for (int b = 0; b < 5; b++)
+                    if (c0 == board[b] || c1 == board[b]) { conflict = 1; break; }
             if (conflict) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
             opp_strength[p] = eval7(cards);
@@ -808,8 +849,9 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             /* Traverser hand colliding with the runout board: impossible world,
              * contributes 0 (GPU `blocked`). */
             int tconf = 0;
-            for (int b = 0; b < 5; b++)
-                if (c0 == board[b] || c1 == board[b]) { tconf = 1; break; }
+            if (!es_no_conflict_skip())
+                for (int b = 0; b < 5; b++)
+                    if (c0 == board[b] || c1 == board[b]) { tconf = 1; break; }
             if (tconf) { out_vals[h] = 0.0; continue; }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
             uint32_t hs = eval7(cards);
@@ -858,8 +900,8 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
             return;
         }
-        int a = es_chance_sampled_child(r->master_seed, nd->chance_node_idx,
-                                        nc, iter);
+        int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
+                                              nd->num_board, nc, iter);
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
                         iter, out_vals);
