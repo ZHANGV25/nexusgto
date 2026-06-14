@@ -156,6 +156,21 @@ static int es_chance_key_by_street(void) {
     }
     return v;
 }
+
+/* Chance-node handling mode. DEFAULT = ENUMERATE (average over all dealt cards —
+ * correct, zero chance-variance, the GPU's full-reach equivalent). Set
+ * ES_CHANCE_SAMPLE=1 to fall back to the single-card-per-iter SAMPLED path (the
+ * original OP3 design — high variance + cross-line incoherence; kept for A/B and
+ * for any future cost-bounded mode). Cached on first read. */
+static int es_chance_enumerate(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ES_CHANCE_SAMPLE");
+        int sample = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+        v = sample ? 0 : 1;   /* enumerate unless explicitly asked to sample */
+    }
+    return v;
+}
 static inline int es_chance_sampled_child_keyed(uint64_t master_seed,
                                                 int chance_node_idx, int street_key,
                                                 int num_children, int64_t iter) {
@@ -681,6 +696,26 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     if (type == ES_T_CHANCE) {
         int nc = nd->num_children;
         if (nc <= 0) return 0.0;  /* defensive: empty chance node */
+        if (es_chance_enumerate()) {
+            /* CORRECT (default): ENUMERATE the card outcomes and average — the
+             * chance node's value is E_card[V(child)] over all dealt cards
+             * (uniform). This is zero-variance at the chance node (the GPU's
+             * full-reach equivalent) and is what makes the deep multi-street HU
+             * solve converge correctly: every action's continuation is evaluated
+             * under the SAME full distribution of runouts, so the traverser's
+             * regret across actions is commensurate. Tractable for a depth-
+             * limited HU subgame (turn ~47, river ~46 outcomes). Card-conflict
+             * worlds are handled at the downstream terminals (impossible runouts
+             * contribute their neutral terminal value, same as the GPU). */
+            double acc = 0.0;
+            for (int a = 0; a < nc; a++) {
+                int child = t->children[nd->first_child + a];
+                acc += es_traverse(r, child, traverser, sampled, rng, local, iter);
+            }
+            return acc / (double)nc;
+        }
+        /* SAMPLED (diagnostic): one card per iter — high variance, incoherent
+         * across betting lines unless keyed by street. Kept for A/B only. */
         int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
                                               nd->num_board, nc, iter);
         int child = t->children[nd->first_child + a];
@@ -898,6 +933,20 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         int nc = nd->num_children;
         if (nc <= 0) {
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+            return;
+        }
+        if (es_chance_enumerate()) {
+            /* ENUMERATE (default): per-hand average over all dealt cards. */
+            double tmp[SS_MAX_HANDS];
+            for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+            for (int a = 0; a < nc; a++) {
+                int child = t->children[nd->first_child + a];
+                es_traverse_vec(r, child, traverser, opp_sampled, dead, rng,
+                                local, iter, tmp);
+                for (int h = 0; h < nh; h++) out_vals[h] += tmp[h];
+            }
+            double inv = 1.0 / (double)nc;
+            for (int h = 0; h < nh; h++) out_vals[h] *= inv;
             return;
         }
         int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
