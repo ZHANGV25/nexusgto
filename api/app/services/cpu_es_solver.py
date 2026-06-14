@@ -286,6 +286,31 @@ class CpuEsSolver:
         try:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
+
+            # IN-TREE CHANCE NODE GATE (2026-06-14). The C ES traversal handles
+            # in-tree chance nodes only with a DEFENSIVE STUB (es_resolver.c:
+            # 554-561, "CHANCE nodes are not present in depth-limited cont-strat
+            # subgames ... should not fire") that samples one runout child with
+            # NO reach / strat-sum accounting. That assumption holds for every
+            # validated config (3p+ flop/turn -> cont-strat LEAF; river ->
+            # showdown). But the OP3 depth rule extends a HEADS-UP (2p) flop/turn
+            # tree through a chance node to the next street
+            # (ss_tree_builder.c should_extend_via_chance -> orig_num_players==2)
+            # -> the stub fires -> the returned sigma-bar is DEGENERATE (pure
+            # 0/1 per-hand strategies uncorrelated with hand strength;
+            # EC2-measured 2026-06-14). Until the ES solver gains correct in-tree
+            # chance-node handling, refuse rather than serve a wrong answer:
+            # ReplayUnsupported routes the hybrid to the (correct) blueprint
+            # LOOKUP with honest tier=lookup_fallback provenance. 3p+ solves
+            # build no chance node and are unaffected.
+            if int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0:
+                raise ReplayUnsupported(
+                    "live re-solve tree contains an in-tree chance node (the "
+                    "heads-up turn-extension); the CPU-ES traversal does not yet "
+                    "solve chance nodes correctly, so this decision is served "
+                    "from the blueprint lookup instead of a degenerate solve"
+                )
+
             if street == "river":
                 # RIVER: the tree terminates in SHOWDOWN/FOLD terminals only
                 # (the builder disables cont-strat leaves at is_river:

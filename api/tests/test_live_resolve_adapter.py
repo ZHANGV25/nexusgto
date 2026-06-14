@@ -76,41 +76,33 @@ def _is_uniform(freqs, n_legal, eps=0.02):
     return all(abs(freqs.get(i, 0.0) - u) <= eps for i in range(n_legal))
 
 
-def test_live_resolve_2p_flop_anchor(live_source):
-    """2p flop (UTG raise, BB call -> flop): hero=BB resolves a legal-length,
-    non-DEGENERATE (not the uniform placeholder) mix that maps to the agent's
-    action-index vocab.
+def test_live_resolve_2p_flop_gated_to_lookup(live_source):
+    """2p flop (UTG raise, BB call -> flop): the live re-solve is GATED
+    (2026-06-14, supersedes the old 'anchor' that asserted a live mix).
 
-    Hero = 99, a HIGH-WEIGHT hand in BB's flat-call range (w≈1.0). AKs is a
-    3-bet hand (~0-weight when BB flat-calls), so a reach-weighted re-solve
-    barely resolves it → collapses to ~uniform; 99 is solidly in-range and
-    resolves to a real strategy. (Diagnostic 2026-06-06: 99 -> ~check-mostly,
-    55 -> mixed — genuine, non-uniform.)"""
+    A 2p flop/turn tree extends through an in-tree CHANCE node (the OP3
+    turn-extension; ss_tree_builder.c should_extend_via_chance ->
+    orig_num_players==2). The CPU-ES traversal handles chance nodes only with a
+    defensive stub (es_resolver.c:554) with no reach/strat-sum accounting, so
+    the resolved sigma-bar is DEGENERATE — pure (0/1) per-hand strategies
+    uncorrelated with hand strength (EC2-measured 2026-06-14: pure-checks two
+    pair, pure-bets air). NOTE the OLD anchor's 'not uniform' assertion would
+    have PASSED on that degenerate output (a pure strategy is not uniform) —
+    which is exactly why it gave false confidence. CpuEsSolver.solve now raises
+    ReplayUnsupported on num_chance_nodes>0, and LiveResolveSource converts that
+    to LiveResolveUnsupported -> the hybrid serves the (correct) blueprint
+    lookup. Pin that contract here; 3p+ (no chance node) still resolves live."""
+    from app.agent.live_resolve_adapter import LiveResolveUnsupported
+
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d")],
     )  # pot/stacks derived canonically (2p: 600 / 9725 each)
-    n_legal = st.num_legal_actions()
-    assert n_legal == 2  # flop root, no bet faced: [check, bet 0.75]
+    assert st.num_legal_actions() == 2  # flop root, no bet faced: [check, bet]
 
-    t0 = time.time()
-    mix = live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
-    dt = time.time() - t0
-
-    # legal-length: every key is a valid action index, count matches the vocab.
-    assert set(mix.freqs.keys()) <= set(range(n_legal))
-    assert len(mix.freqs) >= 1
-    assert all(0.0 <= v <= 1.0 for v in mix.freqs.values())
-    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
-    # non-degenerate: a real strategy, NOT the uniform-on-miss fallback and NOT
-    # the uniform placeholder a near-0-weight / unresolved row collapses to.
-    assert mix.is_uniform_fallback is False
-    assert not _is_uniform(mix.freqs, n_legal), (
-        f"2p-flop mix is ~uniform {mix.freqs} — solve did not resolve the hand"
-    )
-    # latency MEASURED, expected seconds (NOT sub-second). Loose upper bound.
-    assert dt < 120.0
-    print(f"\n2p-flop live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+    with pytest.raises(LiveResolveUnsupported) as ei:
+        live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    assert "chance node" in str(ei.value).lower()
 
 
 # ── ANCHOR: 3p turn ──────────────────────────────────────────────────────
@@ -164,37 +156,26 @@ def test_live_resolve_3p_turn_anchor(cpu_es_engine, blueprint_path):
 # ── Check-through: hero NOT first-to-act extracts the RIGHT (no-bet) node ─
 
 
-def test_live_resolve_check_through_extracts_no_bet_node(live_source):
-    """A non-root node where the hero is NOT first-to-act but no bet has
-    happened (BB checks -> UTG to act). The guard ALLOWS it; this asserts the
-    extracted node is the hero's all-CHECK-line node (the no-bet vocab
-    {check, bet}, has_to_call=False), NOT a faced-bet branch that would remap to
-    a silent wrong 2-key mix. Verified 2026-06-06: the raw extracted labels are
-    {Check, Bet 75%} — the correct no-bet set. (Same bug CLASS as the faced-bet
-    first-action fix; this proves the check-through path serves the right node.)
+def test_live_resolve_check_through_2p_flop_gated(live_source):
+    """A 2p flop check-through node (BB checks -> UTG to act, no bet faced).
+    Like the 2p flop anchor, this tree extends via an in-tree chance node, so it
+    is now GATED (2026-06-14): CpuEsSolver.solve raises ReplayUnsupported ->
+    LiveResolveUnsupported -> the hybrid serves the blueprint lookup.
 
-    Values are not asserted (Hogwild + low iters → run-to-run variance); the
-    load-bearing fact is the LEGAL SHAPE: keys ⊆ {0,1}, real solve, sums to 1."""
+    (The node-extraction wiring this used to assert — that the all-check-line
+    node, not a faced-bet branch, is extracted — is unit-covered by the replay
+    tests below on the chance-free river path; for 2p flop the engine no longer
+    runs, so there is no extracted node to check.)"""
+    from app.agent.live_resolve_adapter import LiveResolveUnsupported
+
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d")],
     )
     st = st.advance(0)  # BB checks -> UTG (the raiser) to act, no bet faced
-    assert st.to_act_slot == 1  # UTG, NOT first-to-act
-    assert st.facing_bet is False
-    n_legal = st.num_legal_actions()
-    assert n_legal == 2  # no-bet vocab [check, bet 0.75]
-
-    mix = live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))  # UTG-range
-    # The decisive check: the mix is over the NO-BET vocab (indices {0,1}), i.e.
-    # the extracted node was the all-check-line node, not a 3-action faced-bet
-    # node remapped (which would still land in {0,1} but came from {Fold,Call,
-    # Raise} labels — here has_to_call=False so a faced-bet node could only
-    # produce out-of-range/garbage, which the adapter would reject). A clean
-    # 2-key real mix == right node.
-    assert set(mix.freqs.keys()) <= {0, 1}
-    assert mix.is_uniform_fallback is False
-    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert st.to_act_slot == 1 and st.facing_bet is False
+    with pytest.raises(LiveResolveUnsupported):
+        live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))
 
 
 # ── RIVER is SERVED (2026-06-11): exact showdown terminals, no leaf table ─
