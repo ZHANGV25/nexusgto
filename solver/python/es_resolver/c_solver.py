@@ -75,6 +75,10 @@ if hasattr(_lib, "es_set_cfr_mode"):
     _lib.es_set_cfr_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_vec_mode"):
     _lib.es_set_vec_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_set_chance_mode"):
+    _lib.es_set_chance_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_set_opp_mode"):
+    _lib.es_set_opp_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_enable_visit_counter"):
     _lib.es_enable_visit_counter.argtypes = [ctypes.c_void_p]
     _lib.es_get_visit_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -298,6 +302,26 @@ class CSolver:
             _lib.es_set_vec_mode(self._handle, int(mode))
         elif mode == 1:
             raise RuntimeError("es_set_vec_mode not in this DLL (rebuild)")
+
+    def set_chance_mode(self, mode: int) -> None:
+        """In-tree chance-node handling: 1 = ENUMERATE (correct, zero chance-
+        variance — average over all dealt cards), 0 = SAMPLE (one card/iter,
+        high variance), -1 = inherit env default. REQUIRED=1 for a correct 2p
+        HU flop/turn (in-tree-chance) solve. Set before run()."""
+        if hasattr(_lib, "es_set_chance_mode"):
+            _lib.es_set_chance_mode(self._handle, int(mode))
+        elif mode == 0:
+            raise RuntimeError("es_set_chance_mode not in this DLL (rebuild)")
+
+    def set_opp_mode(self, mode: int) -> None:
+        """Opponent-action handling: 1 = ENUMERATE (full CFR — recurse all opp
+        actions; SMALL player counts only), 0 = SAMPLE (external sampling —
+        mandatory at 5-6p), -1 = inherit env default. For the 2p chance solve set
+        1 (+ vec mode) to kill the single-sample oscillation. Set before run()."""
+        if hasattr(_lib, "es_set_opp_mode"):
+            _lib.es_set_opp_mode(self._handle, int(mode))
+        elif mode == 1:
+            raise RuntimeError("es_set_opp_mode not in this DLL (rebuild)")
 
     def enable_visit_counter(self) -> None:
         """DEBUG: count per-node traverser visits. Call before run()."""

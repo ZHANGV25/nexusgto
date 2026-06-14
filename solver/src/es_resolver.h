@@ -116,6 +116,23 @@ ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
  * SAME exploitability as scalar on a 2p/3p spot with OVERLAPPING ranges. */
 ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
 
+/* Chance-node handling: 1 = ENUMERATE (correct, zero chance-variance: average
+ * the value over ALL dealt cards — the GPU's full-reach equivalent), 0 = SAMPLE
+ * (one card per iter — high variance + cross-line incoherence; the original OP3
+ * design), -1 = inherit the process/env default (ENUMERATE unless
+ * ES_CHANCE_SAMPLE=1). REQUIRED for a correct in-tree-chance (2p HU flop/turn)
+ * solve. Set BEFORE es_run. */
+ES_EXPORT void es_set_chance_mode(ESResolver *r, int mode);
+
+/* Opponent-action handling: 1 = ENUMERATE (full CFR — recurse ALL opponent
+ * actions sigma-weighted; with chance enumeration this removes opponent-action
+ * sampling variance, for SMALL player counts only since the action-product
+ * blows up at high N), 0 = SAMPLE (external sampling — mandatory + validated at
+ * 5-6p), -1 = inherit the env default (SAMPLE unless ES_OPP_ENUMERATE=1). For
+ * the 2p chance-extension solve, set 1 (+ vec mode) to kill the single-sample
+ * oscillation. Set BEFORE es_run. */
+ES_EXPORT void es_set_opp_mode(ESResolver *r, int mode);
+
 /* DEBUG: per-node traverser-visit counter (single-thread localization of the
  * vec reachability bug). Enable BEFORE es_run; read with es_get_visit_count
  * (returns -1 if disabled / bad index). Zero overhead when not enabled. */

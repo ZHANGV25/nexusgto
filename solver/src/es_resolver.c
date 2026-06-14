@@ -157,12 +157,8 @@ static int es_chance_key_by_street(void) {
     return v;
 }
 
-/* Chance-node handling mode. DEFAULT = ENUMERATE (average over all dealt cards —
- * correct, zero chance-variance, the GPU's full-reach equivalent). Set
- * ES_CHANCE_SAMPLE=1 to fall back to the single-card-per-iter SAMPLED path (the
- * original OP3 design — high variance + cross-line incoherence; kept for A/B and
- * for any future cost-bounded mode). Cached on first read. */
-static int es_chance_enumerate(void) {
+/* Process default for chance handling: ENUMERATE unless ES_CHANCE_SAMPLE=1. */
+static int es_chance_enumerate_default(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("ES_CHANCE_SAMPLE");
@@ -171,6 +167,27 @@ static int es_chance_enumerate(void) {
     }
     return v;
 }
+
+/* Opponent-action handling. DEFAULT = SAMPLE (the validated external-sampling
+ * path — preserves ALL existing 2-6p behavior). Set ES_OPP_ENUMERATE=1 to
+ * recurse ALL opponent actions sigma-weighted (full CFR). With chance ALSO
+ * enumerated the traversal is then DETERMINISTIC, so a depth-limited 2p subgame
+ * converges monotonically (kills the QJs single-sample oscillation). This is
+ * OPT-IN, not the global default, because full opponent enumeration is only
+ * tractable at SMALL player counts — at 5-6p the action-product across opponents
+ * blows up, where external sampling is mandatory and validated. cpu_es_solver
+ * turns it ON for the 2p chance-node path ONLY. */
+static int es_enumerate_opponent_default(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ES_OPP_ENUMERATE");
+        v = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+    }
+    return v;
+}
+/* es_chance_enumerate(r) / es_enumerate_opponent(r) — per-resolver resolution
+ * (explicit r->*_mode wins; -1 inherits the env default) — are defined just
+ * after the ESResolver struct (they read its fields). */
 static inline int es_chance_sampled_child_keyed(uint64_t master_seed,
                                                 int chance_node_idx, int street_key,
                                                 int num_children, int64_t iter) {
@@ -207,6 +224,17 @@ struct ESResolver {
      * dead-hand card-conflict skip is exercised). Set BEFORE es_run. */
     int vec_traverser;
 
+    /* Chance / opponent-action handling modes (per-resolver, set before es_run).
+     * -1 = inherit the process default (env var); 0/1 = explicit. Env defaults:
+     *   chance:   ENUMERATE unless ES_CHANCE_SAMPLE=1.
+     *   opponent: SAMPLE unless ES_OPP_ENUMERATE=1.
+     * The caller (cpu_es_solver) sets these per-solve so a 2p chance tree can use
+     * (chance-enum + opp-enum + vec) for a deterministic-modulo-opp-hand solve
+     * while 5-6p keeps sampling — both in the SAME process (env caching can't do
+     * that; these fields can). See es_set_chance_mode / es_set_opp_mode. */
+    int chance_mode;   /* -1 default, 0 sample, 1 enumerate */
+    int opp_mode;      /* -1 default, 0 sample, 1 enumerate */
+
     /* Per-decision-node dense storage, keyed (node, hand, action).
      * For node i:  regrets[off[i] + hand*na[i] + a]. Terminal/non-decision
      * nodes have off[i] = -1 and na[i] = 0. The hand axis uses the ACTING
@@ -229,6 +257,15 @@ struct ESResolver {
      * first node on a path where vec's count diverges from scalar. */
     int64_t *visit_count;   /* [num_nodes] or NULL */
 };
+
+/* Per-resolver mode resolution: explicit r->*_mode wins; -1 inherits the env
+ * default. (Defined here — after the struct — because they read its fields.) */
+static inline int es_chance_enumerate(const ESResolver *r) {
+    return (r->chance_mode >= 0) ? r->chance_mode : es_chance_enumerate_default();
+}
+static inline int es_enumerate_opponent(const ESResolver *r) {
+    return (r->opp_mode >= 0) ? r->opp_mode : es_enumerate_opponent_default();
+}
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
@@ -284,6 +321,8 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->oracle = leaf_oracle;
     r->oracle_ctx = oracle_ctx;
     r->master_seed = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    r->chance_mode = -1;   /* inherit process/env default until set */
+    r->opp_mode = -1;
     if (es_build_offsets(r) != 0) { es_free(r); return NULL; }
     return r;
 }
@@ -294,6 +333,21 @@ void es_set_cfr_mode(ESResolver *r, int mode) {
 
 void es_set_vec_mode(ESResolver *r, int mode) {
     if (r) r->vec_traverser = (mode == 1) ? 1 : 0;
+}
+
+/* Chance-node handling: 1 = ENUMERATE (correct, zero-variance — average over all
+ * dealt cards), 0 = SAMPLE (single card/iter — high variance), -1 = inherit the
+ * env default. Set BEFORE es_run. */
+void es_set_chance_mode(ESResolver *r, int mode) {
+    if (r) r->chance_mode = (mode == 0 || mode == 1) ? mode : -1;
+}
+
+/* Opponent-action handling: 1 = ENUMERATE (full CFR — recurse all opp actions
+ * sigma-weighted; deterministic-modulo-hand-sampling, for SMALL player counts
+ * only — 2p/3p), 0 = SAMPLE (external sampling, mandatory at 5-6p), -1 = inherit
+ * the env default. Set BEFORE es_run. */
+void es_set_opp_mode(ESResolver *r, int mode) {
+    if (r) r->opp_mode = (mode == 0 || mode == 1) ? mode : -1;
 }
 
 /* DEBUG visit counter (single-thread localization only). */
@@ -696,7 +750,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     if (type == ES_T_CHANCE) {
         int nc = nd->num_children;
         if (nc <= 0) return 0.0;  /* defensive: empty chance node */
-        if (es_chance_enumerate()) {
+        if (es_chance_enumerate(r)) {
             /* CORRECT (default): ENUMERATE the card outcomes and average — the
              * chance node's value is E_card[V(child)] over all dealt cards
              * (uniform). This is zero-variance at the chance node (the GPU's
@@ -778,7 +832,24 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
         }
         return node_val;
     } else {
-        /* Opponent: sample ONE action from sigma. */
+        if (es_enumerate_opponent(r)) {
+            /* FULL CFR (default): recurse into ALL of the opponent's actions and
+             * return the sigma-weighted expected value. No regret/strat-sum is
+             * updated here (the opponent's own regrets update when THEY are the
+             * traverser). Combined with chance enumeration, the whole traversal
+             * is DETERMINISTIC — no opponent-action sampling variance — so the
+             * depth-limited 2p subgame converges monotonically (the oscillation
+             * the single-action-sample path showed on large ranges is gone). */
+            double ev = 0.0;
+            for (int a = 0; a < na; a++) {
+                int child = t->children[nd->first_child + a];
+                ev += sigma[a] * es_traverse(r, child, traverser, sampled, rng,
+                                             local, iter);
+            }
+            return ev;
+        }
+        /* SAMPLED (diagnostic): one opponent action from sigma — external
+         * sampling, lower per-iter cost but high variance on large ranges. */
         double rd = es_rng_double(rng);
         double cum = 0.0;
         int a = na - 1;
@@ -935,7 +1006,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
             return;
         }
-        if (es_chance_enumerate()) {
+        if (es_chance_enumerate(r)) {
             /* ENUMERATE (default): per-hand average over all dealt cards. */
             double tmp[SS_MAX_HANDS];
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
