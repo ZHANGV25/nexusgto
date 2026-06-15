@@ -262,6 +262,16 @@ struct ESResolver {
     double *rc_cfv;     /* [num_nodes * max_h] or NULL */
     double *rc_strat;   /* [num_nodes * SS_MAX_ACTIONS * max_h] or NULL */
 
+    /* Showdown strength cache (iteration-invariant: board+hand -> 7-card rank).
+     * rc_sd_strength[node*np*max_h + player*max_h + hand], 0 = "not yet computed
+     * / board-conflicting" (a real eval7 rank is never 0 for a 5-board+2-hole
+     * hand). Filled lazily on the first showdown visit per node and reused every
+     * iteration — eval7 is the dominant per-iter cost (one per (showdown node,
+     * hand)), and it does NOT depend on the strategy. rc_sd_done[node] gates the
+     * fill (so it happens once). NULL until the first reach run. */
+    uint32_t *rc_sd_strength;   /* [num_nodes * np * max_h] or NULL */
+    uint8_t  *rc_sd_done;       /* [num_nodes] 0/1, or NULL */
+
     /* Per-decision-node dense storage, keyed (node, hand, action).
      * For node i:  regrets[off[i] + hand*na[i] + a]. Terminal/non-decision
      * nodes have off[i] = -1 and na[i] = 0. The hand axis uses the ACTING
@@ -407,6 +417,8 @@ void es_free(ESResolver *r) {
     free(r->rc_reach);
     free(r->rc_cfv);
     free(r->rc_strat);
+    free(r->rc_sd_strength);
+    free(r->rc_sd_done);
     free(r);
 }
 
@@ -1238,7 +1250,42 @@ static int es_reach_alloc(ESResolver *r) {
                      reach_n, cfv_n, strat_n);
         return -1;
     }
+    /* Strength cache: [N * np * max_h] uint32 (0 = unset). For the 873k-node flop
+     * tree this is ~460MB at np=2,max_h=200 — large but fine on an EC2 box, and it
+     * eliminates the dominant per-iter eval7 cost. calloc -> all-zero (unset). */
+    size_t sd_n = (size_t)N * np * max_h;
+    r->rc_sd_strength = (uint32_t *)calloc(sd_n, sizeof(uint32_t));
+    r->rc_sd_done = (uint8_t *)calloc((size_t)N, sizeof(uint8_t));
+    if (!r->rc_sd_strength || !r->rc_sd_done) {
+        es_set_error("reach: OOM strength cache (%zu u32)", sd_n);
+        return -1;
+    }
     return 0;
+}
+
+/* Fill the per-(node,player,hand) 7-card strength cache for one showdown node
+ * (idempotent: guarded by rc_sd_done). Board-conflicting hands get 0 (sentinel
+ * "dead"). Called once per showdown node; thereafter the showdown CFV reads the
+ * cache instead of calling eval7 every iteration. */
+static void es_reach_fill_strengths(ESResolver *r, int node_idx, const int *board) {
+    if (r->rc_sd_done[node_idx]) return;
+    const SSTreeData *t = r->tree;
+    int np = r->np, max_h = r->reach_max_h;
+    uint32_t *base = r->rc_sd_strength + (size_t)node_idx * np * max_h;
+    for (int p = 0; p < np; p++) {
+        int nh = t->num_hands[p];
+        uint32_t *row = base + (size_t)p * max_h;
+        for (int h = 0; h < nh; h++) {
+            int c0 = t->hands[p][h][0], c1 = t->hands[p][h][1];
+            int conf = 0;
+            for (int b = 0; b < 5; b++) if (c0 == board[b] || c1 == board[b]) { conf = 1; break; }
+            if (conf) { row[h] = 0; continue; }
+            int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
+            uint32_t s = eval7(cards);
+            row[h] = s ? s : 1;  /* avoid 0 collision with the dead sentinel */
+        }
+    }
+    r->rc_sd_done[node_idx] = 1;
 }
 
 /* Step 1: regret-match every decision node into rc_strat (the GPU d_strategy).
@@ -1247,6 +1294,11 @@ static int es_reach_alloc(ESResolver *r) {
 static void es_reach_regret_match_all(ESResolver *r) {
     const SSTreeData *t = r->tree;
     int max_h = r->reach_max_h;
+    /* Each node writes only its own rc_strat slice — node-independent, parallel.
+     * Bit-identical regardless of thread count. */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 256)
+#endif
     for (int i = 0; i < r->num_nodes; i++) {
         const SSNode *nd = &t->nodes[i];
         if (nd->type != ES_T_DECISION) continue;
@@ -1392,41 +1444,153 @@ static void es_reach_showdown_cfv(ESResolver *r, int node_idx, int traverser) {
     int nh_o = t->num_hands[opp];
     double pot = (double)nd->pot;
 
-    /* Precompute opponent strengths once (board-conflicting opp hands excluded;
-     * their reach drops out of the integral). */
-    uint32_t ostr[SS_MAX_HANDS];
-    int ovalid[SS_MAX_HANDS];
-    for (int o = 0; o < nh_o; o++) {
-        ovalid[o] = 0;
-        if (oreach[o] <= 0.0) continue;
-        int oc0 = t->hands[opp][o][0], oc1 = t->hands[opp][o][1];
-        int conf = 0;
-        for (int b = 0; b < 5; b++) if (oc0 == board[b] || oc1 == board[b]) { conf = 1; break; }
-        if (conf) continue;
-        int cards[7] = { board[0], board[1], board[2], board[3], board[4], oc0, oc1 };
-        ostr[o] = eval7(cards);
-        ovalid[o] = 1;
+    /* ES_SHOWDOWN_NAIVE=1 forces the reference O(nh·nh_o) integral (cached once/
+     * process) — the A/B equivalence gate for the linearized path below. */
+    static int s_naive = -1;
+    if (s_naive < 0) {
+        const char *e = getenv("ES_SHOWDOWN_NAIVE");
+        s_naive = (e && (e[0]=='1'||e[0]=='t'||e[0]=='T'||e[0]=='y'||e[0]=='Y')) ? 1 : 0;
     }
+
+    /* Strength cache: eval7 once per (node,player,hand) across ALL iterations
+     * (board+hand -> rank is iteration-invariant; eval7 is the dominant per-iter
+     * cost). Filled on first visit; thereafter a pure array read. 0 = dead
+     * (board-conflicting). */
+    es_reach_fill_strengths(r, node_idx, board);
+    const uint32_t *tstr = r->rc_sd_strength
+        + (size_t)node_idx * r->np * max_h + (size_t)traverser * max_h;
+    const uint32_t *ostr = r->rc_sd_strength
+        + (size_t)node_idx * r->np * max_h + (size_t)opp * max_h;
+
+    /* valid opp hands = positive reach AND non-dead (board-compatible) strength. */
+    int ovalid[SS_MAX_HANDS];
+    for (int o = 0; o < nh_o; o++)
+        ovalid[o] = (oreach[o] > 0.0 && ostr[o] != 0) ? 1 : 0;
+
+    if (s_naive) {
+        /* Reference O(nh·nh_o) integral (the equivalence target). */
+        for (int h = 0; h < nh; h++) {
+            int c0 = t->hands[traverser][h][0], c1 = t->hands[traverser][h][1];
+            uint32_t hs = tstr[h];
+            if (hs == 0) { cfv[h] = 0.0; continue; }  /* board-conflicting traverser hand */
+            double val = 0.0;
+            for (int o = 0; o < nh_o; o++) {
+                if (!ovalid[o]) continue;
+                int oc0 = t->hands[opp][o][0], oc1 = t->hands[opp][o][1];
+                if (oc0 == c0 || oc0 == c1 || oc1 == c0 || oc1 == c1) continue;
+                double w = oreach[o]; uint32_t os = ostr[o];
+                if (hs > os) val += w * (pot - my_bet);
+                else if (hs < os) val += w * (-my_bet);
+                else val += w * (pot * 0.5 - my_bet);
+            }
+            cfv[h] = val;
+        }
+        return;
+    }
+
+    /* ── LINEARIZED reach integral (O((nh+nh_o)·log nh_o + conflicts), not the
+     * naive O(nh·nh_o)) — this is what makes flop-scale full reach tractable.
+     *
+     * Per traverser hand h (strength hs), the value is
+     *   val = (pot-mb)·W + (pot/2-mb)·T + (-mb)·L
+     *       = pot·(W + T/2) - mb·(W+T+L)
+     * where W/T/L = reach mass of opp hands the traverser BEATS / TIES / LOSES to
+     * AMONG opp hands not sharing a card with h. Sort the valid opp hands by
+     * strength once and prefix-sum their reach; then W,T over ALL valid opp hands
+     * are O(log) range lookups by hs, and the per-h CARD-REMOVAL correction
+     * subtracts only the (few) opp hands sharing card c0/c1 with h.
+     *
+     * Card-removal index: ohands_by_card[c] lists valid opp-hand sorted-positions
+     * containing card c (each card is in <=~50 opp hands; a hand has 2 cards, so
+     * the correction per traverser hand is small and bounded). */
+    /* sorted-by-strength order of the valid opp hands */
+    int sidx[SS_MAX_HANDS]; int ns = 0;
+    for (int o = 0; o < nh_o; o++) if (ovalid[o]) sidx[ns++] = o;
+    /* insertion sort by strength (ns <= 200; cheap, stable enough — ties grouped).
+     * For larger ranges this is the one O(ns^2) step, but ns<=200 keeps it ~20k
+     * ops, dwarfed by the avoided O(nh·nh_o) showdown integral. */
+    for (int i = 1; i < ns; i++) {
+        int key = sidx[i]; uint32_t ks = ostr[key]; int j = i - 1;
+        while (j >= 0 && ostr[sidx[j]] > ks) { sidx[j + 1] = sidx[j]; j--; }
+        sidx[j + 1] = key;
+    }
+    /* prefix[k] = sum of reach over sorted opp hands [0,k); prefix[ns] = total. */
+    double prefix[SS_MAX_HANDS + 1];
+    prefix[0] = 0.0;
+    for (int k = 0; k < ns; k++) prefix[k + 1] = prefix[k] + oreach[sidx[k]];
+    double total_reach = prefix[ns];
+    /* strengths in sorted order, for binary search by hs */
+    uint32_t sstr[SS_MAX_HANDS];
+    for (int k = 0; k < ns; k++) sstr[k] = ostr[sidx[k]];
+
+    /* card -> sorted-positions index (only valid opp hands). Each card has a
+     * short list; SS_MAX_HANDS cap on the per-card list is safe (<=51 hands
+     * share any given card in a 2-card-combo range). */
+    int card_cnt[52];
+    for (int c = 0; c < 52; c++) card_cnt[c] = 0;
+    for (int k = 0; k < ns; k++) {
+        int o = sidx[k];
+        card_cnt[t->hands[opp][o][0]]++;
+        card_cnt[t->hands[opp][o][1]]++;
+    }
+    /* flatten into a CSR-style structure: offsets + positions */
+    int card_off[53]; card_off[0] = 0;
+    for (int c = 0; c < 52; c++) card_off[c + 1] = card_off[c] + card_cnt[c];
+    /* card_pos: each of the ns valid opp hands contributes exactly 2 refs (its
+     * two cards), so total refs = 2·ns <= 2·SS_MAX_HANDS — a stack buffer (no
+     * per-node malloc; this runs 873k×/iter under OpenMP, heap contention would
+     * dominate). */
+    int card_pos[2 * SS_MAX_HANDS];
+    { int fill[52]; for (int c = 0; c < 52; c++) fill[c] = card_off[c];
+      for (int k = 0; k < ns; k++) {
+          int o = sidx[k];
+          int a = t->hands[opp][o][0], b = t->hands[opp][o][1];
+          card_pos[fill[a]++] = k; card_pos[fill[b]++] = k;
+      } }
 
     for (int h = 0; h < nh; h++) {
         int c0 = t->hands[traverser][h][0], c1 = t->hands[traverser][h][1];
-        int tconf = 0;
-        for (int b = 0; b < 5; b++) if (c0 == board[b] || c1 == board[b]) { tconf = 1; break; }
-        if (tconf) { cfv[h] = 0.0; continue; }
-        int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
-        uint32_t hs = eval7(cards);
-        double val = 0.0;
-        for (int o = 0; o < nh_o; o++) {
-            if (!ovalid[o]) continue;
-            int oc0 = t->hands[opp][o][0], oc1 = t->hands[opp][o][1];
-            if (oc0 == c0 || oc0 == c1 || oc1 == c0 || oc1 == c1) continue;  /* shared card */
-            double w = oreach[o];
-            uint32_t os = ostr[o];
-            if (hs > os)      val += w * (pot - my_bet);
-            else if (hs < os) val += w * (-my_bet);
-            else              val += w * (pot * 0.5 - my_bet);
+        uint32_t hs = tstr[h];
+        if (hs == 0) { cfv[h] = 0.0; continue; }  /* board-conflicting traverser hand */
+
+        /* W = reach of sorted opp with strength < hs; T = strength == hs.
+         * Binary search: lo = first index with sstr >= hs; hi = first with
+         * sstr > hs. W = prefix[lo]; T = prefix[hi] - prefix[lo]. */
+        int lo = 0, hiend = ns;
+        { int a = 0, b = ns; while (a < b) { int m = (a + b) >> 1; if (sstr[m] < hs) a = m + 1; else b = m; } lo = a; }
+        { int a = lo, b = ns; while (a < b) { int m = (a + b) >> 1; if (sstr[m] <= hs) a = m + 1; else b = m; } hiend = a; }
+        double W = prefix[lo];
+        double T = prefix[hiend] - prefix[lo];
+        double Z = total_reach;
+
+        /* CARD-REMOVAL correction: subtract opp hands sharing c0 or c1 with h.
+         * Walk the (short) per-card position lists; guard double-count when an
+         * opp hand contains BOTH c0 and c1 (impossible — opp can't hold the same
+         * two cards as h unless h==o, but ranges may overlap; a hand sharing both
+         * c0 and c1 IS the same combo and would appear in both lists -> dedup by
+         * only counting it once). We dedup by skipping a position whose opp hand
+         * contains c0 when we are processing the c1 list AND c0<c1-driven order;
+         * simpler: process c0 list fully, then c1 list skipping hands that also
+         * contain c0. */
+        int cc[2] = { c0, c1 };
+        for (int ci = 0; ci < 2; ci++) {
+            int cardv = cc[ci];
+            for (int idx = card_off[cardv]; idx < card_off[cardv + 1]; idx++) {
+                int k = card_pos[idx];
+                int o = sidx[k];
+                int oc0 = t->hands[opp][o][0], oc1 = t->hands[opp][o][1];
+                if (ci == 1) {
+                    /* skip if this opp hand ALSO contains c0 (already removed in
+                     * the c0 pass) — avoids double subtraction. */
+                    if (oc0 == c0 || oc1 == c0) continue;
+                }
+                double w = oreach[o]; uint32_t os = sstr[k];
+                Z -= w;
+                if (os < hs) W -= w;
+                else if (os == hs) T -= w;
+            }
         }
-        cfv[h] = val;
+        cfv[h] = pot * (W + 0.5 * T) - my_bet * Z;
     }
 }
 
