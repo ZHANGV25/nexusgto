@@ -287,33 +287,41 @@ class CpuEsSolver:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
 
-            # IN-TREE CHANCE NODE GATE (2026-06-14). Historically the C ES
-            # traversal STUBBED in-tree chance nodes (es_resolver.c, "should not
-            # fire") — it sampled one runout child with a per-CALL RNG and NO
-            # per-iteration discipline. The OP3 depth rule extends a HEADS-UP
-            # (2p) flop/turn tree THROUGH a chance node to the next street
-            # (ss_tree_builder.c should_extend_via_chance -> orig_num_players==2)
-            # -> the stub fired -> a DEGENERATE pure sigma-bar (EC2-measured
-            # 2026-06-14). The gate routed 2p chance-node solves to the blueprint
-            # LOOKUP (tier=lookup_fallback, honest provenance) instead.
+            # IN-TREE CHANCE NODE GATE (2026-06-14, narrowed 2026-06-15).
+            # Background: the OP3 §4 depth rule once extended a HEADS-UP (2p) flop
+            # tree THROUGH a chance node, enumerating the full turn+river runout
+            # (873k nodes). The CPU-ES chance handling was first a degenerate stub,
+            # then fixed with full-per-hand-REACH vector CFR (correct) — but the
+            # 873k-node flop tree is 20-90 min on CPU (not interactive), and that
+            # full extension is NOT what Pluribus does.
             #
-            # The chance-node MCCFR fix (poker-solver es_chance_sampled_child,
-            # GPU-bit-exact per-iter card sampling) makes 2p solves CORRECT. The
-            # gate stays ON BY DEFAULT until that fix is GPU-validated end-to-end
-            # in production; set NEXUS_ALLOW_CHANCE_SOLVE=1 to let 2p chance-node
-            # trees solve live (the validation path, and — once green — the way
-            # to flip the default). Fail-loud opt-in: when the flag is off we
-            # refuse rather than risk a wrong answer; 3p+ solves build no chance
-            # node and are unaffected either way.
+            # PLURIBUS-FAITHFUL (2026-06-15, paper-verified, Science 2019 supp):
+            # the FLOP subgame terminates at a continuation-strategy LEAF at the
+            # turn chance boundary — NO in-tree chance node — for ALL player
+            # counts. poker-solver ss_tree_builder now depth-limits the 2p flop by
+            # DEFAULT (POKER_FLOP_DEPTH_LIMIT=1): the 2p flop is a ~21-node
+            # cont-strat-leaf betting tree (sub-ms), IDENTICAL in shape to the
+            # already-shipping 3p+ flop path → it solves LIVE here with NO chance
+            # node and NO gate. (POKER_FLOP_DEPTH_LIMIT=0 restores the 873k
+            # extension for research.)
+            #
+            # So this gate now ONLY fires for trees that STILL contain a chance
+            # node — the 2p TURN subgame (turn extends to river per the paper's
+            # "all other cases"). The turn reach-CFR solve is correct + interactive
+            # (~5k nodes, few seconds) but stays gated behind NEXUS_ALLOW_CHANCE_SOLVE
+            # until the ship decision is made; until then a 2p turn decision is
+            # served from the blueprint LOOKUP (honest fallback). 2p flop/river and
+            # 3p+ build no chance node and are unaffected.
             _allow_chance = os.environ.get(
                 "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
             if (not _allow_chance
                     and int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0):
                 raise ReplayUnsupported(
                     "live re-solve tree contains an in-tree chance node (the "
-                    "heads-up turn-extension); chance-node solving is gated off "
-                    "(set NEXUS_ALLOW_CHANCE_SOLVE=1 once GPU-validated), so this "
-                    "decision is served from the blueprint lookup instead"
+                    "heads-up TURN->river extension); chance-node solving is gated "
+                    "off (set NEXUS_ALLOW_CHANCE_SOLVE=1 to enable the reach-CFR "
+                    "turn solve), so this decision is served from the blueprint "
+                    "lookup instead"
                 )
 
             n_leaf_nodes = int(gpu._tree.num_leaf_nodes)

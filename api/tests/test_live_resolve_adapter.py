@@ -76,33 +76,40 @@ def _is_uniform(freqs, n_legal, eps=0.02):
     return all(abs(freqs.get(i, 0.0) - u) <= eps for i in range(n_legal))
 
 
-def test_live_resolve_2p_flop_gated_to_lookup(live_source):
-    """2p flop (UTG raise, BB call -> flop): the live re-solve is GATED
-    (2026-06-14, supersedes the old 'anchor' that asserted a live mix).
+def test_live_resolve_2p_flop_solves_live(live_source):
+    """2p flop (UTG raise, BB call -> flop): solves LIVE (2026-06-15,
+    Pluribus-faithful; supersedes the 2026-06-14 'gated to lookup' contract).
 
-    A 2p flop/turn tree extends through an in-tree CHANCE node (the OP3
-    turn-extension; ss_tree_builder.c should_extend_via_chance ->
-    orig_num_players==2). The CPU-ES traversal handles chance nodes only with a
-    defensive stub (es_resolver.c:554) with no reach/strat-sum accounting, so
-    the resolved sigma-bar is DEGENERATE — pure (0/1) per-hand strategies
-    uncorrelated with hand strength (EC2-measured 2026-06-14: pure-checks two
-    pair, pure-bets air). NOTE the OLD anchor's 'not uniform' assertion would
-    have PASSED on that degenerate output (a pure strategy is not uniform) —
-    which is exactly why it gave false confidence. CpuEsSolver.solve now raises
-    ReplayUnsupported on num_chance_nodes>0, and LiveResolveSource converts that
-    to LiveResolveUnsupported -> the hybrid serves the (correct) blueprint
-    lookup. Pin that contract here; 3p+ (no chance node) still resolves live."""
-    from app.agent.live_resolve_adapter import LiveResolveUnsupported
+    HISTORY: the OP3 rule once extended the 2p flop THROUGH an in-tree chance
+    node (full turn+river runout, 873k nodes). The CPU-ES handled that first with
+    a degenerate stub, then with correct full-per-hand-reach vector CFR — but the
+    873k-node solve is 20-90 min (not interactive) and is NOT what Pluribus does.
+    Verified against the Science 2019 paper: a FLOP subgame terminates at a
+    continuation-strategy LEAF at the turn boundary (no in-tree chance node), for
+    ALL player counts. poker-solver now depth-limits the 2p flop by default
+    (POKER_FLOP_DEPTH_LIMIT=1) -> a ~21-node cont-strat-leaf betting tree (sub-ms),
+    IDENTICAL in shape to the 3p+ flop path. So the 2p flop now SOLVES LIVE with
+    no chance node and no gate.
 
+    Assert the real-solve quality (a degenerate/uniform mix would FAIL): a
+    legal-length, non-fallback, sums-to-1 mix that is NOT uniform-over-legal."""
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d")],
     )  # pot/stacks derived canonically (2p: 600 / 9725 each)
-    assert st.num_legal_actions() == 2  # flop root, no bet faced: [check, bet]
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # flop root, no bet faced: [check, bet]
 
-    with pytest.raises(LiveResolveUnsupported) as ei:
-        live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
-    assert "chance node" in str(ei.value).lower()
+    t0 = time.time()
+    mix = live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False           # a REAL solve, not the miss fallback
+    assert not _is_uniform(mix.freqs, n_legal)        # not the uniform placeholder
+    assert dt < 30.0                                   # Pluribus-faithful flop is sub-second
+    print(f"\n2p-flop live-resolve (Pluribus-faithful): dt={dt:.3f}s mix={mix.freqs}")
 
 
 # ── ANCHOR: 3p turn ──────────────────────────────────────────────────────
@@ -156,26 +163,26 @@ def test_live_resolve_3p_turn_anchor(cpu_es_engine, blueprint_path):
 # ── Check-through: hero NOT first-to-act extracts the RIGHT (no-bet) node ─
 
 
-def test_live_resolve_check_through_2p_flop_gated(live_source):
-    """A 2p flop check-through node (BB checks -> UTG to act, no bet faced).
-    Like the 2p flop anchor, this tree extends via an in-tree chance node, so it
-    is now GATED (2026-06-14): CpuEsSolver.solve raises ReplayUnsupported ->
-    LiveResolveUnsupported -> the hybrid serves the blueprint lookup.
-
-    (The node-extraction wiring this used to assert — that the all-check-line
-    node, not a faced-bet branch, is extracted — is unit-covered by the replay
-    tests below on the chance-free river path; for 2p flop the engine no longer
-    runs, so there is no extracted node to check.)"""
-    from app.agent.live_resolve_adapter import LiveResolveUnsupported
-
+def test_live_resolve_check_through_2p_flop_solves_live(live_source):
+    """A 2p flop check-through node (BB checks -> UTG to act, no bet faced) now
+    SOLVES LIVE (2026-06-15, Pluribus-faithful depth-limit — see
+    test_live_resolve_2p_flop_solves_live). This also exercises the node
+    extraction at a non-first-to-act flop node (UTG to act after BB's check):
+    the engine must resolve the correct no-bet-faced node, not a faced-bet
+    branch. Assert a real, legal-length, non-fallback mix."""
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d")],
     )
     st = st.advance(0)  # BB checks -> UTG (the raiser) to act, no bet faced
     assert st.to_act_slot == 1 and st.facing_bet is False
-    with pytest.raises(LiveResolveUnsupported):
-        live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))
+    n_legal = st.num_legal_actions()
+
+    mix = live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n2p-flop check-through live-resolve: mix={mix.freqs}")
 
 
 # ── RIVER is SERVED (2026-06-11): exact showdown terminals, no leaf table ─
