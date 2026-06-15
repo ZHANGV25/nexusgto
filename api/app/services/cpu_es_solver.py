@@ -316,19 +316,28 @@ class CpuEsSolver:
                     "decision is served from the blueprint lookup instead"
                 )
 
-            if street == "river":
-                # RIVER: the tree terminates in SHOWDOWN/FOLD terminals only
-                # (the builder disables cont-strat leaves at is_river:
-                # street_solver_gpu.py use_cs) and the C ES settles showdowns
-                # natively (es_showdown_value — side-pot validated, see module
-                # docstring). There is NO leaf table to construct; the
-                # zero-leaf table below makes the table oracle exist but be
-                # provably unreachable. FAIL-LOUD: a depth-limit leaf in a
-                # river tree would read garbage from the empty table, so its
-                # presence is a hard error, not a warning.
-                n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
-                n_leaves = int(gpu._tree.num_leaves)
-                if n_leaf_nodes != 0 or n_leaves != 0:
+            n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
+            n_leaves = int(gpu._tree.num_leaves)
+            # ZERO-LEAF trees terminate in SHOWDOWN/FOLD only and need NO leaf
+            # table — the C ES settles those natively. Two cases:
+            #   (a) RIVER: the builder disables cont-strat leaves at is_river.
+            #   (b) A 2p FLOP/TURN tree EXTENDED through an in-tree CHANCE node to
+            #       the next street (the OP3 depth rule): the extension deals the
+            #       remaining board and terminates at showdown/fold, so it ALSO
+            #       has zero leaves (verified: flop 873k-node + turn 5349-node 2p
+            #       chance trees both have 0 leaf nodes). Before reach mode this
+            #       path raised "no leaf infos extracted" (the chance tree has no
+            #       leaves to extract) — so a 2p chance solve crashed in construct
+            #       BEFORE the solver even ran (EC2 2026-06-14). Route any zero-leaf
+            #       tree through the empty-table path; the table oracle exists but
+            #       is provably unreachable (no leaf node references it).
+            tree_has_chance0 = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
+            if street == "river" or (n_leaf_nodes == 0 and n_leaves == 0
+                                     and tree_has_chance0):
+                # FAIL-LOUD on the river contract: a depth-limit leaf in a river
+                # tree would read garbage from the empty table. (For the chance
+                # branch we already gated on n_leaf_nodes==0, so it cannot fire.)
+                if street == "river" and (n_leaf_nodes != 0 or n_leaves != 0):
                     raise RuntimeError(
                         f"river tree has {n_leaf_nodes} leaf nodes / "
                         f"{n_leaves} leaves — river terminals must all be "
