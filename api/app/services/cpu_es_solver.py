@@ -406,6 +406,23 @@ class CpuEsSolver:
                             self._last_cont_ev_stats["hit_rate"])
                 construct_s = time.time() - t0
 
+            # DIAG (NEXUS_ES_DIAG=1): dump leaf-table stats — isolate the 2p-flop
+            # uniform-0.5 mystery (is the construct producing action-blind/zero
+            # leaf values?). Cheap; off by default.
+            if os.environ.get("NEXUS_ES_DIAG", "")[:1] in ("1", "t", "T", "y", "Y"):
+                try:
+                    import numpy as _np
+                    _t = _np.asarray(table)
+                    logger.info(
+                        "CpuEsSolver DIAG: %dp %s table shape=%s min=%.4f max=%.4f "
+                        "mean=%.4f nonzero=%d/%d", n_players, street, _t.shape,
+                        float(_t.min()) if _t.size else 0.0,
+                        float(_t.max()) if _t.size else 0.0,
+                        float(_t.mean()) if _t.size else 0.0,
+                        int(_np.count_nonzero(_t)) if _t.size else 0, _t.size)
+                except Exception as _e:
+                    logger.info("CpuEsSolver DIAG: table dump failed: %s", _e)
+
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
             cs = self._CSolver.from_table(gpu._tree, table, n_players, max_h, seed=1)
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
@@ -455,6 +472,36 @@ class CpuEsSolver:
             cs.run(iterations, num_threads=num_threads)
             solve_s = time.time() - t1
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
+
+            # DIAG (NEXUS_ES_DIAG=1): dump the RAW first-decision-node strategy for
+            # each player (unfiltered by the freq>0.001 display) + per-hand spread,
+            # to see whether the solver produced action-discriminating mixes or a
+            # uniform 0.5 (the 2p-flop mystery). Off by default.
+            if os.environ.get("NEXUS_ES_DIAG", "")[:1] in ("1", "t", "T", "y", "Y"):
+                try:
+                    import numpy as _np
+                    for _p in range(n_players):
+                        _ni = None
+                        for _cand in gpu._tree.decision_node_indices:
+                            _nd = gpu._tree.nodes[_cand]
+                            if _nd.type == 0 and _nd.player == _p and _nd.num_children > 0:
+                                _ni = _cand
+                                break
+                        if _ni is None:
+                            continue
+                        _sig = read_strategy(_ni)
+                        if _sig is None:
+                            logger.info("CpuEsSolver DIAG: p%d node %d sig=None", _p, _ni)
+                            continue
+                        _sig = _np.asarray(_sig)
+                        logger.info(
+                            "CpuEsSolver DIAG: p%d node=%d na=%d nh=%d colmean=%s "
+                            "perhand_spread(min..max action0)=%.3f..%.3f",
+                            _p, _ni, _sig.shape[1], _sig.shape[0],
+                            _np.round(_sig.mean(axis=0), 4).tolist(),
+                            float(_sig[:, 0].min()), float(_sig[:, 0].max()))
+                except Exception as _e:
+                    logger.info("CpuEsSolver DIAG: strategy dump failed: %s", _e)
 
             # The hero's replayed node (mid-street entry), if requested.
             hero_idx: Optional[int] = None
