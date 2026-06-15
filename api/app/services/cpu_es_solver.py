@@ -405,7 +405,28 @@ class CpuEsSolver:
             # 3p+ has no chance node so leave its (validated) sampling untouched —
             # opponent enumeration would blow up at high N anyway.
             tree_has_chance = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
-            if tree_has_chance and hasattr(cs, "set_chance_mode"):
+            # REACH MODE (2026-06-14): for a 2p in-tree-chance tree, prefer the
+            # full-per-hand-REACH vector CFR (the GPU's own math, ported to CPU) —
+            # it converges to the CORRECT mixed strategy deterministically and is
+            # NOT degenerate, unlike the sampling+enum path (which still floors at
+            # a pure over-bet on the chance-tree fixed point: turn toy spot 36% of
+            # pot exploitable vs reach's 0.84% — validate_reach_cfr.py). Gated to
+            # 2p (np==2): full reach is O(nodes*nh) per iter with an O(nh*nh_opp)
+            # showdown term, tractable only at small player counts; 5-6p MUST keep
+            # sampling and 3p+ trees have no chance node anyway. Off by default
+            # (NEXUS_ES_REACH unset/0 falls back to the prior sampling+enum path so
+            # this is a no-op until explicitly enabled for the validated 2p case).
+            _reach = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
+                "1", "t", "T", "y", "Y")
+            use_reach = (
+                tree_has_chance and n_players == 2 and _reach
+                and hasattr(cs, "set_reach_mode")
+            )
+            if use_reach:
+                cs.set_reach_mode(1)    # full reach; ignores cfr/chance/opp/vec
+                readout = "avg"         # σ̄ readout (the frequency-display contract)
+                vec_mode = 0
+            elif tree_has_chance and hasattr(cs, "set_chance_mode"):
                 cs.set_chance_mode(1)   # enumerate card outcomes (correct)
                 if n_players <= 3 and hasattr(cs, "set_opp_mode"):
                     cs.set_opp_mode(1)  # full CFR over opponent actions (2-3p)
