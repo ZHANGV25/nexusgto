@@ -1708,21 +1708,42 @@ static void es_reach_cfv_and_update(ESResolver *r, int traverser, int64_t iter) 
  * across traversers this iter is WRONG — strategy depends on regrets which the
  * traverser's own update mutates; the GPU re-runs regret_match per traverser, so
  * we do too), reach for each non-traverser, terminal CFV, bottom-up update. */
+/* Per-phase wall-clock accumulators (ES_REACH_PROFILE=1). Racy across threads but
+ * only the single-thread driver writes them; informational. */
+static double g_rc_t1 = 0, g_rc_t2 = 0, g_rc_t3 = 0, g_rc_t4 = 0;
+static int es_reach_profile(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("ES_REACH_PROFILE"); v = (e && e[0]=='1') ? 1 : 0; }
+    return v;
+}
+#ifdef _OPENMP
+#define RC_NOW() omp_get_wtime()
+#else
+#include <time.h>
+#define RC_NOW() ((double)clock()/CLOCKS_PER_SEC)
+#endif
+
 static void es_reach_pass(ESResolver *r, int traverser, int64_t iter,
                           uint64_t *rng) {
     int np = r->np;
     int max_h = r->reach_max_h;
+    int prof = es_reach_profile();
+    double t0;
 
     /* 1. regret-match all decision nodes into rc_strat */
+    t0 = prof ? RC_NOW() : 0;
     es_reach_regret_match_all(r);
+    if (prof) g_rc_t1 += RC_NOW() - t0;
 
     /* 2. reach for each non-traverser (zero its block first, then sweep) */
+    t0 = prof ? RC_NOW() : 0;
     for (int rp = 0; rp < np; rp++) {
         if (rp == traverser) continue;
         double *blk = r->rc_reach + (size_t)rp * r->num_nodes * max_h;
         memset(blk, 0, (size_t)r->num_nodes * max_h * sizeof(double));
         es_reach_propagate(r, rp);
     }
+    if (prof) g_rc_t2 += RC_NOW() - t0;
 
     /* 3. terminal CFV for the traverser. Every terminal node writes only its own
      * cfv slice (no cross-node deps), so this is embarrassingly parallel — and it
@@ -1733,6 +1754,7 @@ static void es_reach_pass(ESResolver *r, int traverser, int64_t iter,
      * have ZERO leaves, so the leaf branch is serial-safe in practice; we keep it
      * off the parallel path's critical bookkeeping by only racing a stats counter
      * (advisory, like the Hogwild stats). */
+    t0 = prof ? RC_NOW() : 0;
     memset(r->rc_cfv, 0, (size_t)r->num_nodes * max_h * sizeof(double));
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 256)
@@ -1743,9 +1765,21 @@ static void es_reach_pass(ESResolver *r, int traverser, int64_t iter,
         else if (type == ES_T_SHOWDOWN) es_reach_showdown_cfv(r, i, traverser);
         else if (type == ES_T_LEAF)     es_reach_leaf_cfv(r, i, traverser, rng);
     }
+    if (prof) g_rc_t3 += RC_NOW() - t0;
 
     /* 4. bottom-up CFV + per-hand regret/strat update */
+    t0 = prof ? RC_NOW() : 0;
     es_reach_cfv_and_update(r, traverser, iter);
+    if (prof) g_rc_t4 += RC_NOW() - t0;
+}
+
+/* Read + reset the per-phase profile accumulators (seconds). */
+void es_reach_profile_read(double *t1, double *t2, double *t3, double *t4) {
+    if (t1) *t1 = g_rc_t1;
+    if (t2) *t2 = g_rc_t2;
+    if (t3) *t3 = g_rc_t3;
+    if (t4) *t4 = g_rc_t4;
+    g_rc_t1 = g_rc_t2 = g_rc_t3 = g_rc_t4 = 0;
 }
 
 /* Full-reach run loop. DETERMINISTIC regardless of thread count (the only

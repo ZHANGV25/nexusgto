@@ -154,6 +154,11 @@ ES_EXPORT void es_set_reach_mode(ESResolver *r, int mode);
 ES_EXPORT double es_exploitability_2p(ESResolver *r, double *out_gap0,
                                       double *out_gap1);
 
+/* Read + reset reach-mode per-phase wall-clock (seconds): t1=regret-match,
+ * t2=reach-propagate, t3=terminal CFV, t4=CFV+update. Accumulated only when
+ * ES_REACH_PROFILE=1. For diagnosing where a flop-scale solve spends its time. */
+ES_EXPORT void es_reach_profile_read(double *t1, double *t2, double *t3, double *t4);
+
 /* DEBUG: per-node traverser-visit counter (single-thread localization of the
  * vec reachability bug). Enable BEFORE es_run; read with es_get_visit_count
  * (returns -1 if disabled / bad index). Zero overhead when not enabled. */

@@ -86,6 +86,10 @@ if hasattr(_lib, "es_exploitability_2p"):
     _lib.es_exploitability_2p.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double)]
+if hasattr(_lib, "es_reach_profile_read"):
+    _lib.es_reach_profile_read.argtypes = [
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
 if hasattr(_lib, "es_enable_visit_counter"):
     _lib.es_enable_visit_counter.argtypes = [ctypes.c_void_p]
     _lib.es_get_visit_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
