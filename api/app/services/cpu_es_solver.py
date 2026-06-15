@@ -413,15 +413,15 @@ class CpuEsSolver:
                 try:
                     import numpy as _np
                     _t = _np.asarray(table)
-                    logger.info(
-                        "CpuEsSolver DIAG: %dp %s table shape=%s min=%.4f max=%.4f "
-                        "mean=%.4f nonzero=%d/%d", n_players, street, _t.shape,
-                        float(_t.min()) if _t.size else 0.0,
-                        float(_t.max()) if _t.size else 0.0,
-                        float(_t.mean()) if _t.size else 0.0,
-                        int(_np.count_nonzero(_t)) if _t.size else 0, _t.size)
+                    print(
+                        f"CpuEsSolver DIAG: {n_players}p {street} table shape={_t.shape} "
+                        f"min={float(_t.min()) if _t.size else 0.0:.4f} "
+                        f"max={float(_t.max()) if _t.size else 0.0:.4f} "
+                        f"mean={float(_t.mean()) if _t.size else 0.0:.4f} "
+                        f"nonzero={int(_np.count_nonzero(_t)) if _t.size else 0}/{_t.size} "
+                        f"iters={iterations}", file=sys.stderr, flush=True)
                 except Exception as _e:
-                    logger.info("CpuEsSolver DIAG: table dump failed: %s", _e)
+                    print(f"CpuEsSolver DIAG: table dump failed: {_e}", file=sys.stderr, flush=True)
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
             cs = self._CSolver.from_table(gpu._tree, table, n_players, max_h, seed=1)
@@ -494,14 +494,13 @@ class CpuEsSolver:
                             logger.info("CpuEsSolver DIAG: p%d node %d sig=None", _p, _ni)
                             continue
                         _sig = _np.asarray(_sig)
-                        logger.info(
-                            "CpuEsSolver DIAG: p%d node=%d na=%d nh=%d colmean=%s "
-                            "perhand_spread(min..max action0)=%.3f..%.3f",
-                            _p, _ni, _sig.shape[1], _sig.shape[0],
-                            _np.round(_sig.mean(axis=0), 4).tolist(),
-                            float(_sig[:, 0].min()), float(_sig[:, 0].max()))
+                        print(
+                            f"CpuEsSolver DIAG: p{_p} node={_ni} na={_sig.shape[1]} "
+                            f"nh={_sig.shape[0]} colmean={_np.round(_sig.mean(axis=0), 4).tolist()} "
+                            f"action0_spread={float(_sig[:, 0].min()):.3f}..{float(_sig[:, 0].max()):.3f}",
+                            file=sys.stderr, flush=True)
                 except Exception as _e:
-                    logger.info("CpuEsSolver DIAG: strategy dump failed: %s", _e)
+                    print(f"CpuEsSolver DIAG: strategy dump failed: {_e}", file=sys.stderr, flush=True)
 
             # The hero's replayed node (mid-street entry), if requested.
             hero_idx: Optional[int] = None
