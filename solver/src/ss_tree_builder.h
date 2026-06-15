@@ -45,6 +45,22 @@ typedef struct SSTreeBuilder {
     int depth_rule_enabled;
     int root_street;
     int orig_num_players;
+    /* PLURIBUS-FAITHFUL flop depth limit (2026-06-15). The Pluribus paper
+     * (Science 2019 supp): "If search is being done on the first betting round,
+     * the subgame extends to the end of the round, with LEAF NODES at the chance
+     * nodes at the start of the second round" — i.e. the FLOP subgame terminates
+     * at a continuation-strategy LEAF at the turn boundary, for ALL player counts,
+     * NOT an in-tree turn+river expansion. The original OP3 `full` rule extended
+     * the 2p flop through turn AND river (873k nodes; ~5 orders of magnitude more
+     * expensive — the paper's own estimate of depth-limiting's savings).
+     *   1 (default under depth_rule_enabled): flop root -> cont-strat leaf at the
+     *     turn boundary (Pluribus-faithful, ~21 nodes, sub-ms). 2p flop matches
+     *     the already-shipping 3p+ flop path.
+     *   0: legacy OP3 `full` behavior — 2p flop extends through the chance node
+     *     (the validated-but-expensive reach-CFR path; kept for research/A-B).
+     * Turn/river roots are unaffected (turn still extends to river — the paper's
+     * "all other cases -> end of game"; a 2p turn tree is only ~5k nodes). */
+    int flop_depth_limit;
     int *chance_card_per_child;
     int  chance_card_per_child_len;
     int  chance_card_per_child_cap;

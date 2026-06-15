@@ -70,6 +70,17 @@ SS_EXPORT int ss_build_tree2(
         tb.depth_rule_enabled = (d && strcmp(d, "full") == 0) ? 1 : 0;
         tb.root_street = num_board;
         tb.orig_num_players = num_players;
+        /* PLURIBUS-FAITHFUL flop depth limit (2026-06-15). Default 1: a FLOP
+         * subgame terminates at a cont-strat LEAF at the turn boundary (the
+         * Science 2019 rule, verified verbatim) for ALL player counts — ~21
+         * nodes, sub-ms, vs the legacy 2p-flop full turn+river expansion (873k
+         * nodes, ~5 orders of magnitude more per the paper). Set
+         * POKER_FLOP_DEPTH_LIMIT=0 to restore the full 2p-flop extension (the
+         * validated reach-CFR research path). Turn roots still extend to river
+         * (the paper's "all other cases"). */
+        const char *fdl = getenv("POKER_FLOP_DEPTH_LIMIT");
+        tb.flop_depth_limit = (fdl && (fdl[0] == '0' || fdl[0] == 'n' || fdl[0] == 'N'))
+                              ? 0 : 1;
     }
 
     /* Initialize betting state */

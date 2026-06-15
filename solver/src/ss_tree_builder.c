@@ -30,6 +30,7 @@ void stb_init(SSTreeBuilder *tb) {
     tb->depth_rule_enabled = 0;
     tb->root_street = 0;
     tb->orig_num_players = 0;
+    tb->flop_depth_limit = 1;  /* Pluribus-faithful default (flop -> cont-strat leaf) */
     tb->chance_card_per_child = NULL;
     tb->chance_card_per_child_len = 0;
     tb->chance_card_per_child_cap = 0;
@@ -136,8 +137,15 @@ static int should_extend_via_chance(const SSTreeBuilder *tb,
     if (!tb->depth_rule_enabled) return 0;
     if (is_river || current_num_board >= 5) return 0;
     if (current_num_board == tb->root_street) {
-        if (tb->root_street == 3) return tb->orig_num_players == 2;
-        return 1;
+        /* FLOP root: Pluribus-faithful = terminate at a cont-strat LEAF at the
+         * turn boundary (flop_depth_limit=1, default) — for ALL player counts,
+         * matching the 3p+ flop path. flop_depth_limit=0 restores the legacy 2p
+         * full-extension (reach-CFR research path). 3p+ flop already terminated
+         * at a leaf (the old `orig_num_players==2` only extended the 2p case),
+         * so flop_depth_limit=1 simply drops the 2p exception. */
+        if (tb->root_street == 3)
+            return tb->flop_depth_limit ? 0 : (tb->orig_num_players == 2);
+        return 1;  /* turn root: extend to river (paper: "all other cases") */
     }
     return current_num_board < 5;
 }

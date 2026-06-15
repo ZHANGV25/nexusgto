@@ -48,6 +48,14 @@ def _pair(c0: str, c1: str) -> Tuple[int, int, float]:
 def _build_tree(board_strs: List[str], num_players: int, search_depth: str,
                  bet_sizes: List[float] = None) -> StreetSolverGPU:
     os.environ["POKER_SEARCH_DEPTH"] = search_depth
+    # These OP3 shape gates validate the FULL 2p-flop chance EXTENSION machinery
+    # (test_hu_flop_full asserts the 2p flop has chance nodes). As of 2026-06-15
+    # the Pluribus-faithful default depth-limits the 2p flop to a cont-strat leaf
+    # (POKER_FLOP_DEPTH_LIMIT=1), so to keep exercising the full-extension path
+    # these tests pin POKER_FLOP_DEPTH_LIMIT=0. The production default (1) is
+    # validated separately (the depth-limited flop is the 3p+ leaf path, already
+    # covered). Turn-root extension is unaffected by the flag.
+    os.environ["POKER_FLOP_DEPTH_LIMIT"] = "0"
     bet_sizes = bet_sizes or [0.75]
 
     # Generic ranges — 2 hands per player, all board-compat and distinct.
