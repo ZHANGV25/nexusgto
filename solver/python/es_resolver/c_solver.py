@@ -79,6 +79,13 @@ if hasattr(_lib, "es_set_chance_mode"):
     _lib.es_set_chance_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_opp_mode"):
     _lib.es_set_opp_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_set_reach_mode"):
+    _lib.es_set_reach_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_exploitability_2p"):
+    _lib.es_exploitability_2p.restype = ctypes.c_double
+    _lib.es_exploitability_2p.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double)]
 if hasattr(_lib, "es_enable_visit_counter"):
     _lib.es_enable_visit_counter.argtypes = [ctypes.c_void_p]
     _lib.es_get_visit_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -322,6 +329,30 @@ class CSolver:
             _lib.es_set_opp_mode(self._handle, int(mode))
         elif mode == 1:
             raise RuntimeError("es_set_opp_mode not in this DLL (rebuild)")
+
+    def set_reach_mode(self, mode: int) -> None:
+        """Full-per-hand-reach vector CFR: 1 = ON (the interactive 2p chance
+        solve — carry per-hand opponent reach, integrate ALL opponent hands each
+        iter with NO sampling; Linear CFR + chance-enumerate by construction;
+        deterministic; np==2 only), 0 = OFF (default; sampling traversers). When
+        ON it supersedes cfr/vec/chance/opp modes. Set before run(). Raises if the
+        DLL predates the feature and mode==1."""
+        if hasattr(_lib, "es_set_reach_mode"):
+            _lib.es_set_reach_mode(self._handle, int(mode))
+        elif mode == 1:
+            raise RuntimeError("es_set_reach_mode not in this DLL (rebuild)")
+
+    def exploitability_2p(self):
+        """2p exploitability (best-response gap) of the current σ̄, in pot-chip
+        units per hand. Returns (total, gap0, gap1); each gap >= 0; total DROPS
+        toward 0 as the solve converges. Reuses the reach machinery's showdown/
+        fold evaluators (grades chance trees). Raises if the DLL predates it."""
+        if not hasattr(_lib, "es_exploitability_2p"):
+            raise RuntimeError("es_exploitability_2p not in this DLL (rebuild)")
+        g0 = ctypes.c_double(0.0)
+        g1 = ctypes.c_double(0.0)
+        tot = _lib.es_exploitability_2p(self._handle, ctypes.byref(g0), ctypes.byref(g1))
+        return float(tot), float(g0.value), float(g1.value)
 
     def enable_visit_counter(self) -> None:
         """DEBUG: count per-node traverser visits. Call before run()."""

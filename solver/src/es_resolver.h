@@ -133,6 +133,27 @@ ES_EXPORT void es_set_chance_mode(ESResolver *r, int mode);
  * oscillation. Set BEFORE es_run. */
 ES_EXPORT void es_set_opp_mode(ESResolver *r, int mode);
 
+/* Full-per-hand-REACH vector CFR: 1 = ON, 0 = OFF (default). When ON, es_run
+ * carries a per-player per-node per-hand reach vector and integrates ALL
+ * opponent hands each iteration with NO opponent-hand sampling — mirroring the
+ * GPU street_solve.cu. Zero variance over opponent hands AND chance (enumerated),
+ * so a 2p in-tree-chance subgame converges to the correct mixed strategy in
+ * ~hundreds of iters in seconds, instead of the minutes the sampling vec path
+ * needs to average out opponent-hand variance. It is always Linear-CFR + chance-
+ * ENUMERATE + full reach by construction (ignores cfr/vec/chance/opp modes) and
+ * is DETERMINISTIC (no RNG). For SMALL player counts only — 5-6p MUST keep
+ * SAMPLING (set reach_mode=0). Set BEFORE es_run. */
+ES_EXPORT void es_set_reach_mode(ESResolver *r, int mode);
+
+/* 2p exploitability (best-response gap) of the CURRENT σ̄, in pot-chip units per
+ * hand. Returns gap_0 + gap_1 (each >= 0; written to *out_gap0/1 if non-NULL); a
+ * VALIDATED quality computer that reuses the reach machinery's own showdown/fold
+ * evaluators (so it grades chance trees, unlike the Python exploitability_c.py
+ * which zeros showdowns). DROPS toward 0 as the solve converges — the structural
+ * truth garbage can't fake. np==2 only; returns NAN otherwise. */
+ES_EXPORT double es_exploitability_2p(ESResolver *r, double *out_gap0,
+                                      double *out_gap1);
+
 /* DEBUG: per-node traverser-visit counter (single-thread localization of the
  * vec reachability bug). Enable BEFORE es_run; read with es_get_visit_count
  * (returns -1 if disabled / bad index). Zero overhead when not enabled. */
