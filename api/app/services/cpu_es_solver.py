@@ -373,6 +373,16 @@ class CpuEsSolver:
                     rc.reset_cont_ev_boundary_hit_count()
                     rc.set_use_cont_ev_at_flop_boundary(True)
 
+                # DIAG (NEXUS_ES_DIAG=1): reset the rollout blueprint-miss counters
+                # before the construct so we can read the miss-rate after. A high
+                # blueprint miss-rate -> the turn/river CONTINUATION falls back to
+                # UNIFORM random play, which over-rewards BETTING (betting into a
+                # randomly-playing villain looks great) -> the QJs over-bet. This
+                # is the suspected cause (memory solve_overbet_rootcause_turn_centroids).
+                _diag = os.environ.get("NEXUS_ES_DIAG", "")[:1] in ("1","t","T","y","Y")
+                if _diag and hasattr(rc, "reset_rollout_observability"):
+                    rc.reset_rollout_observability()
+
                 # ── Construct the leaf table (parallel batch, off-lock) ──
                 t0 = time.time()
                 try:
@@ -420,6 +430,18 @@ class CpuEsSolver:
                         f"mean={float(_t.mean()) if _t.size else 0.0:.4f} "
                         f"nonzero={int(_np.count_nonzero(_t)) if _t.size else 0}/{_t.size} "
                         f"iters={iterations}", file=sys.stderr, flush=True)
+                    # blueprint MISS-RATE during the construct rollout — the key
+                    # over-bet suspect (miss -> uniform continuation -> bet looks
+                    # too good).
+                    if hasattr(rc, "get_rollout_observability"):
+                        _miss, _zs = rc.get_rollout_observability()
+                        _bm = rc.get_rollout_bucket_miss_count() if hasattr(
+                            rc, "get_rollout_bucket_miss_count") else -1
+                        _ps = rc.get_rollout_per_street_miss_counts() if hasattr(
+                            rc, "get_rollout_per_street_miss_counts") else None
+                        print(f"CpuEsSolver DIAG: rollout blueprint_miss={_miss} "
+                              f"zerosum={_zs} bucket_miss={_bm} per_street={_ps}",
+                              file=sys.stderr, flush=True)
                 except Exception as _e:
                     print(f"CpuEsSolver DIAG: table dump failed: {_e}", file=sys.stderr, flush=True)
 
