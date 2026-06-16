@@ -468,8 +468,19 @@ class CpuEsSolver:
                     vec_mode = 1        # force vec for the readout below
             if vec_mode:
                 cs.set_vec_mode(1)
+            # SMALL-TREE -> SINGLE-THREAD (2026-06-16). Multi-thread Hogwild on a
+            # tiny tree is dominated by race noise: the Pluribus-faithful 2p flop
+            # is only ~21 nodes / 8 decision nodes, and at num_threads=0 (all
+            # cores) racing on those few shared regret arrays produced a DEGENERATE
+            # uniform 0.500 mix, while single-thread gave a sensible check ~0.92
+            # (EC2 2026-06-16). Hogwild buys nothing on a tree this small (the
+            # per-iter work is trivial), so force single-thread below a node
+            # threshold — deterministic AND correct. Large trees (873k flop ext,
+            # 5-6p) keep multi-thread. Reach mode already runs single-thread.
+            _nn = int(getattr(gpu._tree, "num_nodes", 0))
+            _eff_threads = 1 if (0 < _nn <= 2000 and not use_reach) else num_threads
             t1 = time.time()
-            cs.run(iterations, num_threads=num_threads)
+            cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
 
