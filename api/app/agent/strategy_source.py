@@ -300,12 +300,20 @@ class LiveResolveSource(StrategySource):
         self, config: ModeConfig, cpu_es_solver=None, iterations: int = 200,
         seed_ranges: bool = True, strategy_reader=None,
         vec_mode: bool = False, readout: str = "avg", num_threads: int = 0,
-        num_rollouts: int = 3,
+        num_rollouts: int = 3, cache_k: int = 1,
     ) -> None:
         self._config = config
         self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
         self._iterations = int(iterations)
         self._num_threads = int(num_threads)  # 0 = all cores
+        # cache_k = bias-profile samples per leaf (each leaf value averages over
+        # cache_k random continuation-strategy draws). cache_k=1 is one random
+        # joint-bias draw -> high variance AND a directional bias when that single
+        # draw favors aggression (EC2 2026-06-15: the 2p flop QJs leaf at cache_k=1
+        # converged stably to bet-heavy vs the blueprint's check 0.957). Averaging
+        # over more draws approximates the exact 4^np-profile mean. Small trees
+        # (2p flop, 16 joint profiles) afford a high cache_k cheaply.
+        self._cache_k = int(cache_k)
         # Leaf-table rollouts per (leaf, bias). The 6p floor is leaf-sample-
         # noise-dominated: nr=3 floors ~0.15%/pot and the per-spot strategy is
         # noise-realization-driven (mean |dSigma| 0.40 across noise seeds);
@@ -428,6 +436,7 @@ class LiveResolveSource(StrategySource):
                 iterations=self._iterations,
                 num_threads=self._num_threads,
                 num_rollouts=self._num_rollouts,
+                cache_k=self._cache_k,
                 vec_mode=1 if self._vec_mode else 0,
                 readout=self._readout,
                 hero_replay={
