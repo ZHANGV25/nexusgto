@@ -275,14 +275,41 @@ class CpuEsSolver:
             )
         street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
 
-        # ── Build the tree (CPU tree-builder; no GPU solve / no leaf_value_fn) ──
-        gpu = self._StreetSolverGPU(
-            board=board_strs, pot_bb=pot_bb, stack_bb=stack_bb,
-            player_ranges=player_ranges, bet_sizes=bet_sizes,
-            subsequent_bet_sizes=subsequent_bet_sizes,
-            use_cont_strats=True, leaf_value_fn=None,
-            add_explicit_allin=add_explicit_allin,
-        )
+        # ── 2p-TURN reach-CFR enablement (2026-06-17, scoped) ──
+        # The in-tree chance node (turn->river extension) that the reach-CFR turn
+        # solve needs is built ONLY when POKER_SEARCH_DEPTH=full is set at C
+        # tree-build time (ss_tree_api.c ss_build_tree2). Nothing else in the
+        # engine sets it, so by default the 2p turn builds a cont-strat-LEAF tree
+        # (same sampled path as the flop). To serve the VALIDATED reach-CFR for
+        # the 2p turn, set it for THIS build only — and ONLY for n_players==2
+        # turn, so 3p+/5p turns (which would also build a chance node under
+        # 'full' but have NO validated reach-CFR path -> degenerate sampling+enum)
+        # are NOT affected. Restored in finally so it never leaks to another
+        # solve. Honors an explicit operator override (if already 'full'/'single'
+        # in the env, we leave it).
+        _want_turn_reach = (n_players == 2 and street == "turn")
+        _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
+        _depth_set = False
+        if _want_turn_reach and _depth_prev is None:
+            os.environ["POKER_SEARCH_DEPTH"] = "full"
+            _depth_set = True
+        try:
+            # ── Build the tree (CPU tree-builder; no GPU solve / no leaf_value_fn) ──
+            gpu = self._StreetSolverGPU(
+                board=board_strs, pot_bb=pot_bb, stack_bb=stack_bb,
+                player_ranges=player_ranges, bet_sizes=bet_sizes,
+                subsequent_bet_sizes=subsequent_bet_sizes,
+                use_cont_strats=True, leaf_value_fn=None,
+                add_explicit_allin=add_explicit_allin,
+            )
+        finally:
+            # Restore immediately after the build (the env only matters during
+            # ss_build_tree2); keep the window minimal.
+            if _depth_set:
+                if _depth_prev is None:
+                    os.environ.pop("POKER_SEARCH_DEPTH", None)
+                else:
+                    os.environ["POKER_SEARCH_DEPTH"] = _depth_prev
         try:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
@@ -306,22 +333,35 @@ class CpuEsSolver:
             # extension for research.)
             #
             # So this gate now ONLY fires for trees that STILL contain a chance
-            # node — the 2p TURN subgame (turn extends to river per the paper's
-            # "all other cases"). The turn reach-CFR solve is correct + interactive
-            # (~5k nodes, few seconds) but stays gated behind NEXUS_ALLOW_CHANCE_SOLVE
-            # until the ship decision is made; until then a 2p turn decision is
-            # served from the blueprint LOOKUP (honest fallback). 2p flop/river and
-            # 3p+ build no chance node and are unaffected.
+            # node. The ONLY such tree the engine builds by default is the 2p TURN
+            # subgame (we set POKER_SEARCH_DEPTH=full for it above; the turn
+            # extends to river per the paper's "all other cases"). The 2p turn
+            # reach-CFR solve is correct + interactive (~5k nodes, few seconds) and
+            # CONDITIONS the opponent range in-tree, so unlike the flop cont-strat
+            # leaf it matches the blueprint — it is SHIPPED LIVE by default
+            # (2026-06-17, user decision).
+            #
+            # A chance node at ANY OTHER player count would only appear if an
+            # operator forced POKER_SEARCH_DEPTH=full globally (we don't); those
+            # have NO validated reach-CFR path (reach is n_players==2 only) and
+            # would fall to the degenerate sampling+enum chance path — so they
+            # stay GATED to the blueprint lookup unless NEXUS_ALLOW_CHANCE_SOLVE=1
+            # is explicitly set. _chance_is_reach mirrors the use_reach predicate
+            # below (2p + reach available); only that case is served by default.
+            _has_chance = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
+            _reach_default = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
+                "1", "t", "T", "y", "Y")
+            _chance_is_reach = (_has_chance and n_players == 2 and _reach_default)
             _allow_chance = os.environ.get(
                 "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
-            if (not _allow_chance
-                    and int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0):
+            if _has_chance and not _chance_is_reach and not _allow_chance:
                 raise ReplayUnsupported(
-                    "live re-solve tree contains an in-tree chance node (the "
-                    "heads-up TURN->river extension); chance-node solving is gated "
-                    "off (set NEXUS_ALLOW_CHANCE_SOLVE=1 to enable the reach-CFR "
-                    "turn solve), so this decision is served from the blueprint "
-                    "lookup instead"
+                    "live re-solve tree contains an in-tree chance node at a "
+                    "player count with no validated reach-CFR path (reach is "
+                    "heads-up only); chance-node solving is gated off for it (set "
+                    "NEXUS_ALLOW_CHANCE_SOLVE=1 to force the sampling+enum chance "
+                    "path), so this decision is served from the blueprint lookup "
+                    "instead"
                 )
 
             n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
@@ -383,21 +423,65 @@ class CpuEsSolver:
                 if _diag and hasattr(rc, "reset_rollout_observability"):
                     rc.reset_rollout_observability()
 
+                # ── 2p-FLOP OPPONENT-RANGE CONDITIONING (2026-06-17, gated) ──
+                # The depth-limited cont-strat-leaf values the BET leaf against
+                # the UN-conditioned full preflop range -> betting marginal hands
+                # (QJs) is under-punished -> over-bet vs the blueprint's confident
+                # check (root cause: docs/CPU_ES_CHANCE_NODE_FINDINGS). Condition
+                # each leaf's villain sampling weights on the blueprint probability
+                # that the seat took the flop actions on the leaf's line, so the
+                # BET leaf is valued vs the CALLING subset. Gated to 2p flop ONLY:
+                # the 3p+ flop and 5-6p external-sampling paths take the UNCHANGED
+                # shared-range construct below (provably no regression).
+                _cond_on = os.environ.get(
+                    "NEXUS_LEAF_RANGE_CONDITIONING", "")[:1] in (
+                        "1", "t", "T", "y", "Y")
+                _use_cond = (_cond_on and n_players == 2 and street == "flop")
+                per_leaf_ranges = None
+                if _use_cond:
+                    from leaf_villain_conditioning import (  # type: ignore
+                        build_conditioned_per_leaf_ranges)
+                    per_leaf_ranges, _cond_stats = build_conditioned_per_leaf_ranges(
+                        leaf_infos=leaf_infos, player_ranges=player_ranges,
+                        flop_board=board_ints, player_seats=list(player_seats),
+                        game_action_history=list(game_action_indices or []),
+                        blueprint=self._blueprint, n_players=n_players,
+                    )
+                    if _diag:
+                        print(f"CpuEsSolver DIAG: range-conditioning stats="
+                              f"{_cond_stats}", file=sys.stderr, flush=True)
+
                 # ── Construct the leaf table (parallel batch, off-lock) ──
                 t0 = time.time()
                 try:
-                    table = rc.compute_subgame_leaf_values_sampled_c(
-                        leaf_infos=leaf_infos, board=board_ints, street=street,
-                        player_hands=player_ranges, active=[True] * n_players,
-                        acting_order=list(range(n_players)),
-                        player_seats=list(player_seats),
-                        game_action_history=list(game_action_indices or []),
-                        blueprint=self._blueprint,
-                        starting_pot_chips=int(round(pot_bb * scale)),
-                        stack_chips=stack_chips, max_hands=max_h,
-                        num_rollouts=num_rollouts, num_samples_k=cache_k,
-                        master_seed=master_seed,
-                    )
+                    if per_leaf_ranges is not None:
+                        table = rc.compute_subgame_leaf_values_sampled_perleaf_c(
+                            leaf_infos=leaf_infos, board=board_ints, street=street,
+                            player_hands=player_ranges,
+                            per_leaf_player_hands=per_leaf_ranges,
+                            active=[True] * n_players,
+                            acting_order=list(range(n_players)),
+                            player_seats=list(player_seats),
+                            game_action_history=list(game_action_indices or []),
+                            blueprint=self._blueprint,
+                            starting_pot_chips=int(round(pot_bb * scale)),
+                            stack_chips=stack_chips, max_hands=max_h,
+                            num_rollouts=num_rollouts, num_samples_k=cache_k,
+                            master_seed=master_seed,
+                        )
+                    else:
+                        table = rc.compute_subgame_leaf_values_sampled_c(
+                            leaf_infos=leaf_infos, board=board_ints, street=street,
+                            player_hands=player_ranges, active=[True] * n_players,
+                            acting_order=list(range(n_players)),
+                            player_seats=list(player_seats),
+                            game_action_history=list(game_action_indices or []),
+                            blueprint=self._blueprint,
+                            starting_pot_chips=int(round(pot_bb * scale)),
+                            stack_chips=stack_chips, max_hands=max_h,
+                            num_rollouts=num_rollouts, num_samples_k=cache_k,
+                            master_seed=master_seed,
+                        )
                 finally:
                     if a3_armed:
                         # Disable the global flag so it can't leak into other
