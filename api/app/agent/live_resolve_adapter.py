@@ -158,7 +158,15 @@ def build_solve_inputs(
     # (already SB-first); solver player index == position in entry_slots.
     positions_sorted = [SEAT_NAME[state.seat_of_slot[s]] for s in entry_slots]
     n = len(entry_slots)
-    player_seats = list(range(n))
+    # The C rollout keys the blueprint's postflop CONTINUATION strategies by FULL
+    # seat id (mccfr_blueprint.c stores key.player = the seat; bps_query_strategy
+    # looks up by that seat). player_seats passed compact indices range(n) here,
+    # so for any spot whose compact ids differ from full seats (HU [BB,UTG] is
+    # compact [0,1] but full [1,2]) the blueprint query used the WRONG seat and
+    # task-mqgm2hpp). Pass the FULL seat per compact slot. (player_seats reaches
+    # the engine ONLY as the rollout's blueprint seat key — cpu_es_solver passes
+    # it straight to compute_subgame_leaf_values_sampled_c.)
+    player_seats = [state.seat_of_slot[s] for s in entry_slots]
     hero_player_idx = entry_slots.index(hero_slot)
 
     # 169 grid per entry player, blocked by the board (mirrors solve_cpu_es).
