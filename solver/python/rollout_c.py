@@ -80,6 +80,28 @@ class _RolloutLeafInfo(ctypes.Structure):
     ]
 
 
+def _pack_leaf_flop_history(dst, li, leaf_idx_for_error: int) -> None:
+    """Copy a leaf's training-encoded flop action history into the C struct.
+
+    flop_history_train is the this-street action-index path the trainer used to
+    KEY the blueprint's postflop nodes; the rollout concatenates it after the
+    preflop game_action_history to reconstruct the blueprint key for its
+    continuation queries. BOTH the sampled and non-sampled wrappers must pack it
+    — omitting it (the sampled-path bug, 2026-06-16) drops the postflop key and
+    every continuation query misses -> uniform fallback -> over-bet. Missing on
+    legacy LeafInfo objects is tolerated (empty -> old dropped-history behavior).
+    """
+    fh = getattr(li, "flop_history_train", ()) or ()
+    if len(fh) > _ROLLOUT_MAX_ACTION_HISTORY:
+        raise ValueError(
+            f"leaf {leaf_idx_for_error}: flop_history_train length {len(fh)} "
+            f"exceeds ROLLOUT_MAX_ACTION_HISTORY={_ROLLOUT_MAX_ACTION_HISTORY}"
+        )
+    for j, idx in enumerate(fh):
+        dst.flop_history[j] = int(idx)
+    dst.flop_history_len = len(fh)
+
+
 # ─── Library loader ──────────────────────────────────────────────────────
 
 
@@ -615,15 +637,7 @@ def compute_subgame_leaf_values_c(
         bets_src = list(li.bets) if hasattr(li, "bets") else [0] * num_players
         for p in range(_ROLLOUT_MAX_PLAYERS):
             li_arr[i].bets[p] = int(bets_src[p]) if p < num_players else 0
-        fh = getattr(li, "flop_history_train", ()) or ()
-        if len(fh) > _ROLLOUT_MAX_ACTION_HISTORY:
-            raise ValueError(
-                f"leaf {i}: flop_history_train length {len(fh)} exceeds "
-                f"ROLLOUT_MAX_ACTION_HISTORY={_ROLLOUT_MAX_ACTION_HISTORY}"
-            )
-        for j, idx in enumerate(fh):
-            li_arr[i].flop_history[j] = int(idx)
-        li_arr[i].flop_history_len = len(fh)
+        _pack_leaf_flop_history(li_arr[i], li, i)
 
     active_arr = (ctypes.c_int32 * num_players)(
         *[1 if a else 0 for a in active]
@@ -740,6 +754,13 @@ def compute_subgame_leaf_values_sampled_c(
         bets_src = list(li.bets) if hasattr(li, "bets") else [0] * num_players
         for p in range(_ROLLOUT_MAX_PLAYERS):
             li_arr[i].bets[p] = int(bets_src[p]) if p < num_players else 0
+        # SAMPLED path must copy flop_history_train too (2026-06-16) — it was
+        # OMITTED here (the non-sampled path above packs it), so the rollout's
+        # blueprint CONTINUATION queries keyed on the preflop prefix ONLY and
+        # MISSED on every postflop street (EC2: per_street flop=1235,
+        # bucket_miss=0), falling back to UNIFORM random continuation -> the
+        # cont-strat leaf over-rewarded BETTING (2p flop QJs bet 0.99 vs the
+        _pack_leaf_flop_history(li_arr[i], li, i)
 
     active_arr = (ctypes.c_int32 * num_players)(
         *[1 if a else 0 for a in active]
