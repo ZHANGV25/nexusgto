@@ -279,6 +279,8 @@ def test_extract_leaf_info_check_check():
     # !facing + check both → train_idx 0 each
     assert li.flop_history_train == (0, 0)
     assert li.bets == (0, 0)
+    # flop_actor_train parallels flop_history_train: P0 acted, then P1.
+    assert li.flop_actor_train == (0, 1)
 
 
 def test_extract_leaf_info_bet_call():
@@ -292,6 +294,8 @@ def test_extract_leaf_info_bet_call():
     li = leaves[0]
     # P0 bets 0.5 (no facing → idx 1), P1 calls (facing → idx 1)
     assert li.flop_history_train == (1, 1)
+    # The BET-call leaf line: P0 (the bettor), then P1 (the caller).
+    assert li.flop_actor_train == (0, 1)
 
 
 def test_extract_leaf_info_bet_raise_call():
@@ -308,6 +312,8 @@ def test_extract_leaf_info_bet_raise_call():
     assert len(leaves) == 1
     li = leaves[0]
     assert li.flop_history_train == (1, 2, 1)
+    # P0 bet, P1 raise, P0 call.
+    assert li.flop_actor_train == (0, 1, 0)
 
 
 def test_extract_leaf_info_check_bet_call():
@@ -321,6 +327,8 @@ def test_extract_leaf_info_check_bet_call():
     assert len(leaves) == 1
     li = leaves[0]
     assert li.flop_history_train == (0, 2, 1)
+    # P0 check, P1 bet, P0 call.
+    assert li.flop_actor_train == (0, 1, 0)
 
 
 def test_extract_leaf_info_empty_root_is_cont_chain():
@@ -330,6 +338,7 @@ def test_extract_leaf_info_empty_root_is_cont_chain():
     assert len(leaves) == 1
     li = leaves[0]
     assert li.flop_history_train == ()
+    assert li.flop_actor_train == ()
 
 
 # ── SAMPLED-mode tree shape ─────────────────────────────────────────────

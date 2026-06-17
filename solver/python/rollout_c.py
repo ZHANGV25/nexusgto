@@ -208,6 +208,37 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.rollout_compute_subgame_leaf_values_sampled_c.restype = ctypes.c_int32
 
+    # Per-leaf conditioned variant (2026-06-17): same as sampled_c + an extra
+    # per_leaf_player_hands array (n_leaves*num_players RolloutHandList). Optional
+    # symbol — only the 2p-flop range-conditioning path binds it.
+    if hasattr(lib, "rollout_compute_subgame_leaf_values_sampled_perleaf_c"):
+        lib.rollout_compute_subgame_leaf_values_sampled_perleaf_c.argtypes = [
+            ctypes.c_void_p,                    # BPSReader *
+            ctypes.POINTER(ctypes.c_int),       # board
+            ctypes.c_int32,                     # n_board_cards
+            ctypes.c_int32,                     # street
+            ctypes.POINTER(_RolloutLeafInfo),   # leaf_infos
+            ctypes.c_int32,                     # n_leaves
+            ctypes.POINTER(ctypes.c_int32),     # active
+            ctypes.c_int32,                     # num_players
+            ctypes.POINTER(_RolloutHandList),   # player_hands (shared fallback)
+            ctypes.POINTER(_RolloutHandList),   # per_leaf_player_hands
+            ctypes.POINTER(ctypes.c_int32),     # acting_order
+            ctypes.c_int32,                     # acting_order_len
+            ctypes.POINTER(ctypes.c_int32),     # player_seats
+            ctypes.POINTER(ctypes.c_int32),     # game_action_history
+            ctypes.c_int32,                     # gah_len
+            ctypes.c_int32,                     # stack_chips
+            ctypes.c_int32,                     # max_hands
+            ctypes.c_int32,                     # num_rollouts
+            ctypes.c_int32,                     # num_samples_k
+            ctypes.c_uint64,                    # master_seed
+            ctypes.POINTER(ctypes.c_float),     # out
+            ctypes.c_int32,                     # out_size
+        ]
+        lib.rollout_compute_subgame_leaf_values_sampled_perleaf_c.restype = \
+            ctypes.c_int32
+
     lib.rollout_compute_leaf_value_c.argtypes = [
         ctypes.c_void_p,                    # BPSReader *
         ctypes.POINTER(ctypes.c_int),       # board
@@ -801,6 +832,149 @@ def compute_subgame_leaf_values_sampled_c(
         raise LeafValueUnavailable(
             street=street, num_players=num_players,
             reason=f"[rollout.c sampled] {msg}",
+        )
+    return out
+
+
+def compute_subgame_leaf_values_sampled_perleaf_c(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    per_leaf_player_hands: List[List[List[Tuple[int, int, float]]]],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    starting_pot_chips: int,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int = 3,
+    num_samples_k: int = 1,
+    rng=None,
+    master_seed: int = 0x5a17_e8c0_feed_beef,
+) -> np.ndarray:
+    """Per-leaf-conditioned variant of compute_subgame_leaf_values_sampled_c.
+
+    Identical contract/return shape, except each leaf samples opponents from its
+    OWN conditioned ranges: per_leaf_player_hands[leaf_local_idx][player] is that
+    leaf's per-player [(c0,c1,weight), ...]. Used ONLY by the 2p-flop
+    opponent-range conditioning (leaf_villain_conditioning.py); the C side keys the
+    per-leaf array by the LOOP index (1:1 with leaf_infos), so the ordering of
+    per_leaf_player_hands MUST match leaf_infos. player_hands is still passed (the
+    shared-fallback contract) but is ignored by the C core when per-leaf is set.
+
+    Fail-loud on a shape mismatch (wrong leaf count / wrong player count) — a
+    silent mis-shape would scramble the conditioning.
+    """
+    if street not in _STREET_NUM:
+        raise ValueError(f"bad street {street!r}")
+    if num_samples_k < 1:
+        raise ValueError(f"num_samples_k must be >= 1, got {num_samples_k}")
+    lib = _lib()
+    if not hasattr(lib, "rollout_compute_subgame_leaf_values_sampled_perleaf_c"):
+        raise RuntimeError(
+            "rollout lib lacks rollout_compute_subgame_leaf_values_sampled_perleaf_c "
+            "— rebuild es_resolver_real / rollout with the 2026-06-17 conditioning"
+        )
+
+    if rng is not None:
+        try:
+            master_seed = int(rng.integers(0, 2**64 - 1, dtype=np.uint64))
+        except Exception:
+            pass
+
+    if not hasattr(blueprint, "_reader"):
+        raise TypeError(
+            "C rollout requires a BPSReaderC blueprint (has ._reader handle); "
+            f"got {type(blueprint).__name__}."
+        )
+    bp_ptr = blueprint._reader
+
+    num_players = len(player_hands)
+    if num_players <= 0 or num_players > _ROLLOUT_MAX_PLAYERS:
+        raise ValueError(f"num_players {num_players} out of range [1, 6]")
+
+    n_leaves = len(leaf_infos)
+    if len(per_leaf_player_hands) != n_leaves:
+        raise ValueError(
+            f"per_leaf_player_hands has {len(per_leaf_player_hands)} entries, "
+            f"expected one per leaf ({n_leaves})"
+        )
+    for lf, plr in enumerate(per_leaf_player_hands):
+        if len(plr) != num_players:
+            raise ValueError(
+                f"per_leaf_player_hands[{lf}] has {len(plr)} player ranges, "
+                f"expected {num_players}"
+            )
+
+    max_leaf_idx = max((li.leaf_idx for li in leaf_infos), default=-1)
+    total = max_leaf_idx + 1
+    floats_needed = total * num_players * max_hands
+    out = np.zeros((total, num_players, max_hands), dtype=np.float32)
+
+    board_arr = (ctypes.c_int * len(board))(*board) if board else None
+    board_ptr = board_arr if board_arr is not None else ctypes.POINTER(ctypes.c_int)()
+
+    li_arr = (_RolloutLeafInfo * n_leaves)()
+    for i, li in enumerate(leaf_infos):
+        li_arr[i].leaf_idx = int(li.leaf_idx)
+        li_arr[i].pot_chips = int(li.pot)
+        bets_src = list(li.bets) if hasattr(li, "bets") else [0] * num_players
+        for p in range(_ROLLOUT_MAX_PLAYERS):
+            li_arr[i].bets[p] = int(bets_src[p]) if p < num_players else 0
+        _pack_leaf_flop_history(li_arr[i], li, i)
+
+    active_arr = (ctypes.c_int32 * num_players)(
+        *[1 if a else 0 for a in active]
+    )
+
+    stash: list = []
+    # Shared fallback range (unused by the core when per-leaf is set, but the
+    # signature requires a valid pointer).
+    hl_arr = (_RolloutHandList * num_players)()
+    for p in range(num_players):
+        hl_arr[p] = _hand_list_struct(player_hands[p], stash)
+
+    # Per-leaf array: n_leaves*num_players RolloutHandList, row-major
+    # [leaf*num_players + player] — exactly how the C core indexes it.
+    pl_arr = (_RolloutHandList * (n_leaves * num_players))()
+    for lf in range(n_leaves):
+        for p in range(num_players):
+            pl_arr[lf * num_players + p] = _hand_list_struct(
+                per_leaf_player_hands[lf][p], stash)
+
+    acting_order_arr = (ctypes.c_int32 * len(acting_order))(*acting_order)
+    player_seats_arr = (ctypes.c_int32 * len(player_seats))(*player_seats)
+    gah_arr = (ctypes.c_int32 * len(game_action_history))(*game_action_history) \
+        if game_action_history else (ctypes.c_int32 * 0)()
+
+    out_ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+    rc = lib.rollout_compute_subgame_leaf_values_sampled_perleaf_c(
+        bp_ptr,
+        board_ptr, ctypes.c_int32(len(board)),
+        ctypes.c_int32(_STREET_NUM[street]),
+        li_arr, ctypes.c_int32(n_leaves),
+        active_arr, ctypes.c_int32(num_players),
+        hl_arr,
+        pl_arr,
+        acting_order_arr, ctypes.c_int32(len(acting_order)),
+        player_seats_arr,
+        gah_arr, ctypes.c_int32(len(game_action_history)),
+        ctypes.c_int32(int(stack_chips)),
+        ctypes.c_int32(int(max_hands)),
+        ctypes.c_int32(int(num_rollouts)),
+        ctypes.c_int32(int(num_samples_k)),
+        ctypes.c_uint64(int(master_seed) & 0xFFFFFFFFFFFFFFFF),
+        out_ptr, ctypes.c_int32(int(floats_needed)),
+    )
+    if rc != 0:
+        msg, street_n, np_n = _last_error()
+        raise LeafValueUnavailable(
+            street=street, num_players=num_players,
+            reason=f"[rollout.c sampled perleaf] {msg}",
         )
     return out
 

@@ -234,10 +234,16 @@ _POSTFLOP_MAX_RAISES = 3
 # field. The hasattr() guard in rollout_c.py handles the absent-field case
 # for legacy callers (LeafInfo without flop_history_train works as before;
 # the rollout falls back to the dropped-history behavior).
+# flop_actor_train (2026-06-17): the per-step ACTOR (node.player) parallel to
+# flop_history_train — same length, same DFS order. Consumed by the 2p-flop
+# opponent-range conditioning (leaf_villain_conditioning.py) to attribute each
+# flop action on a leaf's line to the seat that took it. Appended LAST and
+# defaulted so every existing positional/legacy caller is unaffected (the rollout
+# never reads it; only the Python conditioning helper does).
 LeafInfo = namedtuple(
     'LeafInfo',
-    ['leaf_idx', 'pot', 'bets', 'flop_history_train'],
-    defaults=((),),
+    ['leaf_idx', 'pot', 'bets', 'flop_history_train', 'flop_actor_train'],
+    defaults=((), ()),
 )
 
 
@@ -370,10 +376,12 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
     leaves = []
     # Iterative DFS — Python's default recursion limit is 1000 and SS
     # trees at 6p with off-tree sizes can exceed that. Stack carries
-    # (node_idx, history_tuple, raises_so_far).
-    stack = [(0, (), 0)]
+    # (node_idx, history_tuple, actors_tuple, raises_so_far). actors is the
+    # parallel per-step acting seat (node.player at each decision on the line),
+    # threaded for the 2p-flop range conditioning; same length as history.
+    stack = [(0, (), (), 0)]
     while stack:
-        node_idx, history, raises_so_far = stack.pop()
+        node_idx, history, actors, raises_so_far = stack.pop()
         node = tree_data.nodes[node_idx]
 
         if node.type == 0 and node.num_children == 4 and \
@@ -387,6 +395,7 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
                 pot=node.pot,
                 bets=bets,
                 flop_history_train=history,
+                flop_actor_train=actors,
             ))
             continue
 
@@ -397,6 +406,7 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
                 pot=node.pot,
                 bets=bets,
                 flop_history_train=history,
+                flop_actor_train=actors,
             ))
             continue
 
@@ -446,7 +456,8 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
                     new_raises = raises_so_far + 1
 
             train_idx = _train_action_idx(facing, raises_so_far, kind, frac)
-            stack.append((child_idx, history + (train_idx,), new_raises))
+            stack.append((child_idx, history + (train_idx,),
+                          actors + (acting,), new_raises))
 
     leaves.sort(key=lambda x: x.leaf_idx)
     return leaves

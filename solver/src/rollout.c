@@ -1641,13 +1641,27 @@ static inline void rollout_sampled_draw_bias(
     }
 }
 
-BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
+/* Shared core for the sampled cont-strat-leaf construct.
+ *
+ * per_leaf_player_hands: optional. When NULL, EVERY leaf samples opponents from
+ * the single shared `player_hands` (the historical behavior — the public
+ * rollout_compute_subgame_leaf_values_sampled_c wrapper passes NULL, so it is
+ * byte-for-byte unchanged). When non-NULL it is an array of n_leaves*num_players
+ * RolloutHandList: leaf li_idx uses &per_leaf_player_hands[li_idx*num_players] as
+ * its per-player range, so the VILLAIN's sampled-hand weights can be conditioned
+ * on the flop action sequence that reached that leaf (the 2p-flop range
+ * conditioning, 2026-06-17 — see python/leaf_villain_conditioning.py). HERO rows
+ * keep the full static range, so hero is still enumerated over all hands.
+ * leaf_infos[li_idx].leaf_idx still drives the output slot; the per-leaf list is
+ * indexed by the LOOP index li_idx (1:1 with leaf_infos). */
+static int32_t rollout_sampled_core(
     const BPSReader *r,
     const int *board, int32_t n_board_cards,
     int32_t street,
     const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
     const int32_t *active, int32_t num_players,
     const RolloutHandList *player_hands,
+    const RolloutHandList *per_leaf_player_hands,
     const int32_t *acting_order, int32_t acting_order_len,
     const int32_t *player_seats,
     const int32_t *game_action_history, int32_t gah_len,
@@ -1712,6 +1726,7 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
         shared(acc, leaf_infos, n_leaves, num_samples_k, stack_chips, \
                 num_players, max_hands, num_rollouts, master_seed, \
                 r, board, n_board_cards, street, active, player_hands, \
+                per_leaf_player_hands, \
                 acting_order, acting_order_len, player_seats, \
                 game_action_history, gah_len, g_fail, \
                 cap_reason, cap_street, cap_num_players)
@@ -1777,13 +1792,20 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
             /* Skip the leaf's first betting round when the leaf already
              * carries a closed flop_history — see rollout_simulate_one. */
             int32_t skip_first = (fh_len > 0) ? 1 : 0;
+            /* Per-leaf opponent range (2026-06-17): when conditioning is active,
+             * leaf li_idx samples opponents from its OWN conditioned ranges
+             * (villain weights filtered by the flop line); otherwise the shared
+             * static range (the historical path). */
+            const RolloutHandList *leaf_hands = per_leaf_player_hands
+                ? &per_leaf_player_hands[(int64_t)li_idx * num_players]
+                : player_hands;
             /* Derive a per-sample seed for the rollout's RNG chain.
              * leaf_idx slot reuses li->leaf_idx; combo slot carries
              * sample_idx so each sample's rollout stream is distinct. */
             int rc = rollout_compute_leaf_values_all_hands_c(
                 r, board, n_board_cards, street, li->pot_chips,
                 active, num_players, stacks, li->bets,
-                player_hands, acting_order, acting_order_len,
+                leaf_hands, acting_order, acting_order_len,
                 player_seats, per_leaf_history, per_leaf_history_len,
                 bias_profile, max_hands, num_rollouts, master_seed,
                 li->leaf_idx, sample_idx, skip_first, scratch);
@@ -1845,4 +1867,71 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
 
     free(acc);
     return 0;
+}
+
+/* Public sampled construct (historical ABI, unchanged). Delegates to the shared
+ * core with NO per-leaf ranges → every leaf uses the single shared player_hands,
+ * byte-for-byte identical to the pre-refactor behavior. This is the symbol the
+ * 3p+ flop and 5-6p external-sampling paths bind and call. */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_samples_k,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+) {
+    return rollout_sampled_core(
+        r, board, n_board_cards, street, leaf_infos, n_leaves,
+        active, num_players, player_hands, /*per_leaf=*/NULL,
+        acting_order, acting_order_len, player_seats,
+        game_action_history, gah_len, stack_chips, max_hands,
+        num_rollouts, num_samples_k, master_seed, out, out_size);
+}
+
+/* Per-leaf sampled construct (2026-06-17). Identical to the above except each
+ * leaf samples opponents from its OWN conditioned ranges:
+ * per_leaf_player_hands is an array of n_leaves*num_players RolloutHandList,
+ * indexed [li_idx*num_players + player]. Used ONLY by the 2p-flop opponent-range
+ * conditioning (gated n_players==2 && street==flop in the engine). player_hands
+ * is still passed for the shared-fallback contract but is ignored when
+ * per_leaf_player_hands is non-NULL. */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_perleaf_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const RolloutHandList *per_leaf_player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_samples_k,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+) {
+    if (!per_leaf_player_hands) {
+        rollout_set_error(street, num_players,
+            "perleaf construct called with NULL per_leaf_player_hands");
+        return -1;
+    }
+    return rollout_sampled_core(
+        r, board, n_board_cards, street, leaf_infos, n_leaves,
+        active, num_players, player_hands, per_leaf_player_hands,
+        acting_order, acting_order_len, player_seats,
+        game_action_history, gah_len, stack_chips, max_hands,
+        num_rollouts, num_samples_k, master_seed, out, out_size);
 }
