@@ -52,6 +52,11 @@ SS_EXPORT int ss_build_tree2(
 ) {
     memset(tree_out, 0, sizeof(SSTreeData));
 
+    /* [SS] tree-build progress logging is OFF by default: it fires on every
+     * tree build = every /v1/solve and would flood production stdout. Opt in
+     * with POKER_SS_DEBUG=1 to restore the diagnostic prints. */
+    const int ss_debug = (getenv("POKER_SS_DEBUG") != NULL);
+
     SSTreeBuilder tb;
     stb_init(&tb);
 
@@ -114,12 +119,14 @@ SS_EXPORT int ss_build_tree2(
                         add_explicit_allin,
                         board, num_board);
 
-    printf("[SS] After betting tree: %d nodes, %d leaves\n", tb.num_nodes, tb.num_leaves);
+    if (ss_debug)
+        printf("[SS] After betting tree: %d nodes, %d leaves\n", tb.num_nodes, tb.num_leaves);
 
     if (use_cont_strats && !is_river && tb.num_leaves > 0) {
         expand_continuation_leaves_n(&tb, num_players, active);
-        printf("[SS] After cont strat expansion: %d nodes, %d terminal leaves\n",
-               tb.num_nodes, tb.num_leaves);
+        if (ss_debug)
+            printf("[SS] After cont strat expansion: %d nodes, %d terminal leaves\n",
+                   tb.num_nodes, tb.num_leaves);
     }
 
     /* Transfer to output */
@@ -309,17 +316,19 @@ SS_EXPORT int ss_build_tree2(
         free(map_val);
         free(map_occ);
 
-        printf("[SS] OP3+OP1 commit 5: %d abstract future-round infosets "
-               "(collapsed from future-round decision nodes across sampled boards)\n",
-               next_abstract);
+        if (ss_debug)
+            printf("[SS] OP3+OP1 commit 5: %d abstract future-round infosets "
+                   "(collapsed from future-round decision nodes across sampled boards)\n",
+                   next_abstract);
     }
 
-    printf("[SS] Tree: %d nodes (%d decision, %d fold, %d showdown, %d leaf, %d chance), "
-           "%d players, depth=%d\n",
-           N, tree_out->num_decision_nodes, tree_out->num_fold_nodes,
-           tree_out->num_showdown_nodes, tree_out->num_leaf_nodes,
-           tree_out->num_chance_nodes,
-           num_players, tree_out->max_depth);
+    if (ss_debug)
+        printf("[SS] Tree: %d nodes (%d decision, %d fold, %d showdown, %d leaf, %d chance), "
+               "%d players, depth=%d\n",
+               N, tree_out->num_decision_nodes, tree_out->num_fold_nodes,
+               tree_out->num_showdown_nodes, tree_out->num_leaf_nodes,
+               tree_out->num_chance_nodes,
+               num_players, tree_out->max_depth);
 
     return 0;
 }

@@ -245,3 +245,103 @@ def test_turn_street_needs_4card_board():
             game_action_history=[], blueprint=_FakeBlueprint(), n_players=2,
             street=2,
         )
+
+
+# ── Prefix-sensitive fake: proves the MULTI-STEP product math ─────────────
+#
+# The single-factor cases above lock P_continue at ONE decision node. The fix's
+# actual formula is a PRODUCT over every node on the line where the villain acts,
+# each keyed by the INCREMENTAL action-history prefix (preflop ++ this-street
+# actions BEFORE that step). A fake that returns the same strategy regardless of
+# prefix cannot distinguish "product of two nodes" from "one node, applied twice".
+# This fake keys on (bucket, prefix length) so a regression that drops a step,
+# reuses the wrong prefix, or stops being a true product fails loud.
+
+
+class _PrefixBlueprint:
+    """Returns a strategy that depends on (bucket, len(action_history)) so each
+    decision node on a line can carry a DISTINCT frequency — the only way to
+    verify the conditioning multiplier is the PRODUCT across the villain's steps,
+    keyed by the correct incremental prefix."""
+
+    def __init__(self, *, bucket_of_c0, strat_by_bucket_and_prefixlen):
+        self._bucket_of_c0 = bucket_of_c0
+        # {(bucket, prefix_len): [a0, a1, ...]}
+        self._table = strat_by_bucket_and_prefixlen
+
+    def hand_to_bucket(self, board, c0, c1):
+        return int(self._bucket_of_c0.get(int(c0), 0))
+
+    def hand_to_bucket_turn(self, board, c0, c1):
+        return int(self._bucket_of_c0.get(int(c0), 0))
+
+    def get_strategy(self, *, board, action_history, player, bucket, street):
+        s = self._table.get((int(bucket), len(action_history)))
+        return list(s) if s is not None else None
+
+
+def test_multistep_product_locks_incremental_prefix_math():
+    """Villain (P1) acts TWICE on the line — bet then call — so its conditioning
+    multiplier must be the PRODUCT of the two node frequencies, each keyed by the
+    incremental prefix. Line: P0 check, P1 bet, P0 raise, P1 call.
+        history = [0, 1, 2, 1]   actors = [0, 1, 0, 1]
+    P1's steps (where actor==1):
+        step i=1: action idx 1 (bet, !facing), prefix len = len(preflop)+1 = 1
+        step i=3: action idx 1 (call, facing),  prefix len = len(preflop)+3 = 3
+    Continue hand (bucket 0): P(bet|len1)=0.6, P(call|len3)=0.5 -> 0.30.
+    Fold hand   (bucket 1): P(bet|len1)=0.4, P(call|len3)=0.10 -> 0.04.
+    A regression that keys the wrong prefix, drops a step, or applies a single
+    factor twice cannot reproduce BOTH products from these distinct per-node
+    frequencies.
+    """
+    preflop = [2, 0, 0, 0, 0, 1]  # non-empty: indices 1 and 3 land at len 7 and 9
+    bp = _PrefixBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket_and_prefixlen={
+            # bucket 0 (continue hand): bet@len7 -> 0.6 ; call@len9 -> 0.5
+            (0, len(preflop) + 1): [0.4, 0.6],          # !facing [check, bet]
+            (0, len(preflop) + 3): [0.5, 0.5],          # facing  [fold, call]
+            # bucket 1 (fold-y hand): bet@len7 -> 0.4 ; call@len9 -> 0.10
+            (1, len(preflop) + 1): [0.6, 0.4],
+            (1, len(preflop) + 3): [0.9, 0.1],
+        },
+    )
+    ranges = _ranges()
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([0, 1, 2, 1], [0, 1, 0, 1])], player_ranges=ranges,
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=preflop, blueprint=bp, n_players=2,
+    )
+    villain = per_leaf[0][1]
+    # PRODUCT of the two distinct node frequencies — NOT a single factor.
+    assert villain[0] == (0, 1, pytest.approx(0.6 * 0.5))   # continue -> 0.30
+    assert villain[1] == (4, 5, pytest.approx(0.4 * 0.10))  # fold-y  -> 0.04
+    # Two villain nodes conditioned PER hand -> >= 2 across the two-hand range.
+    assert stats["nodes_conditioned"] >= 2
+    assert stats["underflow_fallback"] == 0
+
+
+def test_folding_villain_drives_weight_toward_zero():
+    """The product can collapse a folding villain's weight toward ~0 (the QJs fix
+    in miniature: the BET-call leaf should be valued vs the CALLING subset, so a
+    hand the blueprint almost never continues with carries almost no villain
+    weight). Hand A continues (call 0.92); hand B is a near-pure fold (call 0.01).
+    Assert the RATIO collapses by ~the call-frequency ratio, not merely 'not
+    uniform' — locks the magnitude, the thing the EC2 QJs run validated."""
+    bp = _FakeBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket={0: [0.08, 0.92], 1: [0.99, 0.01]},
+    )
+    ranges = _ranges()
+    per_leaf, _ = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=[], blueprint=bp, n_players=2,
+    )
+    cont_w = per_leaf[0][1][0][2]   # continuing hand weight
+    fold_w = per_leaf[0][1][1][2]   # folding hand weight
+    assert cont_w == pytest.approx(0.92)
+    assert fold_w == pytest.approx(0.01)
+    # Folding hand is ~92x lighter than the continuing hand — the leaf is now
+    # valued overwhelmingly against the calling range (the over-bet cure).
+    assert fold_w < cont_w / 50.0
