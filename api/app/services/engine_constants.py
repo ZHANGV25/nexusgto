@@ -69,9 +69,22 @@ MEASURED_FLOORS_PCT_POT: Dict[Tuple[int, int, bool, str], float] = {
     (5, 3, True, "final"): 0.133,
     (5, 10, True, "final"): 0.076,
 }
-# The floors above are the best rung of a 5/20/50M-iteration ladder; below
-# the 20M rung the floor is not established for that arm.
+# The 5p/6p floors above are the best rung of a 5/20/50M-iteration ladder; below
+# the 20M rung the floor is not established for THAT arm (the vec-Linear-FINAL
+# playing-agent path). This is the DEFAULT minimum for any arm without a more
+# specific entry in FLOOR_MIN_ITERATIONS_BY_ARM.
 FLOOR_MIN_ITERATIONS = 20_000_000
+
+# Per-arm minimum iterations (2026-06-18). The single 20M global was correct for
+# the vec-final ladder but wrong for the 2p scalar/avg ANALYSIS SURFACE: that arm
+# is a sub-second few-hundred-iteration regime (the historically validated 2p/3p
+# live re-solve, see this file's header and DEFAULT_LIVE_CONFIG_BY_N), measured at
+# its OWN budget — not on the 20M ladder. An arm listed here uses its own minimum;
+# any arm not listed falls back to FLOOR_MIN_ITERATIONS. Each entry's value is the
+# exact iteration budget the arm's floor was MEASURED at (cite the run).
+FLOOR_MIN_ITERATIONS_BY_ARM: Dict[Tuple[int, int, bool, str], int] = {
+    # (2, 3, False, "avg"): 400,  # filled from the EC2 measurement below
+}
 
 # The product's numeric quality bar (%/pot/player), anchored on 5p nr=3 ship
 # quality (DISCRIMINATOR_2026-06-10.md caveat applies across nr).
@@ -189,13 +202,18 @@ def measured_floor_for(
 ) -> Optional[float]:
     """The exactly-measured floor for this FULL config, or None (never
     estimated, never cross-config). None when the iteration budget is below
-    the measured rung. None on RIVER unconditionally: every measured arm is
+    the arm's measured rung. None on RIVER unconditionally: every measured arm is
     a flop/turn leaf-table configuration and no river floor has been
-    measured (see RIVER_QUALITY_NOTE)."""
+    measured (see RIVER_QUALITY_NOTE).
+
+    The iteration gate is PER-ARM (FLOOR_MIN_ITERATIONS_BY_ARM), defaulting to the
+    20M ladder minimum: the vec-final 5p/6p arms require 20M iters, but the 2p
+    scalar/avg analysis-surface arm is measured at its own (few-hundred-iter)
+    budget — citing the 20M global there would wrongly suppress a real floor."""
     if street == "river":
         return None
-    if iterations < FLOOR_MIN_ITERATIONS:
+    arm = (n_players, num_rollouts, vec_mode, readout)
+    min_iters = FLOOR_MIN_ITERATIONS_BY_ARM.get(arm, FLOOR_MIN_ITERATIONS)
+    if iterations < min_iters:
         return None
-    return MEASURED_FLOORS_PCT_POT.get(
-        (n_players, num_rollouts, vec_mode, readout)
-    )
+    return MEASURED_FLOORS_PCT_POT.get(arm)
