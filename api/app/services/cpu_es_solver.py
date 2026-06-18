@@ -506,6 +506,32 @@ class CpuEsSolver:
                         print(f"CpuEsSolver DIAG: range-conditioning ({street}) stats="
                               f"{_cond_stats}", file=sys.stderr, flush=True)
 
+                    # CENTROID-ABSENCE GUARD (2026-06-18, review critic finding).
+                    # If conditioning silently no-op'd because the bucketizer could
+                    # not bucket ANY hand — the dominant failure mode is the TURN
+                    # when turn_centroids.bin was dropped from the deploy (memory:
+                    # turn_centroids has been omitted from CPU userdata before),
+                    # making hand_to_bucket_turn return -1 for every hand -> every
+                    # multiplier 1.0 -> the conditioning becomes a no-op and the
+                    # answer reverts to the UN-conditioned over-bet, but still ships
+                    # with full "live solve" provenance. There is no other reason a
+                    # whole solve would condition zero nodes while attempting it, so
+                    # surface it LOUD. We log a WARNING rather than hard-fail the
+                    # request: a degraded (un-conditioned) answer is still a valid
+                    # solve, and crashing a live request on a deploy misconfig is
+                    # worse than serving it with a screaming log line for ops.
+                    _nc = int(_cond_stats.get("nodes_conditioned", 0))
+                    _bm = int(_cond_stats.get("bucket_miss", 0))
+                    if _nc == 0 and _bm > 0:
+                        logger.warning(
+                            "CpuEsSolver: %dp %s range-conditioning conditioned 0 "
+                            "nodes with %d bucket misses — the bucketizer returned "
+                            "no bucket for any hand (turn_centroids.bin missing for "
+                            "a turn solve?). Conditioning is a SILENT NO-OP and this "
+                            "answer reverts to the un-conditioned (over-bet) leaf "
+                            "values. Check the deploy's blueprint/centroid artifacts.",
+                            n_players, street, _bm)
+
                 # ── Construct the leaf table (parallel batch, off-lock) ──
                 t0 = time.time()
                 try:
