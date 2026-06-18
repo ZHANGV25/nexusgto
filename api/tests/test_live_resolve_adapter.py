@@ -146,49 +146,61 @@ def test_live_resolve_2p_flop_qjs_checks_with_conditioning(cpu_es_engine, bluepr
     print(f"\n2p-flop QJs conditioned (400it): check={check:.3f} mix={mix.freqs}")
 
 
-# ── ANCHOR: 2p turn (reach-CFR live by default, 2026-06-17) ───────────────
+# ── 2p turn: blueprint LOOKUP by default; reach-CFR opt-in (2026-06-17) ───
 
 
-def test_live_resolve_2p_turn_solves_live_reach(cpu_es_engine, blueprint_path):
-    """2p turn (UTG raise, BB call -> flop check-through -> turn): solves LIVE by
-    default via the reach-CFR path (2026-06-17, user decision; supersedes the
-    'gated to lookup' turn contract).
-
-    The engine sets POKER_SEARCH_DEPTH=full for the 2p-turn case so the in-tree
-    chance node (turn->river extension) is built, and the validated
-    full-per-hand-REACH vector CFR solves it (it CONDITIONS the opponent range
-    in-tree, so unlike the flop cont-strat leaf it matches the blueprint
-    direction). No NEXUS_ALLOW_CHANCE_SOLVE flag is needed.
-
-    Assert a real, legal-length, non-fallback, non-degenerate mix. The reach
-    solve is a few seconds (the ~5k-node turn tree), so the latency bound is
-    looser than the sub-second flop."""
-    from app.agent.strategy_source import LiveResolveSource
-    src = LiveResolveSource(
-        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
-        cpu_es_solver=cpu_es_engine, iterations=200,
-    )
+def _turn_state():
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
         board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h")],
     )
-    # Walk the flop check-through to the turn root: BB chk, UTG chk.
-    for idx in [0, 0]:
+    for idx in [0, 0]:  # flop check-through to the turn root: BB chk, UTG chk
         st = st.advance(idx)
-    assert st.street == 2  # turn root
-    n_legal = st.num_legal_actions()
-    assert n_legal == 2  # turn root, no bet faced
+    assert st.street == 2 and st.num_legal_actions() == 2  # turn root, no bet
+    return st
 
+
+def test_live_resolve_2p_turn_defaults_to_lookup(cpu_es_engine, blueprint_path, monkeypatch):
+    """2p turn DEFAULTS to the blueprint lookup (2026-06-17 probe verdict):
+    reach-CFR is correct but under-converged at interactive iters (muddy
+    non-polarized mix worse than lookup), so it is gated behind
+    NEXUS_ALLOW_CHANCE_SOLVE. Without the opt-in the engine raises
+    ReplayUnsupported, which LiveResolveSource converts to LiveResolveUnsupported
+    so HybridSource falls back to LOOKUP."""
+    from app.agent.strategy_source import LiveResolveSource, LiveResolveUnsupported
+    monkeypatch.delenv("NEXUS_ALLOW_CHANCE_SOLVE", raising=False)
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=200,
+    )
+    st = _turn_state()
+    with pytest.raises(LiveResolveUnsupported):
+        src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    print("\n2p-turn default: LiveResolveUnsupported -> HybridSource lookup (as expected)")
+
+
+def test_live_resolve_2p_turn_reach_optin_solves_live(cpu_es_engine, blueprint_path, monkeypatch):
+    """2p turn with NEXUS_ALLOW_CHANCE_SOLVE=1 (the research opt-in) solves LIVE
+    via reach-CFR: the engine sets POKER_SEARCH_DEPTH=full so the in-tree chance
+    node is built and the validated full-per-hand-REACH vector CFR runs. Assert a
+    real, legal-length, non-fallback mix (quality is a separate concern — the
+    probe showed it needs more iters than interactive to fully polarize)."""
+    from app.agent.strategy_source import LiveResolveSource
+    monkeypatch.setenv("NEXUS_ALLOW_CHANCE_SOLVE", "1")
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=200,
+    )
+    st = _turn_state()
+    n_legal = st.num_legal_actions()
     t0 = time.time()
     mix = src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
     dt = time.time() - t0
-
     assert set(mix.freqs.keys()) <= set(range(n_legal))
     assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
     assert mix.is_uniform_fallback is False    # a REAL reach solve, not lookup
-    assert not _is_uniform(mix.freqs, n_legal)  # not the uniform placeholder
     assert dt < 60.0                            # reach turn is a few seconds
-    print(f"\n2p-turn reach-CFR live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+    print(f"\n2p-turn reach-CFR opt-in live-resolve: dt={dt:.2f}s mix={mix.freqs}")
 
 
 # ── ANCHOR: 3p turn ──────────────────────────────────────────────────────

@@ -275,19 +275,29 @@ class CpuEsSolver:
             )
         street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
 
-        # ── 2p-TURN reach-CFR enablement (2026-06-17, scoped) ──
+        # ── 2p-TURN reach-CFR enablement (2026-06-17, OPT-IN, scoped) ──
         # The in-tree chance node (turn->river extension) that the reach-CFR turn
         # solve needs is built ONLY when POKER_SEARCH_DEPTH=full is set at C
-        # tree-build time (ss_tree_api.c ss_build_tree2). Nothing else in the
-        # engine sets it, so by default the 2p turn builds a cont-strat-LEAF tree
-        # (same sampled path as the flop). To serve the VALIDATED reach-CFR for
-        # the 2p turn, set it for THIS build only — and ONLY for n_players==2
-        # turn, so 3p+/5p turns (which would also build a chance node under
-        # 'full' but have NO validated reach-CFR path -> degenerate sampling+enum)
-        # are NOT affected. Restored in finally so it never leaks to another
-        # solve. Honors an explicit operator override (if already 'full'/'single'
-        # in the env, we leave it).
-        _want_turn_reach = (n_players == 2 and street == "turn")
+        # tree-build time (ss_tree_api.c ss_build_tree2). We set it for THIS build
+        # only, ONLY for an n_players==2 turn, and ONLY when explicitly opted in
+        # via NEXUS_ALLOW_CHANCE_SOLVE (restored in finally so it never leaks).
+        #
+        # DEFAULT OFF (2026-06-17, EC2 probe verdict): reach-CFR is a correct,
+        # CONVERGING solver (es_exploitability_2p dropped 5028->21 pot-chips/hand
+        # over 50->2000 iters on the real turn tree), BUT at the INTERACTIVE iter
+        # budget (50-1000) it is far from converged: it gives a muddy ~0.65-check
+        # strategy that does NOT discriminate by hand strength like the blueprint
+        # (e.g. AsAh nut overpair: reach 0.5 check vs blueprint bet 1.0; Td9d
+        # gutshot: reach 0.66 vs blueprint 0.004). An under-converged turn solve is
+        # WORSE than the blueprint lookup. So a 2p turn defaults to the blueprint
+        # LOOKUP; reach-CFR stays behind NEXUS_ALLOW_CHANCE_SOLVE for research /
+        # a future higher-iter path. (Turn full convergence needs far more than the
+        # interactive budget — the 5349-node tree's BR gap was still ~3.5% pot at
+        # 2000 iters; matches the findings doc's "reach correct but iter-hungry".)
+        _allow_chance_turn = os.environ.get(
+            "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
+        _want_turn_reach = (n_players == 2 and street == "turn"
+                            and _allow_chance_turn)
         _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
         _depth_set = False
         if _want_turn_reach and _depth_prev is None:
@@ -336,18 +346,19 @@ class CpuEsSolver:
             # node. The ONLY such tree the engine builds by default is the 2p TURN
             # subgame (we set POKER_SEARCH_DEPTH=full for it above; the turn
             # extends to river per the paper's "all other cases"). The 2p turn
-            # reach-CFR solve is correct + interactive (~5k nodes, few seconds) and
-            # CONDITIONS the opponent range in-tree, so unlike the flop cont-strat
-            # leaf it matches the blueprint — it is SHIPPED LIVE by default
-            # (2026-06-17, user decision).
+            # reach-CFR solve is correct + converging (es_exploitability_2p drops
+            # monotonically) BUT iter-hungry: at the interactive budget it is
+            # UNDER-converged and gives a muddy non-polarized strategy worse than
+            # the blueprint lookup (EC2 probe 2026-06-17). So it is OPT-IN only
+            # (NEXUS_ALLOW_CHANCE_SOLVE=1 sets POKER_SEARCH_DEPTH=full above to
+            # build the chance node); without the opt-in NO chance node is built
+            # for the 2p turn and we route it to the blueprint LOOKUP (below).
             #
-            # A chance node at ANY OTHER player count would only appear if an
-            # operator forced POKER_SEARCH_DEPTH=full globally (we don't); those
-            # have NO validated reach-CFR path (reach is n_players==2 only) and
-            # would fall to the degenerate sampling+enum chance path — so they
-            # stay GATED to the blueprint lookup unless NEXUS_ALLOW_CHANCE_SOLVE=1
-            # is explicitly set. _chance_is_reach mirrors the use_reach predicate
-            # below (2p + reach available); only that case is served by default.
+            # A chance node here therefore means EITHER the 2p-turn opt-in fired
+            # (n_players==2 + reach available -> served by reach-CFR), OR an
+            # operator forced POKER_SEARCH_DEPTH=full at a player count with NO
+            # validated reach path -> gated to lookup. _chance_is_reach mirrors the
+            # use_reach predicate below.
             _has_chance = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
             _reach_default = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
                 "1", "t", "T", "y", "Y")
@@ -362,6 +373,23 @@ class CpuEsSolver:
                     "NEXUS_ALLOW_CHANCE_SOLVE=1 to force the sampling+enum chance "
                     "path), so this decision is served from the blueprint lookup "
                     "instead"
+                )
+
+            # 2p TURN, NOT opted into reach-CFR (the default): no chance node was
+            # built, so the tree is a cont-strat-LEAF turn tree whose sampled solve
+            # has the SAME un-conditioned-range over-bet as the flop (and the flop
+            # conditioning fix is flop-gated, not validated for the turn). Rather
+            # than serve a known-over-betting turn solve, route to the blueprint
+            # LOOKUP (the honest fallback) — matches the probe verdict that the
+            # turn live-solve is not yet ship-quality.
+            if (n_players == 2 and street == "turn" and not _has_chance
+                    and not _allow_chance):
+                raise ReplayUnsupported(
+                    "2p turn live-solve is gated to the blueprint lookup (the "
+                    "cont-strat-leaf turn solve has an un-conditioned-range "
+                    "over-bet, and reach-CFR is under-converged at interactive "
+                    "iters — EC2 probe 2026-06-17); set NEXUS_ALLOW_CHANCE_SOLVE=1 "
+                    "to opt into the research reach-CFR turn solve"
                 )
 
             n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
@@ -568,6 +596,11 @@ class CpuEsSolver:
                 and hasattr(cs, "set_reach_mode")
             )
             if use_reach:
+                # NOTE (2026-06-17): reach mode only RUNS for the 2p turn when the
+                # operator opted in (NEXUS_ALLOW_CHANCE_SOLVE -> POKER_SEARCH_DEPTH
+                # =full -> chance node built). It is correct + converging but
+                # iter-hungry; the default 2p turn never reaches here (gated to
+                # lookup above). Research / future higher-iter path.
                 cs.set_reach_mode(1)    # full reach; ignores cfr/chance/opp/vec
                 readout = "avg"         # σ̄ readout (the frequency-display contract)
                 vec_mode = 0
