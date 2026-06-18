@@ -83,7 +83,17 @@ FLOOR_MIN_ITERATIONS = 20_000_000
 # any arm not listed falls back to FLOOR_MIN_ITERATIONS. Each entry's value is the
 # exact iteration budget the arm's floor was MEASURED at (cite the run).
 FLOOR_MIN_ITERATIONS_BY_ARM: Dict[Tuple[int, int, bool, str], int] = {
-    # (2, 3, False, "avg"): 400,  # filled from the EC2 measurement below
+    # (2, 3, False, "avg"): NOT POPULATED. Three EC2 attempts (2026-06-18) could
+    # not produce a trustworthy 2p exploitability floor: exploitability_c.py is
+    # validated/authored on the pot≈stack-scale setup (measure_nr_ladder, 20 bb
+    # pot) and structurally inflates %/pot ~16x on the real HU regime (≈6 bb pot,
+    # 95 bb stack) — even an UNCONDITIONED control measured ~200%/pot there. So no
+    # honest 2p floor exists for this arm yet. The mechanism above is ready to
+    # accept one if the metric is re-derived for low-pot/high-stack trees.
+    # 2p quality is instead asserted behaviorally (the QJs/99 over-bet cure, real
+    # LiveResolveSource path) — see poker-solver docs/HERO_FLOOR_DIAGNOSIS.md.
+    # Until then 2p ships floor=None + the honest "scalar/avg analysis surface"
+    # note (the provenance never implies an unmeasured number).
 }
 
 # The product's numeric quality bar (%/pot/player), anchored on 5p nr=3 ship
