@@ -236,6 +236,68 @@ def test_turn_street_filters_via_turn_bucketizer():
     assert stats["nodes_conditioned"] >= 1
 
 
+def test_hero_pure_zero_action_is_floored_not_zeroed():
+    """REGRESSION (review 2026-06-18, MEDIUM): a HERO hand the blueprint plays
+    with pure-0 probability on the leaf's line must be FLOORED to a tiny epsilon,
+    NOT driven to exactly 0.0. The C all-hands construct reuses this list to
+    enumerate each seat as hero for its own table row and zero-gates weight<=0 to
+    a SPURIOUS 0.0 leaf EV (rollout.c:1250), which would bias hero's solved
+    strategy. Here HERO (player 0) bet a hand (c0=8, bucket 5) the blueprint bets
+    with probability 0.0 -> multiplier 0.0 -> must be floored, not zeroed.
+    """
+    from leaf_villain_conditioning import _HERO_ENUM_FLOOR  # type: ignore
+    bp = _FakeBlueprint(
+        # hero hand A c0=8 -> bucket 5 (pure-0 bet); hand B c0=12 -> bucket 6 (bets 0.7)
+        # villain hands unchanged (c0=0 -> bucket 0, c0=4 -> bucket 1)
+        bucket_of_c0={8: 5, 12: 6, 0: 0, 4: 1},
+        strat_by_bucket={
+            5: [1.0, 0.0],    # hero bucket 5: NEVER bets (pure check) -> bet mult 0.0
+            6: [0.3, 0.7],    # hero bucket 6: bets 0.7
+            0: [0.1, 0.9], 1: [0.95, 0.05],
+        },
+    )
+    ranges = _ranges()
+    # BET-call leaf: hero (P0) BET (idx 1, !facing), villain (P1) CALL (idx 1).
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=[], blueprint=bp, n_players=2,
+    )
+    hero = per_leaf[0][0]
+    # Hand A (pure-0 bet) is FLOORED, not zeroed — still enumerable as hero.
+    assert hero[0][2] == pytest.approx(_HERO_ENUM_FLOOR)
+    assert hero[0][2] > 0.0
+    # Hand B (bets 0.7) keeps its conditioned weight, well above the floor.
+    assert hero[1][2] == pytest.approx(0.7)
+    # The floor fired at least once and is reported in stats.
+    assert stats["hero_floor"] >= 1
+
+
+def test_villain_pure_zero_also_floored_but_sampling_negligible():
+    """A villain hand driven to a pure-0 multiplier is floored too (same list,
+    same C zero-gate), but the floor (1e-12) is so far below any real σ̄ mass that
+    it is sampling-negligible — the conditioning's relative down-weighting of the
+    folding range is preserved."""
+    from leaf_villain_conditioning import _HERO_ENUM_FLOOR  # type: ignore
+    bp = _FakeBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket={0: [0.1, 0.9], 1: [1.0, 0.0]},  # bucket 1: pure fold -> call 0.0
+    )
+    ranges = _ranges()
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=[], blueprint=bp, n_players=2,
+    )
+    villain = per_leaf[0][1]
+    assert villain[0][2] == pytest.approx(0.9)              # continues
+    assert villain[1][2] == pytest.approx(_HERO_ENUM_FLOOR)  # pure-fold floored, not 0
+    # Floored weight is >12 orders of magnitude below the continuing hand -> the
+    # opponent sampler (weight-proportional) draws it with ~0 probability.
+    assert villain[1][2] < villain[0][2] / 1e10
+    assert stats["hero_floor"] >= 1
+
+
 def test_turn_street_needs_4card_board():
     """street=2 fail-loud on a 3-card board (would mis-key the turn node)."""
     with pytest.raises(ValueError):

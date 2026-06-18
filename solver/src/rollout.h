@@ -295,6 +295,34 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_c(
     float *out, int32_t out_size
 );
 
+/* Per-leaf conditioned variant of the SAMPLED construct (2026-06-17). Identical
+ * to rollout_compute_subgame_leaf_values_sampled_c except for the extra
+ * `per_leaf_player_hands` array (n_leaves * num_players RolloutHandLists): leaf
+ * li_idx samples opponents from &per_leaf_player_hands[li_idx*num_players], so the
+ * villain's sampled-hand weights can be conditioned on the action line that
+ * reached that leaf (the 2p flop/turn range conditioning — see
+ * python/leaf_villain_conditioning.py). With per_leaf_player_hands==NULL this is
+ * byte-identical to the plain sampled_c (both delegate to rollout_sampled_core),
+ * so the 3p+/5-6p shared-range path is provably unchanged. */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_perleaf_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const RolloutHandList *per_leaf_player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_samples_k,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+);
+
 /* ── Error surface ───────────────────────────────────────────────────── */
 
 BPS_EXPORT void rollout_get_last_error(

@@ -27,14 +27,22 @@ range is unchanged. The leaf-table value's relative villain weights are what
 matter (rollout_sample_opp_hand renormalizes by total), so no global
 normalization is needed here.
 
-SCOPE / GATING: 2p FLOP only. Multiway acting-order attribution is NOT trusted
-here, and the 5-6p external-sampling path and the 3p+ flop path call the
-UNCHANGED sampled construct (they never reach this module). Fail-loud on misuse.
+SCOPE / GATING: 2p FLOP and TURN only (street=1 flop / street=2 turn). Multiway
+acting-order attribution is NOT trusted here, and the 5-6p external-sampling path
+and the 3p+ flop path call the UNCHANGED sampled construct (they never reach this
+module). Fail-loud on misuse.
 
 A blueprint MISS (no bucket / no strategy / action index out of range) yields a
 multiplier of EXACTLY 1.0 for that node — a strict no-op, mirroring the rollout's
 own tolerate-miss policy. Conditioning can only SHARPEN the villain range toward
 the continuing hands; it can never corrupt a hand the blueprint has no opinion on.
+
+HERO-ROW CONTRACT (2026-06-18): the per-leaf list this returns is reused by the C
+all-hands construct to enumerate EACH seat as hero for its own table row, and the
+hero zero-gate (rollout.c:1250) treats weight<=0 as "skip -> 0.0 EV". So a
+conditioned weight is FLOORED to _HERO_ENUM_FLOOR whenever the static weight was
+positive: as hero the hand keeps a true EV (contract: "hero keeps the full static
+range"); as a sampled opponent the floored hand is ~0 (conditioning preserved).
 """
 from __future__ import annotations
 
@@ -48,13 +56,32 @@ PerLeafRanges = List[List[List[Tuple[int, int, float]]]]
 # a long product of small probabilities could underflow). Bumps a counter.
 _MIN_TOTAL_COND_WEIGHT = 1e-9
 
+# HERO-ROW FLOOR (2026-06-18, fixes the review's MEDIUM finding). The per-leaf
+# list is consumed by the C all-hands construct in BOTH roles: it samples the
+# OPPONENT from each seat's list (rollout_sample_opp_hand, which skips weight<=0
+# and renormalizes — so conditioning works) AND it enumerates each seat as HERO
+# for that seat's own table row (rollout.c:1250 zero-gates `if (hw<=0) return
+# 0.0`). The C export's contract is "HERO rows keep the full static range, so
+# hero is still enumerated over all hands" (rollout.c:1657). A conditioning
+# multiplier of EXACTLY 0.0 (the blueprint plays a hand's leaf action with pure-0
+# probability) would zero that hand's weight, tripping the hero zero-gate and
+# handing hero a SPURIOUS 0.0 leaf EV instead of its true rollout value — biasing
+# hero's solved strategy precisely on the off-blueprint deviations a live
+# re-solve exists to evaluate. FIX: floor every conditioned weight whose STATIC
+# weight was positive to this epsilon. As an opponent the hand is then sampled
+# with ~eps/total ≈ 0 probability (sampling-equivalent to dropped — conditioning
+# preserved); as hero it has weight>0 so the zero-gate does NOT fire and the row
+# gets the hand's true EV (contract honored). eps is far below any real σ̄ mass so
+# it never perturbs the relative villain weights that drive opponent sampling.
+_HERO_ENUM_FLOOR = 1e-12
+
 
 class _CondStats:
     """Lightweight observability for a conditioning pass (not thread-shared —
     one instance per build call)."""
 
     __slots__ = ("nodes_conditioned", "bucket_miss", "strat_miss",
-                 "idx_oor", "underflow_fallback")
+                 "idx_oor", "underflow_fallback", "hero_floor")
 
     def __init__(self) -> None:
         self.nodes_conditioned = 0
@@ -62,6 +89,7 @@ class _CondStats:
         self.strat_miss = 0
         self.idx_oor = 0
         self.underflow_fallback = 0
+        self.hero_floor = 0  # hands lifted off a pure-0 multiplier (hero-row fix)
 
     def as_dict(self) -> dict:
         return {
@@ -70,6 +98,7 @@ class _CondStats:
             "strat_miss": self.strat_miss,
             "idx_oor": self.idx_oor,
             "underflow_fallback": self.underflow_fallback,
+            "hero_floor": self.hero_floor,
         }
 
 
@@ -107,8 +136,14 @@ def build_conditioned_per_leaf_ranges(
             dispatched on this length.
         player_seats: full blueprint seat id per compact player slot (so the
             blueprint query keys by the SAME seat the rollout uses).
-        game_action_history: the preflop action-index prefix (the trainer key for
-            postflop nodes is preflop ++ this-street-actions-so-far).
+        game_action_history: the action-index prefix UP TO the subgame-root street
+            — preflop for a FLOP root, but preflop ++ flop actions for a TURN root
+            (the caller passes full_history minus this street's actions). The
+            trainer key for a node on the leaf's line is this prefix ++
+            this-street-actions-so-far; the conditioner concatenates them the same
+            way the C rollout does, so it keys the SAME node. (Named "preflop"
+            locally for the flop case; do NOT trim it to only-preflop or turn
+            conditioning will miss every node.)
         blueprint: a BPSReaderC with get_strategy(board, action_history, player,
             bucket, street), hand_to_bucket(board, c0, c1) [flop] and
             hand_to_bucket_turn(board, c0, c1) [turn].
@@ -140,7 +175,11 @@ def build_conditioned_per_leaf_ranges(
 
     stats = _CondStats()
     board = list(board[:_need_cards])
-    preflop = list(game_action_history or [])
+    # Action prefix up to the subgame-root street (preflop for a flop root;
+    # preflop ++ flop for a turn root). NOT necessarily preflop-only — see the
+    # game_action_history arg doc. The node key on the line is root_prefix ++
+    # this-street-actions-before-the-step.
+    root_prefix = list(game_action_history or [])
 
     # Street-dispatched bucketizer (the conditioning MUST use the same bucket the
     # trainer/rollout used for that street, or the query keys the wrong node).
@@ -199,7 +238,7 @@ def build_conditioned_per_leaf_ranges(
             for i, (a_idx, actor) in enumerate(zip(history, actors)):
                 if int(actor) != p:
                     continue
-                prefix = tuple(preflop) + tuple(int(x) for x in history[:i])
+                prefix = tuple(root_prefix) + tuple(int(x) for x in history[:i])
                 steps.append((prefix, int(a_idx)))
 
             new_hands: List[Tuple[int, int, float]] = []
@@ -228,6 +267,16 @@ def build_conditioned_per_leaf_ranges(
                         mult *= (s / ssum) if ssum > 0.0 else 1.0
                         stats.nodes_conditioned += 1
                 new_w = float(w) * mult
+                # HERO-ROW FLOOR: a hand that was in the static range (w>0) must
+                # never reach EXACTLY 0 — the C all-hands construct reuses this
+                # list to enumerate the seat as HERO and zero-gates hw<=0 to a
+                # spurious 0.0 leaf EV (see _HERO_ENUM_FLOOR). Floor keeps the
+                # hand enumerable as hero (true EV) while leaving it ~0 for
+                # opponent sampling (conditioning preserved). Only lifts hands the
+                # blueprint drove to a pure-0 action; all others are untouched.
+                if new_w < _HERO_ENUM_FLOOR:
+                    new_w = _HERO_ENUM_FLOOR
+                    stats.hero_floor += 1
                 new_hands.append((int(c0), int(c1), new_w))
                 total += new_w
 
