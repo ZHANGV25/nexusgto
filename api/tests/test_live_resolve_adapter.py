@@ -146,7 +146,7 @@ def test_live_resolve_2p_flop_qjs_checks_with_conditioning(cpu_es_engine, bluepr
     print(f"\n2p-flop QJs conditioned (400it): check={check:.3f} mix={mix.freqs}")
 
 
-# ── 2p turn: blueprint LOOKUP by default; reach-CFR opt-in (2026-06-17) ───
+# ── 2p turn: Pluribus-depth-limited cont-strat-leaf, LIVE by default (2026-06-18)
 
 
 def _turn_state():
@@ -160,31 +160,38 @@ def _turn_state():
     return st
 
 
-def test_live_resolve_2p_turn_defaults_to_lookup(cpu_es_engine, blueprint_path, monkeypatch):
-    """2p turn DEFAULTS to the blueprint lookup (2026-06-17 probe verdict):
-    reach-CFR is correct but under-converged at interactive iters (muddy
-    non-polarized mix worse than lookup), so it is gated behind
-    NEXUS_ALLOW_CHANCE_SOLVE. Without the opt-in the engine raises
-    ReplayUnsupported, which LiveResolveSource converts to LiveResolveUnsupported
-    so HybridSource falls back to LOOKUP."""
-    from app.agent.strategy_source import LiveResolveSource, LiveResolveUnsupported
+def test_live_resolve_2p_turn_solves_live_depth_limited(cpu_es_engine, blueprint_path, monkeypatch):
+    """2p turn solves LIVE by default via the Pluribus turn depth-limit
+    (2026-06-18): the turn terminates at a cont-strat LEAF at the river boundary
+    (POKER_TURN_DEPTH_LIMIT=1, the C default) and is solved live + range-
+    conditioned, exactly like the flop — sub-second, NO chance node, no opt-in.
+    Assert a real, legal-length, non-fallback, non-degenerate mix that is FAST
+    (the multi-second reach-CFR river extension would blow the latency bound)."""
+    from app.agent.strategy_source import LiveResolveSource
     monkeypatch.delenv("NEXUS_ALLOW_CHANCE_SOLVE", raising=False)
     src = LiveResolveSource(
         ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
-        cpu_es_solver=cpu_es_engine, iterations=200,
+        cpu_es_solver=cpu_es_engine, iterations=400,
     )
     st = _turn_state()
-    with pytest.raises(LiveResolveUnsupported):
-        src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
-    print("\n2p-turn default: LiveResolveUnsupported -> HybridSource lookup (as expected)")
+    n_legal = st.num_legal_actions()
+    t0 = time.time()
+    mix = src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False     # a REAL solve, not lookup fallback
+    assert not _is_uniform(mix.freqs, n_legal)  # not the uniform placeholder
+    assert dt < 10.0                            # depth-limited turn is fast (vs reach)
+    print(f"\n2p-turn depth-limited live-resolve: dt={dt:.2f}s mix={mix.freqs}")
 
 
 def test_live_resolve_2p_turn_reach_optin_solves_live(cpu_es_engine, blueprint_path, monkeypatch):
-    """2p turn with NEXUS_ALLOW_CHANCE_SOLVE=1 (the research opt-in) solves LIVE
-    via reach-CFR: the engine sets POKER_SEARCH_DEPTH=full so the in-tree chance
-    node is built and the validated full-per-hand-REACH vector CFR runs. Assert a
-    real, legal-length, non-fallback mix (quality is a separate concern — the
-    probe showed it needs more iters than interactive to fully polarize)."""
+    """2p turn with NEXUS_ALLOW_CHANCE_SOLVE=1 (the research opt-in) solves the
+    FULL river extension via reach-CFR: the engine sets POKER_SEARCH_DEPTH=full +
+    POKER_TURN_DEPTH_LIMIT=0 so the in-tree chance node is built. Assert a real,
+    legal-length, non-fallback mix (quality is a separate concern — the probe
+    showed it needs more iters than interactive to fully polarize)."""
     from app.agent.strategy_source import LiveResolveSource
     monkeypatch.setenv("NEXUS_ALLOW_CHANCE_SOLVE", "1")
     src = LiveResolveSource(
@@ -199,7 +206,7 @@ def test_live_resolve_2p_turn_reach_optin_solves_live(cpu_es_engine, blueprint_p
     assert set(mix.freqs.keys()) <= set(range(n_legal))
     assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
     assert mix.is_uniform_fallback is False    # a REAL reach solve, not lookup
-    assert dt < 60.0                            # reach turn is a few seconds
+    assert dt < 60.0                            # reach river extension is slower
     print(f"\n2p-turn reach-CFR opt-in live-resolve: dt={dt:.2f}s mix={mix.freqs}")
 
 

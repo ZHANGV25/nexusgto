@@ -275,33 +275,29 @@ class CpuEsSolver:
             )
         street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
 
-        # ── 2p-TURN reach-CFR enablement (2026-06-17, OPT-IN, scoped) ──
-        # The in-tree chance node (turn->river extension) that the reach-CFR turn
-        # solve needs is built ONLY when POKER_SEARCH_DEPTH=full is set at C
-        # tree-build time (ss_tree_api.c ss_build_tree2). We set it for THIS build
-        # only, ONLY for an n_players==2 turn, and ONLY when explicitly opted in
-        # via NEXUS_ALLOW_CHANCE_SOLVE (restored in finally so it never leaks).
+        # ── 2p-TURN: Pluribus-DEPTH-LIMITED by default (2026-06-18) ──
+        # The 2p turn now terminates at a cont-strat LEAF at the RIVER boundary
+        # (POKER_TURN_DEPTH_LIMIT=1, the C default), exactly like the flop — a
+        # sub-second tree solved live by the conditioned sampled construct. NO
+        # special env is needed for the default path.
         #
-        # DEFAULT OFF (2026-06-17, EC2 probe verdict): reach-CFR is a correct,
-        # CONVERGING solver (es_exploitability_2p dropped 5028->21 pot-chips/hand
-        # over 50->2000 iters on the real turn tree), BUT at the INTERACTIVE iter
-        # budget (50-1000) it is far from converged: it gives a muddy ~0.65-check
-        # strategy that does NOT discriminate by hand strength like the blueprint
-        # (e.g. AsAh nut overpair: reach 0.5 check vs blueprint bet 1.0; Td9d
-        # gutshot: reach 0.66 vs blueprint 0.004). An under-converged turn solve is
-        # WORSE than the blueprint lookup. So a 2p turn defaults to the blueprint
-        # LOOKUP; reach-CFR stays behind NEXUS_ALLOW_CHANCE_SOLVE for research /
-        # a future higher-iter path. (Turn full convergence needs far more than the
-        # interactive budget — the 5349-node tree's BR gap was still ~3.5% pot at
-        # 2000 iters; matches the findings doc's "reach correct but iter-hungry".)
+        # The legacy in-tree turn->river reach-CFR extension (the iter-hungry
+        # research path — EC2 probe 2026-06-17: correct/converging but
+        # under-converged at interactive iters, a muddy ~0.65-check strategy worse
+        # than lookup) is OPT-IN via NEXUS_ALLOW_CHANCE_SOLVE. It needs BOTH
+        # POKER_SEARCH_DEPTH=full (enable the depth rule) AND POKER_TURN_DEPTH_LIMIT
+        # =0 (so the turn root extends to the river instead of depth-limiting), set
+        # for THIS build only and restored in finally so they never leak.
         _allow_chance_turn = os.environ.get(
             "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
         _want_turn_reach = (n_players == 2 and street == "turn"
                             and _allow_chance_turn)
         _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
+        _tdl_prev = os.environ.get("POKER_TURN_DEPTH_LIMIT")
         _depth_set = False
-        if _want_turn_reach and _depth_prev is None:
+        if _want_turn_reach and _depth_prev is None and _tdl_prev is None:
             os.environ["POKER_SEARCH_DEPTH"] = "full"
+            os.environ["POKER_TURN_DEPTH_LIMIT"] = "0"
             _depth_set = True
         try:
             # ── Build the tree (CPU tree-builder; no GPU solve / no leaf_value_fn) ──
@@ -320,6 +316,10 @@ class CpuEsSolver:
                     os.environ.pop("POKER_SEARCH_DEPTH", None)
                 else:
                     os.environ["POKER_SEARCH_DEPTH"] = _depth_prev
+                if _tdl_prev is None:
+                    os.environ.pop("POKER_TURN_DEPTH_LIMIT", None)
+                else:
+                    os.environ["POKER_TURN_DEPTH_LIMIT"] = _tdl_prev
         try:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
@@ -375,22 +375,14 @@ class CpuEsSolver:
                     "instead"
                 )
 
-            # 2p TURN, NOT opted into reach-CFR (the default): no chance node was
-            # built, so the tree is a cont-strat-LEAF turn tree whose sampled solve
-            # has the SAME un-conditioned-range over-bet as the flop (and the flop
-            # conditioning fix is flop-gated, not validated for the turn). Rather
-            # than serve a known-over-betting turn solve, route to the blueprint
-            # LOOKUP (the honest fallback) — matches the probe verdict that the
-            # turn live-solve is not yet ship-quality.
-            if (n_players == 2 and street == "turn" and not _has_chance
-                    and not _allow_chance):
-                raise ReplayUnsupported(
-                    "2p turn live-solve is gated to the blueprint lookup (the "
-                    "cont-strat-leaf turn solve has an un-conditioned-range "
-                    "over-bet, and reach-CFR is under-converged at interactive "
-                    "iters — EC2 probe 2026-06-17); set NEXUS_ALLOW_CHANCE_SOLVE=1 "
-                    "to opt into the research reach-CFR turn solve"
-                )
+            # 2p TURN is now Pluribus-DEPTH-LIMITED (POKER_TURN_DEPTH_LIMIT=1,
+            # default, 2026-06-18): it builds a cont-strat-LEAF tree at the river
+            # boundary with NO chance node, exactly like the flop, and solves LIVE
+            # via the same conditioned sampled construct below (sub-second). The
+            # old "turn -> lookup" gate is gone. The reach-CFR full river extension
+            # remains available behind NEXUS_ALLOW_CHANCE_SOLVE (sets
+            # POKER_TURN_DEPTH_LIMIT=0 -> chance node -> the gate above), but it is
+            # the iter-hungry research path, not the default.
 
             n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
             n_leaves = int(gpu._tree.num_leaves)
@@ -451,37 +443,41 @@ class CpuEsSolver:
                 if _diag and hasattr(rc, "reset_rollout_observability"):
                     rc.reset_rollout_observability()
 
-                # ── 2p-FLOP OPPONENT-RANGE CONDITIONING (2026-06-17, gated) ──
+                # ── 2p OPPONENT-RANGE CONDITIONING (2026-06-17, gated) ──
                 # The depth-limited cont-strat-leaf values the BET leaf against
                 # the UN-conditioned full preflop range -> betting marginal hands
                 # (QJs) is under-punished -> over-bet vs the blueprint's confident
                 # check (root cause: docs/CPU_ES_CHANCE_NODE_FINDINGS). Condition
                 # each leaf's villain sampling weights on the blueprint probability
-                # that the seat took the flop actions on the leaf's line, so the
-                # BET leaf is valued vs the CALLING subset. Gated to 2p flop ONLY:
-                # the 3p+ flop and 5-6p external-sampling paths take the UNCHANGED
-                # shared-range construct below (provably no regression).
+                # that the seat took THIS street's actions on the leaf's line, so
+                # the BET leaf is valued vs the CALLING subset. Gated to 2p
+                # FLOP/TURN ONLY (both are now Pluribus-depth-limited cont-strat-
+                # leaf trees, 2026-06-18); the 3p+ and 5-6p external-sampling paths
+                # take the UNCHANGED shared-range construct (provably no regression).
                 #
-                # DEFAULT ON (2026-06-17, EC2-validated, user flip): QJs check
+                # DEFAULT ON (2026-06-17, EC2-validated, user flip): QJs flop check
                 # OFF=0.002 (over-bet) -> ON=0.97-0.99 (matches blueprint 0.957),
                 # clean (nodes_conditioned=1498, zero miss/fallback), faster
                 # (1.5s vs 2.7s). Explicit NEXUS_LEAF_RANGE_CONDITIONING=0 opts out.
                 _cond_on = os.environ.get(
                     "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
                         "0", "f", "F", "n", "N")
-                _use_cond = (_cond_on and n_players == 2 and street == "flop")
+                _use_cond = (_cond_on and n_players == 2
+                             and street in ("flop", "turn"))
                 per_leaf_ranges = None
                 if _use_cond:
                     from leaf_villain_conditioning import (  # type: ignore
                         build_conditioned_per_leaf_ranges)
+                    _cond_street = 1 if street == "flop" else 2
                     per_leaf_ranges, _cond_stats = build_conditioned_per_leaf_ranges(
                         leaf_infos=leaf_infos, player_ranges=player_ranges,
-                        flop_board=board_ints, player_seats=list(player_seats),
+                        board=board_ints, player_seats=list(player_seats),
                         game_action_history=list(game_action_indices or []),
                         blueprint=self._blueprint, n_players=n_players,
+                        street=_cond_street,
                     )
                     if _diag:
-                        print(f"CpuEsSolver DIAG: range-conditioning stats="
+                        print(f"CpuEsSolver DIAG: range-conditioning ({street}) stats="
                               f"{_cond_stats}", file=sys.stderr, flush=True)
 
                 # ── Construct the leaf table (parallel batch, off-lock) ──
