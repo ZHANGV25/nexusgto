@@ -174,6 +174,14 @@ def build_conditioned_per_leaf_ranges(
         )
 
     stats = _CondStats()
+    # Diagnostic toggle (default OFF -> floor ENABLED). NEXUS_HERO_FLOOR_DISABLE=1
+    # reverts to the pre-fix behavior (conditioned weight can reach exactly 0,
+    # re-introducing the hero zero-gate bug) so a measurement harness can A/B the
+    # exploitability of the fixed vs bug-masked tables in one run WITHOUT reverting
+    # the commit. Production never sets this. See docs/HERO_FLOOR_DIAGNOSIS.md.
+    import os as _os
+    _hero_floor_on = _os.environ.get(
+        "NEXUS_HERO_FLOOR_DISABLE", "")[:1] not in ("1", "t", "T", "y", "Y")
     board = list(board[:_need_cards])
     # Action prefix up to the subgame-root street (preflop for a flop root;
     # preflop ++ flop for a turn root). NOT necessarily preflop-only — see the
@@ -274,7 +282,7 @@ def build_conditioned_per_leaf_ranges(
                 # hand enumerable as hero (true EV) while leaving it ~0 for
                 # opponent sampling (conditioning preserved). Only lifts hands the
                 # blueprint drove to a pure-0 action; all others are untouched.
-                if new_w < _HERO_ENUM_FLOOR:
+                if _hero_floor_on and new_w < _HERO_ENUM_FLOOR:
                     new_w = _HERO_ENUM_FLOOR
                     stats.hero_floor += 1
                 new_hands.append((int(c0), int(c1), new_w))
