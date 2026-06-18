@@ -433,9 +433,14 @@ class CpuEsSolver:
                 # BET leaf is valued vs the CALLING subset. Gated to 2p flop ONLY:
                 # the 3p+ flop and 5-6p external-sampling paths take the UNCHANGED
                 # shared-range construct below (provably no regression).
+                #
+                # DEFAULT ON (2026-06-17, EC2-validated, user flip): QJs check
+                # OFF=0.002 (over-bet) -> ON=0.97-0.99 (matches blueprint 0.957),
+                # clean (nodes_conditioned=1498, zero miss/fallback), faster
+                # (1.5s vs 2.7s). Explicit NEXUS_LEAF_RANGE_CONDITIONING=0 opts out.
                 _cond_on = os.environ.get(
-                    "NEXUS_LEAF_RANGE_CONDITIONING", "")[:1] in (
-                        "1", "t", "T", "y", "Y")
+                    "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
+                        "0", "f", "F", "n", "N")
                 _use_cond = (_cond_on and n_players == 2 and street == "flop")
                 per_leaf_ranges = None
                 if _use_cond:

@@ -112,6 +112,40 @@ def test_live_resolve_2p_flop_solves_live(live_source):
     print(f"\n2p-flop live-resolve (Pluribus-faithful): dt={dt:.3f}s mix={mix.freqs}")
 
 
+def test_live_resolve_2p_flop_qjs_checks_with_conditioning(cpu_es_engine, blueprint_path):
+    """2p flop QJs (Qh Jh) on Ah Ks Td (UTG raise / BB call, BB to act): with the
+    opponent-range CONDITIONING fix (default ON, 2026-06-17) the marginal
+    gutshot+overcards hand CHECKS, matching the blueprint's confident check 0.957.
+
+    REGRESSION GUARD for the over-bet: the un-conditioned cont-strat leaf valued
+    QJs's bet vs the FULL preflop range -> bet ~0.99 (EC2-measured). Conditioning
+    values it vs the bet-CALLING subset -> check ~0.97-0.99 (EC2-measured A/B:
+    check OFF=0.002 vs ON=0.878@400 / 0.986@800). At 400 iters the conditioned
+    solve is solidly check-heavy; assert check is the majority action so a
+    regression that reintroduces the over-bet (check < 0.05) FAILS here — the
+    prior structural-only anchors would not catch it."""
+    from app.agent.strategy_source import LiveResolveSource
+    # 400 iters: past the uniform warm-up (50/150 ~0.5 per the EC2 sweep).
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=400,
+    )
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Ah"), _ci("Ks"), _ci("Td")],
+    )
+    assert st.num_legal_actions() == 2  # [check, bet]
+    mix = src.get_mix(st, hero_cards=(_ci("Qh"), _ci("Jh")))
+    check = mix.freqs.get(0, 0.0)
+    assert mix.is_uniform_fallback is False
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert check > 0.5, (
+        f"2p-flop QJs should CHECK with conditioning (blueprint 0.957), got "
+        f"check={check:.3f} mix={mix.freqs} — the over-bet may have regressed"
+    )
+    print(f"\n2p-flop QJs conditioned (400it): check={check:.3f} mix={mix.freqs}")
+
+
 # ── ANCHOR: 2p turn (reach-CFR live by default, 2026-06-17) ───────────────
 
 
