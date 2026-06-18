@@ -61,6 +61,11 @@ RIVER_QUALITY_SOURCE = (
 #
 # 6p arms: NR_LADDER_2026-06-10.md (replicated by NR_LADDER_REWEIGHT).
 # 5p vec-final arms: RAISE_CAP_2026-06-10.md (cap=2 rows, same protocol).
+# 4p vec-final arms: nr_ladder 4p run 2026-06-18 (ec2_nr_ladder_4p_userdata.sh,
+#   c7a.16xlarge, board AhKh2c, pot_bb=20 — the validated %/pot regime, same
+#   measure_nr_ladder.py methodology as 5p/6p; best rung of the 5/20/50M ladder):
+#     nr=3:0.067  nr=10:0.072  nr=20:0.060  nr=30:0.057 %/pot/p; all << BAR 0.127.
+#     Robust + low; no cont_ev needed (the rollout already floors well).
 MEASURED_FLOORS_PCT_POT: Dict[Tuple[int, int, bool, str], float] = {
     (6, 3, True, "final"): 0.144,
     (6, 10, True, "final"): 0.089,
@@ -68,6 +73,8 @@ MEASURED_FLOORS_PCT_POT: Dict[Tuple[int, int, bool, str], float] = {
     (6, 30, True, "final"): 0.073,
     (5, 3, True, "final"): 0.133,
     (5, 10, True, "final"): 0.076,
+    (4, 3, True, "final"): 0.067,
+    (4, 10, True, "final"): 0.072,
 }
 # The 5p/6p floors above are the best rung of a 5/20/50M-iteration ladder; below
 # the 20M rung the floor is not established for THAT arm (the vec-Linear-FINAL
@@ -134,7 +141,11 @@ DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     ),
     4: LiveSolveConfig(
         iterations=5_000_000, num_rollouts=3, vec_mode=True, readout="final",
-        note="4p vec-Linear-FINAL; no exactly-measured 4p floor",
+        note=(
+            "4p vec-Linear-FINAL nr=3 floor 0.067%/pot measured at the 50M rung "
+            "(nr_ladder 4p, 2026-06-18); floors describe AGGREGATE "
+            "exploitability, not per-spot mix reproducibility"
+        ),
     ),
     5: LiveSolveConfig(
         iterations=5_000_000, num_rollouts=10, vec_mode=True, readout="final",
