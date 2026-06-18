@@ -50,6 +50,13 @@ class _FakeBlueprint:
             return -1
         return int(self._bucket_of_c0.get(int(c0), 0))
 
+    def hand_to_bucket_turn(self, board, c0, c1):
+        # Same mapping as flop for the fake (the test steers by c0 regardless of
+        # street); the real blueprint uses k-means turn centroids.
+        if self._miss_bucket:
+            return -1
+        return int(self._bucket_of_c0.get(int(c0), 0))
+
     def get_strategy(self, *, board, action_history, player, bucket, street):
         if self._miss_strat:
             return None
@@ -79,7 +86,7 @@ def test_raises_on_non_2p():
     with pytest.raises(ValueError):
         build_conditioned_per_leaf_ranges(
             leaf_infos=[_leaf([], [])], player_ranges=[[], [], []],
-            flop_board=[0, 1, 2], player_seats=[0, 1, 2],
+            board=[0, 1, 2], player_seats=[0, 1, 2],
             game_action_history=[], blueprint=_FakeBlueprint(), n_players=3,
         )
 
@@ -90,7 +97,7 @@ def test_no_op_on_bucket_miss():
     # BET-call leaf: P0 bet (idx 1, !facing), P1 call (idx 1, facing).
     per_leaf, stats = build_conditioned_per_leaf_ranges(
         leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[2, 0, 0, 0, 0, 1], blueprint=bp, n_players=2,
     )
     # Every multiplier 1.0 -> villain weights unchanged from static.
@@ -103,7 +110,7 @@ def test_no_op_on_strat_miss():
     ranges = _ranges()
     per_leaf, stats = build_conditioned_per_leaf_ranges(
         leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[], blueprint=bp, n_players=2,
     )
     assert per_leaf[0][1] == [(0, 1, 1.0), (4, 5, 1.0)]
@@ -121,7 +128,7 @@ def test_bet_call_leaf_filters_folders():
     # P0 bet (idx1), P1 call (idx1) -> on the line, P1's action index is 1 (call).
     per_leaf, stats = build_conditioned_per_leaf_ranges(
         leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[], blueprint=bp, n_players=2,
     )
     villain = per_leaf[0][1]
@@ -149,7 +156,7 @@ def test_check_check_root_leaf_unchanged():
     ranges = _ranges()
     per_leaf, _ = build_conditioned_per_leaf_ranges(
         leaf_infos=[_leaf([0, 0], [0, 1])], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[], blueprint=bp, n_players=2,
     )
     villain = per_leaf[0][1]
@@ -167,7 +174,7 @@ def test_immutability_inputs_untouched():
     snapshot = [list(r) for r in ranges]
     build_conditioned_per_leaf_ranges(
         leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[], blueprint=bp, n_players=2,
     )
     assert ranges == snapshot  # the input ranges object was not mutated
@@ -183,7 +190,7 @@ def test_underflow_guard_falls_back_to_static():
     ranges = _ranges()
     per_leaf, stats = build_conditioned_per_leaf_ranges(
         leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[], blueprint=bp, n_players=2,
     )
     # Fell back to static (non-zero) weights rather than an all-zero range.
@@ -203,7 +210,38 @@ def test_legacy_leafinfo_without_actor_is_no_op():
                       flop_history_train=(1, 1))  # no flop_actor_train
     per_leaf, _ = build_conditioned_per_leaf_ranges(
         leaf_infos=[legacy], player_ranges=ranges,
-        flop_board=[0, 1, 2], player_seats=[1, 2],
+        board=[0, 1, 2], player_seats=[1, 2],
         game_action_history=[], blueprint=bp, n_players=2,
     )
     assert per_leaf[0][1] == [(0, 1, 1.0), (4, 5, 1.0)]
+
+
+def test_turn_street_filters_via_turn_bucketizer():
+    """street=2 (turn): same filtering mechanism, dispatched on the 4-card board
+    via hand_to_bucket_turn + get_strategy(street=2). The BET-call leaf
+    down-weights the villain's folding hands exactly as on the flop."""
+    bp = _FakeBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket={0: [0.1, 0.9], 1: [0.95, 0.05]},
+    )
+    ranges = _ranges()
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=ranges,
+        board=[0, 1, 2, 6], player_seats=[1, 2],  # 4-card turn board
+        game_action_history=[], blueprint=bp, n_players=2, street=2,
+    )
+    villain = per_leaf[0][1]
+    assert villain[0] == (0, 1, pytest.approx(0.9))   # continues
+    assert villain[1] == (4, 5, pytest.approx(0.05))  # mostly folds
+    assert stats["nodes_conditioned"] >= 1
+
+
+def test_turn_street_needs_4card_board():
+    """street=2 fail-loud on a 3-card board (would mis-key the turn node)."""
+    with pytest.raises(ValueError):
+        build_conditioned_per_leaf_ranges(
+            leaf_infos=[_leaf([1, 1], [0, 1])], player_ranges=_ranges(),
+            board=[0, 1, 2], player_seats=[1, 2],  # only 3 cards
+            game_action_history=[], blueprint=_FakeBlueprint(), n_players=2,
+            street=2,
+        )

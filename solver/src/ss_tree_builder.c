@@ -31,6 +31,7 @@ void stb_init(SSTreeBuilder *tb) {
     tb->root_street = 0;
     tb->orig_num_players = 0;
     tb->flop_depth_limit = 1;  /* Pluribus-faithful default (flop -> cont-strat leaf) */
+    tb->turn_depth_limit = 1;  /* Pluribus-faithful default (turn -> cont-strat leaf) */
     tb->chance_card_per_child = NULL;
     tb->chance_card_per_child_len = 0;
     tb->chance_card_per_child_cap = 0;
@@ -128,7 +129,9 @@ static int max_bet(const int *bets, const int *active, int n) {
  *   - Flop root, multi-way (≥3p): terminate at end-of-street betting
  *     leaf; cont-strat rollout takes over. 2-raise cap may also fire
  *     mid-street (existing SS_MULTIWAY_MAX_RAISES logic).
- *   - Turn root, any player count: extend to river.
+ *   - Turn root: Pluribus-faithful = terminate at a cont-strat LEAF at the
+ *     river boundary (turn_depth_limit=1, default); =0 extends to the river
+ *     (the reach-CFR research path).
  *   - Past the root street (in an extended subtree): always extend
  *     through to river ("all other cases — end of game"). */
 static int should_extend_via_chance(const SSTreeBuilder *tb,
@@ -145,7 +148,13 @@ static int should_extend_via_chance(const SSTreeBuilder *tb,
          * so flop_depth_limit=1 simply drops the 2p exception. */
         if (tb->root_street == 3)
             return tb->flop_depth_limit ? 0 : (tb->orig_num_players == 2);
-        return 1;  /* turn root: extend to river (paper: "all other cases") */
+        /* TURN root: Pluribus-faithful = terminate at a cont-strat LEAF at the
+         * river boundary (turn_depth_limit=1, default), exactly mirroring the
+         * flop. turn_depth_limit=0 restores the legacy full river extension
+         * (reach-CFR research path). */
+        if (tb->root_street == 4)
+            return tb->turn_depth_limit ? 0 : 1;
+        return 1;  /* river root never reaches here (is_river guard above) */
     }
     return current_num_board < 5;
 }

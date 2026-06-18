@@ -58,9 +58,22 @@ typedef struct SSTreeBuilder {
      *     the already-shipping 3p+ flop path.
      *   0: legacy OP3 `full` behavior — 2p flop extends through the chance node
      *     (the validated-but-expensive reach-CFR path; kept for research/A-B).
-     * Turn/river roots are unaffected (turn still extends to river — the paper's
-     * "all other cases -> end of game"; a 2p turn tree is only ~5k nodes). */
+     * Turn-root extension is governed separately by `turn_depth_limit`. */
     int flop_depth_limit;
+    /* PLURIBUS-FAITHFUL turn depth limit (2026-06-18). Same rationale as
+     * flop_depth_limit, applied to a TURN subgame root: the paper depth-limits
+     * EVERY post-first-round street to a cont-strat leaf at the next chance
+     * boundary, NOT just the flop. The original rule extended a turn root through
+     * the river (in-tree river runout -> ~5k-node 2p turn tree solved live via
+     * reach-CFR, which is iter-hungry and under-converged at interactive speed —
+     * EC2 probe 2026-06-17). Depth-limiting the turn makes it a cont-strat-leaf
+     * tree at the RIVER boundary (sub-second), identical in shape to the flop,
+     * valued by the same conditioned blueprint rollout.
+     *   1 (default under depth_rule_enabled): turn root -> cont-strat leaf at the
+     *     river boundary (Pluribus-faithful, sub-second).
+     *   0: legacy behavior — turn extends through the river chance node (the
+     *     reach-CFR research path; POKER_TURN_DEPTH_LIMIT=0). */
+    int turn_depth_limit;
     int *chance_card_per_child;
     int  chance_card_per_child_len;
     int  chance_card_per_child_cap;

@@ -77,13 +77,14 @@ def build_conditioned_per_leaf_ranges(
     *,
     leaf_infos: Sequence,
     player_ranges: List[List[Tuple[int, int, float]]],
-    flop_board: List[int],
+    board: List[int],
     player_seats: List[int],
     game_action_history: List[int],
     blueprint,
     n_players: int,
+    street: int = 1,
 ) -> Tuple[PerLeafRanges, dict]:
-    """Build a conditioned villain range per leaf for the 2p flop solve.
+    """Build a conditioned villain range per leaf for a 2p FLOP or TURN solve.
 
     Returns (per_leaf_ranges, stats). per_leaf_ranges[leaf][player] is a NEW list
     of (c0, c1, weight) tuples (immutable — the inputs are not mutated). For the
@@ -95,23 +96,37 @@ def build_conditioned_per_leaf_ranges(
 
     Args:
         leaf_infos: the LeafInfo list from extract_leaf_info_from_tree; each must
-            carry flop_history_train (the trainer-encoded flop action indices on
-            the line) and flop_actor_train (the parallel acting seat per step).
+            carry flop_history_train (the trainer-encoded this-street action
+            indices on the line) and flop_actor_train (the parallel acting seat
+            per step). The fields are named "flop_*" for historical reasons but
+            hold the SUBGAME-ROOT street's actions (flop for a flop root, turn for
+            a turn root).
         player_ranges: static per-player [(c0, c1, weight), ...] (the grid range).
-        flop_board: 3 flop card ints.
+        board: the subgame-root board ints — 3 cards for a flop root (street=1),
+            4 for a turn root (street=2). The bucketizer + blueprint street are
+            dispatched on this length.
         player_seats: full blueprint seat id per compact player slot (so the
             blueprint query keys by the SAME seat the rollout uses).
         game_action_history: the preflop action-index prefix (the trainer key for
-            postflop nodes is preflop ++ flop-actions-so-far).
+            postflop nodes is preflop ++ this-street-actions-so-far).
         blueprint: a BPSReaderC with get_strategy(board, action_history, player,
-            bucket, street) and hand_to_bucket(board, c0, c1).
+            bucket, street), hand_to_bucket(board, c0, c1) [flop] and
+            hand_to_bucket_turn(board, c0, c1) [turn].
         n_players: must be 2.
+        street: blueprint street int — 1 (flop, 3-card board) or 2 (turn, 4-card).
     """
     if n_players != 2:
         raise ValueError(
             f"build_conditioned_per_leaf_ranges is heads-up only, got "
             f"n_players={n_players} (gate this off for 3p+)"
         )
+    if street not in (1, 2):
+        raise ValueError(
+            f"conditioning supports flop (street=1) / turn (street=2), got {street}")
+    _need_cards = 3 if street == 1 else 4
+    if len(board) < _need_cards:
+        raise ValueError(
+            f"street={street} needs a {_need_cards}-card board, got {len(board)}")
     if len(player_ranges) != n_players:
         raise ValueError(
             f"player_ranges has {len(player_ranges)} entries, expected "
@@ -124,8 +139,15 @@ def build_conditioned_per_leaf_ranges(
         )
 
     stats = _CondStats()
-    flop_board = list(flop_board[:3])
+    board = list(board[:_need_cards])
     preflop = list(game_action_history or [])
+
+    # Street-dispatched bucketizer (the conditioning MUST use the same bucket the
+    # trainer/rollout used for that street, or the query keys the wrong node).
+    def _bucket(c0: int, c1: int) -> int:
+        if street == 1:
+            return int(blueprint.hand_to_bucket(board, c0, c1))
+        return int(blueprint.hand_to_bucket_turn(board, c0, c1))
 
     # Cache bucket per (player_seat, hand) — the bucket is board-only, identical
     # across leaves, so compute it once per player per hand.
@@ -136,19 +158,19 @@ def build_conditioned_per_leaf_ranges(
             if w <= 0.0:
                 row.append(-1)
                 continue
-            row.append(int(blueprint.hand_to_bucket(flop_board, int(c0), int(c1))))
+            row.append(_bucket(int(c0), int(c1)))
         bucket_cache.append(row)
 
     # Cache strategy per (player_seat, prefix_key, bucket): many leaves share the
-    # same flop decision-node prefix, and many hands share a bucket.
+    # same decision-node prefix, and many hands share a bucket.
     strat_cache: dict = {}
 
     def _strat(seat: int, prefix: Tuple[int, ...], bucket: int):
         key = (seat, prefix, bucket)
         if key not in strat_cache:
             strat_cache[key] = blueprint.get_strategy(
-                board=flop_board, action_history=list(prefix), player=seat,
-                bucket=bucket, street=1,
+                board=board, action_history=list(prefix), player=seat,
+                bucket=bucket, street=street,
             )
         return strat_cache[key]
 

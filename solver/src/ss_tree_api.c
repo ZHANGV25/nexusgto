@@ -76,10 +76,19 @@ SS_EXPORT int ss_build_tree2(
          * nodes, sub-ms, vs the legacy 2p-flop full turn+river expansion (873k
          * nodes, ~5 orders of magnitude more per the paper). Set
          * POKER_FLOP_DEPTH_LIMIT=0 to restore the full 2p-flop extension (the
-         * validated reach-CFR research path). Turn roots still extend to river
-         * (the paper's "all other cases"). */
+         * validated reach-CFR research path). */
         const char *fdl = getenv("POKER_FLOP_DEPTH_LIMIT");
         tb.flop_depth_limit = (fdl && (fdl[0] == '0' || fdl[0] == 'n' || fdl[0] == 'N'))
+                              ? 0 : 1;
+        /* PLURIBUS-FAITHFUL turn depth limit (2026-06-18). Default 1: a TURN
+         * subgame terminates at a cont-strat LEAF at the river boundary, exactly
+         * mirroring the flop — sub-second, valued by the conditioned blueprint
+         * rollout. The paper depth-limits EVERY post-first-round street, not just
+         * the flop. POKER_TURN_DEPTH_LIMIT=0 restores the legacy river extension
+         * (the reach-CFR research path, iter-hungry / under-converged at
+         * interactive iters — EC2 probe 2026-06-17). */
+        const char *tdl = getenv("POKER_TURN_DEPTH_LIMIT");
+        tb.turn_depth_limit = (tdl && (tdl[0] == '0' || tdl[0] == 'n' || tdl[0] == 'N'))
                               ? 0 : 1;
     }
 
