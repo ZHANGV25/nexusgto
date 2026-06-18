@@ -31,12 +31,23 @@ import importlib.util
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Serializes the OPT-IN env-mutation window (NEXUS_ALLOW_CHANCE_SOLVE -> set
+# POKER_SEARCH_DEPTH/POKER_TURN_DEPTH_LIMIT around the tree build). solves run in
+# asyncio.to_thread worker threads and os.environ is process-global: today the
+# tier executor runs solves one-at-a-time so this never contends, but if solve
+# concurrency is ever bumped >1 a concurrent default-path build could observe a
+# half-set env. The lock is taken ONLY on the opt-in path (the common default
+# path never touches env and never acquires it), so it adds zero contention to
+# normal solves. See solve().
+_ENV_MUTATION_LOCK = threading.Lock()
 
 
 class ReplayUnsupported(Exception):
@@ -295,10 +306,21 @@ class CpuEsSolver:
         _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
         _tdl_prev = os.environ.get("POKER_TURN_DEPTH_LIMIT")
         _depth_set = False
+        # CONCURRENCY GUARD (2026-06-18): os.environ is process-global and solves
+        # run in asyncio.to_thread worker threads. Hold _ENV_MUTATION_LOCK across
+        # the mutate -> build -> restore window so a concurrent solve can never
+        # observe a half-set env (or have its restore race ours). Taken ONLY on
+        # this opt-in path; the default path (the overwhelming majority of solves)
+        # never sets env, never acquires, never serializes. Released in finally.
         if _want_turn_reach and _depth_prev is None and _tdl_prev is None:
-            os.environ["POKER_SEARCH_DEPTH"] = "full"
-            os.environ["POKER_TURN_DEPTH_LIMIT"] = "0"
-            _depth_set = True
+            _ENV_MUTATION_LOCK.acquire()
+            try:
+                os.environ["POKER_SEARCH_DEPTH"] = "full"
+                os.environ["POKER_TURN_DEPTH_LIMIT"] = "0"
+                _depth_set = True
+            except BaseException:
+                _ENV_MUTATION_LOCK.release()
+                raise
         try:
             # ── Build the tree (CPU tree-builder; no GPU solve / no leaf_value_fn) ──
             gpu = self._StreetSolverGPU(
@@ -310,16 +332,20 @@ class CpuEsSolver:
             )
         finally:
             # Restore immediately after the build (the env only matters during
-            # ss_build_tree2); keep the window minimal.
+            # ss_build_tree2); keep the window minimal. Restore THEN release the
+            # lock so the next opt-in solve sees the restored env.
             if _depth_set:
-                if _depth_prev is None:
-                    os.environ.pop("POKER_SEARCH_DEPTH", None)
-                else:
-                    os.environ["POKER_SEARCH_DEPTH"] = _depth_prev
-                if _tdl_prev is None:
-                    os.environ.pop("POKER_TURN_DEPTH_LIMIT", None)
-                else:
-                    os.environ["POKER_TURN_DEPTH_LIMIT"] = _tdl_prev
+                try:
+                    if _depth_prev is None:
+                        os.environ.pop("POKER_SEARCH_DEPTH", None)
+                    else:
+                        os.environ["POKER_SEARCH_DEPTH"] = _depth_prev
+                    if _tdl_prev is None:
+                        os.environ.pop("POKER_TURN_DEPTH_LIMIT", None)
+                    else:
+                        os.environ["POKER_TURN_DEPTH_LIMIT"] = _tdl_prev
+                finally:
+                    _ENV_MUTATION_LOCK.release()
         try:
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
