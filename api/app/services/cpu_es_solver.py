@@ -101,6 +101,7 @@ class CpuEsSolver:
         self._StreetSolverGPU = None
         self._cev_holder = None  # A3: kept alive iff NEXUS_A3_CONT_EV=1
         self._last_cont_ev_stats = None  # A3: {hits, attempts} from last solve
+        self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -675,6 +676,35 @@ class CpuEsSolver:
             cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
+
+            # BR-GAP EXPOSE (NEXUS_BR_GAP_EXPOSE=1, default OFF). Stash the GENUINE
+            # production solve objects (tree snapshot + leaf table + served sigma)
+            # so an offline per-spot correctness harness can compute the in-tree
+            # best-response gap on EXACTLY what production served — conditioning,
+            # small-tree single-thread, the lot — instead of replicating (and
+            # risking diverging from) the solve. Pure read-only stash, no behavior
+            # change; only allocates when the flag is set. See
+            # scripts/measure_per_spot_correctness.py.
+            if os.environ.get("NEXUS_BR_GAP_EXPOSE", "")[:1] in (
+                    "1", "t", "T", "y", "Y"):
+                try:
+                    from es_resolver.es_solver import snapshot_tree as _snap
+                    _ranges = [[(c0, c1, w) for (c0, c1, w) in rng]
+                               for rng in player_ranges]
+                    _tree_snap = _snap(gpu._tree, _ranges)
+                    _sigma = {}
+                    for _ni in _tree_snap.decision_node_indices:
+                        _a = read_strategy(_ni)
+                        if _a is not None:
+                            _sigma[_ni] = _a
+                    self._last_br_gap_objs = {
+                        "tree": _tree_snap, "table": table, "sigma": _sigma,
+                        "n_players": n_players, "street": street,
+                        "pot_chips": int(round(pot_bb * scale)),
+                    }
+                except Exception as _e:  # never break a real solve for the stash
+                    logger.warning("BR-gap expose stash failed: %s", _e)
+                    self._last_br_gap_objs = None
 
             # DIAG (NEXUS_ES_DIAG=1): dump the RAW first-decision-node strategy for
             # each player (unfiltered by the freq>0.001 display) + per-hand spread,
