@@ -42,15 +42,15 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from app.agent.game_state import BIG_BLIND, SEAT_NAME, GameState
-from app.agent.key_builder import build_key
+from app.engine.agent.game_state import BIG_BLIND, SEAT_NAME, GameState
+from app.engine.agent.key_builder import build_key
 
 # Reuse the production card encoder (rank<<2 | suit, A=12) — identical to the
 # agent's card ints, so a round-trip int->str->int is the identity.
 from app.services.postflop_provider import _build_hand_grid_range, _int_to_card
 
 # Reuse the production label↔index translation (metadata-driven, bet_sizes-aware).
-from app.services.session_pipeline import _solver_label_to_action_index
+from app.services.card_codec import _solver_label_to_action_index
 
 
 class LiveResolveUnsupported(Exception):  # noqa: N818 - sibling-naming convention

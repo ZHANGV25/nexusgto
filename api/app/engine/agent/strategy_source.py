@@ -23,12 +23,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from app.agent.game_state import GameState
-from app.agent.key_builder import build_key
-from app.agent.live_resolve_adapter import LiveResolveUnsupported
-from app.agent.modes import ModeConfig
+from app.engine.agent.game_state import GameState
+from app.engine.agent.key_builder import build_key
+from app.engine.agent.live_resolve_adapter import LiveResolveUnsupported
+from app.engine.agent.modes import ModeConfig
 
-# Re-export so callers can `from app.agent.strategy_source import
+# Re-export so callers can `from app.engine.agent.strategy_source import
 # LiveResolveUnsupported` alongside LiveResolveSource (the public seam).
 __all__ = [
     "ActionMix",
@@ -114,10 +114,7 @@ class LookupSource(StrategySource):
                 raise ValueError(
                     "LookupSource needs a blueprint_path (or an injected reader)"
                 )
-            try:
-                from bps_reader_py import BPSReaderC  # type: ignore[import-untyped]
-            except ImportError:  # pragma: no cover
-                from python.bps_reader_py import BPSReaderC  # type: ignore[no-redef]
+            from engine.bps_reader_py import BPSReaderC  # type: ignore[import-untyped]
             self._reader = BPSReaderC(config.blueprint_path)
 
         # Read the trained vocab from the blueprint metadata (the single
@@ -352,7 +349,7 @@ class LiveResolveSource(StrategySource):
                 "LiveResolveSource needs a blueprint_path (or an injected "
                 "cpu_es_solver) to construct the CpuEsSolver engine."
             )
-        from app.services.cpu_es_solver import CpuEsSolver
+        from app.engine.cpu_es_solver import CpuEsSolver
         self._engine = CpuEsSolver(self._config.blueprint_path)
         return self._engine
 
@@ -376,7 +373,7 @@ class LiveResolveSource(StrategySource):
         if get_strategy is None:
             return None
         try:
-            from app.agent.live_resolve_ranges import seat_range_weight_dicts
+            from app.engine.agent.live_resolve_ranges import seat_range_weight_dicts
             return seat_range_weight_dicts(
                 state.seat_of_slot, state.preflop_prefix, get_strategy,
             )
@@ -393,7 +390,7 @@ class LiveResolveSource(StrategySource):
             return None
 
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
-        from app.agent.live_resolve_adapter import (
+        from app.engine.agent.live_resolve_adapter import (
             build_solve_inputs,
             hero_grid_row,
             labels_to_index_freqs,
@@ -453,7 +450,7 @@ class LiveResolveSource(StrategySource):
             # to LOOKUP. Anything else (real solver errors, vocab drift)
             # propagates loud. (Name fallback covers injected fake engines
             # that define their own ReplayUnsupported.)
-            from app.services.cpu_es_solver import ReplayUnsupported
+            from app.engine.cpu_es_solver import ReplayUnsupported
             if isinstance(e, ReplayUnsupported) or \
                     type(e).__name__ == "ReplayUnsupported":
                 raise LiveResolveUnsupported(str(e)) from e

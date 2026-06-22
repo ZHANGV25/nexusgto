@@ -24,8 +24,8 @@ import time
 
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.modes import ModeConfig
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.modes import ModeConfig
 
 
 def _ci(card: str) -> int:
@@ -44,7 +44,7 @@ def cpu_es_engine(blueprint_path):
     Skips if the engine can't be built (no es_resolver_real.dll / blueprint).
     """
     try:
-        from app.services.cpu_es_solver import CpuEsSolver
+        from app.engine.cpu_es_solver import CpuEsSolver
     except Exception as e:  # pragma: no cover
         pytest.skip(f"CpuEsSolver not importable: {e}")
     try:
@@ -58,7 +58,7 @@ def cpu_es_engine(blueprint_path):
 
 @pytest.fixture(scope="session")
 def live_source(cpu_es_engine, blueprint_path):
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     cfg = ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0)
     # A low iteration count keeps the anchor fast; quality is verified by the
     # EV-beats-floor test, not by iteration count here.
@@ -124,7 +124,7 @@ def test_live_resolve_2p_flop_qjs_checks_with_conditioning(cpu_es_engine, bluepr
     solve is solidly check-heavy; assert check is the majority action so a
     regression that reintroduces the over-bet (check < 0.05) FAILS here — the
     prior structural-only anchors would not catch it."""
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     # 400 iters: past the uniform warm-up (50/150 ~0.5 per the EC2 sweep).
     src = LiveResolveSource(
         ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
@@ -167,7 +167,7 @@ def test_live_resolve_2p_turn_solves_live_depth_limited(cpu_es_engine, blueprint
     conditioned, exactly like the flop — sub-second, NO chance node, no opt-in.
     Assert a real, legal-length, non-fallback, non-degenerate mix that is FAST
     (the multi-second reach-CFR river extension would blow the latency bound)."""
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     monkeypatch.delenv("NEXUS_ALLOW_CHANCE_SOLVE", raising=False)
     src = LiveResolveSource(
         ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
@@ -192,7 +192,7 @@ def test_live_resolve_2p_turn_reach_optin_solves_live(cpu_es_engine, blueprint_p
     POKER_TURN_DEPTH_LIMIT=0 so the in-tree chance node is built. Assert a real,
     legal-length, non-fallback mix (quality is a separate concern — the probe
     showed it needs more iters than interactive to fully polarize)."""
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     monkeypatch.setenv("NEXUS_ALLOW_CHANCE_SOLVE", "1")
     src = LiveResolveSource(
         ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
@@ -227,7 +227,7 @@ def test_live_resolve_3p_turn_anchor(cpu_es_engine, blueprint_path):
     legal-length, NOT the uniform-on-miss fallback, sums to 1, measured latency —
     are the 3p headline. Strict non-uniformity is asserted on the lower-variance
     2p anchor. We bump iters to reduce (not eliminate) the variance."""
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     src = LiveResolveSource(
         ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
         cpu_es_solver=cpu_es_engine, iterations=600,
@@ -353,7 +353,7 @@ def test_live_resolve_2p_river_faced_bet_replay(live_source):
 
 @pytest.fixture(scope="session")
 def live_source_6p(cpu_es_engine, blueprint_path):
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     cfg = ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0)
     return LiveResolveSource(
         cfg, cpu_es_solver=cpu_es_engine, iterations=2000,

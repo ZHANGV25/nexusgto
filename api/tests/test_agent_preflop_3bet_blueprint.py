@@ -25,9 +25,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.key_builder import build_key
-from app.agent.preflop_constructor import PreflopAction, build_preflop_prefix
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.key_builder import build_key
+from app.engine.agent.preflop_constructor import PreflopAction, build_preflop_prefix
 
 from tests.test_agent_preflop_3bet import CAPTURED, _threebet_line
 
@@ -217,13 +217,13 @@ def _replay_captured_preflop_nodes(blueprint, w, prefix, hero=None):
         trainer na (per-node na signature).
     hero default AsAd (class AA) — GOLDEN across the capture.
     """
-    from app.agent.game_state import (
+    from app.engine.agent.game_state import (
         BIG_BLIND,
         INITIAL_STACK,
         SMALL_BLIND,
         preflop_raise_amount_f32,
     )
-    from app.agent.preflop_range import hand_class_169
+    from app.engine.agent.preflop_range import hand_class_169
 
     if hero is None:
         hero = (_ci("As"), _ci("Ad"))

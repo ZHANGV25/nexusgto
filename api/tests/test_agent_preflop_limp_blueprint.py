@@ -22,9 +22,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.key_builder import build_key
-from app.agent.preflop_constructor import PreflopAction, build_preflop_prefix
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.key_builder import build_key
+from app.engine.agent.preflop_constructor import PreflopAction, build_preflop_prefix
 
 
 def _ci(card: str) -> int:

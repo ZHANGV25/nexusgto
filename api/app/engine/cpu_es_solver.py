@@ -149,9 +149,9 @@ class CpuEsSolver:
                     _ES_DLL_NAME, time.time() - t0)
 
         # Tree builder + helpers (shared, read-only use).
-        from street_solver_gpu import StreetSolverGPU, _build_labels_at_node  # type: ignore
+        from engine.street_solver_gpu import StreetSolverGPU, _build_labels_at_node  # type: ignore
         from es_resolver.es_solver import snapshot_tree  # type: ignore
-        from leaf_values import extract_leaf_info_from_tree  # type: ignore
+        from engine.leaf_values import extract_leaf_info_from_tree  # type: ignore
         self._StreetSolverGPU = StreetSolverGPU
         self._build_labels = _build_labels_at_node
         self._snapshot_tree = snapshot_tree
@@ -493,7 +493,7 @@ class CpuEsSolver:
                              and street in ("flop", "turn"))
                 per_leaf_ranges = None
                 if _use_cond:
-                    from leaf_villain_conditioning import (  # type: ignore
+                    from engine.leaf_villain_conditioning import (  # type: ignore
                         build_conditioned_per_leaf_ranges)
                     _cond_street = 1 if street == "flop" else 2
                     per_leaf_ranges, _cond_stats = build_conditioned_per_leaf_ranges(

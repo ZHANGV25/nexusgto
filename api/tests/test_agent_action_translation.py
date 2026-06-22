@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.action_translation import (
+from app.engine.agent.action_translation import (
     OFF_TREE_PSEUDOHARMONIC,
     ON_TREE_EXACT,
     translate_action,
@@ -114,7 +114,7 @@ def test_allin_explicit_slot_when_enabled():
 
 
 def test_index_within_legal_set_no_bet():
-    from rollout import classify_postflop_actions  # type: ignore[import-untyped]
+    from engine.rollout import classify_postflop_actions  # type: ignore[import-untyped]
     res = translate_action("raise", 75.0, pot=100, bet_sizes=SIZES,
                            add_explicit_allin=ADD_ALLIN, facing_bet=False,
                            raises_so_far=0)
@@ -123,7 +123,7 @@ def test_index_within_legal_set_no_bet():
 
 
 def test_index_within_legal_set_facing_bet():
-    from rollout import classify_postflop_actions  # type: ignore[import-untyped]
+    from engine.rollout import classify_postflop_actions  # type: ignore[import-untyped]
     res = translate_action("raise", 100.0, pot=100, bet_sizes=SIZES,
                            add_explicit_allin=ADD_ALLIN, facing_bet=True,
                            raises_so_far=1)

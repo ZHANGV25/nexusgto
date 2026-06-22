@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.agent.preflop_range import (
+from app.engine.agent.preflop_range import (
     NUM_PREFLOP_CLASSES,
     class_combos,
     hand_class_169,

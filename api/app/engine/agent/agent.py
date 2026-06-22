@@ -16,9 +16,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from app.agent.game_state import GameState
-from app.agent.modes import ModeConfig
-from app.agent.strategy_source import ActionMix, HeroCards, StrategySource
+from app.engine.agent.game_state import GameState
+from app.engine.agent.modes import ModeConfig
+from app.engine.agent.strategy_source import ActionMix, HeroCards, StrategySource
 
 
 @dataclass(frozen=True)

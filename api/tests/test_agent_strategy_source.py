@@ -15,9 +15,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.modes import ModeConfig
-from app.agent.strategy_source import (
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.modes import ModeConfig
+from app.engine.agent.strategy_source import (
     ActionMix,
     LookupSource,
     OfflineLiftedSource,

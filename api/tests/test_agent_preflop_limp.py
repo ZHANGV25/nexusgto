@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.game_state import (
+from app.engine.agent.game_state import (
     CanonicalChipsUnsupported,
     canonical_flop_chips,
 )
-from app.agent.preflop_constructor import (
+from app.engine.agent.preflop_constructor import (
     PreflopAction,
     PreflopConstructionUnsupported,
     build_preflop_prefix,

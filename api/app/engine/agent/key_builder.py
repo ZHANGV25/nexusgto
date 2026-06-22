@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from app.agent.game_state import GameState
+from app.engine.agent.game_state import GameState
 
 
 @dataclass(frozen=True)

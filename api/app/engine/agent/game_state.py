@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple
 # Action-set COUNT comes from the blueprint's trained vocab (metadata-driven,
 # see action_vocab); the category SEMANTICS (fold/call/raise) reuse the
 # solver's enum. The seat / who-acts-next logic lives below, unchanged.
-from app.agent.action_vocab import (
+from app.engine.agent.action_vocab import (
     DEFAULT_ADD_EXPLICIT_ALLIN,
     DEFAULT_POSTFLOP_BET_SIZES,
     DEFAULT_SUBSEQUENT_BET_SIZES,
@@ -37,10 +37,7 @@ from app.agent.action_vocab import (
     raise_to_amount,
 )
 
-try:
-    from rollout import ActionCategory  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover - exercised only on bare checkouts
-    from python.rollout import ActionCategory  # type: ignore[no-redef]
+from engine.rollout import ActionCategory  # type: ignore[import-untyped]
 
 
 # Blueprint seat encoding (capture-verified — see agent_node_key_encoding memo).

@@ -7,8 +7,8 @@ memory names this the real open design question). On-tree actions translate
 exactly.
 
 REUSES the production primitives rather than reimplementing them:
-  - session_pipeline._action_to_solver_label   (action+amount -> "Bet 75%")
-  - session_pipeline._solver_label_to_action_index  (label -> tree index)
+  - card_codec._action_to_solver_label   (action+amount -> "Bet 75%")
+  - card_codec._solver_label_to_action_index  (label -> tree index)
   - off_tree.pseudoharmonic_map                 (off-tree size -> tree sizes)
 
 The returned index matches rollout.classify_postflop_actions ordering, so
@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from app.services.session_pipeline import (
+from app.services.card_codec import (
     _action_to_solver_label,
     _solver_label_to_action_index,
 )

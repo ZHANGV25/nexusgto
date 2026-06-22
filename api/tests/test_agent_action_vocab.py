@@ -7,7 +7,7 @@ pin the count for the 8.05B vocab and a 2-size vocab, mirroring training.
 
 from __future__ import annotations
 
-from app.agent.action_vocab import (
+from app.engine.agent.action_vocab import (
     DEFAULT_ADD_EXPLICIT_ALLIN,
     DEFAULT_POSTFLOP_BET_SIZES,
     DEFAULT_SUBSEQUENT_BET_SIZES,
@@ -52,7 +52,7 @@ def test_explicit_allin_adds_a_slot():
 
 
 def test_tree_closed_at_max_raises():
-    from app.agent.action_vocab import POSTFLOP_MAX_RAISES
+    from app.engine.agent.action_vocab import POSTFLOP_MAX_RAISES
     # facing a bet at the raise cap -> [fold, call] only
     assert num_legal(True, POSTFLOP_MAX_RAISES, P, S, A) == 2
     # no bet at the cap -> [check] only
@@ -60,7 +60,7 @@ def test_tree_closed_at_max_raises():
 
 
 def test_categories_have_correct_semantics():
-    from rollout import ActionCategory  # type: ignore[import-untyped]
+    from engine.rollout import ActionCategory  # type: ignore[import-untyped]
     cats = legal_categories(True, 0, P, S, A)
     assert cats[0] == ActionCategory.FOLD
     assert cats[1] == ActionCategory.CALL
@@ -79,7 +79,7 @@ def test_categories_have_correct_semantics():
 # the blueprint's stored σ̄ length on committed lines (no more crash). The
 # legacy legal_categories is the deep-stack (no-prune) special case.
 
-from app.agent.action_vocab import (  # noqa: E402
+from app.engine.agent.action_vocab import (  # noqa: E402
     legal_categories_chips,
     num_legal_chips,
 )
@@ -115,7 +115,7 @@ def test_commitment_drops_raise_facing_bet_sigma_is_fold_call():
     # Use a short stack: stack=120, to_call=120 (all-in just to call). The raise
     # ba = 120 + int(1.0*(pot+120)); clamp ba>=stack(120) -> ba=120; 120<=120 ->
     # DROP. Result [fold, call].
-    from rollout import ActionCategory
+    from engine.rollout import ActionCategory
     chips = legal_categories_chips(
         facing_bet=True, raises_so_far=1, pot=1380, stack=120, to_call=120,
         postflop_bet_sizes=P, subsequent_bet_sizes=S, add_explicit_allin=A,
@@ -127,7 +127,7 @@ def test_commitment_drops_raise_facing_bet_sigma_is_fold_call():
 def test_commitment_drops_bet_no_bet_node_sigma_is_check_only():
     # σ̄=[1.0] case: all-in actor (stack 0) at a no-bet node. to_call=0,
     # ba = int(0.75*pot) clamped to stack(0) -> 0; 0<=0 -> DROP -> [check] (len 1).
-    from rollout import ActionCategory
+    from engine.rollout import ActionCategory
     chips = legal_categories_chips(
         facing_bet=False, raises_so_far=0, pot=30050, stack=0, to_call=0,
         postflop_bet_sizes=P, subsequent_bet_sizes=S, add_explicit_allin=A,
@@ -139,7 +139,7 @@ def test_commitment_drops_bet_no_bet_node_sigma_is_check_only():
 def test_allin_dedup_single_slot_when_ba_ge_stack():
     # Two bet sizes both >= stack -> a SINGLE all-in raise slot (deduped), not
     # two. v3-style [0.5,1.0] sizes, short stack so both clamp to all-in.
-    from rollout import ActionCategory
+    from engine.rollout import ActionCategory
     chips = legal_categories_chips(
         facing_bet=False, raises_so_far=0, pot=10000, stack=500, to_call=0,
         postflop_bet_sizes=(0.5, 1.0), subsequent_bet_sizes=(1.0,),
@@ -159,7 +159,7 @@ def test_int_truncation_matches_c_not_round():
     # The decisive case: to_call=330. Then for a FIRST raise (size 0.75):
     # ba = 330 + int(0.75*(pot+330)). With pot=1, ba=330+int(0.75*331)=330+248=578>330 survives.
     # Direct truncation check on the no-bet bet amount via the helper:
-    from app.agent.action_vocab import raise_to_amount
+    from app.engine.agent.action_vocab import raise_to_amount
     assert raise_to_amount(0.75, pot=441, to_call=0, stack=_DEEP) == 330  # not 331
     # facing-bet form: ba = to_call + int(frac*(pot+to_call))
     assert raise_to_amount(0.75, pot=100, to_call=330, stack=_DEEP) == 330 + int(0.75 * 430)
@@ -176,7 +176,7 @@ def test_chips_add_explicit_allin_off_no_extra_slot():
 
 
 def test_chips_max_raises_cap_ignores_chips():
-    from rollout import ActionCategory
+    from engine.rollout import ActionCategory
     # At the raise cap, chips are irrelevant: facing -> [fold,call], else [check].
     facing = legal_categories_chips(
         facing_bet=True, raises_so_far=3, pot=600, stack=_DEEP, to_call=450,
