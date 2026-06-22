@@ -29,6 +29,13 @@
 extern "C" {
 #endif
 
+/* ── Internal shared sort helper ─────────────────────────────────── */
+/* Promoted from file-static so the river-nd / ochs split files can share
+ * the same percentile-sort comparator with the parent translation unit.
+ * Not part of the public ABI (no CA_EXPORT); used only for qsort callbacks. */
+typedef struct { int idx; float ehs; } EhsPair;
+int ca_cmp_ehs(const void *a, const void *b);
+
 /**
  * Compute Expected Hand Strength for a set of hands on a given board.
  *
