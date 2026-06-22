@@ -5,7 +5,7 @@ Uses ~4 GB RAM instead of ~240 GB by delegating storage and lookups to a
 compact C hash table (src/bps_reader.c).
 
 Usage:
-    from bps_reader_py import BPSReaderC
+    from engine.bps_reader_py import BPSReaderC
 
     bp = BPSReaderC("blueprint_data_v3/unified_blueprint_v3_1.5B.bps")
 
@@ -157,7 +157,9 @@ def _find_lib() -> ctypes.CDLL:
     Prefers bps_ev_walk (which includes both reader + EV walk support).
     Falls back to bps_reader (read-only, no EV computation).
     """
-    base = Path(__file__).resolve().parent.parent / "build"
+    # LOAD-BEARING DEPTH: file is python/engine/bps_reader_py.py -> go up 3 parents
+    # (engine -> python -> repo root) to reach build/. (Was parent.parent at python/.)
+    base = Path(__file__).resolve().parent.parent.parent / "build"
     ext = ".dll" if sys.platform == "win32" else ".so"
 
     # Prefer the ev_walk build (superset of bps_reader)
@@ -719,7 +721,8 @@ class BPSReaderC:
         )
 
         bps_dir = Path(bps_path).parent
-        repo_root = Path(__file__).resolve().parent.parent
+        # LOAD-BEARING DEPTH: python/engine/ -> 3 parents to repo root (was parent.parent).
+        repo_root = Path(__file__).resolve().parent.parent.parent
         candidates = [
             bps_dir / "texture_cache.bin",
             repo_root / "texture_cache.bin",
@@ -760,7 +763,8 @@ class BPSReaderC:
         if not hasattr(self._lib, "bps_load_turn_centroids"):
             return
         bps_dir = Path(bps_path).parent
-        repo_root = Path(__file__).resolve().parent.parent
+        # LOAD-BEARING DEPTH: python/engine/ -> 3 parents to repo root (was parent.parent).
+        repo_root = Path(__file__).resolve().parent.parent.parent
         candidates = [
             bps_dir / "turn_centroids.bin",
             repo_root / "turn_centroids.bin",

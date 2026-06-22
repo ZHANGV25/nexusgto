@@ -21,8 +21,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from leaf_values import LeafInfo  # type: ignore[import-untyped]
-from leaf_villain_conditioning import (  # type: ignore[import-untyped]
+from engine.leaf_values import LeafInfo  # type: ignore[import-untyped]
+from engine.leaf_villain_conditioning import (  # type: ignore[import-untyped]
     build_conditioned_per_leaf_ranges,
 )
 
@@ -245,7 +245,7 @@ def test_hero_pure_zero_action_is_floored_not_zeroed():
     strategy. Here HERO (player 0) bet a hand (c0=8, bucket 5) the blueprint bets
     with probability 0.0 -> multiplier 0.0 -> must be floored, not zeroed.
     """
-    from leaf_villain_conditioning import _HERO_ENUM_FLOOR  # type: ignore
+    from engine.leaf_villain_conditioning import _HERO_ENUM_FLOOR  # type: ignore
     bp = _FakeBlueprint(
         # hero hand A c0=8 -> bucket 5 (pure-0 bet); hand B c0=12 -> bucket 6 (bets 0.7)
         # villain hands unchanged (c0=0 -> bucket 0, c0=4 -> bucket 1)
@@ -278,7 +278,7 @@ def test_villain_pure_zero_also_floored_but_sampling_negligible():
     same C zero-gate), but the floor (1e-12) is so far below any real σ̄ mass that
     it is sampling-negligible — the conditioning's relative down-weighting of the
     folding range is preserved."""
-    from leaf_villain_conditioning import _HERO_ENUM_FLOOR  # type: ignore
+    from engine.leaf_villain_conditioning import _HERO_ENUM_FLOOR  # type: ignore
     bp = _FakeBlueprint(
         bucket_of_c0={0: 0, 4: 1},
         strat_by_bucket={0: [0.1, 0.9], 1: [1.0, 0.0]},  # bucket 1: pure fold -> call 0.0

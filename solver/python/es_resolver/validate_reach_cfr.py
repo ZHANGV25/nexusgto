@@ -54,8 +54,8 @@ POT_CHIPS = POT_BB * 100.0
 
 def _build(nh, board):
     """A 2p subgame on `board` with `nh` arbitrary off-deck hands per player."""
-    from street_solver_gpu import StreetSolverGPU
-    from solver import card_to_int
+    from engine.street_solver_gpu import StreetSolverGPU
+    from engine.solver import card_to_int
 
     bset = {card_to_int(c) for c in board}
     deck = [x for x in range(52) if x not in bset]

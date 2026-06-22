@@ -10,8 +10,8 @@ with-Python limitations, and test plan.
 
 Usage:
 
-    from bps_reader_py import BPSReaderC
-    from rollout_c import compute_subgame_leaf_values_c
+    from engine.bps_reader_py import BPSReaderC
+    from engine.rollout_c import compute_subgame_leaf_values_c
 
     bp = BPSReaderC(".../unified_blueprint_v3_1.5B.bps")
     leaf_values = compute_subgame_leaf_values_c(
@@ -37,9 +37,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from leaf_values import LeafValueUnavailable  # type: ignore[import-untyped]
+    from engine.leaf_values import LeafValueUnavailable  # type: ignore[import-untyped]
 except ImportError:
-    from python.leaf_values import LeafValueUnavailable  # type: ignore[no-redef]
+    from engine.leaf_values import LeafValueUnavailable  # type: ignore[no-redef]
 
 
 # Must match ROLLOUT_MAX_PLAYERS in src/rollout.h

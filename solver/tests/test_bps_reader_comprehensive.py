@@ -20,7 +20,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from bps_reader_py import BPSReaderC
+from engine.bps_reader_py import BPSReaderC
 
 
 # ── Card encoding helpers ─────────────────────────────────────────────

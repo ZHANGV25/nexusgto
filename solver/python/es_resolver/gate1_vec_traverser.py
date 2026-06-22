@@ -38,8 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ES_DLL", "es_resolver")
 
-from street_solver_gpu import StreetSolverGPU  # noqa: E402
-from solver import card_to_int  # noqa: E402
+from engine.street_solver_gpu import StreetSolverGPU  # noqa: E402
+from engine.solver import card_to_int  # noqa: E402
 from es_resolver.es_solver import snapshot_tree, T_LEAF  # noqa: E402
 from es_resolver.c_solver import CSolver  # noqa: E402
 from es_resolver.exploitability_c import exploitability, player_gap  # noqa: E402

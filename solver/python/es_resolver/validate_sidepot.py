@@ -72,12 +72,12 @@ _REPO = os.path.dirname(os.path.dirname(_HERE))
 sys.path.insert(0, os.path.dirname(_HERE))   # python/
 sys.path.insert(0, _HERE)
 
-from leaf_values import _eval7_py  # noqa: E402  (validated vs C eval7)
+from engine.leaf_values import _eval7_py  # noqa: E402  (validated vs C eval7)
 
 # Canonical SSNode/SSTreeData ctypes mirrors (must match street_solve.cuh) —
 # importing street_solver_gpu is DLL-free at module level (its CDLL loads are
 # lazy inside StreetSolverGPU.__init__ / _get_lib).
-from street_solver_gpu import (  # noqa: E402
+from engine.street_solver_gpu import (  # noqa: E402
     SS_MAX_HANDS,
     SS_MAX_PLAYERS,
     SSNode,

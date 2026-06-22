@@ -29,8 +29,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from street_solver_gpu import StreetSolverGPU, SS_MAX_HANDS  # noqa: E402
-from solver import card_to_int  # noqa: E402
+from engine.street_solver_gpu import StreetSolverGPU, SS_MAX_HANDS  # noqa: E402
+from engine.solver import card_to_int  # noqa: E402
 
 
 # Budget: A1 S-tables are

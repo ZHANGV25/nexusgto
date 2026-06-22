@@ -48,16 +48,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    from leaf_values import (  # type: ignore[import-untyped]
-        LeafValueUnavailable,
-        _eval7_py,
-    )
-except ImportError:
-    from python.leaf_values import (  # type: ignore[no-redef]
-        LeafValueUnavailable,
-        _eval7_py,
-    )
+from engine.leaf_values import (  # type: ignore[import-untyped]
+    LeafValueUnavailable,
+    _eval7_py,
+)
 
 
 # ─── Constants — matches Pluribus Science 2019 §4 exactly ────────────────
@@ -327,10 +321,7 @@ def _lookup_strategy(
     function communicates the substitution-needed signal as None;
     callers MUST handle it.
     """
-    try:
-        from leaf_coverage import record as _rec
-    except ImportError:
-        from python.leaf_coverage import record as _rec  # type: ignore
+    from engine.leaf_coverage import record as _rec
 
     strat = blueprint.get_strategy(
         board, action_history, player, bucket, street=street,
@@ -525,10 +516,7 @@ def _simulate_one(
             # would silently absorb this; the explicit substitution
             # here keeps the leaf_coverage record visible.
             if strat_full is not None and strat.sum() <= 0.0:
-                try:
-                    from leaf_coverage import record as _rec
-                except ImportError:
-                    from python.leaf_coverage import record as _rec  # type: ignore
+                from engine.leaf_coverage import record as _rec
                 _rec("rollout_sigma", hit=False,
                      detail=f"post_truncate_zerosum_p={p}_bucket={bucket}")
                 strat = np.full(n_actions, 1.0 / n_actions, dtype=np.float64)

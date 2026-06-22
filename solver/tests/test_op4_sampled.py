@@ -94,7 +94,7 @@ def _mk_bp_2p() -> Tuple[Any, List[LI], List[List[Tuple[int, int, float]]]]:
 
 def test_python_shape() -> None:
     """Python sampled path returns [max_leaf_idx+1, P, H] shape."""
-    from rollout import compute_subgame_leaf_values_sampled  # type: ignore
+    from engine.rollout import compute_subgame_leaf_values_sampled  # type: ignore
 
     bp, leaf_infos, ph = _mk_bp_2p()
     out = compute_subgame_leaf_values_sampled(
@@ -113,7 +113,7 @@ def test_python_shape() -> None:
 
 def test_python_determinism() -> None:
     """Fixed rng seed -> bit-identical output across runs."""
-    from rollout import compute_subgame_leaf_values_sampled  # type: ignore
+    from engine.rollout import compute_subgame_leaf_values_sampled  # type: ignore
 
     bp, leaf_infos, ph = _mk_bp_2p()
     kwargs = dict(
@@ -141,7 +141,7 @@ def test_python_k_converges_to_joint_mean() -> None:
     Proves the estimator is unbiased: uniform draws from {0,1,2,3}^N
     converge to E_{k~U} [joint[k]] = mean over all 4^N combos of joint.
     """
-    from rollout import (  # type: ignore
+    from engine.rollout import (  # type: ignore
         compute_subgame_leaf_values,
         compute_subgame_leaf_values_sampled,
     )
@@ -192,8 +192,8 @@ def test_c_determinism() -> None:
         return
 
     try:
-        from bps_reader_py import BPSReaderC  # type: ignore
-        from rollout_c import compute_subgame_leaf_values_sampled_c  # type: ignore
+        from engine.bps_reader_py import BPSReaderC  # type: ignore
+        from engine.rollout_c import compute_subgame_leaf_values_sampled_c  # type: ignore
     except ImportError as e:
         check("c determinism: imports", False, str(e))
         return
@@ -240,9 +240,9 @@ def test_c_matches_python_in_expectation() -> None:
         return
 
     try:
-        from bps_reader_py import BPSReaderC  # type: ignore
-        from rollout import compute_subgame_leaf_values_sampled  # type: ignore
-        from rollout_c import compute_subgame_leaf_values_sampled_c  # type: ignore
+        from engine.bps_reader_py import BPSReaderC  # type: ignore
+        from engine.rollout import compute_subgame_leaf_values_sampled  # type: ignore
+        from engine.rollout_c import compute_subgame_leaf_values_sampled_c  # type: ignore
     except ImportError as e:
         check("c-vs-python: imports", False, str(e))
         return

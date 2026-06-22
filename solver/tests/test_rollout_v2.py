@@ -145,7 +145,7 @@ class FixedStrategyBlueprint:
 
 def test_bias_unmodified() -> None:
     """Profile 0 returns the input unchanged."""
-    from rollout import apply_bias, ActionCategory  # type: ignore
+    from engine.rollout import apply_bias, ActionCategory  # type: ignore
     s = np.array([0.2, 0.3, 0.4, 0.1], dtype=np.float64)
     cats = [ActionCategory.CALL, ActionCategory.RAISE,
             ActionCategory.RAISE, ActionCategory.RAISE]
@@ -160,7 +160,7 @@ def test_bias_fold_5x() -> None:
     After fold×5: [1.0, 0.3, 0.4, 0.1]  (sum=1.8)
     Normalized: [0.5556, 0.1667, 0.2222, 0.0556]
     """
-    from rollout import apply_bias, ActionCategory
+    from engine.rollout import apply_bias, ActionCategory
     s = np.array([0.2, 0.3, 0.4, 0.1], dtype=np.float64)
     cats = [ActionCategory.FOLD, ActionCategory.CALL,
             ActionCategory.RAISE, ActionCategory.RAISE]
@@ -172,7 +172,7 @@ def test_bias_fold_5x() -> None:
 
 def test_bias_call_5x() -> None:
     """Profile 2: P(call) × 5, then renormalize."""
-    from rollout import apply_bias, ActionCategory
+    from engine.rollout import apply_bias, ActionCategory
     s = np.array([0.2, 0.3, 0.4, 0.1], dtype=np.float64)
     cats = [ActionCategory.FOLD, ActionCategory.CALL,
             ActionCategory.RAISE, ActionCategory.RAISE]
@@ -189,7 +189,7 @@ def test_bias_raise_5x() -> None:
     raise is multiplied (the relative proportions between raises are
     preserved after renormalization — that's fine).
     """
-    from rollout import apply_bias, ActionCategory
+    from engine.rollout import apply_bias, ActionCategory
     s = np.array([0.2, 0.3, 0.4, 0.1], dtype=np.float64)
     cats = [ActionCategory.FOLD, ActionCategory.CALL,
             ActionCategory.RAISE, ActionCategory.RAISE]
@@ -203,7 +203,7 @@ def test_bias_raise_preserves_ratios() -> None:
     """After raise×5 bias, the relative ratio between raises is the
     same as before (both multiplied by 5 then renormalized together).
     """
-    from rollout import apply_bias, ActionCategory
+    from engine.rollout import apply_bias, ActionCategory
     s = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float64)
     cats = [ActionCategory.FOLD, ActionCategory.CALL,
             ActionCategory.RAISE, ActionCategory.RAISE]
@@ -220,7 +220,7 @@ def test_bias_degenerate_target_falls_back_to_unbiased() -> None:
     sum is 0 (for the bumped categories), so we fall back to the
     *unbiased* strategy, NOT to uniform (the old code's mistake).
     """
-    from rollout import apply_bias, ActionCategory
+    from engine.rollout import apply_bias, ActionCategory
     # Check-only node: only CHECK (we treat check as CALL category).
     s = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     cats = [ActionCategory.CALL, ActionCategory.RAISE, ActionCategory.RAISE]
@@ -241,7 +241,7 @@ def _build_hu_flop_leaf(rec: RecorderBlueprint):
     Preflop: UTG=player 0 opens (action 2), BB=player 1 calls (action 1).
     Postflop starts with BB to act (OOP). Pot = 6 BB. Stacks 97 BB each.
     """
-    from rollout import RolloutLeaf  # type: ignore
+    from engine.rollout import RolloutLeaf  # type: ignore
     # AhKsTd flop
     board = [47, 50, 34]  # specific card ints; values don't matter for this test
     return RolloutLeaf(
@@ -264,7 +264,7 @@ def test_action_history_includes_preflop() -> None:
     """First blueprint lookup after entering the rollout must see the
     preflop action prefix, not an empty history.
     """
-    from rollout import compute_leaf_value  # type: ignore
+    from engine.rollout import compute_leaf_value  # type: ignore
     rec = RecorderBlueprint()
     leaf = _build_hu_flop_leaf(rec)
     # Just one rollout; we only care about the first call.
@@ -291,7 +291,7 @@ def test_action_history_grows_in_street() -> None:
     """As rollout actions are taken within a street, they append to the
     history passed to blueprint lookups.
     """
-    from rollout import compute_leaf_value
+    from engine.rollout import compute_leaf_value
     rec = RecorderBlueprint()
     leaf = _build_hu_flop_leaf(rec)
     _ = compute_leaf_value(
@@ -324,7 +324,7 @@ def test_acting_order_postflop_hu() -> None:
     """In HU (2p), BB acts first postflop (OOP). Confirm via the first
     player in the recorder's call list.
     """
-    from rollout import compute_leaf_value
+    from engine.rollout import compute_leaf_value
     rec = RecorderBlueprint()
     leaf = _build_hu_flop_leaf(rec)
     _ = compute_leaf_value(
@@ -347,7 +347,7 @@ def test_acting_order_postflop_hu() -> None:
 
 def test_acting_order_respects_active_mask() -> None:
     """Folded players are skipped in the acting order."""
-    from rollout import RolloutLeaf, compute_leaf_value
+    from engine.rollout import RolloutLeaf, compute_leaf_value
     rec = RecorderBlueprint()
     # 3 players, player 1 has already folded.
     leaf = RolloutLeaf(
@@ -392,7 +392,7 @@ def test_uses_blueprint_hand_to_bucket() -> None:
     """The rollout should call blueprint.hand_to_bucket for every hero
     hand bucket lookup, not compute its own EHS.
     """
-    from rollout import compute_leaf_value
+    from engine.rollout import compute_leaf_value
     rec = RecorderBlueprint()
     leaf = _build_hu_flop_leaf(rec)
     _ = compute_leaf_value(
@@ -422,9 +422,9 @@ def test_coverage_miss_substitutes_uniform() -> None:
     1 supplementary. The leaf_coverage record makes the substitution
     observable; the rollout must NOT raise LeafValueUnavailable.
     """
-    from rollout import compute_leaf_value
-    from leaf_values import LeafValueUnavailable
-    import leaf_coverage
+    from engine.rollout import compute_leaf_value
+    from engine.leaf_values import LeafValueUnavailable
+    import engine.leaf_coverage as leaf_coverage
     bp = NoneBlueprint()
     rec_leaf = _build_hu_flop_leaf(RecorderBlueprint())  # reuse shape
     with leaf_coverage.CoverageScope() as scope:
@@ -465,7 +465,7 @@ def test_coverage_hit_returns_blueprint_strategy() -> None:
     uses its strategy, NOT uniform. Without this, every "expect uniform
     on miss" test could pass by always returning uniform.
     """
-    from rollout import _lookup_strategy
+    from engine.rollout import _lookup_strategy
     bp = FixedStrategyBlueprint(np.array([0.7, 0.2, 0.1], dtype=np.float32))
     result = _lookup_strategy(
         blueprint=bp, board=[0, 1, 2], action_history=[],
@@ -490,8 +490,8 @@ def test_post_truncate_zerosum_records_miss() -> None:
     the C and Python counters diverge). Mirrors src/rollout.c's
     post-truncate zero-sum check.
     """
-    from rollout import compute_leaf_value
-    import leaf_coverage
+    from engine.rollout import compute_leaf_value
+    import engine.leaf_coverage as leaf_coverage
     # Blueprint returns BPS_MAX_ACTIONS (16) actions with all mass at
     # the last index. Rollout tree's n_actions is always < 16 at
     # postflop nodes, so strat_full[:n_actions] is always all-zero —
@@ -538,8 +538,8 @@ def test_post_truncate_zerosum_records_miss() -> None:
 
 def test_showdown_hero_wins() -> None:
     """Hero with pocket aces on a dry board beats opponent with 72o."""
-    from rollout import compute_showdown_payoff  # type: ignore
-    from solver import card_to_int
+    from engine.rollout import compute_showdown_payoff  # type: ignore
+    from engine.solver import card_to_int
 
     # Hero: AhAs; Opp: 7d2c; Board: Ks8s3h5c9d (hero has AA, opp has high 9)
     hero_hand = (card_to_int("Ah"), card_to_int("As"))
@@ -563,8 +563,8 @@ def test_showdown_hero_wins() -> None:
 
 def test_showdown_chop() -> None:
     """Two hands that chop (e.g., both play the board) split the pot."""
-    from rollout import compute_showdown_payoff
-    from solver import card_to_int
+    from engine.rollout import compute_showdown_payoff
+    from engine.solver import card_to_int
 
     # Board has a flush, both hands play it: 2c3c (no spades) vs 4d5d (no spades)
     # Board: AsKsQsJs9s — royal flush on board with spades, both players
@@ -589,8 +589,8 @@ def test_showdown_chop() -> None:
 
 def test_fold_payoff_hero_last_standing() -> None:
     """Everyone folded to hero: hero wins pot, loses own bets."""
-    from rollout import compute_showdown_payoff
-    from solver import card_to_int
+    from engine.rollout import compute_showdown_payoff
+    from engine.solver import card_to_int
 
     hero_hand = (card_to_int("Ah"), card_to_int("As"))
     opp_hand = (card_to_int("7d"), card_to_int("2c"))
@@ -618,14 +618,14 @@ def test_fold_payoff_hero_last_standing() -> None:
 
 def test_determinism_same_seed() -> None:
     """Same seed → same output bit-for-bit."""
-    from rollout import compute_leaf_value
+    from engine.rollout import compute_leaf_value
     # Use FixedStrategyBlueprint so rollout actions are sampled from the
     # same distribution at every step — any nondeterminism will appear.
     strat = np.array([0.2, 0.3, 0.3, 0.2], dtype=np.float32)
     bp = FixedStrategyBlueprint(strat)
 
     def run(seed: int) -> float:
-        from rollout import RolloutLeaf
+        from engine.rollout import RolloutLeaf
         leaf = RolloutLeaf(
             board=[47, 50, 34],
             pot_chips=600,
