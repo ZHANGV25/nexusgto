@@ -106,7 +106,7 @@ def _pack_leaf_flop_history(dst, li, leaf_idx_for_error: int) -> None:
 
 
 def _find_lib() -> ctypes.CDLL:
-    base = Path(__file__).resolve().parent.parent / "build"
+    base = Path(__file__).resolve().parent.parent.parent / "build"  # engine/ -> python/ -> repo root (2026-06 relocation)
     ext = ".dll" if sys.platform == "win32" else ".so"
     candidates = [base / f"rollout{ext}"]
     env_path = os.environ.get("POKER_SOLVER_PATH")
@@ -1329,7 +1329,7 @@ def dump_cont_ev_table_to_file(holder, output_path: str,
 
 
 def _find_blueprint_lib() -> ctypes.CDLL:
-    base = Path(__file__).resolve().parent.parent / "build"
+    base = Path(__file__).resolve().parent.parent.parent / "build"  # engine/ -> python/ -> repo root (2026-06 relocation)
     ext = ".dll" if sys.platform == "win32" else ".so"
     candidates = [base / f"mccfr_blueprint{ext}"]
     env_path = os.environ.get("POKER_SOLVER_PATH")
