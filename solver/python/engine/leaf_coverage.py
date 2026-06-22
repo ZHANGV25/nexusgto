@@ -19,7 +19,7 @@ Scope:
 
 Typical shape:
 
-    from leaf_coverage import CoverageScope, record
+    from engine.leaf_coverage import CoverageScope, record
 
     with CoverageScope() as cov:
         result = provider.solve(query)
@@ -29,7 +29,7 @@ Typical shape:
 
 Inside the lookup code:
 
-    from leaf_coverage import record
+    from engine.leaf_coverage import record
     ...
     if strat is None:
         record("sigma_lookup", hit=False, detail=f"street={street}")

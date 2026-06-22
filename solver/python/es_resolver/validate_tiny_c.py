@@ -20,8 +20,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from street_solver_gpu import StreetSolverGPU  # noqa: E402
-from solver import card_to_int  # noqa: E402
+from engine.street_solver_gpu import StreetSolverGPU  # noqa: E402
+from engine.solver import card_to_int  # noqa: E402
 from es_resolver.es_solver import snapshot_tree  # noqa: E402
 from es_resolver.validate_tiny import exploitability  # noqa: E402
 from es_resolver.c_solver import CSolver  # noqa: E402

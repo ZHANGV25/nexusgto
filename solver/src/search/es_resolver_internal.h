@@ -1,0 +1,164 @@
+/**
+ * es_resolver_internal.h — cross-TU internal declarations shared between
+ * es_resolver.c and the reach-CFR split es_resolver_reach.c.
+ *
+ * NOT a public API. These symbols were file-static in es_resolver.c and are
+ * promoted to extern (definitions stay in their original TU) solely so the
+ * reach-CFR block can live in a sibling translation unit compiled into the
+ * SAME shared library. No behavior change.
+ */
+#ifndef ES_RESOLVER_INTERNAL_H
+#define ES_RESOLVER_INTERNAL_H
+
+#include "es_resolver.h"
+
+/* Node type codes (mirror street_solve.cuh SS_NODE_*). Shared by es_resolver.c
+ * and es_resolver_reach.c (moved here from es_resolver.c; macros emit no symbol). */
+#define ES_T_DECISION 0
+#define ES_T_FOLD     1
+#define ES_T_SHOWDOWN 2
+#define ES_T_CHANCE   3
+#define ES_T_LEAF     4
+
+/* Pluribus uses -310M on int32; we use float64 regrets with a generous floor
+ * (matches es_solver.py REGRET_FLOOR = -1e12). */
+#define ES_REGRET_FLOOR (-1e12)
+
+/* Full ESResolver state — promoted here (was file-private in es_resolver.c)
+ * so es_resolver_reach.c sees the complete type. A struct definition emits
+ * no symbol, so this changes no ABI. */
+/* ── Resolver state ──────────────────────────────────────────────────────── */
+struct ESResolver {
+    const SSTreeData *tree;
+    int np;
+    int num_nodes;
+
+    ESLeafOracle oracle;
+    void *oracle_ctx;
+    uint64_t master_seed;
+
+    /* CFR variant. 0 = VANILLA (the validated reference fixed point — plain
+     * per-visit strat-sum, no regret discount). 1 = LINEAR CFR matching the GPU
+     * (street_solve.cu:1933-1943): strat-sum += t·σ, regrets ·= t/(t+1) per
+     * traverser-node visit. Linear converges to the SAME Nash but faster — the
+     * GPU runs Linear, so an iso-quality iteration comparison must give the C ES
+     * the same acceleration. Vanilla kept for the validation gates (matches
+     * es_solver.py, whose linear_cfr flag is dead). */
+    int cfr_mode;
+
+    /* Traverser vectorization. 0 = SCALAR (the validated reference: one walk
+     * updates exactly one traverser hand = sampled[traverser]). 1 = VECTORIZED:
+     * one walk down a single opponent-sampled path updates ALL traverser hands
+     * at once (shared tree traversal, per-hand regret-match + update + leaf).
+     * Lower variance ⇒ fewer iters for the same exploitability. The fixed point
+     * is IDENTICAL — Gate 1 (es_resolver.c design doc) asserts same exploitability
+     * as scalar on a validated 2p/3p spot WITH OVERLAPPING ranges (so the
+     * dead-hand card-conflict skip is exercised). Set BEFORE es_run. */
+    int vec_traverser;
+
+    /* Chance / opponent-action handling modes (per-resolver, set before es_run).
+     * -1 = inherit the process default (env var); 0/1 = explicit. Env defaults:
+     *   chance:   ENUMERATE unless ES_CHANCE_SAMPLE=1.
+     *   opponent: SAMPLE unless ES_OPP_ENUMERATE=1.
+     * The caller (cpu_es_solver) sets these per-solve so a 2p chance tree can use
+     * (chance-enum + opp-enum + vec) for a deterministic-modulo-opp-hand solve
+     * while 5-6p keeps sampling — both in the SAME process (env caching can't do
+     * that; these fields can). See es_set_chance_mode / es_set_opp_mode. */
+    int chance_mode;   /* -1 default, 0 sample, 1 enumerate */
+    int opp_mode;      /* -1 default, 0 sample, 1 enumerate */
+
+    /* Full-per-hand-REACH vector CFR (2026-06-14, the interactive 2p chance fix).
+     * 0 = OFF (default; the validated sampling traversers above). 1 = ON: carry a
+     * per-player per-node per-hand reach vector and integrate ALL opponent hands
+     * each iteration with NO opponent-hand sampling, mirroring street_solve.cu's
+     * vector CFR (ss_batch_propagate_reach / _cfv / _showdown_value). Zero
+     * variance over opponent hands AND chance (chance is ENUMERATED), so the
+     * solve converges in ~hundreds of iters in seconds instead of the
+     * minutes-per-solve the sampling vec path needs to average out opponent-hand
+     * variance. Tractable only for SMALL player counts (the reach pass is O(nodes
+     * · max_hands · np) per iter, no action/hand product blow-up — but 5-6p keep
+     * SAMPLING, never reach, so the high-N intractability is structural elsewhere,
+     * not here). Set via es_set_reach_mode BEFORE es_run; takes the dedicated
+     * es_run_reach path and ignores cfr/vec/chance/opp modes (it is always
+     * Linear-CFR + chance-enumerate + full reach by construction). */
+    int reach_mode;
+
+    /* Reach-CFR scratch (allocated lazily by es_run_reach; freed in es_free).
+     * reach[p * num_nodes * max_h + node * max_h + hand] — one block per player.
+     * cfv[node * max_h + hand] — the current traverser's counterfactual values.
+     * strat[node * SS_MAX_ACTIONS * max_h + a * max_h + hand] — regret-matched
+     * strategy per acting player's hand (filled once per traverser-iter; the
+     * GPU's d_strategy). max_h is the per-resolver max over players' hand counts. */
+    int reach_max_h;
+    double *rc_reach;   /* [np * num_nodes * max_h] or NULL */
+    double *rc_cfv;     /* [num_nodes * max_h] or NULL */
+    double *rc_strat;   /* [num_nodes * SS_MAX_ACTIONS * max_h] or NULL */
+
+    /* Showdown strength cache (iteration-invariant: board+hand -> 7-card rank).
+     * rc_sd_strength[node*np*max_h + player*max_h + hand], 0 = "not yet computed
+     * / board-conflicting" (a real eval7 rank is never 0 for a 5-board+2-hole
+     * hand). Filled lazily on the first showdown visit per node and reused every
+     * iteration — eval7 is the dominant per-iter cost (one per (showdown node,
+     * hand)), and it does NOT depend on the strategy. rc_sd_done[node] gates the
+     * fill (so it happens once). NULL until the first reach run. */
+    uint32_t *rc_sd_strength;   /* [num_nodes * np * max_h] or NULL */
+    uint8_t  *rc_sd_done;       /* [num_nodes] 0/1, or NULL */
+
+    /* Per-decision-node dense storage, keyed (node, hand, action).
+     * For node i:  regrets[off[i] + hand*na[i] + a]. Terminal/non-decision
+     * nodes have off[i] = -1 and na[i] = 0. The hand axis uses the ACTING
+     * player's hand count at node i (an info set is (node, acting-player hand)).
+     */
+    int64_t *node_off;        /* [num_nodes]; -1 if not a decision node */
+    int *node_na;             /* [num_nodes]; 0 if not a decision node */
+    int64_t total_elems;
+    double *regrets;          /* [total_elems], shared (Hogwild) */
+    double *strat_sum;        /* [total_elems], shared (Hogwild) */
+
+    /* Stats. Under Hogwild these are racy counters (informational, like the
+     * Python reference's stats); the validated metric is convergence, not
+     * exact counts. */
+    ESStats stats;
+
+    /* DEBUG: per-node traverser-visit counter (incremented when acting==traverser
+     * at a decision node). Allocated lazily by es_enable_visit_counter; NULL =
+     * off (zero overhead). Used to localize the vec reachability bug — find the
+     * first node on a path where vec's count diverges from scalar. */
+    int64_t *visit_count;   /* [num_nodes] or NULL */
+};
+
+
+/* Hidden-visibility for promoted-from-static internals (see mccfr_blueprint_internal.h).
+ * Keeps these un-exported so a second in-process .so cannot interpose them. */
+#ifndef NEXUS_INTERNAL
+#  if defined(__GNUC__) || defined(__clang__)
+#    define NEXUS_INTERNAL __attribute__((visibility("hidden")))
+#  else
+#    define NEXUS_INTERNAL
+#  endif
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Set the thread-local last-error string (printf-style). Definition (and the
+ * g_es_error thread-local buffer it writes) stay in es_resolver.c. */
+NEXUS_INTERNAL void es_set_error(const char *fmt, ...);
+
+/* Regret-matching: positive-regret normalize into a strategy (uniform if all
+ * non-positive). Definition in es_resolver.c. */
+void es_regret_match(const double *r, int na, double *out);
+
+/* Accumulate one ESStats into another (thread-merge). Definition in es_resolver.c. */
+void es_merge_stats(ESStats *dst, const ESStats *src);
+
+/* Full per-hand vector reach-CFR driver (np==2 only). Definition in
+ * es_resolver_reach.c; called from es_run in es_resolver.c. */
+NEXUS_INTERNAL int es_run_reach(ESResolver *r, int64_t iterations, int num_threads);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ES_RESOLVER_INTERNAL_H */

@@ -27,9 +27,9 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO / "python"))
 
-import rollout as py_rollout  # type: ignore[import-untyped]
-import rollout_c as c_rollout  # type: ignore[import-untyped]
-from rollout import ActionCategory  # type: ignore[import-untyped]
+import engine.rollout as py_rollout  # type: ignore[import-untyped]
+import engine.rollout_c as c_rollout  # type: ignore[import-untyped]
+from engine.rollout import ActionCategory  # type: ignore[import-untyped]
 
 
 # ─── Harness ─────────────────────────────────────────────────────────────

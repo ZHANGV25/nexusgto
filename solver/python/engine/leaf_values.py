@@ -512,9 +512,9 @@ def compute_flop_leaf_values_bpr3(
     # The action_hash is computed from game_action_indices (preflop sequence).
     # board=[] and street=1 (flop) with board_hash=0 per the unified format.
     try:
-        from leaf_coverage import record as _cov_record
+        from engine.leaf_coverage import record as _cov_record
     except ImportError:
-        from python.leaf_coverage import record as _cov_record  # type: ignore
+        from engine.leaf_coverage import record as _cov_record  # type: ignore
 
     player_evs = []
     player_strats = []

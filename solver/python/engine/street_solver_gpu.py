@@ -36,10 +36,7 @@ SS_MAX_ACTIONS = 8
 SS_MAX_BOARD = 5
 SCALE = 100
 
-try:
-    from solver import card_to_int, int_to_card, parse_range_string
-except ImportError:
-    from python.solver import card_to_int, int_to_card, parse_range_string
+from engine.solver import card_to_int, int_to_card, parse_range_string
 
 # ── DLL loading ──────────────────────────────────────────────────────────
 
@@ -59,7 +56,11 @@ def _get_lib(lib_filename: Optional[str] = None):
     cached = _LIB_CACHE.get(lib_filename)
     if cached is not None:
         return cached
-    solver_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # LOAD-BEARING DEPTH: this file is python/engine/street_solver_gpu.py, so go up
+    # 3 levels (engine -> python -> repo root) to reach build/. (Was 2 levels when
+    # this lived at python/street_solver_gpu.py.) If the final path ends in
+    # python/build the depth is WRONG.
+    solver_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     lib_path = os.path.join(solver_dir, "build", lib_filename)
     if not os.path.exists(lib_path):
         raise FileNotFoundError(f"street_solve library not found at {lib_path}")

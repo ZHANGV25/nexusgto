@@ -45,11 +45,11 @@ def _spawn_build(board: List[str], num_players: int) -> int:
         import os, sys
         os.environ['POKER_SEARCH_DEPTH'] = 'single'
         sys.path.insert(0, {str(ROOT / 'python')!r})
-        from street_solver_gpu import StreetSolverGPU
+        from engine.street_solver_gpu import StreetSolverGPU
 
         hands = []
         board_set = set([])  # cards parsed below
-        from solver import card_to_int
+        from engine.solver import card_to_int
         board_cards = [card_to_int(c) for c in {board_repr}]
         board_set = set(board_cards)
         for c0 in range(52):

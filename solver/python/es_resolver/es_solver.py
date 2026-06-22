@@ -260,7 +260,7 @@ class ESSolver:
         """Value at a SHOWDOWN terminal (river only). Uses sampled hands +
         7-card eval. Single-pot (no side pots) to mirror the rollout
         convention (rollout.py compute_showdown_payoff)."""
-        from leaf_values import _eval7_py  # local import; heavy module
+        from engine.leaf_values import _eval7_py  # local import; heavy module
         board = list(self.tree.board)
         live = [p for p in range(self._np) if node.active[p]]
         if traverser not in live:

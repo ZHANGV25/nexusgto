@@ -10,8 +10,8 @@ with-Python limitations, and test plan.
 
 Usage:
 
-    from bps_reader_py import BPSReaderC
-    from rollout_c import compute_subgame_leaf_values_c
+    from engine.bps_reader_py import BPSReaderC
+    from engine.rollout_c import compute_subgame_leaf_values_c
 
     bp = BPSReaderC(".../unified_blueprint_v3_1.5B.bps")
     leaf_values = compute_subgame_leaf_values_c(
@@ -37,9 +37,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from leaf_values import LeafValueUnavailable  # type: ignore[import-untyped]
+    from engine.leaf_values import LeafValueUnavailable  # type: ignore[import-untyped]
 except ImportError:
-    from python.leaf_values import LeafValueUnavailable  # type: ignore[no-redef]
+    from engine.leaf_values import LeafValueUnavailable  # type: ignore[no-redef]
 
 
 # Must match ROLLOUT_MAX_PLAYERS in src/rollout.h
@@ -106,7 +106,7 @@ def _pack_leaf_flop_history(dst, li, leaf_idx_for_error: int) -> None:
 
 
 def _find_lib() -> ctypes.CDLL:
-    base = Path(__file__).resolve().parent.parent / "build"
+    base = Path(__file__).resolve().parent.parent.parent / "build"  # engine/ -> python/ -> repo root (2026-06 relocation)
     ext = ".dll" if sys.platform == "win32" else ".so"
     candidates = [base / f"rollout{ext}"]
     env_path = os.environ.get("POKER_SOLVER_PATH")
@@ -1329,7 +1329,7 @@ def dump_cont_ev_table_to_file(holder, output_path: str,
 
 
 def _find_blueprint_lib() -> ctypes.CDLL:
-    base = Path(__file__).resolve().parent.parent / "build"
+    base = Path(__file__).resolve().parent.parent.parent / "build"  # engine/ -> python/ -> repo root (2026-06 relocation)
     ext = ".dll" if sys.platform == "win32" else ".so"
     candidates = [base / f"mccfr_blueprint{ext}"]
     env_path = os.environ.get("POKER_SOLVER_PATH")

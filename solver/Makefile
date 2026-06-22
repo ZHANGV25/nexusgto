@@ -7,6 +7,20 @@ SRC_DIR = src
 BENCH_DIR = bench
 BUILD_DIR = build
 
+# ── Include search path ──
+# Every #include uses a BARE sibling name (e.g. "card_abstraction.h",
+# "mccfr_blueprint.h", "rollout.h"); the C sources now live in domain subdirs
+# (core/blueprint/search/archive) so one -I per subdir resolves them all WITHOUT
+# editing any #include line. -I$(SRC_DIR) MUST be kept so the relative
+# "cuda/street_solve.cuh" includes still resolve (cuda/ stays at src/cuda/).
+INCS = -I$(SRC_DIR) -I$(SRC_DIR)/core -I$(SRC_DIR)/blueprint -I$(SRC_DIR)/search
+
+# ── Relocated source paths (domain subdirs; structure-only move) ──
+CORE_DIR   = $(SRC_DIR)/core
+BP_DIR     = $(SRC_DIR)/blueprint
+SEARCH_DIR = $(SRC_DIR)/search
+ARCH_DIR   = $(SRC_DIR)/archive
+
 # Detect OS for shared library extension
 ifeq ($(OS),Windows_NT)
   SHLIB_EXT = .dll
@@ -18,7 +32,7 @@ endif
 
 .PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve street_solve_joint street_solve_cpu subgame_preflop
 
-all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
+all: blueprint
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -27,12 +41,12 @@ $(BUILD_DIR):
 # Requires both mccfr_blueprint.c and card_abstraction.c (k-means bucketing)
 blueprint: $(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT)
 
-$(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
 
 # ── Street solver v2 (GPU re-solve support library) ──
-$(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(ARCH_DIR)/solver_v2.c $(ARCH_DIR)/solver_v2.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $(INCS) $(ARCH_DIR)/solver_v2.c -o $@ $(LDFLAGS)
 
 # ── Preflop subgame CFR (CPU, OpenMP-parallel over hero buckets) ──
 # Pure CFR core: takes a flat tree + reaches + leaf values, returns σ̄.
@@ -56,36 +70,36 @@ else
   SUBGAME_OMP_LIBS =
 endif
 
-$(BUILD_DIR)/subgame_preflop$(SHLIB_EXT): $(SRC_DIR)/subgame_preflop.c $(SRC_DIR)/subgame_preflop.h $(SRC_DIR)/bps_reader.h | $(BUILD_DIR)
+$(BUILD_DIR)/subgame_preflop$(SHLIB_EXT): $(ARCH_DIR)/subgame_preflop.c $(ARCH_DIR)/subgame_preflop.h $(BP_DIR)/bps_reader.h | $(BUILD_DIR)
 	$(CC) -O3 -march=native -Wall -Wextra -Wno-unused-parameter \
-	    $(SHLIB_FLAGS) $(SUBGAME_OMP_FLAGS) -I$(SRC_DIR) \
-	    $(SRC_DIR)/subgame_preflop.c -o $@ $(LDFLAGS) $(SUBGAME_OMP_LIBS)
+	    $(SHLIB_FLAGS) $(SUBGAME_OMP_FLAGS) $(INCS) \
+	    $(ARCH_DIR)/subgame_preflop.c -o $@ $(LDFLAGS) $(SUBGAME_OMP_LIBS)
 
 # ── Street solver v1 (legacy, for Python bindings compatibility) ──
-$(BUILD_DIR)/solver$(SHLIB_EXT): $(SRC_DIR)/solver.c $(SRC_DIR)/solver.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/solver.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/solver$(SHLIB_EXT): $(ARCH_DIR)/solver.c $(ARCH_DIR)/solver.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $(INCS) $(ARCH_DIR)/solver.c -o $@ $(LDFLAGS)
 
 # ── BPS reader (pure reader + turn/river bucketizer) ──
 # Links card_abstraction.c for bps_hand_to_bucket_turn/river (EHS/k-means).
 # No OpenMP needed — bucketizer is single-hand at a time.
 bps_reader: $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
 
-$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -I$(SRC_DIR) $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $(INCS) $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c -o $@ $(LDFLAGS)
 
 # ── BPS EV walk (reader + card_abstraction + OpenMP) ──
 bps_ev_walk: $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT)
 
-$(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c -o $@ $(LDFLAGS)
 
 # ── Rollout (C port of python/rollout.py) ──
 # Depth-limited Pluribus-faithful leaf values for real-time solve.
 # Links bps_reader.c (blueprint queries); eval7 is header-only.
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
-$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp -I$(SRC_DIR) $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
 
 # ── CPU external-sampling ES re-solver (HYBRID 5p flop/turn path) ──
 # es_resolver: lightweight (table/joint oracles only) — validation harnesses.
@@ -105,15 +119,15 @@ endif
 es_resolver: $(BUILD_DIR)/es_resolver$(SHLIB_EXT)
 es_resolver_real: $(BUILD_DIR)/es_resolver_real$(SHLIB_EXT)
 
-$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_resolver.h $(SRC_DIR)/es_oracles.c $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp -I$(SRC_DIR) \
-	    $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_oracles.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_oracles.c $(SRC_DIR)/es_real_oracle.c $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/es_resolver.h $(SRC_DIR)/rollout.h | $(BUILD_DIR)
-	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) -I$(SRC_DIR) \
-	    $(SRC_DIR)/es_resolver.c $(SRC_DIR)/es_oracles.c $(SRC_DIR)/es_real_oracle.c \
-	    $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_phase_r.c \
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/rollout.h | $(BUILD_DIR)
+	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
 
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
@@ -125,9 +139,9 @@ NVCC ?= nvcc
 SS_GPU_ARCH ?= sm_75
 street_solve: $(BUILD_DIR)/street_solve$(SHLIB_EXT)
 
-$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h $(SRC_DIR)/ss_tree_api.c | $(BUILD_DIR)
-	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -I$(SRC_DIR) \
-	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_api.c -o $@
+$(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_tree_builder.h $(SEARCH_DIR)/ss_tree_api.c | $(BUILD_DIR)
+	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) $(INCS) \
+	    $(SRC_DIR)/cuda/street_solve.cu $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_tree_api.c -o $@
 
 # JOINT-mode variant for the nexusgto-api Phase 5.1 diagnostic
 # (docs/OP4_CONT_STRAT_MARGINAL_PLAN.md). Same sources, compiled with
@@ -138,9 +152,9 @@ $(BUILD_DIR)/street_solve$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR
 # stay on SAMPLED.
 street_solve_joint: $(BUILD_DIR)/street_solve_joint$(SHLIB_EXT)
 
-$(BUILD_DIR)/street_solve_joint$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h $(SRC_DIR)/ss_tree_api.c | $(BUILD_DIR)
-	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -DSS_CONT_STRAT_MODE=0 -I$(SRC_DIR) \
-	    $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_api.c -o $@
+$(BUILD_DIR)/street_solve_joint$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(SRC_DIR)/cuda/street_solve.cuh $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_tree_builder.h $(SEARCH_DIR)/ss_tree_api.c | $(BUILD_DIR)
+	$(NVCC) -O2 -shared -Xcompiler -fPIC -arch=$(SS_GPU_ARCH) -DSS_CONT_STRAT_MODE=0 $(INCS) \
+	    $(SRC_DIR)/cuda/street_solve.cu $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_tree_api.c -o $@
 
 # ── Street solve (CPU-only — tree builder, NO GPU solve) ──
 # gcc build of just the tree-build API (ss_tree_api.c + ss_tree_builder.c) plus
@@ -155,18 +169,18 @@ $(BUILD_DIR)/street_solve_joint$(SHLIB_EXT): $(SRC_DIR)/cuda/street_solve.cu $(S
 CC ?= gcc
 street_solve_cpu: $(BUILD_DIR)/street_solve_cpu$(SHLIB_EXT)
 
-$(BUILD_DIR)/street_solve_cpu$(SHLIB_EXT): $(SRC_DIR)/ss_tree_api.c $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_cpu_stub.c $(SRC_DIR)/ss_tree_builder.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
-	$(CC) -O2 -shared -fPIC -I$(SRC_DIR) \
-	    $(SRC_DIR)/ss_tree_api.c $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_cpu_stub.c -o $@
+$(BUILD_DIR)/street_solve_cpu$(SHLIB_EXT): $(SEARCH_DIR)/ss_tree_api.c $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_cpu_stub.c $(SEARCH_DIR)/ss_tree_builder.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) -O2 -shared -fPIC $(INCS) \
+	    $(SEARCH_DIR)/ss_tree_api.c $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_cpu_stub.c -o $@
 
 dll: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT) $(BUILD_DIR)/solver$(SHLIB_EXT) $(BUILD_DIR)/bps_reader$(SHLIB_EXT) $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT) $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
 # ── Benchmarks ──
-$(BUILD_DIR)/bench_v2: $(BENCH_DIR)/bench_v2.c $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -static -I$(SRC_DIR) $< $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/bench_v2: $(BENCH_DIR)/bench_v2.c $(ARCH_DIR)/solver_v2.c $(ARCH_DIR)/solver_v2.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -static $(INCS) $< $(ARCH_DIR)/solver_v2.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/test_phase1: $(BENCH_DIR)/test_phase1.c $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -static -I$(SRC_DIR) $< $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_phase1: $(BENCH_DIR)/test_phase1.c $(ARCH_DIR)/solver_v2.c $(ARCH_DIR)/solver_v2.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -static $(INCS) $< $(ARCH_DIR)/solver_v2.c -o $@ $(LDFLAGS)
 
 bench: $(BUILD_DIR)/bench_v2
 	./$(BUILD_DIR)/bench_v2
@@ -178,23 +192,23 @@ test: $(BUILD_DIR)/test_phase1
 # Statically links the blueprint solver for a self-contained test binary.
 # Python-side verifier (tests/test_phase_1_3_synthetic.py) consumes the
 # bundle this produces and asserts CFR identity + enumerated ground truth.
-$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fopenmp -I$(SRC_DIR) tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_phase_1_3_synthetic.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
 
 test_phase_1_3: $(BUILD_DIR)/test_phase_1_3
 	./$(BUILD_DIR)/test_phase_1_3 $(BUILD_DIR)/phase_1_3_synthetic.tbn
 	python3 tests/test_phase_1_3_synthetic.py $(BUILD_DIR)/phase_1_3_synthetic.tbn
 
 # ── BPS EV walk tests ──
-$(BUILD_DIR)/test_bps_ev_walk: tests/test_bps_ev_walk.c $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fopenmp -I$(SRC_DIR) tests/test_bps_ev_walk.c $(SRC_DIR)/bps_ev_walk.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS) -static
+$(BUILD_DIR)/test_bps_ev_walk: tests/test_bps_ev_walk.c $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_bps_ev_walk.c $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c -o $@ $(LDFLAGS) -static
 
 test_ev_walk: $(BUILD_DIR)/test_bps_ev_walk
 	./$(BUILD_DIR)/test_bps_ev_walk
 
 # ── PA-EMD tests (ca_emd_1d + ca_compute_ehs_distribution) ──
-$(BUILD_DIR)/test_pa_emd: tests/test_pa_emd.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_pa_emd.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_pa_emd: tests/test_pa_emd.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_pa_emd.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c -o $@ $(LDFLAGS)
 
 test_pa_emd: $(BUILD_DIR)/test_pa_emd
 	./$(BUILD_DIR)/test_pa_emd
@@ -202,8 +216,8 @@ test_pa_emd: $(BUILD_DIR)/test_pa_emd
 # ── BPS OCHS river bucketer regression test ──
 # Pins the Phase B fix: bps_init_ochs_river + bps_hand_to_bucket_river
 # routing through the OCHS path on representative river fixtures.
-$(BUILD_DIR)/test_bps_ochs_river: tests/test_bps_ochs_river.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/bps_reader.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_bps_ochs_river.c $(SRC_DIR)/bps_reader.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_bps_ochs_river: tests/test_bps_ochs_river.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_bps_ochs_river.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c -o $@ $(LDFLAGS)
 
 test_bps_ochs_river: $(BUILD_DIR)/test_bps_ochs_river
 	./$(BUILD_DIR)/test_bps_ochs_river
@@ -211,8 +225,8 @@ test_bps_ochs_river: $(BUILD_DIR)/test_bps_ochs_river
 # ── Phase R Block A.1: dispatch helper unit tests ──
 # Pure helper (mccfr_phase_r.c) tested in isolation — no card_abstraction
 # / hand_eval / OMP needed. Mac-runnable, <1s wall.
-$(BUILD_DIR)/test_phase_r_dispatch: tests/test_phase_r_dispatch.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_dispatch.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+$(BUILD_DIR)/test_phase_r_dispatch: tests/test_phase_r_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
 
 test_phase_r_dispatch: $(BUILD_DIR)/test_phase_r_dispatch
 	./$(BUILD_DIR)/test_phase_r_dispatch
@@ -221,16 +235,16 @@ test_phase_r_dispatch: $(BUILD_DIR)/test_phase_r_dispatch
 # Tests the boundary EV slot table (mccfr_cont_ev_table.{c,h}) in
 # isolation. Uses OpenMP for the multi-thread CAS test (T5) — falls
 # back to a SKIP if OMP isn't available (Mac without libomp).
-$(BUILD_DIR)/test_cont_ev_table: tests/test_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+$(BUILD_DIR)/test_cont_ev_table: tests/test_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
 
 test_cont_ev_table: $(BUILD_DIR)/test_cont_ev_table
 	./$(BUILD_DIR)/test_cont_ev_table
 
 # ── Phase R Block A.2: cont-bias reweighting helper unit tests ──
 # Pure math (bp_apply_cont_bias in mccfr_phase_r.c). Mac-runnable, <1s.
-$(BUILD_DIR)/test_cont_bias_strategy: tests/test_cont_bias_strategy.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_bias_strategy.c $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+$(BUILD_DIR)/test_cont_bias_strategy: tests/test_cont_bias_strategy.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_cont_bias_strategy.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
 
 test_cont_bias_strategy: $(BUILD_DIR)/test_cont_bias_strategy
 	./$(BUILD_DIR)/test_cont_bias_strategy
@@ -245,13 +259,13 @@ test_cont_bias_strategy: $(BUILD_DIR)/test_cont_bias_strategy
 # Compiled WITHOUT -fopenmp so it runs on Mac with Apple clang. The
 # trainer's omp pragmas degrade to no-ops; bp_solve runs single-threaded.
 $(BUILD_DIR)/test_phase_r_regression_smoke: tests/test_phase_r_regression_smoke.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_regression_smoke.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_regression_smoke.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_regression_smoke: $(BUILD_DIR)/test_phase_r_regression_smoke
@@ -263,13 +277,13 @@ test_phase_r_regression_smoke: $(BUILD_DIR)/test_phase_r_regression_smoke
 # allocates cont-ev table slots, and accumulates ev_count > 0 with
 # finite ev_sum values. Mac-runnable, ~10-20s.
 $(BUILD_DIR)/test_phase_r_heads_rollout: tests/test_phase_r_heads_rollout.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_heads_rollout.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_heads_rollout.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_heads_rollout: $(BUILD_DIR)/test_phase_r_heads_rollout
@@ -281,13 +295,13 @@ test_phase_r_heads_rollout: $(BUILD_DIR)/test_phase_r_heads_rollout
 # Plus T3: bp_compute_action_hash determinism (cont-bias-free by
 # signature). Mac-runnable, ~10-15s.
 $(BUILD_DIR)/test_phase_r_cont_strat_signed: tests/test_phase_r_cont_strat_signed.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_cont_strat_signed.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_cont_strat_signed.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_cont_strat_signed: $(BUILD_DIR)/test_phase_r_cont_strat_signed
@@ -296,9 +310,9 @@ test_phase_r_cont_strat_signed: $(BUILD_DIR)/test_phase_r_cont_strat_signed
 # ── Phase R Block B.2: bps_query_boundary_ev contract ──
 # Pure-table test; no trainer dep. ~<1s wall.
 $(BUILD_DIR)/test_bps_query_boundary_ev: tests/test_bps_query_boundary_ev.c \
-        $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_bps_query_boundary_ev.c \
-	    $(SRC_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+        $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_bps_query_boundary_ev.c \
+	    $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
 
 test_bps_query_boundary_ev: $(BUILD_DIR)/test_bps_query_boundary_ev
 	./$(BUILD_DIR)/test_bps_query_boundary_ev
@@ -309,13 +323,13 @@ test_bps_query_boundary_ev: $(BUILD_DIR)/test_bps_query_boundary_ev
 # byte-exact match on every (action_hash, player, bucket) → (ev_sum[4],
 # ev_count[4]) tuple. Mac-runnable, ~10-20s.
 $(BUILD_DIR)/test_bpr5_roundtrip: tests/test_bpr5_roundtrip.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_bpr5_roundtrip.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_bpr5_roundtrip.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
@@ -326,13 +340,13 @@ test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
 # index (rollout_hand_index_for_flop encoding), NOT a texture bucket and
 # NOT the raw per-player hand-list index. Deterministic, <1s.
 $(BUILD_DIR)/test_cont_ev_key: tests/test_cont_ev_key.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_cont_ev_key.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_cont_ev_key.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
@@ -343,13 +357,13 @@ test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
 # (ev_sum, ev_count); save+load; query via bp_query_boundary_ev; assert
 # byte-exact match on stored fields and OK status with the divided ratio.
 $(BUILD_DIR)/test_phase_r_save_load_e2e: tests/test_phase_r_save_load_e2e.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_save_load_e2e.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_save_load_e2e.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_save_load_e2e: $(BUILD_DIR)/test_phase_r_save_load_e2e
@@ -360,16 +374,16 @@ test_phase_r_save_load_e2e: $(BUILD_DIR)/test_phase_r_save_load_e2e
 # kernel-side root-to-leaf walk reproduces bp_compute_action_hash for
 # every leaf. PASS gate per spec §9.
 $(BUILD_DIR)/test_ss_action_hash: tests/test_ss_action_hash.c \
-        $(SRC_DIR)/ss_action_hash.c $(SRC_DIR)/ss_action_hash.h \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(ARCH_DIR)/ss_action_hash.c $(ARCH_DIR)/ss_action_hash.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
         $(SRC_DIR)/cuda/street_solve.cuh \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_ss_action_hash.c \
-	    $(SRC_DIR)/ss_action_hash.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) -I$(ARCH_DIR) tests/test_ss_action_hash.c \
+	    $(ARCH_DIR)/ss_action_hash.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_ss_action_hash: $(BUILD_DIR)/test_ss_action_hash
@@ -382,13 +396,13 @@ test_ss_action_hash: $(BUILD_DIR)/test_ss_action_hash
 # then runs bp_solve would silently scale every loaded ev_sum on each
 # discount tick. Mac-runnable, ~5-10s wall.
 $(BUILD_DIR)/test_phase_r_discount_gate: tests/test_phase_r_discount_gate.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_discount_gate.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_discount_gate.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_discount_gate: $(BUILD_DIR)/test_phase_r_discount_gate
@@ -399,17 +413,17 @@ test_phase_r_discount_gate: $(BUILD_DIR)/test_phase_r_discount_gate
 # trainer's bp_generate_actions byte-for-byte, on v3/phase3 production
 # config. Mac-runnable via the ss_tree_builder.{c,h} extraction.
 $(BUILD_DIR)/test_b3_encoding_alignment: tests/test_b3_encoding_alignment.c \
-        $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_tree_builder.h \
-        $(SRC_DIR)/ss_action_hash.c $(SRC_DIR)/ss_action_hash.h \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_tree_builder.h \
+        $(ARCH_DIR)/ss_action_hash.c $(ARCH_DIR)/ss_action_hash.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
         $(SRC_DIR)/cuda/street_solve.cuh \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_b3_encoding_alignment.c \
-	    $(SRC_DIR)/ss_tree_builder.c $(SRC_DIR)/ss_action_hash.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) -I$(ARCH_DIR) tests/test_b3_encoding_alignment.c \
+	    $(SEARCH_DIR)/ss_tree_builder.c $(ARCH_DIR)/ss_action_hash.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_b3_encoding_alignment: $(BUILD_DIR)/test_b3_encoding_alignment
@@ -422,15 +436,15 @@ test_b3_encoding_alignment: $(BUILD_DIR)/test_b3_encoding_alignment
 # all non-blocked (c0,c1) pairs, asserts trainer-stored bucket ==
 # reader-queried bucket on every covered query.
 $(BUILD_DIR)/test_b3_bucket_alignment: tests/test_b3_bucket_alignment.c \
-        $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_b3_bucket_alignment.c \
-	    $(SRC_DIR)/bps_reader.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_b3_bucket_alignment.c \
+	    $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS)
 
 test_b3_bucket_alignment: $(BUILD_DIR)/test_b3_bucket_alignment
@@ -445,13 +459,13 @@ test_b3_bucket_alignment: $(BUILD_DIR)/test_b3_bucket_alignment
 #   T3: same EV-only run, assert every cont_ev_table slot's bucket is
 #       in [0, postflop_num_buckets) (the Gate C.1 acceptance criterion).
 $(BUILD_DIR)/test_phase_r_boundary_bucket: tests/test_phase_r_boundary_bucket.c \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/hand_eval.h $(SRC_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_phase_r_boundary_bucket.c \
-	    $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_boundary_bucket.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_phase_r_boundary_bucket: $(BUILD_DIR)/test_phase_r_boundary_bucket
@@ -467,16 +481,16 @@ test_phase_r_boundary_bucket: $(BUILD_DIR)/test_phase_r_boundary_bucket
 # (rollout_compute_leaf_values_all_hands_c on the skip-betting path)
 # never enters the OMP parallel regions.
 $(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.c \
-        $(SRC_DIR)/rollout.c $(SRC_DIR)/rollout.h \
-        $(SRC_DIR)/bps_reader.c $(SRC_DIR)/bps_reader.h \
-        $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/card_abstraction.h \
-        $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/mccfr_blueprint.h \
-        $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
-        $(SRC_DIR)/mccfr_cont_ev_table.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) tests/test_rollout_cont_ev_boundary.c \
-	    $(SRC_DIR)/rollout.c $(SRC_DIR)/bps_reader.c \
-	    $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_blueprint.c \
-	    $(SRC_DIR)/mccfr_phase_r.c $(SRC_DIR)/mccfr_cont_ev_table.c \
+        $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_boundary.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
@@ -486,11 +500,11 @@ test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
 # Self-contained — links only against mccfr_cont_ev_table.c.
 $(BUILD_DIR)/test_cont_ev_standalone_roundtrip: \
         tests/test_cont_ev_standalone_roundtrip.c \
-        $(SRC_DIR)/mccfr_cont_ev_table.c $(SRC_DIR)/mccfr_cont_ev_table.h \
+        $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.h \
         | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) \
+	$(CC) $(CFLAGS) $(INCS) \
 	    tests/test_cont_ev_standalone_roundtrip.c \
-	    $(SRC_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_cont_ev_table.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_cont_ev_standalone_roundtrip: $(BUILD_DIR)/test_cont_ev_standalone_roundtrip

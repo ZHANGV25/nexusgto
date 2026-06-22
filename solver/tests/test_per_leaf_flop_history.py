@@ -18,12 +18,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from street_solver_gpu import (  # type: ignore[import-untyped]
+from engine.street_solver_gpu import (  # type: ignore[import-untyped]
     SSNode,
     SSTreeData,
     SS_MAX_PLAYERS,
 )
-from leaf_values import (  # type: ignore[import-untyped]
+from engine.leaf_values import (  # type: ignore[import-untyped]
     LeafInfo,
     _train_action_idx,
     extract_leaf_info_from_tree,

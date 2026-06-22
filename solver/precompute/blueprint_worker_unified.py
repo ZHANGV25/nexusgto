@@ -966,7 +966,7 @@ def main():
             try:
                 sys.path.insert(0, os.path.join(
                     os.path.dirname(os.path.dirname(__file__)), "python"))
-                from bps_reader_py import BPSReaderC
+                from engine.bps_reader_py import BPSReaderC
 
                 ev_t0 = time.time()
                 print(f"Loading final blueprint from {bps_path}...", flush=True)

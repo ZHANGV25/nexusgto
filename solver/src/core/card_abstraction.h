@@ -29,6 +29,22 @@
 extern "C" {
 #endif
 
+/* ── Internal shared sort helper ─────────────────────────────────── */
+/* Promoted from file-static so the river-nd / ochs split files can share
+ * the same percentile-sort comparator with the parent translation unit.
+ * Not part of the public ABI (no CA_EXPORT); used only for qsort callbacks.
+ * Hidden visibility so it is never exported from the .so (preserves the old
+ * file-static isolation; no cross-DSO interposition). No-op on MSVC/Windows. */
+#ifndef NEXUS_INTERNAL
+#  if defined(__GNUC__) || defined(__clang__)
+#    define NEXUS_INTERNAL __attribute__((visibility("hidden")))
+#  else
+#    define NEXUS_INTERNAL
+#  endif
+#endif
+typedef struct { int idx; float ehs; } EhsPair;
+NEXUS_INTERNAL int ca_cmp_ehs(const void *a, const void *b);
+
 /**
  * Compute Expected Hand Strength for a set of hands on a given board.
  *

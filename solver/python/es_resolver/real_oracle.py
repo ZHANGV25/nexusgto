@@ -22,8 +22,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rollout import compute_leaf_value, RolloutLeaf, NUM_ROLLOUTS_DEFAULT, NUM_BIAS_PROFILES  # noqa: E402
-from leaf_values import extract_leaf_info_from_tree  # noqa: E402
+from engine.rollout import compute_leaf_value, RolloutLeaf, NUM_ROLLOUTS_DEFAULT, NUM_BIAS_PROFILES  # noqa: E402
+from engine.leaf_values import extract_leaf_info_from_tree  # noqa: E402
 
 
 def build_real_leaf_oracle(

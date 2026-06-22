@@ -51,7 +51,7 @@ def _extract_leaf_state(ss_tree, n_players):
     """Per-leaf flat int32 arrays for the C oracle: pot, bets, active, hist,
     hist_len. pot/bets/hist come from the production extract_leaf_info_from_tree
     (the load-bearing flop_history_train); active is read from the leaf SSNode."""
-    from leaf_values import extract_leaf_info_from_tree
+    from engine.leaf_values import extract_leaf_info_from_tree
     leaf_infos = extract_leaf_info_from_tree(ss_tree, num_players=n_players)
     by_idx = {li.leaf_idx: li for li in leaf_infos}
     n_leaves = ss_tree.num_leaves
@@ -100,7 +100,7 @@ def main() -> int:
 
     # ── Load blueprint THROUGH es_resolver_real.dll (single-DLL pointer) ──
     print(f"\n[1/5] Loading blueprint via es_resolver_real.dll ...", flush=True)
-    import bps_reader_py
+    import engine.bps_reader_py as bps_reader_py
     from es_resolver.c_solver import _lib as es_real_lib, _HAS_REAL
     if not _HAS_REAL:
         print("  ERROR: es_resolver_real.dll not loaded (set ES_DLL). Abort.")
@@ -108,15 +108,15 @@ def main() -> int:
     # Repoint BPSReaderC's lib at the real ES DLL so the reader struct + rollout
     # share one module.
     bps_reader_py._find_lib = lambda: es_real_lib
-    from bps_reader_py import BPSReaderC
+    from engine.bps_reader_py import BPSReaderC
     t0 = time.time()
     blueprint = BPSReaderC(bp_path)
     print(f"      loaded in {time.time()-t0:.1f}s", flush=True)
     bp_handle = blueprint._reader.value  # BPSReader* address (int)
 
     # ── Build tree ──
-    from street_solver_gpu import StreetSolverGPU, _build_labels_at_node
-    from solver import card_to_int
+    from engine.street_solver_gpu import StreetSolverGPU, _build_labels_at_node
+    from engine.solver import card_to_int
     board = ["Ah", "Kh", "2c"]
     bi = [card_to_int(c) for c in board]
     ranges, nh = _real_grid_ranges(bi, n_players)
