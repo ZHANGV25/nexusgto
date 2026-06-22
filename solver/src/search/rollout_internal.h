@@ -23,6 +23,17 @@
 #define ROLLOUT_MAX_HANDS 1326
 #endif
 
+
+/* Hidden-visibility for promoted-from-static internals (see mccfr_blueprint_internal.h).
+ * Keeps these un-exported so a second in-process .so cannot interpose them. */
+#ifndef NEXUS_INTERNAL
+#  if defined(__GNUC__) || defined(__clang__)
+#    define NEXUS_INTERNAL __attribute__((visibility("hidden")))
+#  else
+#    define NEXUS_INTERNAL
+#  endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -53,12 +64,12 @@ static inline uint64_t rollout_derive_seed(
 
 /* Set the thread-local last-error (printf-style). Definition (and the
  * g_rollout_last_error thread-local) stay in rollout.c. */
-void rollout_set_error(int32_t street, int32_t num_players,
+NEXUS_INTERNAL void rollout_set_error(int32_t street, int32_t num_players,
                        const char *fmt, ...);
 
 /* Simulate one full rollout from a subgame leaf to terminal; writes payoff.
  * Definition in rollout.c (owns the simulator state/globals). */
-int rollout_simulate_one(
+NEXUS_INTERNAL int rollout_simulate_one(
     const BPSReader *r,
     const int *board_in, int32_t n_board_in,
     int32_t leaf_street,

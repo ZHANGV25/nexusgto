@@ -127,13 +127,24 @@ struct ESResolver {
     int64_t *visit_count;   /* [num_nodes] or NULL */
 };
 
+
+/* Hidden-visibility for promoted-from-static internals (see mccfr_blueprint_internal.h).
+ * Keeps these un-exported so a second in-process .so cannot interpose them. */
+#ifndef NEXUS_INTERNAL
+#  if defined(__GNUC__) || defined(__clang__)
+#    define NEXUS_INTERNAL __attribute__((visibility("hidden")))
+#  else
+#    define NEXUS_INTERNAL
+#  endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Set the thread-local last-error string (printf-style). Definition (and the
  * g_es_error thread-local buffer it writes) stay in es_resolver.c. */
-void es_set_error(const char *fmt, ...);
+NEXUS_INTERNAL void es_set_error(const char *fmt, ...);
 
 /* Regret-matching: positive-regret normalize into a strategy (uniform if all
  * non-positive). Definition in es_resolver.c. */
@@ -144,7 +155,7 @@ void es_merge_stats(ESStats *dst, const ESStats *src);
 
 /* Full per-hand vector reach-CFR driver (np==2 only). Definition in
  * es_resolver_reach.c; called from es_run in es_resolver.c. */
-int es_run_reach(ESResolver *r, int64_t iterations, int num_threads);
+NEXUS_INTERNAL int es_run_reach(ESResolver *r, int64_t iterations, int num_threads);
 
 #ifdef __cplusplus
 }
