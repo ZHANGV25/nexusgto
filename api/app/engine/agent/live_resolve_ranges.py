@@ -38,8 +38,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from app.agent.game_state import SEAT_NAME
-from app.agent.preflop_range import build_seat_range_weights, hand_class_169
+from app.engine.agent.game_state import SEAT_NAME
+from app.engine.agent.preflop_range import build_seat_range_weights, hand_class_169
 from app.services.preflop_provider import HAND_GRID
 
 # Preflop acting order (UTG first), matching game_state._PREFLOP_ORDER.

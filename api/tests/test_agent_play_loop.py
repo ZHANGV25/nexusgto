@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.agent import PokerAgent, SampledAction
-from app.agent.game_state import new_postflop_state
-from app.agent.modes import ModeConfig
-from app.agent.strategy_source import ActionMix, LookupSource, StrategySource
+from app.engine.agent.agent import PokerAgent, SampledAction
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.modes import ModeConfig
+from app.engine.agent.strategy_source import ActionMix, LookupSource, StrategySource
 
 
 def _ci(card: str) -> int:
@@ -218,7 +218,7 @@ def test_deep_raise_war_node_now_serves_correct_length_mix(blueprint_path):
 def test_live_resolve_requires_engine_or_blueprint():
     # LIVE_RESOLVE must fail LOUD (not silently fall back to LOOKUP) when it has
     # neither an injected CpuEsSolver nor a blueprint_path to build one.
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
     src = LiveResolveSource(ModeConfig(mode="LIVE_RESOLVE", blueprint_path=None))
     with pytest.raises(ValueError):
         src._ensure_engine()
@@ -231,7 +231,7 @@ def test_live_resolve_river_without_dealt_cards_fails_loud():
     # silent wrong-street solve and never a lookup-fallback (this is a driver
     # bug, not a documented unsupported surface). A fake engine that would
     # explode if called proves get_mix never reaches it.
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
 
     class _ExplodingEngine:
         def solve(self, **_kw):  # pragma: no cover - must never be called
@@ -264,10 +264,10 @@ def test_live_resolve_river_without_dealt_cards_fails_loud():
 
 def test_6p_live_resolve_plays_faced_bet_decision(blueprint_path):
     pytest.importorskip("numpy")
-    from app.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.strategy_source import LiveResolveSource
 
     try:
-        from app.services.cpu_es_solver import CpuEsSolver
+        from app.engine.cpu_es_solver import CpuEsSolver
         engine = CpuEsSolver(blueprint_path)
     except Exception as e:
         pytest.skip(f"CpuEsSolver unavailable: {e}")
@@ -328,12 +328,12 @@ def test_6p_live_resolve_plays_faced_bet_decision(blueprint_path):
 
 def test_6p_full_hand_off_tree_bet_hybrid(blueprint_path):
     pytest.importorskip("numpy")
-    from app.agent.strategy_source import (
+    from app.engine.agent.strategy_source import (
         HybridSource, LiveResolveSource, LookupSource,
     )
 
     try:
-        from app.services.cpu_es_solver import CpuEsSolver
+        from app.engine.cpu_es_solver import CpuEsSolver
         engine = CpuEsSolver(blueprint_path)
     except Exception as e:
         pytest.skip(f"CpuEsSolver unavailable: {e}")

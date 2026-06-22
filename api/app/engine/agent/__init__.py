@@ -22,17 +22,17 @@ Public surface:
 
 from __future__ import annotations
 
-from app.agent.action_translation import TranslatedAction, translate_action
-from app.agent.agent import PokerAgent, SampledAction
-from app.agent.game_state import GameState, new_postflop_state
-from app.agent.key_builder import NodeKey, build_key
-from app.agent.modes import AgentMode, ModeConfig
-from app.agent.preflop_constructor import (
+from app.engine.agent.action_translation import TranslatedAction, translate_action
+from app.engine.agent.agent import PokerAgent, SampledAction
+from app.engine.agent.game_state import GameState, new_postflop_state
+from app.engine.agent.key_builder import NodeKey, build_key
+from app.engine.agent.modes import AgentMode, ModeConfig
+from app.engine.agent.preflop_constructor import (
     PreflopAction,
     PreflopConstructionUnsupported,
     build_preflop_prefix,
 )
-from app.agent.strategy_source import (
+from app.engine.agent.strategy_source import (
     ActionMix,
     LiveResolveSource,
     LookupSource,

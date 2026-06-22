@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.game_state import (
+from app.engine.agent.game_state import (
     FULL_SEAT,
     new_postflop_state,
 )
@@ -167,7 +167,7 @@ def test_round_closes_on_bet_call_call_advances_street():
 # pot=600/stacks 9725; 3p pot=875/stacks 9725. The old fixture 440/720 was
 # chip-INCONSISTENT and produced a wrong prune depth at the deepest node.
 
-from app.agent.game_state import canonical_flop_chips  # noqa: E402
+from app.engine.agent.game_state import canonical_flop_chips  # noqa: E402
 
 
 def test_canonical_flop_chips_2p():

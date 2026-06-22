@@ -108,6 +108,10 @@ class CpuEsSolver:
         py_dir = os.path.join(_POKER_SOLVER, "python")
         if py_dir not in sys.path:
             sys.path.insert(0, py_dir)
+        # The live solver modules live in python/engine/ (2026-06 repo cleanup).
+        # The two private isolated copies below are loaded by explicit FILE PATH
+        # (not import), so they must point at the engine/ subdir.
+        engine_dir = os.path.join(py_dir, "engine")
 
         # Force c_solver to load es_resolver_real.dll (rollout + bps + ES in one).
         os.environ["ES_DLL"] = _ES_DLL_NAME
@@ -124,7 +128,7 @@ class CpuEsSolver:
         # `_LIB` global points at es_resolver_real.dll WITHOUT mutating the
         # shared rollout_c the GPU provider uses.
         spec = importlib.util.spec_from_file_location(
-            "rollout_c_es", os.path.join(py_dir, "rollout_c.py")
+            "rollout_c_es", os.path.join(engine_dir, "rollout_c.py")
         )
         rc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(rc)
@@ -137,7 +141,7 @@ class CpuEsSolver:
         # the BPSReader* + the construct + the ES all live in one DLL (the
         # validated config) and the shared bps_reader_py is untouched.
         spec2 = importlib.util.spec_from_file_location(
-            "bps_reader_py_es", os.path.join(py_dir, "bps_reader_py.py")
+            "bps_reader_py_es", os.path.join(engine_dir, "bps_reader_py.py")
         )
         bpm = importlib.util.module_from_spec(spec2)
         spec2.loader.exec_module(bpm)
@@ -149,9 +153,9 @@ class CpuEsSolver:
                     _ES_DLL_NAME, time.time() - t0)
 
         # Tree builder + helpers (shared, read-only use).
-        from street_solver_gpu import StreetSolverGPU, _build_labels_at_node  # type: ignore
+        from engine.street_solver_gpu import StreetSolverGPU, _build_labels_at_node  # type: ignore
         from es_resolver.es_solver import snapshot_tree  # type: ignore
-        from leaf_values import extract_leaf_info_from_tree  # type: ignore
+        from engine.leaf_values import extract_leaf_info_from_tree  # type: ignore
         self._StreetSolverGPU = StreetSolverGPU
         self._build_labels = _build_labels_at_node
         self._snapshot_tree = snapshot_tree
@@ -493,7 +497,7 @@ class CpuEsSolver:
                              and street in ("flop", "turn"))
                 per_leaf_ranges = None
                 if _use_cond:
-                    from leaf_villain_conditioning import (  # type: ignore
+                    from engine.leaf_villain_conditioning import (  # type: ignore
                         build_conditioned_per_leaf_ranges)
                     _cond_street = 1 if street == "flop" else 2
                     per_leaf_ranges, _cond_stats = build_conditioned_per_leaf_ranges(

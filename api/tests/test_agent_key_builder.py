@@ -17,8 +17,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.key_builder import NodeKey, build_key
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.key_builder import NodeKey, build_key
 
 # ── Pure unit: assembly correctness (no blueprint) ───────────────────────
 

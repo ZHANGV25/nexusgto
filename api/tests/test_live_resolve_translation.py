@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.live_resolve_adapter import (
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.live_resolve_adapter import (
     LiveResolveUnsupported,
     build_solve_inputs,
     hero_grid_row,
     labels_to_index_freqs,
 )
-from app.agent.live_resolve_ranges import (
+from app.engine.agent.live_resolve_ranges import (
     _parse_canonical_preflop,
     _parse_preflop_decisions,
     _prefix_up_to,
@@ -426,8 +426,8 @@ class _FakeEsEngine:
 
 
 def test_live_resolve_source_records_uniform_seeding_without_reader():
-    from app.agent.strategy_source import LiveResolveSource
-    from app.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.modes import ModeConfig
 
     st = new_postflop_state(
         seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
@@ -444,8 +444,8 @@ def test_live_resolve_source_records_uniform_seeding_without_reader():
 
 
 def test_live_resolve_source_records_blueprint_seeding_with_reader():
-    from app.agent.strategy_source import LiveResolveSource
-    from app.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LiveResolveSource
+    from app.engine.agent.modes import ModeConfig
 
     class _Reader:
         def get_strategy(self, board, history, player, bucket, street):

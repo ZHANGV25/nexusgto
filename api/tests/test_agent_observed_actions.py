@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.game_state import ObservedAdvance, new_postflop_state
-from app.agent.strategy_source import (
+from app.engine.agent.game_state import ObservedAdvance, new_postflop_state
+from app.engine.agent.strategy_source import (
     ActionMix,
     HybridSource,
     LiveResolveUnsupported,
@@ -266,9 +266,9 @@ def test_live_resolve_converts_replay_unsupported_to_fallback_type():
     # The engine signals known abstraction limits (tree raise cap, action-
     # count divergence) as ReplayUnsupported; LiveResolveSource must convert
     # it to LiveResolveUnsupported (the hybrid-fallback type) -- and ONLY it.
-    from app.agent.modes import ModeConfig
-    from app.agent.strategy_source import LiveResolveSource
-    from app.services.cpu_es_solver import ReplayUnsupported
+    from app.engine.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LiveResolveSource
+    from app.engine.cpu_es_solver import ReplayUnsupported
 
     class _CapLimitedEngine:
         def solve(self, **_kw):
@@ -287,8 +287,8 @@ def test_lookup_projects_stored_sigma_onto_real_pruned_vocab():
     # [fold, call] while the blueprint stored 3 actions (canonical chips).
     # The stored sigma is prefix-aligned (raise slots are the tail) -> the
     # lookup must project + renormalize, not crash.
-    from app.agent.modes import ModeConfig
-    from app.agent.strategy_source import LookupSource
+    from app.engine.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LookupSource
 
     class _FakeReader:
         def get_metadata(self):

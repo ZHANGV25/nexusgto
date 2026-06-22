@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.game_state import new_postflop_state
-from app.agent.modes import ModeConfig
-from app.agent.preflop_constructor import (
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.modes import ModeConfig
+from app.engine.agent.preflop_constructor import (
     PreflopAction,
     PreflopConstructionUnsupported,
     build_preflop_prefix,
 )
-from app.agent.strategy_source import (
+from app.engine.agent.strategy_source import (
     ActionMix,
     LiftedCacheEntry,
     OfflineLiftedSource,
@@ -162,8 +162,8 @@ def test_unsupported_action_string_raises():
 
 
 def test_agent_act_on_terminal_raises():
-    from app.agent.agent import PokerAgent
-    from app.agent.strategy_source import StrategySource
+    from app.engine.agent.agent import PokerAgent
+    from app.engine.agent.strategy_source import StrategySource
 
     class _Src(StrategySource):
         def get_mix(self, state, hero_cards):
@@ -178,8 +178,8 @@ def test_agent_act_on_terminal_raises():
 
 
 def test_agent_mode_property():
-    from app.agent.agent import PokerAgent
-    from app.agent.strategy_source import StrategySource
+    from app.engine.agent.agent import PokerAgent
+    from app.engine.agent.strategy_source import StrategySource
 
     class _Src(StrategySource):
         def get_mix(self, state, hero_cards):

@@ -19,16 +19,10 @@ from typing import List, Tuple
 
 # Reuse the category enum + max-raises cap from the solver so the index
 # SEMANTICS (fold/call/raise categories) stay bit-identical to training.
-try:
-    from rollout import (  # type: ignore[import-untyped]
-        POSTFLOP_MAX_RAISES,
-        ActionCategory,
-    )
-except ImportError:  # pragma: no cover
-    from python.rollout import (  # type: ignore[no-redef]
-        POSTFLOP_MAX_RAISES,
-        ActionCategory,
-    )
+from engine.rollout import (  # type: ignore[import-untyped]
+    POSTFLOP_MAX_RAISES,
+    ActionCategory,
+)
 
 # The 8.05B-trained vocab (capture-verified). v1 targets this blueprint.
 DEFAULT_POSTFLOP_BET_SIZES: Tuple[float, ...] = (0.75,)
