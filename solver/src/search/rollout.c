@@ -74,6 +74,29 @@ static inline int32_t rollout_rand_weighted(
 static const BPContEVTable *g_rollout_cont_ev_table = NULL;
 static int g_rollout_use_cont_ev_at_flop_boundary = 0;
 
+/* SYNTHETIC mode (DEBUG / MEASUREMENT ONLY — default OFF). When enabled, a
+ * boundary query MISS/EMPTY_BIAS does NOT fail loud; instead the consumer
+ * find_or_creates the slot with a dummy finite EV (ev_sum=0, ev_count=1) using
+ * the SAME key the query used, so this and every subsequent query for that key
+ * returns OK. This lets the armed-RESIDUAL latency probe measure the
+ * cont_ev-armed decision wall-clock (independent of the EV VALUES — only of
+ * hit-vs-miss) WITHOUT a populated walk artifact. INVALID (bias out of range)
+ * is a real bug and still fails loud. The real (synthetic OFF) path is
+ * UNCHANGED and still fail-loud. Applies to BOTH the flop and turn boundaries.
+ * A separate MUTABLE table handle is kept because the normal consumer is a
+ * pure reader (const) and only synthetic mode inserts. Both are set by the
+ * same rollout_set_cont_ev_table call. */
+static BPContEVTable *g_rollout_cont_ev_table_mut = NULL;
+static int g_rollout_cont_ev_synthetic = 0;
+
+/* Dual-boundary build (2026-06-25): independent TURN-boundary enable flag,
+ * parallel to the flop flag above. Default OFF — the served path does NOT
+ * change. The SAME g_rollout_cont_ev_table holds both boundaries' slots
+ * (street disambiguation is in the key-hash, bp_cont_ev_boundary_key_hash),
+ * so no separate table handle is needed. The two flags are orthogonal:
+ * either, both, or neither boundary may be armed. */
+static int g_rollout_use_cont_ev_at_turn_boundary = 0;
+
 /* PROCESS-GLOBAL atomic counters (NOT thread-local). The construct runs the
  * rollouts under `#pragma omp parallel for`, so a per-thread counter is
  * invisible to the parent thread that reads it from Python afterward (each
@@ -89,12 +112,56 @@ static int g_rollout_use_cont_ev_at_flop_boundary = 0;
 static volatile uint64_t g_rollout_cont_ev_boundary_hits = 0;
 static volatile uint64_t g_rollout_cont_ev_boundary_attempts = 0;
 
+/* Dual-boundary build: SEPARATE turn-boundary hit/attempt counters so a
+ * turn hit-rate isn't aliased into the flop counters (and vice versa). A
+ * turn-decision construct queries ONLY turn boundaries; a flop-decision
+ * construct queries ONLY flop boundaries — but keeping them distinct makes
+ * the per-boundary hit-rate unambiguous in mixed harnesses. */
+static volatile uint64_t g_rollout_cont_ev_turn_boundary_hits = 0;
+static volatile uint64_t g_rollout_cont_ev_turn_boundary_attempts = 0;
+
 BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t) {
     g_rollout_cont_ev_table = t;
+    /* The underlying table object is mutable (the loader populates it); the
+     * read-only handle is the consumer's pure-reader view. Synthetic mode uses
+     * the mutable handle to insert dummy slots on miss. Casting away const is
+     * sound: the caller owns a non-const BPContEVTable. */
+    g_rollout_cont_ev_table_mut = (BPContEVTable *)t;
 }
 
 BPS_EXPORT const BPContEVTable *rollout_get_cont_ev_table(void) {
     return g_rollout_cont_ev_table;
+}
+
+/* SYNTHETIC mode toggle (DEBUG / MEASUREMENT ONLY — default OFF). See the
+ * g_rollout_cont_ev_synthetic declaration comment. Applies to both boundaries. */
+BPS_EXPORT void rollout_set_cont_ev_synthetic(int enabled) {
+    g_rollout_cont_ev_synthetic = enabled ? 1 : 0;
+}
+
+BPS_EXPORT int rollout_get_cont_ev_synthetic(void) {
+    return g_rollout_cont_ev_synthetic;
+}
+
+/* SYNTHETIC-mode slot fill, shared by the flop and turn consumer loops.
+ * On a MISS/EMPTY_BIAS (synthetic ON, mutable table set), create-or-fill the
+ * slot with a dummy finite EV (0.0) keyed IDENTICALLY to the query (the caller
+ * passes the already-salted key), so this and every subsequent query for that
+ * key returns OK. Returns 1 on success (treat as OK), 0 if synthetic cannot
+ * satisfy (caller should fail loud exactly as the real path would). Never
+ * called for INVALID (a real bug). */
+static int rollout_cont_ev_synth_fill(uint64_t key_ah, int player,
+                                      int bucket, int bias) {
+    if (!g_rollout_cont_ev_synthetic || g_rollout_cont_ev_table_mut == NULL)
+        return 0;
+    BPContEVEntry *e = bp_cont_ev_find_or_create(
+        g_rollout_cont_ev_table_mut, key_ah, player, bucket);
+    if (e == NULL) return 0;  /* table saturated/unallocated — cannot synthesize */
+    if (e->ev_count[bias] == 0) {
+        e->ev_sum[bias] = 0.0f;
+        e->ev_count[bias] = 1;
+    }
+    return 1;
 }
 
 BPS_EXPORT void rollout_set_use_cont_ev_at_flop_boundary(int enabled) {
@@ -123,6 +190,38 @@ BPS_EXPORT void rollout_get_cont_ev_boundary_attempt_count(uint64_t *out_attempt
                                         __ATOMIC_RELAXED);
 }
 
+/* ── Dual-boundary build (2026-06-25): TURN-boundary consumer API ─────── */
+
+BPS_EXPORT void rollout_set_use_cont_ev_at_turn_boundary(int enabled) {
+    g_rollout_use_cont_ev_at_turn_boundary = enabled ? 1 : 0;
+}
+
+BPS_EXPORT int rollout_get_use_cont_ev_at_turn_boundary(void) {
+    return g_rollout_use_cont_ev_at_turn_boundary;
+}
+
+/* Turn-boundary successful all-4-bias short-circuits. */
+BPS_EXPORT void rollout_get_cont_ev_turn_boundary_hit_count(uint64_t *out_hits) {
+    if (out_hits)
+        *out_hits = __atomic_load_n(&g_rollout_cont_ev_turn_boundary_hits,
+                                    __ATOMIC_RELAXED);
+}
+
+/* Turn-boundary query attempts (the turn hit-rate denominator). */
+BPS_EXPORT void rollout_get_cont_ev_turn_boundary_attempt_count(uint64_t *out_attempts) {
+    if (out_attempts)
+        *out_attempts = __atomic_load_n(&g_rollout_cont_ev_turn_boundary_attempts,
+                                        __ATOMIC_RELAXED);
+}
+
+/* Reset BOTH turn counters (parallel to rollout_reset_cont_ev_boundary_hit_count
+ * for the flop). Kept separate so a harness can reset/measure one boundary
+ * without disturbing the other's counts. */
+BPS_EXPORT void rollout_reset_cont_ev_turn_boundary_hit_count(void) {
+    __atomic_store_n(&g_rollout_cont_ev_turn_boundary_hits, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rollout_cont_ev_turn_boundary_attempts, 0, __ATOMIC_RELAXED);
+}
+
 /* Mirror of bps_reader.c::hand_index_for (static there).
  * Returns the canonical full-deck pair index for the traverser's hole
  * cards relative to a 3-card flop, in [0, 1326). The trainer's BPR5
@@ -147,6 +246,38 @@ static int rollout_hand_index_for_flop(const int32_t *board,
     if (blocked[c0] || blocked[c1]) return -1;
     if (c0 > c1) { int tmp = c0; c0 = c1; c1 = tmp; }
     return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
+}
+
+/* Dual-boundary build (2026-06-25) — TURN analogue. Same canonical
+ * full-deck pair index in [0, 1326), but the blocked set is the 4-card
+ * TURN board (board[0..3]). The index VALUE is identical to the flop
+ * helper for the same hole cards (the formula depends only on c0,c1) —
+ * the turn card only adds a blocking constraint. This MUST match the
+ * producer's bp_boundary_slot_hand_index_turn exactly (mccfr_blueprint.c)
+ * or every turn-boundary query MISSes. Returns -1 if hero's hole cards
+ * are blocked by the 4-card board (caller surfaces as fail-loud). */
+static int rollout_hand_index_for_turn(const int32_t *board,
+                                        int32_t c0, int32_t c1) {
+    int blocked[52] = {0};
+    for (int i = 0; i < 4; i++) {
+        if (board[i] < 0 || board[i] >= 52) return -1;
+        blocked[board[i]] = 1;
+    }
+    if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52) return -1;
+    if (blocked[c0] || blocked[c1]) return -1;
+    if (c0 > c1) { int tmp = c0; c0 = c1; c1 = tmp; }
+    return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
+}
+
+/* Exported test hook for the TURN hand-index. Exposes the EXACT static
+ * function the live consumer calls at the turn boundary, so the
+ * key-alignment test can assert producer-write == consumer-read against
+ * the REAL consumer code (not a re-typed copy of the formula — a re-typed
+ * copy could drift from the live path and give false confidence). board
+ * is the 4 turn cards (board[0..3]). */
+BPS_EXPORT int rollout_hand_index_for_turn_test(const int32_t *board,
+                                                int32_t c0, int32_t c1) {
+    return rollout_hand_index_for_turn(board, c0, c1);
 }
 
 /* ── Thread-local error surface ──────────────────────────────────────── */
@@ -842,7 +973,11 @@ int rollout_simulate_one(
                         "hand_to_bucket returned %d for (%d,%d) on %d-card board "
                         "[%s] (street=%d, player=%d); turn centroids loaded=%d",
                         bucket, c0, c1, n_board, board_desc, street, p,
-                        r->turn_centroids_k);
+                        /* r is NULL-tolerated everywhere else on this path
+                         * (the bucketizers NULL-guard and return -1); guard
+                         * the diagnostic deref too so a NULL-reader miss
+                         * reports cleanly instead of segfaulting. */
+                        r ? r->turn_centroids_k : -1);
                     return -1;
                 }
             }
@@ -1068,6 +1203,13 @@ street_closed:
                 if (st == BP_BOUNDARY_EV_OK) {
                     ev_acc += ev;
                     n_ok++;
+                } else if ((st == BP_BOUNDARY_EV_MISS
+                            || st == BP_BOUNDARY_EV_EMPTY_BIAS)
+                           && rollout_cont_ev_synth_fill(bah, hero_player,
+                                                         hidx, bias)) {
+                    /* SYNTHETIC (DEBUG/MEASUREMENT): dummy 0.0 filled; treat OK. */
+                    ev_acc += 0.0f;
+                    n_ok++;
                 } else {
                     const char *st_name =
                         (st == BP_BOUNDARY_EV_EMPTY_BIAS) ? "EMPTY_BIAS" :
@@ -1086,6 +1228,86 @@ street_closed:
              * producer's MCCFR-uniform bias sampling distribution. */
             *out_payoff = ev_acc / (float)n_ok;
             __atomic_add_fetch(&g_rollout_cont_ev_boundary_hits, 1,
+                               __ATOMIC_RELAXED);
+            return 0;
+        }
+
+        /* ── Dual-boundary build (2026-06-25): TURN-boundary short-circuit ──
+         *
+         * Structurally identical to the FLOP block above, one street later:
+         * at end-of-multiway-TURN (street==TURN, n_board==4, >=3 live), if
+         * the turn consumer is enabled, query hero's (turn-salted action_hash,
+         * turn hand_idx) at all 4 biases, take the uniform mean, and return it
+         * as the leaf value — short-circuiting the legacy RIVER simulation.
+         *
+         * INDEPENDENT enable flag (g_rollout_use_cont_ev_at_turn_boundary) +
+         * SEPARATE turn counters. The key uses the TURN street salt
+         * (bp_cont_ev_boundary_key_hash) and the 4-card turn hand-index
+         * (rollout_hand_index_for_turn) — EXACTLY what the producer wrote at
+         * the turn boundary. Same fail-loud contract on MISS/EMPTY_BIAS/
+         * INVALID. Flop default is untouched. */
+        if (g_rollout_use_cont_ev_at_turn_boundary
+            && street == ROLLOUT_STREET_TURN
+            && n_live_at_close >= 3
+            && g_rollout_cont_ev_table != NULL
+            && hero_player >= 0 && hero_player < num_players
+            && active[hero_player]
+            && has_sample[hero_player]
+            && n_board >= 4) {
+            __atomic_add_fetch(&g_rollout_cont_ev_turn_boundary_attempts, 1,
+                               __ATOMIC_RELAXED);
+            uint64_t bah_t = bp_cont_ev_boundary_key_hash(
+                bp_compute_action_hash(game_history, gah_len),
+                BP_CONT_EV_STREET_TURN);
+            int hidx_t = rollout_hand_index_for_turn(
+                board,
+                sampled_hands_c0[hero_player],
+                sampled_hands_c1[hero_player]);
+            if (hidx_t < 0) {
+                rollout_set_error(street, num_players,
+                    "cont_ev_table TURN boundary: hand_index_for failed "
+                    "(hero c0=%d c1=%d on board %d,%d,%d,%d)",
+                    (int)sampled_hands_c0[hero_player],
+                    (int)sampled_hands_c1[hero_player],
+                    (int)board[0], (int)board[1], (int)board[2],
+                    (int)board[3]);
+                return -1;
+            }
+            float ev_acc_t = 0.0f;
+            int n_ok_t = 0;
+            for (int bias = 0; bias < BP_CONT_EV_NUM_BIASES; bias++) {
+                float ev = 0.0f;
+                BPBoundaryEVStatus st = bp_query_boundary_ev(
+                    g_rollout_cont_ev_table, bah_t,
+                    hero_player, hidx_t, bias, &ev);
+                if (st == BP_BOUNDARY_EV_OK) {
+                    ev_acc_t += ev;
+                    n_ok_t++;
+                } else if ((st == BP_BOUNDARY_EV_MISS
+                            || st == BP_BOUNDARY_EV_EMPTY_BIAS)
+                           && rollout_cont_ev_synth_fill(bah_t, hero_player,
+                                                         hidx_t, bias)) {
+                    /* SYNTHETIC (DEBUG/MEASUREMENT): dummy 0.0 filled; treat OK.
+                     * Keyed with the TURN-salted bah_t so synthetic turn slots
+                     * stay disjoint from flop slots. */
+                    ev_acc_t += 0.0f;
+                    n_ok_t++;
+                } else {
+                    const char *st_name =
+                        (st == BP_BOUNDARY_EV_EMPTY_BIAS) ? "EMPTY_BIAS" :
+                        (st == BP_BOUNDARY_EV_MISS)       ? "MISS" :
+                        (st == BP_BOUNDARY_EV_INVALID)    ? "INVALID" :
+                                                            "UNKNOWN";
+                    rollout_set_error(street, num_players,
+                        "cont_ev_table TURN boundary: status=%s ah=0x%016llx "
+                        "player=%d hand_idx=%d bias=%d",
+                        st_name, (unsigned long long)bah_t,
+                        (int)hero_player, hidx_t, bias);
+                    return -1;
+                }
+            }
+            *out_payoff = ev_acc_t / (float)n_ok_t;
+            __atomic_add_fetch(&g_rollout_cont_ev_turn_boundary_hits, 1,
                                __ATOMIC_RELAXED);
             return 0;
         }

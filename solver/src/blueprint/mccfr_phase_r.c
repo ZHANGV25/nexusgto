@@ -63,6 +63,68 @@ int bp_should_dispatch_to_boundary(int num_board, int n_active,
     return (u < prob) ? 1 : 0;
 }
 
+/* Dual-boundary build (2026-06-25) — TURN-boundary dispatch decision.
+ *
+ * The flop helper above hardcodes `num_board != 3 → 0` (and a test pins
+ * that num_board==4 NEVER dispatches there). This is its TURN sibling, one
+ * street later: it dispatches only at num_board == 4. Kept as a SEPARATE
+ * function so the flop dispatch matrix + tests are byte-untouched.
+ *
+ * Same byte-identity invariant: flag == 0 returns 0 BEFORE touching
+ * `*rng_state`, so a turn-flag-OFF run is byte-equivalent to legacy. The
+ * RNG consumption pattern (one draw, upper-24-bit uniform float) is
+ * identical to the flop helper and to mccfr_blueprint.c::rng_float, so the
+ * coin-flip is drawn from the same stream the trainer would otherwise use. */
+int bp_should_dispatch_to_turn_boundary(int num_board, int n_active,
+                                        int flag, float prob,
+                                        uint64_t *rng_state) {
+    /* Fast path: feature off → no RNG consumed, no behavior change. */
+    if (flag == 0) return 0;
+
+    if (num_board != 4) return 0;        /* only end-of-turn is a turn boundary */
+    if (n_active < 3) return 0;          /* HU turn continues to showdown */
+
+    if (prob <= 0.0f) return 0;
+    if (prob >= 1.0f) return 1;
+
+    uint64_t x = phase_r_rng_next(rng_state);
+    float u = (float)(x & 0xFFFFFF) / (float)0x1000000;
+    return (u < prob) ? 1 : 0;
+}
+
+int bp_set_depth_limit_cont_strats_turn(BPSolver *s, int enabled) {
+    if (s == NULL) return -1;
+    s->depth_limit_cont_strats_turn = enabled ? 1 : 0;
+    printf("[BP] depth_limit_cont_strats_turn = %d (%s)\n",
+           s->depth_limit_cont_strats_turn,
+           s->depth_limit_cont_strats_turn
+               ? "Phase R: multiway-TURN boundary dispatch active"
+               : "legacy: no turn-boundary dispatch");
+
+    /* Lazily allocate the cont-ev table on first enable, exactly like the
+     * flop setter. Idempotent: if the flop path already allocated it, leave
+     * it. The table is SHARED across both boundaries (street disambiguation
+     * is in the key-hash, not in separate tables). */
+    if (enabled && s->cont_ev_table.entries == NULL) {
+        int64_t target_size = (s->cont_ev_table_size_hint > 0)
+            ? s->cont_ev_table_size_hint
+            : (int64_t)(1LL << 26);
+        if (bp_cont_ev_init(&s->cont_ev_table, target_size) != 0) {
+            fprintf(stderr,
+                    "[BP] WARNING: bp_cont_ev_init(%lld) failed; "
+                    "depth_limit_cont_strats_turn will dispatch but no "
+                    "slots will accumulate\n", (long long)target_size);
+            return -1;
+        }
+        printf("[BP] cont_ev_table allocated (turn enable): %lld slots "
+               "(~%.1f MB)\n",
+               (long long)s->cont_ev_table.table_size,
+               (double)s->cont_ev_table.table_size *
+                   (double)sizeof(BPContEVEntry) / (1024.0 * 1024.0));
+    }
+    return 0;
+}
+
 int bp_set_depth_limit_cont_strats(BPSolver *s, int enabled) {
     if (s == NULL) return -1;
     s->depth_limit_cont_strats = enabled ? 1 : 0;

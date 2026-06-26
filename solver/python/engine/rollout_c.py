@@ -334,6 +334,38 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         ]
         lib.rollout_get_cont_ev_boundary_attempt_count.restype = None
 
+    # SYNTHETIC mode (DEBUG/MEASUREMENT — armed-residual probe). Applies to
+    # both boundaries; default OFF.
+    if hasattr(lib, "rollout_set_cont_ev_synthetic"):
+        lib.rollout_set_cont_ev_synthetic.argtypes = [ctypes.c_int]
+        lib.rollout_set_cont_ev_synthetic.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_synthetic"):
+        lib.rollout_get_cont_ev_synthetic.argtypes = []
+        lib.rollout_get_cont_ev_synthetic.restype = ctypes.c_int
+
+    # Dual-boundary build (2026-06-25): TURN-boundary consumer. Mirrors the
+    # flop bindings above; the SAME table (rollout_set_cont_ev_table) backs
+    # both boundaries. See src/search/rollout.h "Dual-boundary" block.
+    if hasattr(lib, "rollout_set_use_cont_ev_at_turn_boundary"):
+        lib.rollout_set_use_cont_ev_at_turn_boundary.argtypes = [ctypes.c_int]
+        lib.rollout_set_use_cont_ev_at_turn_boundary.restype = None
+    if hasattr(lib, "rollout_get_use_cont_ev_at_turn_boundary"):
+        lib.rollout_get_use_cont_ev_at_turn_boundary.argtypes = []
+        lib.rollout_get_use_cont_ev_at_turn_boundary.restype = ctypes.c_int
+    if hasattr(lib, "rollout_get_cont_ev_turn_boundary_hit_count"):
+        lib.rollout_get_cont_ev_turn_boundary_hit_count.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_turn_boundary_hit_count.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_turn_boundary_attempt_count"):
+        lib.rollout_get_cont_ev_turn_boundary_attempt_count.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_turn_boundary_attempt_count.restype = None
+    if hasattr(lib, "rollout_reset_cont_ev_turn_boundary_hit_count"):
+        lib.rollout_reset_cont_ev_turn_boundary_hit_count.argtypes = []
+        lib.rollout_reset_cont_ev_turn_boundary_hit_count.restype = None
+
     lib.rollout_leaf_info_sizeof.argtypes = []
     lib.rollout_leaf_info_sizeof.restype = ctypes.c_int32
 
@@ -1076,6 +1108,94 @@ def get_cont_ev_boundary_attempt_count() -> int:
     out = ctypes.c_uint64(0)
     lib.rollout_get_cont_ev_boundary_attempt_count(ctypes.byref(out))
     return int(out.value)
+
+
+# ── SYNTHETIC mode wrappers (DEBUG/MEASUREMENT — armed-residual probe) ───
+
+
+def set_cont_ev_synthetic(enabled: bool) -> None:
+    """Toggle synthetic always-hit mode (default OFF). On a boundary MISS the
+    consumer fills the slot with a dummy finite EV instead of failing loud, so
+    the armed-residual probe can measure latency without a populated table.
+    Applies to BOTH boundaries. NEVER enable in production (EVs are dummies)."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_cont_ev_synthetic"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_cont_ev_synthetic — rebuild with "
+            "the dual-boundary (2026-06-25) changes.")
+    lib.rollout_set_cont_ev_synthetic(1 if enabled else 0)
+
+
+def get_cont_ev_synthetic() -> bool:
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_synthetic"):
+        return False
+    return bool(lib.rollout_get_cont_ev_synthetic())
+
+
+# ── Dual-boundary build (2026-06-25): TURN-boundary consumer wrappers ────
+#
+# Mirror the flop wrappers above. The SAME cont_ev_table (set via
+# set_rollout_cont_ev_table) backs both boundaries — street disambiguation
+# is in the key-hash on the C side. INDEPENDENT enable flag and SEPARATE
+# turn hit/attempt counters; the flop default is unchanged.
+
+
+def set_use_cont_ev_at_turn_boundary(enabled: bool) -> None:
+    """Enable / disable the end-of-TURN multiway boundary lookup.
+
+    When enabled (and a table pointer is set), the rollout short-circuits
+    at the turn boundary: queries cont_ev_table for hero's slot (TURN
+    street salt + 4-card turn hand index) at all 4 biases, returns the
+    uniform mean as the leaf payoff, short-circuiting the legacy RIVER
+    simulation. MISS / EMPTY_BIAS / INVALID is fail-loud.
+
+    INDEPENDENT of the flop flag; default OFF. Process-global.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_use_cont_ev_at_turn_boundary"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_use_cont_ev_at_turn_boundary — "
+            "rebuild with the dual-boundary (2026-06-25) changes."
+        )
+    lib.rollout_set_use_cont_ev_at_turn_boundary(1 if enabled else 0)
+
+
+def get_use_cont_ev_at_turn_boundary() -> bool:
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_use_cont_ev_at_turn_boundary"):
+        return False
+    return bool(lib.rollout_get_use_cont_ev_at_turn_boundary())
+
+
+def get_cont_ev_turn_boundary_hit_count() -> int:
+    """Number of TURN-boundary lookups that successfully short-circuited
+    (separate from the flop hit counter)."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_turn_boundary_hit_count"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_turn_boundary_hit_count(ctypes.byref(out))
+    return int(out.value)
+
+
+def get_cont_ev_turn_boundary_attempt_count() -> int:
+    """Number of TURN-boundary query ATTEMPTS (the turn hit-rate
+    denominator; separate from the flop attempt counter)."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_turn_boundary_attempt_count"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_turn_boundary_attempt_count(ctypes.byref(out))
+    return int(out.value)
+
+
+def reset_cont_ev_turn_boundary_hit_count() -> None:
+    """Reset BOTH the turn hit and attempt counters (separate from flop)."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_reset_cont_ev_turn_boundary_hit_count"):
+        return
+    lib.rollout_reset_cont_ev_turn_boundary_hit_count()
 
 
 # ── BPR5 trailer loader (mccfr_blueprint.so) ────────────────────────────

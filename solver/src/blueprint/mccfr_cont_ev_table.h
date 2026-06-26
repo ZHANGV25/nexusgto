@@ -32,6 +32,46 @@ extern "C" {
  * `#define SS_NUM_CONT_STRATS 4`. */
 #define BP_CONT_EV_NUM_BIASES 4
 
+/* ── Boundary-street disambiguation (2026-06-25, dual-boundary build) ──
+ *
+ * The slot key is (action_hash, player, bucket) — there is NO street field
+ * in the struct. The original (flop-only) table relied on the action_hash
+ * to implicitly carry street: a flop boundary hashes [preflop+flop] actions,
+ * a turn boundary hashes [preflop+flop+turn] actions, so their action_hashes
+ * differ in the common case. BUT the bucket (the traverser's canonical
+ * full-deck pair index) is IDENTICAL for the same hole cards on flop vs turn
+ * (it depends only on c0,c1), so a flop slot and a turn slot for the same
+ * hand differ ONLY by action_hash — a 64-bit action_hash collision would
+ * silently cross-contaminate flop and turn EVs (the stated #1 failure mode
+ * for this feature: key drift / silent collision).
+ *
+ * FIX: an explicit, structural street disambiguator applied at the SINGLE
+ * point where the boundary key's action_hash is constructed, used by BOTH
+ * the producer (trainer) and the consumer (rollout) so they cannot drift.
+ *
+ * To preserve byte-compatibility with the existing FLOP artifact (the 667K
+ * `.cev` and every flop test were written with the RAW action_hash), the
+ * flop salt is the identity (raw hash unchanged). The turn salt mixes a
+ * distinct constant in, making turn slots structurally disjoint from flop
+ * slots in the hash/key space — no struct change, no wire-format change,
+ * full flop back-compat.
+ *
+ * bp_cont_ev_boundary_key_hash(action_hash, street) is the ONE canonical
+ * key-hash both sides call. Producer write == consumer read is then
+ * guaranteed by construction, per street. */
+typedef enum {
+    BP_CONT_EV_STREET_FLOP = 3,  /* num_board == 3 (raw action_hash; legacy) */
+    BP_CONT_EV_STREET_TURN = 4,  /* num_board == 4 (salted action_hash)      */
+} BPContEVBoundaryStreet;
+
+/* The canonical boundary key-hash. FLOP returns action_hash unchanged
+ * (legacy byte-compat); TURN folds a fixed salt into action_hash so turn
+ * slots cannot alias flop slots for the same (player, bucket). Any other
+ * street value is treated as "no salt" (returns action_hash) — callers
+ * should only ever pass FLOP or TURN. Pure, header-inlinable, identical
+ * on the producer and consumer side. */
+uint64_t bp_cont_ev_boundary_key_hash(uint64_t action_hash, int street);
+
 /* One slot in the cont-ev hash table. Atomic CAS state machine on
  * `occupied` mirrors info_table_find_or_create:
  *   0 = empty
