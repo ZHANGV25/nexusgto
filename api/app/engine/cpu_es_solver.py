@@ -83,6 +83,23 @@ def _a3_cont_ev_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _a3_cont_ev_turn_enabled() -> bool:
+    """Dual-boundary build (2026-06-25) — TURN-boundary arm flag, DEFAULT OFF
+    and INDEPENDENT of the flop flag. When set (NEXUS_A3_CONT_EV_TURN=1), the
+    engine arms the cont_ev TURN-boundary consumer for multiway TURN solves,
+    short-circuiting the live river rollout with the turn-boundary table
+    lookup. Requires the cont_ev table to be loaded — i.e. NEXUS_A3_CONT_EV=1
+    (+ NEXUS_A3_CEV_PATH) must ALSO be set so _cev_holder is populated; the
+    same .cev carries both boundaries (street disambiguation is in the
+    key-hash). Enabling the turn arm does NOT change the flop default.
+
+    This stays DEFAULT OFF in the served path: enabling either boundary in
+    production is gated behind the 1326-combo equity-validation gate passing
+    AND an explicit user decision (docs/CONT_EV_DUAL_BOUNDARY_*)."""
+    v = os.environ.get("NEXUS_A3_CONT_EV_TURN", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -101,6 +118,7 @@ class CpuEsSolver:
         self._StreetSolverGPU = None
         self._cev_holder = None  # A3: kept alive iff NEXUS_A3_CONT_EV=1
         self._last_cont_ev_stats = None  # A3: {hits, attempts} from last solve
+        self._last_cont_ev_turn_stats = None  # dual-boundary: turn {hits,attempts}
         self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
         self._init(blueprint_path)
 
@@ -464,6 +482,23 @@ class CpuEsSolver:
                     rc.reset_cont_ev_boundary_hit_count()
                     rc.set_use_cont_ev_at_flop_boundary(True)
 
+                # ── Dual-boundary (2026-06-25, default OFF): arm the cont_ev
+                # TURN boundary for THIS construct iff NEXUS_A3_CONT_EV_TURN=1,
+                # the table is loaded, and this is a multiway TURN spot. The
+                # turn arm is INDEPENDENT of the flop arm (separate flag,
+                # separate counters); enabling it does NOT change the flop
+                # default. Stays OFF in the served path until the equity gate
+                # passes + user opt-in. ──
+                a3_turn_armed = (
+                    self._cev_holder is not None
+                    and _a3_cont_ev_turn_enabled()
+                    and street == "turn"
+                    and n_players >= 3
+                )
+                if a3_turn_armed:
+                    rc.reset_cont_ev_turn_boundary_hit_count()
+                    rc.set_use_cont_ev_at_turn_boundary(True)
+
                 # DIAG (NEXUS_ES_DIAG=1): reset the rollout blueprint-miss counters
                 # before the construct so we can read the miss-rate after. A high
                 # blueprint miss-rate -> the turn/river CONTINUATION falls back to
@@ -584,6 +619,22 @@ class CpuEsSolver:
                             "CpuEsSolver A3: cont_ev boundary hits=%d attempts=%d "
                             "hit_rate=%.4f", hits, attempts,
                             self._last_cont_ev_stats["hit_rate"])
+                    if a3_turn_armed:
+                        # Symmetric disarm + snapshot for the TURN boundary.
+                        # MUST happen in finally so an exception cannot leave
+                        # the turn flag enabled for a subsequent solve.
+                        rc.set_use_cont_ev_at_turn_boundary(False)
+                        t_hits = rc.get_cont_ev_turn_boundary_hit_count()
+                        t_att = rc.get_cont_ev_turn_boundary_attempt_count()
+                        self._last_cont_ev_turn_stats = {
+                            "hits": int(t_hits),
+                            "attempts": int(t_att),
+                            "hit_rate": (t_hits / t_att) if t_att else 0.0,
+                        }
+                        logger.info(
+                            "CpuEsSolver dual-boundary: cont_ev TURN hits=%d "
+                            "attempts=%d hit_rate=%.4f", t_hits, t_att,
+                            self._last_cont_ev_turn_stats["hit_rate"])
                 construct_s = time.time() - t0
 
             # DIAG (NEXUS_ES_DIAG=1): dump leaf-table stats — isolate the 2p-flop
