@@ -1,9 +1,28 @@
 """Validates the per-leaf flop_history extraction + threading.
 
 Local part: synthetic 2p flop tree built directly via SSNode/SSTreeData
-ctypes structs (no CUDA needed). Walk it, verify the reconstructed
-flop_history matches what each leaf was reached through. Verifies
-_train_action_idx + the DFS traversal path.
+ctypes structs (no CUDA, no .so, no blueprint needed — the structs are
+plain ctypes and extract_leaf_info_from_tree is pure python). Walk it,
+verify the reconstructed flop_history matches what each leaf was reached
+through. Verifies _train_action_idx + the DFS traversal path.
+
+Bet-vocab desync fix (2026-07-01): the action-index re-encoder
+(_train_action_idx) and the DFS extractor now take the training bet vocab
+as a PARAMETER (threaded from the loaded .bps manifest), instead of a
+hardcoded [0.5,1.0]/[1.0]. This file therefore DERIVES the expected
+indices from the vocab under test and is parametrized over BOTH:
+
+  * the SERVED 8.05B vocab  [0.75] first / [1.0] subsequent
+    (manifest footer, config_hash bc8ac105), and
+  * the LEGACY default vocab [0.5,1.0] first / [1.0] subsequent
+    (the pre-fix compiled default; passing None reproduces it).
+
+Under the served [0.75] vocab an all-in mis-keyed BEFORE the fix (trainer
+all-in idx 2 non-facing / 3 facing vs the pre-fix consumer's 3 / 4 — see
+docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). The parametric expectations
+below encode the CORRECT (vocab-derived) indices for each vocab, so the
+regression is pinned for [0.75] and the legacy [0.5,1.0] behavior is
+preserved.
 
 End-to-end (rollout miss rate against v3 blueprint) lives in
 tools/diagnose_v3_rollout.py and runs only on EC2.
@@ -30,45 +49,161 @@ from engine.leaf_values import (  # type: ignore[import-untyped]
 )
 
 
-# ── Action-index re-encoder direct tests ────────────────────────────────
+# ── Vocab parametrization ────────────────────────────────────────────────
+#
+# Each vocab is (first_fracs, subseq_fracs). SERVED is the 8.05B training
+# vocab; LEGACY is the pre-fix compiled default. `None` for the extractor
+# kwargs reproduces LEGACY exactly, so we also cover the "vocab omitted"
+# (byte-identity) path via the LEGACY case with explicit fracs equal to
+# the module defaults.
+SERVED_FIRST = (0.75,)
+SERVED_SUBSEQ = (1.0,)
+LEGACY_FIRST = (0.5, 1.0)
+LEGACY_SUBSEQ = (1.0,)
+
+VOCABS = [
+    pytest.param(SERVED_FIRST, SERVED_SUBSEQ, id="served_0.75"),
+    pytest.param(LEGACY_FIRST, LEGACY_SUBSEQ, id="legacy_0.5_1.0"),
+]
 
 
-def test_train_action_idx_first_raise_facing():
-    # facing + first raise: [fold(0), call(1), 0.5(2), 1.0(3), allin(4)]
-    assert _train_action_idx(True, 0, "fold", 0.0) == 0
-    assert _train_action_idx(True, 0, "call", 0.0) == 1
-    assert _train_action_idx(True, 0, "raise", 0.5) == 2
-    assert _train_action_idx(True, 0, "raise", 1.0) == 3
+def _closest(fracs, size_frac):
+    """Reference: index of the closest training fraction (fuzzy match)."""
+    return min(range(len(fracs)), key=lambda i: abs(size_frac - fracs[i]))
+
+
+# ── Action-index re-encoder direct tests (vocab-parametric) ──────────────
+#
+# _train_action_idx enumerates, per the trainer's generate_actions rule
+# (src/blueprint/mccfr_blueprint.c:954-991):
+#   !facing:        [check(0), first_fracs...(1..n), allin(1+n)]
+#   facing, first:  [fold(0), call(1), first_fracs...(2..1+n), allin(2+n)]
+#   facing, subseq: [fold(0), call(1), subseq_fracs...(2..1+m), allin(2+m)]
+#   tree_closed + facing:  [fold(0), call(1)]
+#   tree_closed + !facing: [check(0)]
+# where n = len(first_fracs), m = len(subseq_fracs). The all-in index moves
+# with the vocab length — the exact desync this parametrization guards.
+
+
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_train_action_idx_first_raise_facing(first_fracs, subseq_fracs):
+    # facing + first raise: [fold(0), call(1), <first_fracs @2..>, allin@2+n]
+    n = len(first_fracs)
+    assert _train_action_idx(True, 0, "fold", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 0
+    assert _train_action_idx(True, 0, "call", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 1
+    # Each trained size lands at 2 + its slot.
+    for i, frac in enumerate(first_fracs):
+        assert _train_action_idx(True, 0, "raise", frac,
+                                 first_fracs=first_fracs,
+                                 subseq_fracs=subseq_fracs) == 2 + i
+    # All-in sits ONE PAST the last sized-raise slot.
+    assert _train_action_idx(True, 0, "allin", 1.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 2 + n
+    # Fuzzy: an off-tree size maps to the closest trained slot.
+    for probe in (0.6, 0.8, 0.55, 0.95):
+        assert _train_action_idx(True, 0, "raise", probe,
+                                 first_fracs=first_fracs,
+                                 subseq_fracs=subseq_fracs) == \
+            2 + _closest(first_fracs, probe)
+
+
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_train_action_idx_subsequent_facing(first_fracs, subseq_fracs):
+    # facing + subsequent (raises_so_far>=1):
+    #   [fold(0), call(1), <subseq_fracs @2..>, allin@2+m]
+    m = len(subseq_fracs)
+    assert _train_action_idx(True, 1, "fold", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 0
+    assert _train_action_idx(True, 1, "call", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 1
+    for i, frac in enumerate(subseq_fracs):
+        assert _train_action_idx(True, 1, "raise", frac,
+                                 first_fracs=first_fracs,
+                                 subseq_fracs=subseq_fracs) == 2 + i
+    # Lossy: a subgame size with no subsequent counterpart maps to closest.
+    assert _train_action_idx(True, 1, "raise", 0.5,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == \
+        2 + _closest(subseq_fracs, 0.5)
+    assert _train_action_idx(True, 1, "allin", 1.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 2 + m
+
+
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_train_action_idx_no_facing(first_fracs, subseq_fracs):
+    # !facing: [check(0), <first_fracs @1..>, allin@1+n]
+    n = len(first_fracs)
+    assert _train_action_idx(False, 0, "check", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 0
+    for i, frac in enumerate(first_fracs):
+        assert _train_action_idx(False, 0, "bet", frac,
+                                 first_fracs=first_fracs,
+                                 subseq_fracs=subseq_fracs) == 1 + i
+    assert _train_action_idx(False, 0, "allin", 1.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 1 + n
+
+
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_train_action_idx_tree_closed(first_fracs, subseq_fracs):
+    # tree_closed (raises_so_far >= 3) + facing: [fold(0), call(1)]
+    assert _train_action_idx(True, 3, "fold", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 0
+    assert _train_action_idx(True, 3, "call", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 1
+    # tree_closed + !facing: [check(0)]
+    assert _train_action_idx(False, 3, "check", 0.0,
+                             first_fracs=first_fracs,
+                             subseq_fracs=subseq_fracs) == 0
+
+
+# ── Regression: the exact index divergence from the finding doc ──────────
+#
+# docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md "exact index divergence" table.
+# The bug: under the served [0.75] vocab an all-in must sit at idx 2
+# (non-facing) / 3 (facing); the pre-fix consumer hardcoded [0.5,1.0] and put
+# it at 3 / 4. Pin BOTH vocabs so a future edit that reintroduces the desync
+# fails here.
+
+
+def test_allin_index_divergence_served_vs_legacy():
+    # SERVED [0.75]: non-facing all-in = 2, facing all-in = 3.
+    assert _train_action_idx(False, 0, "allin", 1.0,
+                             first_fracs=SERVED_FIRST,
+                             subseq_fracs=SERVED_SUBSEQ) == 2
+    assert _train_action_idx(True, 0, "allin", 1.0,
+                             first_fracs=SERVED_FIRST,
+                             subseq_fracs=SERVED_SUBSEQ) == 3
+    # LEGACY [0.5,1.0]: non-facing all-in = 3, facing all-in = 4 (the
+    # pre-fix values — correct FOR the [0.5,1.0] vocab, wrong for [0.75]).
+    assert _train_action_idx(False, 0, "allin", 1.0,
+                             first_fracs=LEGACY_FIRST,
+                             subseq_fracs=LEGACY_SUBSEQ) == 3
+    assert _train_action_idx(True, 0, "allin", 1.0,
+                             first_fracs=LEGACY_FIRST,
+                             subseq_fracs=LEGACY_SUBSEQ) == 4
+
+
+def test_train_action_idx_default_vocab_is_legacy():
+    # Omitting the vocab kwargs reproduces the pre-fix [0.5,1.0]/[1.0]
+    # indices byte-for-byte (byte-identity invariant for legacy callers).
+    assert _train_action_idx(False, 0, "allin", 1.0) == 3
     assert _train_action_idx(True, 0, "allin", 1.0) == 4
-    # Fuzzy: 0.6 closer to 0.5 than 1.0
-    assert _train_action_idx(True, 0, "raise", 0.6) == 2
-    assert _train_action_idx(True, 0, "raise", 0.8) == 3
-
-
-def test_train_action_idx_subsequent_facing():
-    # facing + subsequent: [fold(0), call(1), 1.0(2), allin(3)]
-    assert _train_action_idx(True, 1, "fold", 0.0) == 0
-    assert _train_action_idx(True, 1, "call", 0.0) == 1
-    assert _train_action_idx(True, 1, "raise", 1.0) == 2
-    # Lossy: subgame's 0.5 has no training counterpart at subsequent → maps to 1.0
-    assert _train_action_idx(True, 1, "raise", 0.5) == 2
-    assert _train_action_idx(True, 1, "allin", 1.0) == 3
-
-
-def test_train_action_idx_no_facing():
-    # !facing: [check(0), 0.5(1), 1.0(2), allin(3)]
-    assert _train_action_idx(False, 0, "check", 0.0) == 0
     assert _train_action_idx(False, 0, "bet", 0.5) == 1
     assert _train_action_idx(False, 0, "bet", 1.0) == 2
-    assert _train_action_idx(False, 0, "allin", 1.0) == 3
-
-
-def test_train_action_idx_tree_closed():
-    # tree_closed (raises_so_far >= 3) + facing: [fold(0), call(1)]
-    assert _train_action_idx(True, 3, "fold", 0.0) == 0
-    assert _train_action_idx(True, 3, "call", 0.0) == 1
-    # tree_closed + !facing: [check(0)]
-    assert _train_action_idx(False, 3, "check", 0.0) == 0
+    assert _train_action_idx(True, 0, "raise", 0.5) == 2
+    assert _train_action_idx(True, 0, "raise", 1.0) == 3
 
 
 # ── LeafInfo backward compat ────────────────────────────────────────────
@@ -264,77 +399,110 @@ def _build_2p_synthetic_tree(
     return tree
 
 
-# ── DFS extraction integration ──────────────────────────────────────────
+# ── DFS extraction integration (vocab-parametric) ───────────────────────
+#
+# These build a synthetic SS tree whose bet sizes are drawn from the vocab
+# under test, then assert extract_leaf_info_from_tree — threaded with THAT
+# vocab — reconstructs the training-encoded flop_history_train.
 
 
-def test_extract_leaf_info_check_check():
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_check_check(first_fracs, subseq_fracs):
     # 2p flop, both check around → cont-chain root reached via [check, check]
     tree = _build_2p_synthetic_tree([
         (0, "check", 0.0, 200, (0, 0)),
         (1, "check", 0.0, 200, (0, 0)),
     ])
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     assert len(leaves) == 1
     li = leaves[0]
-    # !facing + check both → train_idx 0 each
+    # !facing + check both → train_idx 0 each (vocab-independent).
     assert li.flop_history_train == (0, 0)
     assert li.bets == (0, 0)
     # flop_actor_train parallels flop_history_train: P0 acted, then P1.
     assert li.flop_actor_train == (0, 1)
 
 
-def test_extract_leaf_info_bet_call():
-    # 2p flop: P0 bet 0.5×pot (idx 1 in !facing), P1 calls (idx 1 in facing)
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_bet_call(first_fracs, subseq_fracs):
+    # 2p flop: P0 bets the FIRST trained size (!facing → idx 1), P1 calls
+    # (facing → idx 1). Use the vocab's own first size so the bet keys to
+    # the trained slot rather than a fuzzy neighbor.
+    bet_frac = first_fracs[0]
     tree = _build_2p_synthetic_tree([
-        (0, "bet", 0.5, 200, (0, 0)),
+        (0, "bet", bet_frac, 200, (0, 0)),
         (1, "call", 0.0, 200, (0, 0)),
     ])
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     assert len(leaves) == 1
     li = leaves[0]
-    # P0 bets 0.5 (no facing → idx 1), P1 calls (facing → idx 1)
+    # bet first-size → !facing idx 1 (1 + slot 0); call → facing idx 1.
     assert li.flop_history_train == (1, 1)
     # The BET-call leaf line: P0 (the bettor), then P1 (the caller).
     assert li.flop_actor_train == (0, 1)
 
 
-def test_extract_leaf_info_bet_raise_call():
-    # 2p flop: P0 bet 0.5 (raises_so_far=0, !facing → idx 1),
-    # P1 raise 1.0 (raises_so_far=1, facing+SUBSEQUENT → idx 2,
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_bet_raise_call(first_fracs, subseq_fracs):
+    # 2p flop: P0 bet first-size (raises_so_far=0, !facing → idx 1),
+    # P1 raise subseq-size (raises_so_far=1, facing+SUBSEQUENT → idx 2,
     # since training increments raises_so_far on the opening bet too),
     # P0 call (facing subsequent → idx 1).
+    bet_frac = first_fracs[0]
+    raise_frac = subseq_fracs[0]
     tree = _build_2p_synthetic_tree([
-        (0, "bet", 0.5, 200, (0, 0)),
-        (1, "raise", 1.0, 200, (0, 0)),
+        (0, "bet", bet_frac, 200, (0, 0)),
+        (1, "raise", raise_frac, 200, (0, 0)),
         (0, "call", 0.0, 200, (0, 0)),
     ])
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     assert len(leaves) == 1
     li = leaves[0]
+    # bet@idx1, subsequent-raise first-size@idx2, call@idx1.
     assert li.flop_history_train == (1, 2, 1)
     # P0 bet, P1 raise, P0 call.
     assert li.flop_actor_train == (0, 1, 0)
 
 
-def test_extract_leaf_info_check_bet_call():
-    # 2p flop: P0 check (no-facing 0), P1 bet 1.0 (no-facing 2), P0 call (facing 1)
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_check_bet_call(first_fracs, subseq_fracs):
+    # 2p flop: P0 check (!facing → 0), P1 bet LAST trained first-size
+    # (!facing → 1 + last slot), P0 call (facing → 1).
+    bet_frac = first_fracs[-1]
     tree = _build_2p_synthetic_tree([
         (0, "check", 0.0, 200, (0, 0)),
-        (1, "bet", 1.0, 200, (0, 0)),
+        (1, "bet", bet_frac, 200, (0, 0)),
         (0, "call", 0.0, 200, (0, 0)),
     ])
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     assert len(leaves) == 1
     li = leaves[0]
-    assert li.flop_history_train == (0, 2, 1)
+    bet_idx = 1 + (len(first_fracs) - 1)  # last first-size slot
+    assert li.flop_history_train == (0, bet_idx, 1)
     # P0 check, P1 bet, P0 call.
     assert li.flop_actor_train == (0, 1, 0)
 
 
-def test_extract_leaf_info_empty_root_is_cont_chain():
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_empty_root_is_cont_chain(first_fracs, subseq_fracs):
     # 2p flop: cont-chain root IS the SS tree root (no flop betting yet)
     tree = _build_2p_synthetic_tree([])
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     assert len(leaves) == 1
     li = leaves[0]
     assert li.flop_history_train == ()
@@ -352,17 +520,17 @@ def test_extract_leaf_info_empty_root_is_cont_chain():
 #  1/n at every postflop spot, sentinel run 2026-05-01 diagnosis).
 
 
-def _build_2p_sampled_tree(effective_stack=10000):
-    """3-leaf SAMPLED-mode tree:
-        root P0 acts !facing → {check, bet 0.5}
-          check → P1 acts !facing → {check (LEAF 0), bet 0.5}
-                                         bet 0.5 → P0 facing → {fold, call (LEAF 1)}
-          bet 0.5 → P1 facing → {fold, call (LEAF 2)}
+def _build_2p_sampled_tree(bet_frac, effective_stack=10000):
+    """3-leaf SAMPLED-mode tree, parametrized on the opening bet fraction:
+        root P0 acts !facing → {check, bet bet_frac}
+          check → P1 acts !facing → {check (LEAF 0), bet bet_frac}
+                                         bet → P0 facing → {fold, call (LEAF 1)}
+          bet → P1 facing → {fold, call (LEAF 2)}
 
-    Expected histories (per _train_action_idx):
+    Expected histories (per _train_action_idx, bet_frac = first_fracs[0]):
         leaf 0: (0, 0)         check, check
-        leaf 1: (0, 1, 1)      check, bet 0.5, call
-        leaf 2: (1, 1)         bet 0.5, call
+        leaf 1: (0, 1, 1)      check, bet first-size, call
+        leaf 2: (1, 1)         bet first-size, call
     """
     nodes = []
     children = []
@@ -372,14 +540,14 @@ def _build_2p_sampled_tree(effective_stack=10000):
     # check_branch:
     #   1: DECISION p=1, 2 children {LEAF leaf_idx=0, bet_branch_2}
     #   2: LEAF leaf_idx=0 (P0 check, P1 check)
-    #   3: DECISION p=0 facing (after P0 check, P1 bet 0.5), 2 children
+    #   3: DECISION p=0 facing (after P0 check, P1 bet), 2 children
     #   4: FOLD
-    #   5: LEAF leaf_idx=1 (P0 check, P1 bet 0.5, P0 call)
+    #   5: LEAF leaf_idx=1 (P0 check, P1 bet, P0 call)
     # bet_branch:
-    #   6: DECISION p=1 facing (after P0 bet 0.5), 2 children
+    #   6: DECISION p=1 facing (after P0 bet), 2 children
     #   7: FOLD
-    #   8: LEAF leaf_idx=2 (P0 bet 0.5, P1 call)
-    bet_amt = int(0.5 * 200)  # 100
+    #   8: LEAF leaf_idx=2 (P0 bet, P1 call)
+    bet_amt = int(bet_frac * 200)
 
     # 0: root
     nodes.append(_make_node(_NODE_DECISION, 0, 2, -1, 200, (0, 0)))
@@ -387,7 +555,7 @@ def _build_2p_sampled_tree(effective_stack=10000):
     nodes.append(_make_node(_NODE_DECISION, 1, 2, -1, 200, (0, 0)))
     # 2: LEAF — both check
     nodes.append(_make_node(_NODE_LEAF, -1, 0, 0, 200, (0, 0), leaf_idx=0))
-    # 3: P0 facing after [check, bet 0.5]
+    # 3: P0 facing after [check, bet]
     nodes.append(_make_node(
         _NODE_DECISION, 0, 2, -1, 200 + bet_amt, (0, bet_amt),
     ))
@@ -395,12 +563,12 @@ def _build_2p_sampled_tree(effective_stack=10000):
     nodes.append(_make_node(
         _NODE_FOLD, -1, 0, 0, 200 + bet_amt, (0, bet_amt),
     ))
-    # 5: LEAF after [check, bet 0.5, call] — P0 calls bet_amt
+    # 5: LEAF after [check, bet, call] — P0 calls bet_amt
     nodes.append(_make_node(
         _NODE_LEAF, -1, 0, 0, 200 + 2 * bet_amt, (bet_amt, bet_amt),
         leaf_idx=1,
     ))
-    # 6: P1 facing after [bet 0.5]
+    # 6: P1 facing after [bet]
     nodes.append(_make_node(
         _NODE_DECISION, 1, 2, -1, 200 + bet_amt, (bet_amt, 0),
     ))
@@ -408,7 +576,7 @@ def _build_2p_sampled_tree(effective_stack=10000):
     nodes.append(_make_node(
         _NODE_FOLD, -1, 0, 0, 200 + bet_amt, (bet_amt, 0),
     ))
-    # 8: LEAF after [bet 0.5, call]
+    # 8: LEAF after [bet, call]
     nodes.append(_make_node(
         _NODE_LEAF, -1, 0, 0, 200 + 2 * bet_amt, (bet_amt, bet_amt),
         leaf_idx=2,
@@ -443,50 +611,92 @@ def _build_2p_sampled_tree(effective_stack=10000):
     return tree
 
 
-def test_extract_leaf_info_sampled_mode_emits_per_leaf():
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_sampled_mode_emits_per_leaf(first_fracs, subseq_fracs):
     """Production-shape SAMPLED tree: 3 flat SS_NODE_LEAF terminals,
     no cont-chain wrapping. Each must yield one LeafInfo with
     flop_history_train captured from the path."""
-    tree = _build_2p_sampled_tree()
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    bet_frac = first_fracs[0]
+    bet_amt = int(bet_frac * 200)
+    tree = _build_2p_sampled_tree(bet_frac)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
 
     by_idx = {li.leaf_idx: li for li in leaves}
     assert set(by_idx) == {0, 1, 2}, \
         f"expected leaves 0,1,2 (one per SS_NODE_LEAF); got {sorted(by_idx)}"
 
-    # check-check
+    # check-check (vocab-independent)
     assert by_idx[0].flop_history_train == (0, 0)
     assert by_idx[0].bets == (0, 0)
-    # check, bet 0.5, call
+    # check, bet first-size, call → (0, 1, 1)
     assert by_idx[1].flop_history_train == (0, 1, 1)
-    assert by_idx[1].bets == (100, 100)
-    # bet 0.5, call
+    assert by_idx[1].bets == (bet_amt, bet_amt)
+    # bet first-size, call → (1, 1)
     assert by_idx[2].flop_history_train == (1, 1)
-    assert by_idx[2].bets == (100, 100)
+    assert by_idx[2].bets == (bet_amt, bet_amt)
 
 
-def test_extract_leaf_info_sampled_no_folds_no_phantom_leaves():
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_sampled_no_folds_no_phantom_leaves(
+        first_fracs, subseq_fracs):
     """FOLD nodes (type=1) must not produce phantom LeafInfo entries —
     only SS_NODE_LEAF (type=4) terminals carry leaf_idx."""
-    tree = _build_2p_sampled_tree()
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    tree = _build_2p_sampled_tree(first_fracs[0])
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     # Tree has 3 SS_NODE_LEAF + 2 SS_NODE_FOLD; only the 3 LEAFs emit.
     assert len(leaves) == 3
 
 
-def test_extract_leaf_info_allin():
-    # 2p flop: P0 bets allin → child.bets[0] = effective_stack (10000)
+@pytest.mark.parametrize("first_fracs,subseq_fracs", VOCABS)
+def test_extract_leaf_info_allin(first_fracs, subseq_fracs):
+    # 2p flop: P0 bets allin → child.bets[0] = effective_stack (10000).
+    # The non-facing all-in index MOVES with the vocab length — this is
+    # exactly the desync from the finding doc: SERVED [0.75] → idx 2,
+    # LEGACY [0.5,1.0] → idx 3.
     tree = _build_2p_synthetic_tree([
         (0, "allin", 0.0, 200, (0, 0)),
     ], effective_stack=10000)
-    # The cont-chain root is reached after P0's allin AND P1's call (which
-    # we didn't model). We only modeled P0's action; the cont-chain
-    # immediately follows in this test setup. Verify the allin idx.
-    leaves = extract_leaf_info_from_tree(tree, num_players=2)
+    leaves = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=first_fracs, subsequent_bet_sizes=subseq_fracs,
+    )
     assert len(leaves) == 1
     li = leaves[0]
-    # !facing + allin → train_idx 3
-    assert li.flop_history_train == (3,)
+    expected_allin = 1 + len(first_fracs)  # !facing all-in = 1 + n
+    assert li.flop_history_train == (expected_allin,)
+
+
+def test_extract_leaf_info_allin_regression_served_vs_legacy():
+    """Explicit regression pin of the finding-doc divergence at the
+    extractor level: the SAME non-facing all-in tree yields idx 2 under the
+    served [0.75] vocab and idx 3 under the legacy [0.5,1.0] vocab. Before
+    the fix the extractor always emitted 3, mis-keying every served flop
+    all-in line."""
+    tree = _build_2p_synthetic_tree([
+        (0, "allin", 0.0, 200, (0, 0)),
+    ], effective_stack=10000)
+
+    served = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=SERVED_FIRST, subsequent_bet_sizes=SERVED_SUBSEQ,
+    )
+    assert served[0].flop_history_train == (2,)
+
+    legacy = extract_leaf_info_from_tree(
+        tree, num_players=2,
+        postflop_bet_sizes=LEGACY_FIRST, subsequent_bet_sizes=LEGACY_SUBSEQ,
+    )
+    assert legacy[0].flop_history_train == (3,)
+
+    # Vocab omitted → legacy default (byte-identity).
+    default = extract_leaf_info_from_tree(tree, num_players=2)
+    assert default[0].flop_history_train == (3,)
 
 
 if __name__ == "__main__":
