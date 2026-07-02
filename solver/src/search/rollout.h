@@ -499,6 +499,51 @@ BPS_EXPORT void rollout_reset_cont_ev_boundary_hit_count(void);
  * above clears both counters. hit_rate = hits / attempts. */
 BPS_EXPORT void rollout_get_cont_ev_boundary_attempt_count(uint64_t *out_attempts);
 
+/* ── Unit 3 (Stage-1 mean-field): bias-as-hero-action consumer mode ─────
+ *
+ * docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md §"Unit 3" + docs/PLURIBUS_EXACT_
+ * CONFORMANCE_SPEC_2026-06-26.md §Gap 2. Applies to BOTH boundaries (flop and
+ * turn), on any cont_ev HIT. Independent of the flop/turn enable flags — this
+ * only changes HOW an armed boundary combines its 4 stored per-bias EVs.
+ *
+ * Default 0 (OFF) = legacy: return the uniform mean of the 4 stored EVs
+ * (byte-identical to the pre-Unit-3 consumer; the 26/0 flop + 23/0 turn
+ * consumer contract suites stay green unchanged).
+ *
+ * 1 (ON) = the querying player's 4 stored per-bias EVs become a CFR-selectable
+ * action at the leaf: the consumer regret-matches over the 4 EVs (uniform over
+ * positive regret mass; 1/4 when none positive), returns the regret-matched
+ * MIXTURE value (Σ p_b·EV_b), and updates the per-infoset regrets toward the
+ * realized per-bias EVs (regret_b += EV_b − returned). All 4 EVs are already
+ * in the slot — NO extra rollouts.
+ *
+ * PER-INFOSET, NOT PER-VISIT: the regret state persists across visits within a
+ * solve (keyed by leaf slot key + querying player) so the mixture converges to
+ * the best bias, and is RESET per solve via rollout_reset_cont_ev_bias_regrets.
+ * The regret store is lazily allocated on the first hit in this mode and freed
+ * at reset/teardown.
+ *
+ * SEMANTICS NOTE (spec Unit-3 item 3): whether this computes the true
+ * mean-field value or only a best-response-to-uniform-opponents "half measure"
+ * depends on the .cev the values were WALKED under (uniform vs mean_field). The
+ * C layer only exposes the mode + a select-count stat; the PYTHON caller reads
+ * the <cev>.cev.meta.json sidecar and LOGS which semantics ran (absent meta =>
+ * uniform). Fail-loud on MISS/EMPTY_BIAS is unchanged.
+ *
+ * Process-global; set once at startup (like the enable flags). */
+BPS_EXPORT void rollout_set_cont_ev_bias_action(int enabled);
+BPS_EXPORT int  rollout_get_cont_ev_bias_action(void);
+
+/* Number of bias-action mixtures returned since the last reset (per solve).
+ * Zeroed by rollout_reset_cont_ev_bias_regrets. Pass NULL to skip. */
+BPS_EXPORT void rollout_get_cont_ev_bias_action_stats(uint64_t *out_selects);
+
+/* Free the persistent per-solve bias-regret store and zero the select
+ * counter. Call between solves (never while a rollout is running) so the
+ * regret state does not leak across solves — same lifecycle as the hit-count
+ * reset. Idempotent; safe when the store was never allocated. */
+BPS_EXPORT void rollout_reset_cont_ev_bias_regrets(void);
+
 /* ── Dual-boundary build (2026-06-25): TURN-boundary consumer ──────────
  *
  * Mirror of the flop consumer above, one street later. When enabled, the

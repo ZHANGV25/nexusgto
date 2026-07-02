@@ -41,8 +41,8 @@ $(BUILD_DIR):
 # Requires both mccfr_blueprint.c and card_abstraction.c (k-means bucketing)
 blueprint: $(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT)
 
-$(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c -o $@ $(LDFLAGS)
 
 # ── Street solver v2 (GPU re-solve support library) ──
 $(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(ARCH_DIR)/solver_v2.c $(ARCH_DIR)/solver_v2.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
@@ -98,8 +98,8 @@ $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_read
 # Links bps_reader.c (blueprint queries); eval7 is header-only.
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
-$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
 
 # ── CPU external-sampling ES re-solver (HYBRID 5p flop/turn path) ──
 # es_resolver: lightweight (table/joint oracles only) — validation harnesses.
@@ -123,11 +123,11 @@ $(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/rollout.h | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/rollout.h | $(BUILD_DIR)
 	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
+	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
 
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
@@ -192,8 +192,8 @@ test: $(BUILD_DIR)/test_phase1
 # Statically links the blueprint solver for a self-contained test binary.
 # Python-side verifier (tests/test_phase_1_3_synthetic.py) consumes the
 # bundle this produces and asserts CFR identity + enumerated ground truth.
-$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_phase_1_3_synthetic.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_phase_1_3_synthetic.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c -o $@ $(LDFLAGS)
 
 test_phase_1_3: $(BUILD_DIR)/test_phase_1_3
 	./$(BUILD_DIR)/test_phase_1_3 $(BUILD_DIR)/phase_1_3_synthetic.tbn
@@ -225,8 +225,8 @@ test_bps_ochs_river: $(BUILD_DIR)/test_bps_ochs_river
 # ── Phase R Block A.1: dispatch helper unit tests ──
 # Pure helper (mccfr_phase_r.c) tested in isolation — no card_abstraction
 # / hand_eval / OMP needed. Mac-runnable, <1s wall.
-$(BUILD_DIR)/test_phase_r_dispatch: tests/test_phase_r_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+$(BUILD_DIR)/test_phase_r_dispatch: tests/test_phase_r_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c -o $@ $(LDFLAGS) -lpthread
 
 test_phase_r_dispatch: $(BUILD_DIR)/test_phase_r_dispatch
 	./$(BUILD_DIR)/test_phase_r_dispatch
@@ -243,8 +243,8 @@ test_cont_ev_table: $(BUILD_DIR)/test_cont_ev_table
 
 # ── Phase R Block A.2: cont-bias reweighting helper unit tests ──
 # Pure math (bp_apply_cont_bias in mccfr_phase_r.c). Mac-runnable, <1s.
-$(BUILD_DIR)/test_cont_bias_strategy: tests/test_cont_bias_strategy.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCS) tests/test_cont_bias_strategy.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+$(BUILD_DIR)/test_cont_bias_strategy: tests/test_cont_bias_strategy.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_cont_bias_strategy.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c -o $@ $(LDFLAGS) -lpthread
 
 test_cont_bias_strategy: $(BUILD_DIR)/test_cont_bias_strategy
 	./$(BUILD_DIR)/test_cont_bias_strategy
@@ -260,12 +260,12 @@ test_cont_bias_strategy: $(BUILD_DIR)/test_cont_bias_strategy
 # trainer's omp pragmas degrade to no-ops; bp_solve runs single-threaded.
 $(BUILD_DIR)/test_phase_r_regression_smoke: tests/test_phase_r_regression_smoke.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_regression_smoke.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_regression_smoke: $(BUILD_DIR)/test_phase_r_regression_smoke
@@ -278,12 +278,12 @@ test_phase_r_regression_smoke: $(BUILD_DIR)/test_phase_r_regression_smoke
 # finite ev_sum values. Mac-runnable, ~10-20s.
 $(BUILD_DIR)/test_phase_r_heads_rollout: tests/test_phase_r_heads_rollout.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_heads_rollout.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_heads_rollout: $(BUILD_DIR)/test_phase_r_heads_rollout
@@ -296,12 +296,12 @@ test_phase_r_heads_rollout: $(BUILD_DIR)/test_phase_r_heads_rollout
 # signature). Mac-runnable, ~10-15s.
 $(BUILD_DIR)/test_phase_r_cont_strat_signed: tests/test_phase_r_cont_strat_signed.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_cont_strat_signed.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_cont_strat_signed: $(BUILD_DIR)/test_phase_r_cont_strat_signed
@@ -324,12 +324,12 @@ test_bps_query_boundary_ev: $(BUILD_DIR)/test_bps_query_boundary_ev
 # ev_count[4]) tuple. Mac-runnable, ~10-20s.
 $(BUILD_DIR)/test_bpr5_roundtrip: tests/test_bpr5_roundtrip.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_bpr5_roundtrip.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
@@ -341,12 +341,12 @@ test_bpr5_roundtrip: $(BUILD_DIR)/test_bpr5_roundtrip
 # NOT the raw per-player hand-list index. Deterministic, <1s.
 $(BUILD_DIR)/test_cont_ev_key: tests/test_cont_ev_key.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_cont_ev_key.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
@@ -358,12 +358,12 @@ test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
 # byte-exact match on stored fields and OK status with the divided ratio.
 $(BUILD_DIR)/test_phase_r_save_load_e2e: tests/test_phase_r_save_load_e2e.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_save_load_e2e.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_save_load_e2e: $(BUILD_DIR)/test_phase_r_save_load_e2e
@@ -376,14 +376,14 @@ test_phase_r_save_load_e2e: $(BUILD_DIR)/test_phase_r_save_load_e2e
 $(BUILD_DIR)/test_ss_action_hash: tests/test_ss_action_hash.c \
         $(ARCH_DIR)/ss_action_hash.c $(ARCH_DIR)/ss_action_hash.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(SRC_DIR)/cuda/street_solve.cuh \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) -I$(ARCH_DIR) tests/test_ss_action_hash.c \
 	    $(ARCH_DIR)/ss_action_hash.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_ss_action_hash: $(BUILD_DIR)/test_ss_action_hash
@@ -397,12 +397,12 @@ test_ss_action_hash: $(BUILD_DIR)/test_ss_action_hash
 # discount tick. Mac-runnable, ~5-10s wall.
 $(BUILD_DIR)/test_phase_r_discount_gate: tests/test_phase_r_discount_gate.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_discount_gate.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_phase_r_discount_gate: $(BUILD_DIR)/test_phase_r_discount_gate
@@ -416,14 +416,14 @@ $(BUILD_DIR)/test_b3_encoding_alignment: tests/test_b3_encoding_alignment.c \
         $(SEARCH_DIR)/ss_tree_builder.c $(SEARCH_DIR)/ss_tree_builder.h \
         $(ARCH_DIR)/ss_action_hash.c $(ARCH_DIR)/ss_action_hash.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(SRC_DIR)/cuda/street_solve.cuh \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) -I$(ARCH_DIR) tests/test_b3_encoding_alignment.c \
 	    $(SEARCH_DIR)/ss_tree_builder.c $(ARCH_DIR)/ss_action_hash.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_b3_encoding_alignment: $(BUILD_DIR)/test_b3_encoding_alignment
@@ -438,13 +438,13 @@ test_b3_encoding_alignment: $(BUILD_DIR)/test_b3_encoding_alignment
 $(BUILD_DIR)/test_b3_bucket_alignment: tests/test_b3_bucket_alignment.c \
         $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_b3_bucket_alignment.c \
 	    $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
 
 test_b3_bucket_alignment: $(BUILD_DIR)/test_b3_bucket_alignment
@@ -460,12 +460,12 @@ test_b3_bucket_alignment: $(BUILD_DIR)/test_b3_bucket_alignment
 #       in [0, postflop_num_buckets) (the Gate C.1 acceptance criterion).
 $(BUILD_DIR)/test_phase_r_boundary_bucket: tests/test_phase_r_boundary_bucket.c \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_blueprint.h $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_phase_r_boundary_bucket.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_phase_r_boundary_bucket: $(BUILD_DIR)/test_phase_r_boundary_bucket
@@ -484,24 +484,46 @@ $(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
         $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
-        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_boundary.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
 	./$(BUILD_DIR)/test_rollout_cont_ev_boundary
 
+# ── Unit 3 (Stage-1 mean-field, 2026-07-01): bias-as-hero-action consumer ──
+# Rigged slot where bias 2's EV dominates: with bias-action ON the returned
+# leaf value converges toward EV_2 over repeated queries (and equals the
+# uniform mean with the flag OFF, same slot); regret persistence + reset.
+# Same link line as test_rollout_cont_ev_boundary. Mac-runnable, ~<1s.
+# EC2 harness: add to EXTRA_C_TESTS as `test_rollout_cont_ev_bias_action`.
+$(BUILD_DIR)/test_rollout_cont_ev_bias_action: tests/test_rollout_cont_ev_bias_action.c \
+        $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_bias_action.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_rollout_cont_ev_bias_action: $(BUILD_DIR)/test_rollout_cont_ev_bias_action
+	./$(BUILD_DIR)/test_rollout_cont_ev_bias_action
+
 # ── Dual-boundary build (2026-06-25): TURN-boundary dispatch helper ──
 # Pure helper (mccfr_phase_r.c) tested in isolation. Mirrors
 # test_phase_r_dispatch for bp_should_dispatch_to_turn_boundary AND re-pins
 # that the FLOP helper is byte-untouched at num_board==4. Mac-runnable, <1s.
-$(BUILD_DIR)/test_turn_dispatch: tests/test_turn_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCS) tests/test_turn_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+$(BUILD_DIR)/test_turn_dispatch: tests/test_turn_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_turn_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c -o $@ $(LDFLAGS) -lpthread
 
 test_turn_dispatch: $(BUILD_DIR)/test_turn_dispatch
 	./$(BUILD_DIR)/test_turn_dispatch
@@ -515,13 +537,13 @@ $(BUILD_DIR)/test_turn_boundary_key_alignment: tests/test_turn_boundary_key_alig
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
         $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
-        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_turn_boundary_key_alignment.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_turn_boundary_key_alignment: $(BUILD_DIR)/test_turn_boundary_key_alignment
@@ -534,13 +556,13 @@ $(BUILD_DIR)/test_rollout_cont_ev_turn_boundary: tests/test_rollout_cont_ev_turn
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
         $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
-        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_turn_boundary.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_rollout_cont_ev_turn_boundary: $(BUILD_DIR)/test_rollout_cont_ev_turn_boundary
@@ -560,6 +582,40 @@ $(BUILD_DIR)/test_cont_ev_standalone_roundtrip: \
 test_cont_ev_standalone_roundtrip: $(BUILD_DIR)/test_cont_ev_standalone_roundtrip
 	./$(BUILD_DIR)/test_cont_ev_standalone_roundtrip
 
+# ── Stage 1 (2026-07-01): mean-field opponent-bias regret sidecar ──
+# Self-contained — links only against mccfr_bias_regrets.c + the shared
+# key-hash in mccfr_cont_ev_table.c. Covers the Unit-2 item-6 contract:
+# rigged-payoff sampler concentration + uniform fallback, key alignment with
+# the cont_ev table, and same-seed determinism. Mac-runnable, <1s.
+$(BUILD_DIR)/test_bias_regrets: tests/test_bias_regrets.c \
+        $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h \
+        | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_bias_regrets.c \
+	    $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_bias_regrets: $(BUILD_DIR)/test_bias_regrets
+	./$(BUILD_DIR)/test_bias_regrets
+
+# ── Stage 1: mean-field PRODUCER integration (through the trainer) ──
+# Drives the 3p postflop fixture with mean-field mode OFF (sidecar never
+# allocated — wiring-level byte-identity guard) and ON (sidecar allocated +
+# populated, opponent regrets updated, cont_ev still populates). Mac-runnable,
+# ~5-15s. Build: `make test_meanfield_producer`.
+$(BUILD_DIR)/test_meanfield_producer: tests/test_meanfield_producer.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
+        $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_meanfield_producer.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+	    -o $@ $(LDFLAGS)
+
+test_meanfield_producer: $(BUILD_DIR)/test_meanfield_producer
+	./$(BUILD_DIR)/test_meanfield_producer
+
 # ── Combined Phase R test target ──
 test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_cont_bias_strategy test_phase_r_regression_smoke \
@@ -569,8 +625,10 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_phase_r_discount_gate test_b3_encoding_alignment \
                   test_b3_bucket_alignment test_phase_r_boundary_bucket \
                   test_rollout_cont_ev_boundary \
+                  test_rollout_cont_ev_bias_action \
                   test_cont_ev_standalone_roundtrip \
-                  test_turn_all
+                  test_turn_all \
+                  test_meanfield_all
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
 	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Sess 11 + Sess 14"
@@ -585,6 +643,17 @@ test_turn_all: test_turn_dispatch test_turn_boundary_key_alignment \
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
 	@echo "  Dual-boundary (turn) — dispatch + key-alignment + consumer — green"
+	@echo "═══════════════════════════════════════════════════════════"
+
+# ── Stage 1 (2026-07-01) mean-field combined target ──
+# The producer-side mean-field tests: the self-contained sidecar unit test
+# (rigged-payoff / key-alignment / determinism) + the through-the-trainer
+# integration (mode OFF sidecar-NULL byte-identity guard; mode ON populate).
+# Names chosen so both can be passed individually via EXTRA_C_TESTS on EC2.
+test_meanfield_all: test_bias_regrets test_meanfield_producer
+	@echo ""
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "  Stage 1 mean-field producer — sidecar + integration — green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:
