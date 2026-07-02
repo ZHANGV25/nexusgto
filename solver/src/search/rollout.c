@@ -503,21 +503,98 @@ static int rollout_should_add_explicit_allin(void) {
     return parsed;
 }
 
+/* ── Training bet-vocab (runtime, bet-vocab desync fix 2026-07-01) ──────
+ *
+ * The postflop first/subsequent raise sizes the rollout enumerates. Defaults
+ * to the PRE-FIX compiled values ({0.5,1.0} first / {1.0} subsequent) so a
+ * process that never calls rollout_set_train_vocab is byte-identical to the
+ * pre-fix consumer. The served path calls rollout_set_train_vocab() with the
+ * loaded .bps manifest vocab ([0.75]/[1.0] for the 8.05B) at startup.
+ *
+ * Process-global, guarded by g_vocab_set (an ACQUIRE/RELEASE flag). Written
+ * once at startup before workers fork; read on the hot path. No RNG. */
+static float g_rollout_first_fracs[ROLLOUT_MAX_RAISE_SIZES] = { 0.5f, 1.0f };
+static int32_t g_rollout_n_first = ROLLOUT_FIRST_RAISE_DEFAULT_N;
+static float g_rollout_subseq_fracs[ROLLOUT_MAX_RAISE_SIZES] = { 1.0f };
+static int32_t g_rollout_n_subseq = ROLLOUT_SUBSEQUENT_DEFAULT_N;
+
+BPS_EXPORT int32_t rollout_set_train_vocab(
+    int32_t n_first, const float *first_fracs,
+    int32_t n_subseq, const float *subseq_fracs
+) {
+    if (!first_fracs || !subseq_fracs
+        || n_first <= 0 || n_first > ROLLOUT_MAX_RAISE_SIZES
+        || n_subseq <= 0 || n_subseq > ROLLOUT_MAX_RAISE_SIZES) {
+        rollout_set_error(
+            -1, -1,
+            "rollout_set_train_vocab: bad vocab "
+            "(NULL list or count outside [1, ROLLOUT_MAX_RAISE_SIZES])");
+        return -1;
+    }
+    for (int32_t i = 0; i < n_first; i++)  g_rollout_first_fracs[i]  = first_fracs[i];
+    for (int32_t i = 0; i < n_subseq; i++) g_rollout_subseq_fracs[i] = subseq_fracs[i];
+    /* Publish the counts LAST with a RELEASE store so a concurrent reader that
+     * observes the new count also sees the fully-written frac arrays. */
+    __atomic_store_n(&g_rollout_n_first, n_first, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_rollout_n_subseq, n_subseq, __ATOMIC_RELEASE);
+    return 0;
+}
+
+BPS_EXPORT void rollout_get_train_vocab(
+    int32_t *out_n_first, float *out_first_fracs,
+    int32_t *out_n_subseq, float *out_subseq_fracs
+) {
+    int32_t nf = __atomic_load_n(&g_rollout_n_first, __ATOMIC_ACQUIRE);
+    int32_t ns = __atomic_load_n(&g_rollout_n_subseq, __ATOMIC_ACQUIRE);
+    if (out_n_first)  *out_n_first  = nf;
+    if (out_n_subseq) *out_n_subseq = ns;
+    if (out_first_fracs)
+        for (int32_t i = 0; i < nf; i++) out_first_fracs[i] = g_rollout_first_fracs[i];
+    if (out_subseq_fracs)
+        for (int32_t i = 0; i < ns; i++) out_subseq_fracs[i] = g_rollout_subseq_fracs[i];
+}
+
+/* Hot-path accessors: number of raise slots at a first vs subsequent raise. */
+static int32_t rollout_n_first_raises(void) {
+    return __atomic_load_n(&g_rollout_n_first, __ATOMIC_ACQUIRE);
+}
+static int32_t rollout_n_subsequent_raises(void) {
+    return __atomic_load_n(&g_rollout_n_subseq, __ATOMIC_ACQUIRE);
+}
+/* Hot-path accessors: the pot fraction at raise slot `i`. `i` comes from the
+ * action-index arithmetic, which is derived from the SAME vocab counts above,
+ * so a valid action index always lands in-range; the clamp is a defensive
+ * belt-and-suspenders (a caller bug would otherwise read past the array). */
+static float rollout_first_frac(int32_t i) {
+    int32_t nf = __atomic_load_n(&g_rollout_n_first, __ATOMIC_ACQUIRE);
+    if (i < 0) i = 0;
+    if (i >= nf) i = nf - 1;
+    return g_rollout_first_fracs[i];
+}
+static float rollout_subseq_frac(int32_t i) {
+    int32_t ns = __atomic_load_n(&g_rollout_n_subseq, __ATOMIC_ACQUIRE);
+    if (i < 0) i = 0;
+    if (i >= ns) i = ns - 1;
+    return g_rollout_subseq_fracs[i];
+}
+
 /* Matches python/rollout.py::classify_postflop_actions.
  *
- * Returns the number of actions. Layout (depending on
- * BPS_ROLLOUT_ADD_EXPLICIT_ALLIN; phase3 default is OFF):
+ * Returns the number of actions. The raise-slot COUNT comes from the runtime
+ * training vocab (rollout_set_train_vocab); the sizes shown below are the
+ * served 8.05B vocab (postflop_bet_sizes=[0.75], subsequent_bet_sizes=[1.0]).
+ * Layout (depending on BPS_ROLLOUT_ADD_EXPLICIT_ALLIN; phase3 default is OFF):
  *   tree-closed + facing_bet: [fold, call]
  *   tree-closed + !facing_bet: [check]
  *   open + facing_bet (first raise):
- *     allin off (default): [fold, call, raise×0.5, raise×1.0]
- *     allin on:            [fold, call, raise×0.5, raise×1.0, allin]
+ *     allin off (default): [fold, call, raise×0.75]
+ *     allin on:            [fold, call, raise×0.75, allin]
  *   open + facing_bet (subsequent):
  *     allin off (default): [fold, call, raise×1.0]
  *     allin on:            [fold, call, raise×1.0, allin]
  *   open + !facing_bet:
- *     allin off (default): [check, bet×0.5, bet×1.0]
- *     allin on:            [check, bet×0.5, bet×1.0, allin]
+ *     allin off (default): [check, bet×0.75]
+ *     allin on:            [check, bet×0.75, allin]
  */
 BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
     int32_t facing_bet, int32_t raises_so_far,
@@ -541,8 +618,11 @@ BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
     }
 
     if (facing_bet) {
-        int32_t n_raises = (raises_so_far > 0) ? ROLLOUT_SUBSEQUENT_RAISE_N
-                                               : ROLLOUT_FIRST_RAISE_N;
+        /* Raise-slot count from the RUNTIME training vocab (bet-vocab desync
+         * fix). First raise uses the first-raise list; subsequent uses the
+         * subsequent list. See rollout_set_train_vocab. */
+        int32_t n_raises = (raises_so_far > 0) ? rollout_n_subsequent_raises()
+                                               : rollout_n_first_raises();
         /* [fold, call, raise×…, (allin)?] */
         n = 2 + n_raises + (add_allin ? 1 : 0);
         if (cap >= n && out_cats) {
@@ -556,14 +636,18 @@ BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
         return n;
     }
 
-    /* not facing bet: [check, bet×0.5, bet×1.0, (allin)?] */
-    n = 1 + ROLLOUT_FIRST_RAISE_N + (add_allin ? 1 : 0);
-    if (cap >= n && out_cats) {
-        out_cats[0] = ROLLOUT_CAT_CALL;  /* check */
-        for (int32_t i = 0; i < ROLLOUT_FIRST_RAISE_N; i++) {
-            out_cats[1 + i] = ROLLOUT_CAT_RAISE;
+    /* not facing bet: [check, bet×frac_0..frac_{n-1}, (allin)?] — the sizes
+     * come from the runtime first-raise vocab (served: [0.75]). */
+    {
+        int32_t n_bets = rollout_n_first_raises();
+        n = 1 + n_bets + (add_allin ? 1 : 0);
+        if (cap >= n && out_cats) {
+            out_cats[0] = ROLLOUT_CAT_CALL;  /* check */
+            for (int32_t i = 0; i < n_bets; i++) {
+                out_cats[1 + i] = ROLLOUT_CAT_RAISE;
+            }
+            if (add_allin) out_cats[n - 1] = ROLLOUT_CAT_RAISE;  /* allin */
         }
-        if (add_allin) out_cats[n - 1] = ROLLOUT_CAT_RAISE;  /* allin */
     }
     return n;
 }
@@ -614,15 +698,16 @@ BPS_EXPORT void rollout_action_amount_chips_c(
             if (out_amount) *out_amount = stack;
             return;
         }
-        /* Sized raise */
+        /* Sized raise. Fraction from the RUNTIME training vocab
+         * (bet-vocab desync fix): subsequent raises index the subsequent
+         * list, first raises index the first-raise list. Served: [0.75]
+         * first / [1.0] subsequent. */
         int32_t frac_slot = action_idx - 2;
         double frac;
         if (raises_so_far > 0) {
-            /* SUBSEQUENT_BET_FRACTIONS = (1.0,) */
-            frac = 1.0;
+            frac = (double)rollout_subseq_frac(frac_slot);
         } else {
-            /* POSTFLOP_BET_FRACTIONS = (0.5, 1.0) */
-            frac = (frac_slot == 0) ? 0.5 : 1.0;
+            frac = (double)rollout_first_frac(frac_slot);
         }
         /* raise_to = to_call + int(frac * (pot + to_call)) — Python int() truncates toward 0 */
         int32_t raise_to = to_call + (int32_t)(frac * (double)(pot + to_call));
@@ -656,7 +741,8 @@ BPS_EXPORT void rollout_action_amount_chips_c(
         return;
     }
     int32_t frac_slot = action_idx - 1;
-    double frac = (frac_slot == 0) ? 0.5 : 1.0;
+    /* Bet fraction from the RUNTIME first-raise vocab (served: [0.75]). */
+    double frac = (double)rollout_first_frac(frac_slot);
     int32_t bet_amount = (int32_t)(frac * (double)pot);
     /* Python: min(max(bet_amount, 1), stack) */
     int32_t a = bet_amount > 1 ? bet_amount : 1;
