@@ -37,10 +37,34 @@ extern "C" {
 #define ROLLOUT_NUM_BIAS_PROFILES      4
 #define ROLLOUT_POSTFLOP_MAX_RAISES    3
 #define ROLLOUT_MAX_PLAYERS            6
-/* [0.5, 1.0] first raise; [1.0] subsequent — matches training's
- * POSTFLOP_BET_SIZES in precompute/blueprint_worker_unified.py:51. */
-#define ROLLOUT_FIRST_RAISE_N          2   /* 0.5, 1.0 */
-#define ROLLOUT_SUBSEQUENT_RAISE_N     1   /* 1.0 */
+
+/* Postflop bet-vocab is RUNTIME state, not a compile-time constant (bet-vocab
+ * desync fix, 2026-07-01 — docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). The
+ * consumer MUST enumerate the SAME first/subsequent postflop sizes the served
+ * blueprint was TRAINED with, or its action-index sequence hashes to a key
+ * training never stored (all-in mis-key). The served 8.05B manifest footer says
+ * postflop_bet_sizes=[0.75], subsequent_bet_sizes=[1.0] (config_hash bc8ac105);
+ * the caller reads that footer and calls rollout_set_train_vocab() before any
+ * rollout. Until it does, the runtime state DEFAULTS to the values compiled
+ * below (ROLLOUT_FIRST_RAISE_DEFAULT_N / _FRACS), which are the PRE-FIX
+ * hardcoded values — so a never-set process is byte-identical to before this
+ * change (flag-OFF byte-identity invariant). See rollout_set_train_vocab. */
+/* Hard cap on the length of either size list (array sizing). NOTE: the
+ * EFFECTIVE bound rollout_set_train_vocab enforces is TIGHTER:
+ * ROLLOUT_MAX_ACTIONS_PER_NODE - 3 (= 6 with the current cap of 9). A facing
+ * node emits [fold, call, <n sized raises>, allin] = n + 3 actions, which must
+ * fit ROLLOUT_MAX_ACTIONS_PER_NODE; a vocab of 8 sizes would need 11 slots and
+ * overflow the fixed per-node buffers. rollout_set_train_vocab rejects any
+ * n_first/n_subseq > ROLLOUT_MAX_ACTIONS_PER_NODE - 3 fail-loud. This 8 only
+ * bounds the g_rollout_*_fracs arrays; do not raise it above
+ * ROLLOUT_MAX_ACTIONS_PER_NODE - 3 as a usable vocab length without also
+ * enlarging the per-node action buffers. */
+#define ROLLOUT_MAX_RAISE_SIZES        8   /* array cap; effective usable bound is ROLLOUT_MAX_ACTIONS_PER_NODE-3 */
+/* Pre-fix compiled defaults (the byte-identity baseline). NOT the served
+ * training vocab — the served 8.05B is [0.75]/[1.0]; these match what the
+ * consumer hardcoded before the fix so an un-set process is bit-identical. */
+#define ROLLOUT_FIRST_RAISE_DEFAULT_N  2   /* 0.5, 1.0 */
+#define ROLLOUT_SUBSEQUENT_DEFAULT_N   1   /* 1.0 */
 
 /* Action categories for the bias transform. Matches
  * python/rollout.py::ActionCategory. CALL covers check; RAISE covers
@@ -62,9 +86,10 @@ extern "C" {
 #define ROLLOUT_STREET_TURN  2
 #define ROLLOUT_STREET_RIVER 3
 
-/* Upper bound on action count at any single node: [fold, call, 0.5, 1.0,
- * allin] (first raise) = 5. We reserve 9 for safety against future
- * tier widening. */
+/* Upper bound on action count at any single node: [fold, call] + up to
+ * ROLLOUT_MAX_RAISE_SIZES sized raises + allin. We reserve 9 for safety;
+ * the served vocab is [fold, call, raise×0.75, allin] = 4, and the pre-fix
+ * default [fold, call, 0.5, 1.0, allin] = 5. */
 #define ROLLOUT_MAX_ACTIONS_PER_NODE 9
 
 /* Upper bound on the action history a per-leaf rollout receives. Used
@@ -119,6 +144,40 @@ BPS_EXPORT void rollout_apply_bias_c(
 BPS_EXPORT int32_t rollout_classify_postflop_actions_c(
     int32_t facing_bet, int32_t raises_so_far,
     int32_t *out_cats, int32_t cap
+);
+
+/* ── Training bet-vocab setter (bet-vocab desync fix, 2026-07-01) ───────
+ *
+ * Set the postflop bet vocabulary the rollout enumerates so its action-index
+ * sequence matches what the served blueprint was TRAINED with. The caller
+ * reads first_fracs/subseq_fracs from the loaded .bps manifest
+ * (postflop_bet_sizes / subsequent_bet_sizes) and calls this ONCE at startup
+ * before launching workers. Process-global; set-once.
+ *
+ * n_first  : number of first-raise (opening bet) pot fractions (1..MAX).
+ * first_fracs[n_first]  : e.g. {0.75f} for the served 8.05B.
+ * n_subseq : number of subsequent-raise pot fractions (1..MAX).
+ * subseq_fracs[n_subseq]: e.g. {1.0f}.
+ *
+ * Returns 0 on success; -1 on a bad argument (NULL list, count <=0 or
+ * > ROLLOUT_MAX_RAISE_SIZES) — sets rollout_last_error. FAIL-LOUD: never
+ * silently truncates or falls back to constants.
+ *
+ * Until called, the runtime state DEFAULTS to the pre-fix compiled values
+ * ({0.5,1.0} first / {1.0} subsequent) so a never-set process is
+ * bit-identical to the pre-fix consumer (byte-identity invariant). */
+BPS_EXPORT int32_t rollout_set_train_vocab(
+    int32_t n_first, const float *first_fracs,
+    int32_t n_subseq, const float *subseq_fracs
+);
+
+/* Read back the currently-configured training vocab (for the manifest-vs-
+ * runtime assert and tests). Pass NULL for any out pointer to skip it.
+ * out_first_fracs / out_subseq_fracs must have room for at least
+ * ROLLOUT_MAX_RAISE_SIZES floats when non-NULL. */
+BPS_EXPORT void rollout_get_train_vocab(
+    int32_t *out_n_first, float *out_first_fracs,
+    int32_t *out_n_subseq, float *out_subseq_fracs
 );
 
 /* action_amount_chips: translates an action index to (kind, chip_amount).

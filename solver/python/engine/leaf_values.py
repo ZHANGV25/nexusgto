@@ -218,12 +218,23 @@ def bias_strategy(strategy: np.ndarray, bias_type: int,
 
 # ── Leaf info extraction from tree ───────────────────────────────────────
 
-# Pluribus training postflop action enumeration. Mirrors
-# precompute/blueprint_worker_unified.py:51 (POSTFLOP_BET_SIZES = [0.5, 1.0])
-# and src/rollout.h's ROLLOUT_FIRST_RAISE_N=2 / ROLLOUT_SUBSEQUENT_RAISE_N=1.
+# Postflop training action enumeration vocab.
+#
+# These module-level tuples are the PRE-FIX compiled DEFAULTS ([0.5, 1.0]
+# first / [1.0] subsequent), NOT the served training vocab. The served 8.05B
+# blueprint was trained with postflop_bet_sizes=[0.75] / subsequent=[1.0]
+# (manifest footer, config_hash bc8ac105) — the leaf encoder MUST enumerate
+# THAT vocab or it mis-keys every flop all-in line (see
+# docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). So the real vocab is THREADED
+# from the loaded .bps manifest through `extract_leaf_info_from_tree` /
+# `_train_action_idx`; these defaults exist ONLY so a caller that supplies no
+# vocab reproduces the pre-fix byte-for-byte behavior (byte-identity). They
+# are NOT load-bearing for the served path — the served caller
+# (nexusgto-api cpu_es_solver) always passes the manifest vocab.
+#
 # Subgame trees may use richer sizes (off-tree extras from Pluribus
 # Algorithm 2 nested re-solve); _train_action_idx fuzzy-maps subgame
-# sizes back to these training-time slots so the per-leaf flop_history
+# sizes back to the training-time slots so the per-leaf flop_history
 # fed into the rollout's blueprint queries hashes to the keys training
 # stored.
 _POSTFLOP_FIRST_RAISE_FRACS = (0.5, 1.0)
@@ -247,29 +258,43 @@ LeafInfo = namedtuple(
 )
 
 
-def _train_action_idx(facing_bet, raises_so_far, kind, size_frac):
+def _train_action_idx(facing_bet, raises_so_far, kind, size_frac,
+                      first_fracs=_POSTFLOP_FIRST_RAISE_FRACS,
+                      subseq_fracs=_POSTFLOP_SUBSEQUENT_RAISE_FRACS):
     """Map a (kind, size_frac) action back to its training-time action index.
 
-    Mirrors src/rollout.c:218 (rollout_classify_postflop_actions_c)'s
-    enumeration so the per-leaf flop history hashes to the same
-    action_hash training stored. Subgame trees may have richer raise
-    sizes; closest-fraction match maps them to training's discrete
-    enumeration. This is lossy at subsequent-raise nodes (training only
-    stored 1.0×pot there) but the only correct option — the blueprint
-    has nothing to return for sizes it never trained on.
+    Mirrors the trainer's generate_actions enumeration
+    (src/blueprint/mccfr_blueprint.c:954-991) and the C rollout's
+    rollout_classify_postflop_actions_c so the per-leaf flop history hashes
+    to the same action_hash training stored. The all-in index is
+    ``num_bet_sizes`` PAST the last sized-raise slot — so it moves with the
+    vocab length, which is exactly the desync this fixes (see
+    docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md).
 
-    Enumerations:
+    The vocab is a PARAMETER threaded from the loaded .bps manifest
+    (postflop_bet_sizes -> first_fracs, subsequent_bet_sizes -> subseq_fracs);
+    the module-level defaults are the pre-fix [0.5,1.0]/[1.0] and exist only
+    so a caller that passes nothing reproduces the pre-fix indices.
+
+    Subgame trees may have richer raise sizes; closest-fraction match maps
+    them to the training-time slots. This is lossy at subsequent-raise nodes
+    when training stored fewer sizes there — the only correct option, the
+    blueprint has nothing to return for sizes it never trained on.
+
+    Enumerations (with the served [0.75] first / [1.0] subsequent vocab):
         tree_closed (raises_so_far >= 3) + facing: [fold(0), call(1)]
         tree_closed + !facing:                     [check(0)]
-        facing + first raise:    [fold(0), call(1), 0.5(2), 1.0(3), allin(4)]
+        facing + first raise:    [fold(0), call(1), 0.75(2), allin(3)]
         facing + subsequent:     [fold(0), call(1), 1.0(2), allin(3)]
-        !facing:                 [check(0), 0.5(1), 1.0(2), allin(3)]
+        !facing:                 [check(0), 0.75(1), allin(2)]
 
     Args:
         facing_bet: True if to_call > 0 at the parent node.
         raises_so_far: number of raises already made this street.
         kind: 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allin'.
         size_frac: pot fraction for bet/raise; ignored otherwise.
+        first_fracs: first-raise (opening bet) pot fractions from the manifest.
+        subseq_fracs: subsequent-raise pot fractions from the manifest.
     """
     tree_closed = raises_so_far >= _POSTFLOP_MAX_RAISES
 
@@ -284,31 +309,39 @@ def _train_action_idx(facing_bet, raises_so_far, kind, size_frac):
         if kind in ('call', 'check'):
             return 1
         if raises_so_far == 0:
+            # [fold, call, first_fracs..., allin@2+len(first_fracs)]
             if kind == 'allin':
-                return 4
-            choices = _POSTFLOP_FIRST_RAISE_FRACS
+                return 2 + len(first_fracs)
             best_i = min(
-                range(len(choices)),
-                key=lambda i: abs(size_frac - choices[i]),
+                range(len(first_fracs)),
+                key=lambda i: abs(size_frac - first_fracs[i]),
             )
             return 2 + best_i
+        # subsequent raise: [fold, call, subseq_fracs..., allin@2+len(subseq)]
         if kind == 'allin':
-            return 3
-        return 2
+            return 2 + len(subseq_fracs)
+        best_i = min(
+            range(len(subseq_fracs)),
+            key=lambda i: abs(size_frac - subseq_fracs[i]),
+        )
+        return 2 + best_i
 
+    # !facing: [check, first_fracs..., allin@1+len(first_fracs)]
     if kind == 'check':
         return 0
     if kind == 'allin':
-        return 3
-    choices = _POSTFLOP_FIRST_RAISE_FRACS
+        return 1 + len(first_fracs)
     best_i = min(
-        range(len(choices)),
-        key=lambda i: abs(size_frac - choices[i]),
+        range(len(first_fracs)),
+        key=lambda i: abs(size_frac - first_fracs[i]),
     )
     return 1 + best_i
 
 
-def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
+def extract_leaf_info_from_tree(
+    tree_data, num_players=2,
+    postflop_bet_sizes=None, subsequent_bet_sizes=None,
+) -> List[LeafInfo]:
     """Extract pot/bets/flop_history for each subgame leaf.
 
     DFS from the SS tree root accumulates the action sequence taken to
@@ -318,6 +351,15 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
     blueprint queries during turn/river include the real flop slice (not
     the dropped [preflop_only] prefix that triggered the v3 sentinel
     battery's uniform-1/n collapse, 2026-04-30 diagnosis).
+
+    postflop_bet_sizes / subsequent_bet_sizes: the TRAINING bet vocab from
+    the loaded .bps manifest (postflop_bet_sizes / subsequent_bet_sizes).
+    The encoded flop_history_train indices MUST match the vocab the served
+    blueprint was trained with, or every flop all-in line mis-keys (bet-vocab
+    desync — docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). When None, falls
+    back to the pre-fix defaults ([0.5,1.0]/[1.0]) so legacy callers are
+    byte-identical; the served caller (cpu_es_solver) passes the manifest
+    vocab explicitly.
 
     Handles both SS tree shapes (compile-time SS_CONT_STRAT_MODE):
 
@@ -346,6 +388,16 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
     """
     cont_per_leaf = 4 ** num_players  # 16 for 2p, 64 for 3p, etc.
     effective_stack = int(tree_data.effective_stack)
+
+    # Normalize the training vocab (None -> pre-fix defaults for legacy
+    # callers; the served caller passes the manifest vocab). Tuples so the
+    # closure below and _train_action_idx see stable, indexable sequences.
+    first_fracs = (tuple(postflop_bet_sizes)
+                   if postflop_bet_sizes is not None
+                   else _POSTFLOP_FIRST_RAISE_FRACS)
+    subseq_fracs = (tuple(subsequent_bet_sizes)
+                    if subsequent_bet_sizes is not None
+                    else _POSTFLOP_SUBSEQUENT_RAISE_FRACS)
 
     def _is_cont_chain(node_idx, depth):
         """Check if node_idx is the root of a N-deep continuation chain.
@@ -455,7 +507,10 @@ def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
                         frac = ((bet_delta - to_call) / denom) if denom > 0 else 0.0
                     new_raises = raises_so_far + 1
 
-            train_idx = _train_action_idx(facing, raises_so_far, kind, frac)
+            train_idx = _train_action_idx(
+                facing, raises_so_far, kind, frac,
+                first_fracs=first_fracs, subseq_fracs=subseq_fracs,
+            )
             stack.append((child_idx, history + (train_idx,),
                           actors + (acting,), new_raises))
 
