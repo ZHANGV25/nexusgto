@@ -1498,6 +1498,102 @@ static void bp_init_cont_ev_all_biases_from_env(BPSolver *s) {
     }
 }
 
+/* Stage 1 (2026-07-01): read BPS_CONT_EV_BIAS_MODE at init and set the
+ * mean-field opponent-bias-as-action mode. Mirrors the env-plumbing shape of
+ * bp_init_cont_ev_all_biases_from_env. Accepts "mean_field" / "1" for
+ * MEANFIELD; anything else (incl. unset / "uniform" / "0") is UNIFORM. Goes
+ * through bp_set_cont_ev_bias_mode so the sidecar is lazily allocated when
+ * MEANFIELD is requested. Called from both bp_init_ex and bp_init_unified
+ * AFTER cont_ev_bias_mode is defaulted to UNIFORM. */
+static void bp_init_cont_ev_bias_mode_from_env(BPSolver *s) {
+    const char *e = getenv("BPS_CONT_EV_BIAS_MODE");
+    int want_meanfield = (e != NULL &&
+                          (strcmp(e, "1") == 0 ||
+                           strcmp(e, "mean_field") == 0 ||
+                           strcmp(e, "meanfield") == 0 ||
+                           strcmp(e, "MEANFIELD") == 0));
+    if (want_meanfield) {
+        if (bp_set_cont_ev_bias_mode(s, BP_BIAS_MODE_MEANFIELD) != 0) {
+            fprintf(stderr,
+                    "[BP] WARNING: BPS_CONT_EV_BIAS_MODE=%s requested but "
+                    "mean-field mode could not be enabled; staying UNIFORM.\n",
+                    e);
+        } else {
+            fprintf(stderr,
+                    "[BP] BPS_CONT_EV_BIAS_MODE=%s: opponents sample bias by "
+                    "regret matching (mean-field bias-as-action).\n", e);
+        }
+    }
+    /* UNIFORM is the memset/default — no action, no allocation. */
+}
+
+/* ── Stage 1 mean-field opponent-bias helpers ──────────────────────────
+ *
+ * Shared by the FLOP and TURN HEADS branches. In UNIFORM mode these are
+ * NEVER called (the branches keep the literal rng_int draws), so the
+ * legacy path is byte-identical. In MEANFIELD mode:
+ *
+ *   bp_meanfield_sample_opp_biases — for each active OPPONENT (active &&
+ *     != traverser), overwrite bias_tuple[p] with a regret-matched draw from
+ *     that opponent's bias_regrets sidecar slot. The traverser's own entry
+ *     is left untouched (it is force-swept over 0..3 by the caller). Consumes
+ *     EXACTLY ONE rng draw per opponent — the same count the uniform loop
+ *     consumed via rng_int — so the RNG-consumption COUNT matches the uniform
+ *     path (the VALUES differ, which is the whole point of the mode).
+ *
+ *   bp_meanfield_update_opp_regrets — after one rollout produces boundary_ev
+ *     (the traverser's realized value), update each sampled opponent's regret
+ *     for the bias it played, via the outcome-based estimator documented in
+ *     mccfr_bias_regrets.c (regret[b] += opp_value - running-mean baseline).
+ *     opp_value = -boundary_ev (HU-collapsed opponent value; see that file's
+ *     comment for the multiway approximation this trades off). Zero extra
+ *     rollouts — uses only the value the sweep already computed.
+ *
+ * `boundary_action_hash` is the ALREADY street-salted key hash (the caller
+ * passes the same value it keyed the cont_ev slot with), so the sidecar slot
+ * and the cont_ev slot share their key by construction — no drift. `buckets`
+ * carries the per-player boundary bucket (the caller precomputes it once via
+ * bp_boundary_slot_hand_index[_turn]); a bucket < 0 means "skip this player"
+ * (blocked hand / no board), mirroring the cont_ev accumulation guard. */
+
+static void bp_meanfield_sample_opp_biases(
+        BPSolver *s, const TraversalState *ts, uint64_t boundary_action_hash,
+        const int *buckets, int *bias_tuple) {
+    int NP = s->num_players;
+    for (int p = 0; p < NP; p++) {
+        if (!ts->active[p] || p == ts->traverser) continue;
+        /* One rng draw per opponent — matches the uniform loop's count. On an
+         * unseen slot or a blocked-bucket player, bp_bias_regrets_sample
+         * falls back to uniform (and still consumes exactly one draw), so the
+         * RNG-consumption count is invariant to coverage. */
+        uint64_t key_hash = boundary_action_hash;   /* already street-salted */
+        int bucket = (buckets[p] >= 0) ? buckets[p] : 0;
+        bias_tuple[p] = bp_bias_regrets_sample(&s->bias_regrets_table,
+                                               key_hash, p, bucket, ts->rng);
+    }
+}
+
+static void bp_meanfield_update_opp_regrets(
+        BPSolver *s, const TraversalState *ts, uint64_t boundary_action_hash,
+        const int *buckets, const int *bias_tuple, float boundary_ev) {
+    if (s->bias_regrets_table.entries == NULL) return;
+    int NP = s->num_players;
+    /* Opponent's realized value at this boundary (HU-collapsed convention —
+     * the traverser's gain is the opponent's loss). See mccfr_bias_regrets.c
+     * for the multiway approximation this makes. */
+    float opp_value = -boundary_ev;
+    for (int p = 0; p < NP; p++) {
+        if (!ts->active[p] || p == ts->traverser) continue;
+        if (buckets[p] < 0) continue;      /* skip: blocked hand / no board */
+        int b = bias_tuple[p];
+        if (b < 0 || b >= BP_CONT_EV_NUM_BIASES) continue;
+        BPBiasRegretEntry *e = bp_bias_regrets_find_or_create(
+            &s->bias_regrets_table, boundary_action_hash, p, buckets[p]);
+        if (e == NULL) continue;           /* table saturated — drop, non-fatal */
+        bp_bias_regrets_update(e, b, opp_value);
+    }
+}
+
 /* ── Main traversal ──────────────────────────────────────────────── */
 
 static float traverse(TraversalState *ts, int acting_order_idx,
@@ -1601,6 +1697,23 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                                                      trav_bucket);
             }
 
+            /* Stage 1 mean-field: per-player boundary buckets (opponent slot
+             * keys) + regret-matched opponent bias overwrite. In UNIFORM mode
+             * (default) NONE of this runs — the bias_tuple stays exactly what
+             * the uniform rng_int loop above produced, so the path is
+             * byte-identical to legacy. In MEANFIELD mode we overwrite the
+             * opponents' bias entries with a regret-matched draw (the
+             * traverser's entry is force-swept below regardless). */
+            int mf = (s->cont_ev_bias_mode == BP_BIAS_MODE_MEANFIELD);
+            int bnd_buckets[BP_MAX_PLAYERS];
+            if (mf) {
+                for (int p = 0; p < NP; p++)
+                    bnd_buckets[p] = ts->active[p]
+                        ? bp_boundary_slot_hand_index(s, ts, p) : -1;
+                bp_meanfield_sample_opp_biases(s, ts, boundary_action_hash,
+                                               bnd_buckets, bias_tuple);
+            }
+
             /* Build blocked set + next-card pool (mirror legacy turn-deal). */
             int blocked2[52] = {0};
             for (int b = 0; b < ts->num_board; b++) blocked2[ts->board[b]] = 1;
@@ -1631,15 +1744,23 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             float ev_total = 0.0f;
             for (int ri = 0; ri < n_rollouts; ri++) {
                 if (ri > 0) {
-                    /* Fresh iid-uniform opponent biases for this
-                     * rollout (the traverser's entry is overwritten
-                     * below; sampling it anyway keeps the loop body
-                     * uniform and costs one rng_int). */
+                    /* Fresh opponent biases for this rollout (the traverser's
+                     * entry is overwritten below; sampling it anyway keeps the
+                     * loop body uniform and costs one rng_int). UNIFORM mode:
+                     * iid-uniform per active player — byte-identical to legacy.
+                     * MEANFIELD mode: the same uniform draws run FIRST (so the
+                     * uniform stream position is unchanged for the traverser
+                     * force-sweep and the turn deal), then the opponents are
+                     * overwritten by a regret-matched draw. */
                     for (int p = 0; p < NP; p++) {
                         if (ts->active[p])
                             bias_tuple[p] =
                                 rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
                     }
+                    if (mf)
+                        bp_meanfield_sample_opp_biases(
+                            s, ts, boundary_action_hash, bnd_buckets,
+                            bias_tuple);
                 }
                 if (n_rollouts == BP_CONT_EV_NUM_BIASES) {
                     trav_bias = ri;
@@ -1697,6 +1818,17 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                     __atomic_fetch_add(&cb_slot->ev_count[trav_bias], 1,
                                         __ATOMIC_RELAXED);
                 }
+
+                /* Stage 1 mean-field: update the sampled opponents' bias
+                 * regrets from this rollout's realized value (no extra
+                 * rollouts — outcome-based estimator; see
+                 * bp_meanfield_update_opp_regrets). UNIFORM mode skips this
+                 * (mf==0), so the legacy path is untouched. */
+                if (mf)
+                    bp_meanfield_update_opp_regrets(
+                        s, ts, boundary_action_hash, bnd_buckets, bias_tuple,
+                        boundary_ev);
+
                 ev_total += boundary_ev;
             }
 
@@ -1753,6 +1885,20 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                                                        trav_bucket_t);
             }
 
+            /* Stage 1 mean-field: per-player TURN boundary buckets + regret-
+             * matched opponent bias overwrite. Identical to the flop branch
+             * one street later (turn bucket helper + TURN-salted key hash).
+             * UNIFORM mode (default) runs NONE of this — byte-identical. */
+            int mf_t = (s->cont_ev_bias_mode == BP_BIAS_MODE_MEANFIELD);
+            int bnd_buckets_t[BP_MAX_PLAYERS];
+            if (mf_t) {
+                for (int p = 0; p < NP; p++)
+                    bnd_buckets_t[p] = ts->active[p]
+                        ? bp_boundary_slot_hand_index_turn(s, ts, p) : -1;
+                bp_meanfield_sample_opp_biases(s, ts, boundary_action_hash_t,
+                                               bnd_buckets_t, bias_tuple_t);
+            }
+
             /* Blocked set + river-card pool (mirror the legacy river deal). */
             int blocked_t[52] = {0};
             for (int b = 0; b < ts->num_board; b++) blocked_t[ts->board[b]] = 1;
@@ -1778,6 +1924,10 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                             bias_tuple_t[p] =
                                 rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
                     }
+                    if (mf_t)
+                        bp_meanfield_sample_opp_biases(
+                            s, ts, boundary_action_hash_t, bnd_buckets_t,
+                            bias_tuple_t);
                 }
                 if (n_rollouts_t == BP_CONT_EV_NUM_BIASES) {
                     trav_bias_t = ri;
@@ -1824,6 +1974,15 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                     __atomic_fetch_add(&cb_slot_t->ev_count[trav_bias_t], 1,
                                         __ATOMIC_RELAXED);
                 }
+
+                /* Stage 1 mean-field: update sampled opponents' TURN bias
+                 * regrets from this rollout's value (no extra rollouts).
+                 * UNIFORM mode skips this. */
+                if (mf_t)
+                    bp_meanfield_update_opp_regrets(
+                        s, ts, boundary_action_hash_t, bnd_buckets_t,
+                        bias_tuple_t, boundary_ev);
+
                 ev_total_t += boundary_ev;
             }
 
@@ -2086,7 +2245,14 @@ static float traverse(TraversalState *ts, int acting_order_idx,
      *     resolves as TAILS branches accumulate σ̄ for those nodes.
      *   - Reweight σ̄ via bp_apply_cont_bias.
      *   - Sample one action; do NOT update regrets or strategy_sum.
-     *   - The per-info-set arena and num_entries are unaffected. */
+     *   - The per-info-set arena and num_entries are unaffected.
+     *
+     * Stage 1 mean-field note (2026-07-01): this gate is bias-mode-AGNOSTIC.
+     * It consumes cont_bias_per_player[ap], which the HEADS branch already
+     * fixed for this rollout — under UNIFORM mode via rng_int, under
+     * MEANFIELD mode via the regret-matched opponent sampler. So mean-field
+     * changes only WHICH bias value flows in here, not this gate's code path
+     * or its RNG consumption. Nothing to guard; byte-identical when mf==0. */
     {
         int my_bias = ts->cont_bias_per_player[ap];
         if (my_bias >= 0) {
@@ -3083,6 +3249,11 @@ int bp_init_ex(BPSolver *s, int num_players,
     }
     bp_init_cont_ev_all_biases_from_env(s);
 
+    /* Stage 1: mean-field opponent-bias-as-action mode. Default UNIFORM
+     * (memset zeroed cont_ev_bias_mode and bias_regrets_table.entries). */
+    s->cont_ev_bias_mode = BP_BIAS_MODE_UNIFORM;
+    bp_init_cont_ev_bias_mode_from_env(s);
+
     return 0;
 }
 
@@ -3171,6 +3342,11 @@ int bp_init_unified(BPSolver *s, int num_players,
         }
     }
     bp_init_cont_ev_all_biases_from_env(s);
+
+    /* Stage 1: mean-field opponent-bias-as-action mode. Default UNIFORM
+     * (memset zeroed cont_ev_bias_mode and bias_regrets_table.entries). */
+    s->cont_ev_bias_mode = BP_BIAS_MODE_UNIFORM;
+    bp_init_cont_ev_bias_mode_from_env(s);
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
@@ -4527,6 +4703,7 @@ void bp_get_table_stats(const BPSolver *s,
 void bp_free(BPSolver *s) {
     info_table_free(&s->info_table);
     bp_cont_ev_free(&s->cont_ev_table);
+    bp_bias_regrets_free(&s->bias_regrets_table);
     if (s->rng_states) free(s->rng_states);
     if (s->texture_bucket_cache) free(s->texture_bucket_cache);
     if (s->river_centroids) free(s->river_centroids);

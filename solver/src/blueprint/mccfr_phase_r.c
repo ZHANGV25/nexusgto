@@ -169,6 +169,50 @@ int bp_set_cont_ev_table_size(BPSolver *s, int64_t size_hint) {
     return 0;
 }
 
+/* Stage 1 (2026-07-01) — mean-field opponent-bias-as-action mode setter.
+ * See docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md Unit 2 item 2. */
+int bp_set_cont_ev_bias_mode(BPSolver *s, int mode) {
+    if (s == NULL) return -1;
+    if (mode != BP_BIAS_MODE_UNIFORM && mode != BP_BIAS_MODE_MEANFIELD) {
+        fprintf(stderr,
+                "[BP] bp_set_cont_ev_bias_mode: unknown mode=%d "
+                "(expected %d=UNIFORM or %d=MEANFIELD)\n",
+                mode, BP_BIAS_MODE_UNIFORM, BP_BIAS_MODE_MEANFIELD);
+        return -1;
+    }
+    s->cont_ev_bias_mode = mode;
+    printf("[BP] cont_ev_bias_mode = %d (%s)\n",
+           s->cont_ev_bias_mode,
+           s->cont_ev_bias_mode == BP_BIAS_MODE_MEANFIELD
+               ? "Stage 1: opponents sample bias by regret matching"
+               : "legacy: opponents' bias drawn uniformly (rng_int)");
+
+    /* MEANFIELD: lazily allocate the bias-regret sidecar to the same
+     * requested capacity as the cont_ev table (idempotent — leave an
+     * existing table alone so toggling doesn't lose accumulated regrets).
+     * UNIFORM: no allocation; the flag-OFF path never touches the sidecar. */
+    if (mode == BP_BIAS_MODE_MEANFIELD &&
+        s->bias_regrets_table.entries == NULL) {
+        int64_t target_size = (s->cont_ev_table_size_hint > 0)
+            ? s->cont_ev_table_size_hint
+            : (int64_t)(1LL << 26);
+        if (bp_bias_regrets_init(&s->bias_regrets_table, target_size) != 0) {
+            fprintf(stderr,
+                    "[BP] ERROR: bp_bias_regrets_init(%lld) failed; "
+                    "mean-field bias mode requested but the sidecar could "
+                    "not be allocated. Refusing (fail-loud).\n",
+                    (long long)target_size);
+            s->cont_ev_bias_mode = BP_BIAS_MODE_UNIFORM;
+            return -1;
+        }
+        printf("[BP] bias_regrets_table allocated: %lld slots (~%.1f MB)\n",
+               (long long)s->bias_regrets_table.table_size,
+               (double)s->bias_regrets_table.table_size *
+                   (double)sizeof(BPBiasRegretEntry) / (1024.0 * 1024.0));
+    }
+    return 0;
+}
+
 int bp_set_cont_strat_prob(BPSolver *s, float prob) {
     if (s == NULL) return -1;
     if (!(prob >= 0.0f && prob <= 1.0f)) {

@@ -252,6 +252,13 @@ def load_bp_dll(build_dir):
                 bp.bp_set_cont_strat_prob.argtypes = [
                     ctypes.c_void_p, ctypes.c_float,
                 ]
+            # Stage 1 (2026-07-01): mean-field opponent-bias-as-action mode
+            # (no-op if an older C lib doesn't have it).
+            if hasattr(bp, "bp_set_cont_ev_bias_mode"):
+                bp.bp_set_cont_ev_bias_mode.restype = ctypes.c_int
+                bp.bp_set_cont_ev_bias_mode.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int,
+                ]
             bp.bp_save_texture_cache.restype = ctypes.c_int
             bp.bp_save_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_load_texture_cache.restype = ctypes.c_int
@@ -344,6 +351,21 @@ def main():
                              "--depth-limit-cont-strats is set. Must be in "
                              "[0, 1]. Default 0.5; probe (Step 1) may "
                              "argue for a different default.")
+    # Stage 1 (2026-07-01): mean-field opponent-bias-as-action mode. See
+    # docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md Unit 2. Default 'uniform' =
+    # legacy (byte-identical); 'mean_field' makes opponents sample their
+    # continuation bias by regret matching. Only meaningful together with
+    # --depth-limit-cont-strats (the boundary must be armed to sample biases).
+    parser.add_argument("--cont-ev-bias-mode",
+                        choices=["uniform", "mean_field"],
+                        default=os.environ.get("BPS_CONT_EV_BIAS_MODE",
+                                               "uniform"),
+                        help="Stage 1: opponent continuation-bias semantics at "
+                             "the boundary HEADS branch. 'uniform' (default, "
+                             "legacy): opponents' bias drawn uniformly. "
+                             "'mean_field': opponents sample their bias by "
+                             "regret matching over a per-slot sidecar. Requires "
+                             "--depth-limit-cont-strats. env BPS_CONT_EV_BIAS_MODE.")
     parser.add_argument("--checkpoint-prefix", type=str, default="",
                         help="Phase R probe / experimental runs: prepend "
                              "this path component to every S3 key written "
@@ -508,6 +530,26 @@ def main():
               f"(cont_strat_prob={args.cont_strat_prob}). HEADS-branch "
               f"rollouts will populate boundary EV slots; "
               f"bp_save_regrets writes BPR5 trailer on completion.")
+
+        # Stage 1 (2026-07-01): mean-field opponent-bias-as-action mode.
+        # Only applied when a boundary is armed (bias sampling happens at the
+        # HEADS branch). Default 'uniform' is a no-op (byte-identical legacy).
+        if args.cont_ev_bias_mode == "mean_field":
+            if not hasattr(bp_lib, "bp_set_cont_ev_bias_mode"):
+                print("FATAL: --cont-ev-bias-mode mean_field requested but "
+                      "the loaded mccfr_blueprint.so doesn't export "
+                      "bp_set_cont_ev_bias_mode. Rebuild from the Stage-1 "
+                      "mean-field branch.")
+                sys.exit(1)
+            if bp_lib.bp_set_cont_ev_bias_mode(solver, 1) != 0:
+                print("FATAL: bp_set_cont_ev_bias_mode(MEANFIELD) failed")
+                sys.exit(1)
+            print("[Stage 1] mean-field opponent-bias mode ACTIVE — "
+                  "opponents sample continuation bias by regret matching.")
+    elif args.cont_ev_bias_mode == "mean_field":
+        print("WARNING: --cont-ev-bias-mode mean_field has no effect without "
+              "--depth-limit-cont-strats (no boundary armed to sample biases "
+              "at). Ignoring.")
 
     # Set tiered preflop sizing (overrides flat sizes)
     for level, sizes in sorted(PREFLOP_TIERS.items()):
@@ -1522,6 +1564,7 @@ def _export_strategy_snapshot(bp_lib, solver, args, iters_done, n_is,
         "add_explicit_allin": (0 if args.no_explicit_allin else 1),
         "depth_limit_cont_strats": int(args.depth_limit_cont_strats),
         "cont_strat_prob": args.cont_strat_prob,
+        "cont_ev_bias_mode": args.cont_ev_bias_mode,
         "checkpoint_prefix": args.checkpoint_prefix,
         "snapshot_only": True,
         # Self-describing trainer-config block. Every downstream consumer
