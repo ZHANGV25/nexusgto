@@ -531,6 +531,26 @@ BPS_EXPORT int32_t rollout_set_train_vocab(
             "(NULL list or count outside [1, ROLLOUT_MAX_RAISE_SIZES])");
         return -1;
     }
+    /* Node-capacity bound (distinct from the size-list cap above). The worst
+     * case at a facing node is [fold, call, <n sized raises>, allin] = n + 3
+     * actions, which must fit ROLLOUT_MAX_ACTIONS_PER_NODE. So n <=
+     * ROLLOUT_MAX_ACTIONS_PER_NODE - 3. ROLLOUT_MAX_RAISE_SIZES (8) alone is
+     * NOT sufficient: 8 sized raises would emit 8+3=11 > 9 actions and
+     * overflow every fixed ROLLOUT_MAX_ACTIONS_PER_NODE buffer on the hot
+     * path (rollout_classify_postflop_actions_c, the strat/biased/eff_cats
+     * stack arrays). Fail loud instead of overflowing. */
+    if (n_first > ROLLOUT_MAX_ACTIONS_PER_NODE - 3
+        || n_subseq > ROLLOUT_MAX_ACTIONS_PER_NODE - 3) {
+        rollout_set_error(
+            -1, -1,
+            "rollout_set_train_vocab: too many raise sizes "
+            "(n_first=%d n_subseq=%d; each must be <= "
+            "ROLLOUT_MAX_ACTIONS_PER_NODE-3 = %d so [fold,call,sizes,allin] "
+            "fits ROLLOUT_MAX_ACTIONS_PER_NODE=%d)",
+            (int)n_first, (int)n_subseq,
+            ROLLOUT_MAX_ACTIONS_PER_NODE - 3, ROLLOUT_MAX_ACTIONS_PER_NODE);
+        return -1;
+    }
     for (int32_t i = 0; i < n_first; i++)  g_rollout_first_fracs[i]  = first_fracs[i];
     for (int32_t i = 0; i < n_subseq; i++) g_rollout_subseq_fracs[i] = subseq_fracs[i];
     /* Publish the counts LAST with a RELEASE store so a concurrent reader that

@@ -49,7 +49,17 @@ extern "C" {
  * below (ROLLOUT_FIRST_RAISE_DEFAULT_N / _FRACS), which are the PRE-FIX
  * hardcoded values — so a never-set process is byte-identical to before this
  * change (flag-OFF byte-identity invariant). See rollout_set_train_vocab. */
-#define ROLLOUT_MAX_RAISE_SIZES        8   /* cap on either size list */
+/* Hard cap on the length of either size list (array sizing). NOTE: the
+ * EFFECTIVE bound rollout_set_train_vocab enforces is TIGHTER:
+ * ROLLOUT_MAX_ACTIONS_PER_NODE - 3 (= 6 with the current cap of 9). A facing
+ * node emits [fold, call, <n sized raises>, allin] = n + 3 actions, which must
+ * fit ROLLOUT_MAX_ACTIONS_PER_NODE; a vocab of 8 sizes would need 11 slots and
+ * overflow the fixed per-node buffers. rollout_set_train_vocab rejects any
+ * n_first/n_subseq > ROLLOUT_MAX_ACTIONS_PER_NODE - 3 fail-loud. This 8 only
+ * bounds the g_rollout_*_fracs arrays; do not raise it above
+ * ROLLOUT_MAX_ACTIONS_PER_NODE - 3 as a usable vocab length without also
+ * enlarging the per-node action buffers. */
+#define ROLLOUT_MAX_RAISE_SIZES        8   /* array cap; effective usable bound is ROLLOUT_MAX_ACTIONS_PER_NODE-3 */
 /* Pre-fix compiled defaults (the byte-identity baseline). NOT the served
  * training vocab — the served 8.05B is [0.75]/[1.0]; these match what the
  * consumer hardcoded before the fix so an un-set process is bit-identical. */
