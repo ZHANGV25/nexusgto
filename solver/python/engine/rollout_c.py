@@ -368,6 +368,25 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         lib.rollout_reset_cont_ev_turn_boundary_hit_count.argtypes = []
         lib.rollout_reset_cont_ev_turn_boundary_hit_count.restype = None
 
+    # Unit 3 (Stage-1 mean-field, 2026-07-01): bias-as-hero-action consumer
+    # mode. Optional symbols — hasattr-guarded like the turn-boundary bindings
+    # so a pre-Unit-3 .so still loads (the wrapper raises if absent). See
+    # src/search/rollout.h "Unit 3" block.
+    if hasattr(lib, "rollout_set_cont_ev_bias_action"):
+        lib.rollout_set_cont_ev_bias_action.argtypes = [ctypes.c_int]
+        lib.rollout_set_cont_ev_bias_action.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_bias_action"):
+        lib.rollout_get_cont_ev_bias_action.argtypes = []
+        lib.rollout_get_cont_ev_bias_action.restype = ctypes.c_int
+    if hasattr(lib, "rollout_get_cont_ev_bias_action_stats"):
+        lib.rollout_get_cont_ev_bias_action_stats.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_bias_action_stats.restype = None
+    if hasattr(lib, "rollout_reset_cont_ev_bias_regrets"):
+        lib.rollout_reset_cont_ev_bias_regrets.argtypes = []
+        lib.rollout_reset_cont_ev_bias_regrets.restype = None
+
     # Training bet-vocab setter (bet-vocab desync fix, 2026-07-01). Optional
     # symbol — hasattr-guarded like the turn-boundary bindings above, so a
     # pre-fix .so still loads (the caller's set_rollout_train_vocab raises if
@@ -1298,6 +1317,70 @@ def reset_cont_ev_turn_boundary_hit_count() -> None:
     if not hasattr(lib, "rollout_reset_cont_ev_turn_boundary_hit_count"):
         return
     lib.rollout_reset_cont_ev_turn_boundary_hit_count()
+
+
+# ── Unit 3 (Stage-1 mean-field): bias-as-hero-action consumer wrappers ───
+#
+# Toggle the leaf bias-combination semantics for an ARMED cont_ev boundary
+# (flop or turn): default OFF = uniform mean of the 4 stored per-bias EVs
+# (legacy, byte-identical); ON = regret-matched bias-as-hero-action per leaf
+# infoset (Gap 2). Independent of the flop/turn enable flags. See
+# src/search/rollout.h "Unit 3" block.
+
+
+def set_cont_ev_bias_action(enabled: bool) -> None:
+    """Enable / disable the bias-as-hero-action leaf semantics (default OFF).
+
+    When ON (and a cont_ev boundary is armed + the table is set), the consumer
+    regret-matches over the querying player's 4 stored per-bias EVs per leaf
+    infoset and returns the regret-matched mixture value instead of the uniform
+    mean; the per-infoset regret store persists within a solve and must be
+    reset between solves via ``reset_cont_ev_bias_regrets``.
+
+    Fail-loud: raises RuntimeError if the .so predates Unit 3 (symbol absent) —
+    the caller must not silently run legacy uniform-mean when it asked for
+    bias-action. Process-global; set once at startup.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_cont_ev_bias_action"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_cont_ev_bias_action — rebuild with "
+            "the Unit 3 mean-field bias-action changes (src/search/rollout.c, "
+            "2026-07-01)."
+        )
+    lib.rollout_set_cont_ev_bias_action(1 if enabled else 0)
+
+
+def get_cont_ev_bias_action() -> bool:
+    """Whether the bias-as-hero-action leaf mode is enabled (False on a .so
+    that predates Unit 3)."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_bias_action"):
+        return False
+    return bool(lib.rollout_get_cont_ev_bias_action())
+
+
+def get_cont_ev_bias_action_stats() -> int:
+    """Number of bias-action mixtures returned since the last reset (per
+    solve). Zeroed by ``reset_cont_ev_bias_regrets``. Returns 0 on a .so that
+    predates Unit 3."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_bias_action_stats"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_bias_action_stats(ctypes.byref(out))
+    return int(out.value)
+
+
+def reset_cont_ev_bias_regrets() -> None:
+    """Free the persistent per-solve bias-regret store and zero the select
+    counter. Call between solves (never mid-rollout) so regret state does not
+    leak across solves — the same lifecycle as the hit-count reset. No-op on a
+    .so that predates Unit 3."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_reset_cont_ev_bias_regrets"):
+        return
+    lib.rollout_reset_cont_ev_bias_regrets()
 
 
 # ── BPR5 trailer loader (mccfr_blueprint.so) ────────────────────────────
