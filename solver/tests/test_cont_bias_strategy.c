@@ -8,7 +8,7 @@
  * Mac-runnable, <1s. Build: `make test_cont_bias_strategy`.
  */
 
-#include "../src/mccfr_blueprint.h"
+#include "mccfr_blueprint.h"
 
 #include <stdio.h>
 #include <math.h>

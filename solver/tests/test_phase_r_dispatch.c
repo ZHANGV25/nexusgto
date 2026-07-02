@@ -8,7 +8,7 @@
  * Mac-runnable, <1s wall. Build: `make test_phase_r_dispatch`.
  */
 
-#include "../src/mccfr_blueprint.h"
+#include "mccfr_blueprint.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
