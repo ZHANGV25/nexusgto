@@ -60,16 +60,27 @@ from engine.leaf_values import _train_action_idx  # noqa: E402
 #       facing:      [fold@0, call@1]
 #       non-facing:  [check@0]
 #
-# num_bet_sizes at a node = the SIZE LIST in force at that node. The list
-# selection matches the trainer's per-street size lists exactly as the
-# encoder threads them (leaf_values._train_action_idx):
-#   - a FACING SUBSEQUENT raise (to_call>0 AND raises_so_far>=1) uses the
-#     subsequent-raise list (subseq_fracs);
-#   - every other open node (any NON-FACING bet, and the FACING FIRST raise
-#     at raises_so_far==0) uses the opening list (first_fracs).
-# A non-facing bet always draws from first_fracs even after a prior raise on
-# the street (donk re-open) — this is the encoder's documented rule and what
-# the served artifact was keyed under.
+# num_bet_sizes at a node = the SIZE LIST in force at that node. The two
+# artifacts select that list by DIFFERENT predicates:
+#
+#   (i)  TRAINER: selects the subsequent list on num_raises > 0 ALONE — no
+#        facing check (mccfr_blueprint.c:2028-2031 and :2610-2612, both
+#        postflop call sites: `ts->num_raises > 0 && num_subsequent_bet_sizes
+#        > 0` -> subsequent_bet_sizes, else bet_sizes).
+#   (ii) ENCODER: leaf_values._train_action_idx uses first_fracs for ALL
+#        non-facing nodes (its !facing branch never consults raises_so_far
+#        for list selection); only a FACING node with raises_so_far >= 1
+#        uses subseq_fracs.
+#
+# These predicates differ only on nodes with to_call == 0 AND num_raises > 0
+# on the SAME street — which is UNREACHABLE in NLHE betting: once a raise
+# exists on a street, every subsequent actor faces to_call > 0 until the
+# street closes (the round ends when all callers match; nobody acts again
+# at to_call == 0 after a raise). So encoder and trainer agree on every
+# REACHABLE node. The reference below deliberately mirrors the ENCODER's
+# predicate (use_subseq = facing and raises_so_far >= 1) so the contract is
+# exact on reachable nodes and still well-defined on the unreachable probe
+# cases this test sweeps.
 
 _POSTFLOP_MAX_RAISES = 3  # matches leaf_values._POSTFLOP_MAX_RAISES / trainer
 
@@ -147,7 +158,9 @@ def _all_actions(first_fracs, subseq_fracs):
     for f in subseq_fracs:
         cases.append((True, 1, "raise", f))
     cases.append((True, 1, "allin", 1.0))
-    # Non-facing, subsequent raise (donk line re-open): check, bets, all-in.
+    # Non-facing, subsequent (to_call==0, raises_so_far>0): UNREACHABLE in
+    # NLHE betting (see module note) — kept as a defensive probe; both sides
+    # key it with first_fracs, so the contract stays well-defined.
     cases.append((False, 1, "check", 0.0))
     for f in subseq_fracs:
         cases.append((False, 1, "bet", f))
