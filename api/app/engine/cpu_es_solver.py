@@ -28,6 +28,7 @@ effect, no leaf-sampling noise); the bypass is fail-loud (see solve()).
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -100,6 +101,26 @@ def _a3_cont_ev_turn_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _cont_ev_bias_action_enabled() -> bool:
+    """Unit 3 (Stage-1 mean-field) — bias-as-hero-action consumer flag,
+    DEFAULT OFF. When set (NEXUS_CONT_EV_BIAS_ACTION=1), an ARMED cont_ev
+    boundary (flop and/or turn) regret-matches over the querying player's 4
+    stored per-bias EVs PER LEAF INFOSET and returns the regret-matched mixture
+    value instead of the uniform mean (docs/PLURIBUS_EXACT_CONFORMANCE_SPEC
+    Gap 2 / docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md Unit 3). It only changes
+    HOW an armed boundary combines its EVs — it does NOT arm a boundary by
+    itself (still needs NEXUS_A3_CONT_EV=1 + the boundary predicate).
+
+    The SEMANTICS the mode computes depend on the .cev the values were walked
+    under: a mean_field .cev gives the real thing; a uniform .cev (or one with
+    no meta sidecar) gives the hero-best-response-to-uniform "half measure" —
+    still legal, but the engine LOGS which one ran (see _load_cont_ev_table's
+    bias_semantics read). Stays OFF in the served path until the equity gate
+    passes + user opt-in."""
+    v = os.environ.get("NEXUS_CONT_EV_BIAS_ACTION", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -123,6 +144,12 @@ class CpuEsSolver:
         self._cev_holder = None  # A3: kept alive iff NEXUS_A3_CONT_EV=1
         self._last_cont_ev_stats = None  # A3: {hits, attempts} from last solve
         self._last_cont_ev_turn_stats = None  # dual-boundary: turn {hits,attempts}
+        # Unit 3 (mean-field bias-action): semantics the loaded .cev was walked
+        # under ("mean_field"|"uniform"), read from <cev>.cev.meta.json; absent
+        # meta => "uniform" (back-compat with pre-Unit-2 artifacts).
+        self._cev_bias_semantics = "uniform"
+        # {selects, semantics} snapshot from the last bias-action solve.
+        self._last_cont_ev_bias_action_stats = None
         self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
         self._init(blueprint_path)
 
@@ -279,6 +306,46 @@ class CpuEsSolver:
             "CpuEsSolver A3: cont_ev table loaded through %s in %.1fs "
             "(%d slots) — boundary consumer ARMED (default-off flag is ON)",
             _ES_DLL_NAME, time.time() - t0, n_slots)
+
+        # ── Unit 3 (mean-field): read the .cev meta sidecar for bias_semantics.
+        # The Unit-2 walk writes <cev>.cev.meta.json next to the artifact with
+        # bias_semantics="uniform"|"mean_field". Absent meta => "uniform" (the
+        # legacy artifacts predate the sidecar). The C consumer only exposes the
+        # bias-action MODE; the semantics of the values it selects among live in
+        # the artifact, so we surface them here and LOG which one is in play
+        # whenever bias-action mode is used (mean_field = the real thing;
+        # uniform = the hero-best-response-to-uniform half measure).
+        self._cev_bias_semantics = self._read_cev_bias_semantics(cev_path)
+        logger.info(
+            "CpuEsSolver: cont_ev .cev bias_semantics=%s (from %s)",
+            self._cev_bias_semantics, cev_path + ".meta.json")
+
+    @staticmethod
+    def _read_cev_bias_semantics(cev_path: str) -> str:
+        """Read bias_semantics from <cev_path>.meta.json. Returns "mean_field"
+        or "uniform"; ABSENT sidecar => "uniform" (back-compat). A present-but-
+        malformed sidecar, or an unexpected value, logs a warning and falls back
+        to "uniform" — a mislabelled artifact must not silently masquerade as
+        mean_field. The naming matches the Unit-2 walk manifest
+        (docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md Unit 2 item 5)."""
+        meta_path = cev_path + ".meta.json"
+        if not os.path.exists(meta_path):
+            return "uniform"
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            sem = str(meta.get("bias_semantics", "uniform")).strip().lower()
+        except (OSError, ValueError) as e:
+            logger.warning(
+                "CpuEsSolver: cont_ev meta sidecar %s unreadable (%s) — "
+                "treating bias_semantics as uniform", meta_path, e)
+            return "uniform"
+        if sem not in ("uniform", "mean_field"):
+            logger.warning(
+                "CpuEsSolver: cont_ev meta sidecar %s has unexpected "
+                "bias_semantics=%r — treating as uniform", meta_path, sem)
+            return "uniform"
+        return sem
 
     @property
     def ready(self) -> bool:
@@ -553,6 +620,23 @@ class CpuEsSolver:
                     rc.reset_cont_ev_turn_boundary_hit_count()
                     rc.set_use_cont_ev_at_turn_boundary(True)
 
+                # ── Unit 3 (mean-field, default OFF): arm the bias-as-hero-
+                # action leaf semantics iff NEXUS_CONT_EV_BIAS_ACTION=1 AND some
+                # boundary is armed for THIS construct. It only changes how an
+                # armed boundary combines its 4 stored EVs (regret-matched
+                # mixture vs uniform mean). Reset the per-infoset regret store
+                # before the construct so it never leaks across solves; disarmed
+                # + snapshotted in the finally below. When off, the C global is
+                # never touched (byte-identical legacy path). ──
+                bias_action_armed = (
+                    (a3_armed or a3_turn_armed)
+                    and _cont_ev_bias_action_enabled()
+                    and hasattr(rc, "set_cont_ev_bias_action")
+                )
+                if bias_action_armed:
+                    rc.reset_cont_ev_bias_regrets()
+                    rc.set_cont_ev_bias_action(True)
+
                 # DIAG (NEXUS_ES_DIAG=1): reset the rollout blueprint-miss counters
                 # before the construct so we can read the miss-rate after. A high
                 # blueprint miss-rate -> the turn/river CONTINUATION falls back to
@@ -689,6 +773,29 @@ class CpuEsSolver:
                             "CpuEsSolver dual-boundary: cont_ev TURN hits=%d "
                             "attempts=%d hit_rate=%.4f", t_hits, t_att,
                             self._last_cont_ev_turn_stats["hit_rate"])
+                    if bias_action_armed:
+                        # Symmetric disarm + snapshot for the bias-action mode.
+                        # MUST happen in finally so an exception cannot leave the
+                        # mode enabled for a subsequent solve. Reset the regret
+                        # store so its memory is freed and no state leaks across
+                        # solves. Log which .cev semantics the mode ran under
+                        # (mean_field = the real thing; uniform = the hero-best-
+                        # response-to-uniform half measure — both legal, must be
+                        # visible).
+                        rc.set_cont_ev_bias_action(False)
+                        selects = rc.get_cont_ev_bias_action_stats()
+                        rc.reset_cont_ev_bias_regrets()
+                        self._last_cont_ev_bias_action_stats = {
+                            "selects": int(selects),
+                            "bias_semantics": self._cev_bias_semantics,
+                        }
+                        logger.info(
+                            "CpuEsSolver Unit3: cont_ev bias-action selects=%d "
+                            "bias_semantics=%s%s", selects,
+                            self._cev_bias_semantics,
+                            "" if self._cev_bias_semantics == "mean_field"
+                            else " (HERO-BR-TO-UNIFORM half measure — the .cev "
+                                 "was NOT walked mean_field)")
                 construct_s = time.time() - t0
 
             # DIAG (NEXUS_ES_DIAG=1): dump leaf-table stats — isolate the 2p-flop
