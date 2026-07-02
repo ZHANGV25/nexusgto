@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "mccfr_cont_ev_table.h"
+#include "mccfr_bias_regrets.h"
 
 /* ── Limits ──────────────────────────────────────────────────────────── */
 
@@ -40,6 +41,21 @@
 #define BP_ACT_CHECK    1
 #define BP_ACT_CALL     2
 #define BP_ACT_BET      3
+
+/* Stage 1 mean-field bias-as-action mode (docs/STAGE1_MEANFIELD_PLAN_
+ * 2026-07-01.md Unit 2; PLURIBUS_EXACT_CONFORMANCE_SPEC §Gap 2).
+ *
+ * Governs HOW opponents' continuation-strategy bias is drawn at the
+ * boundary HEADS branches (flop AND turn) during the EV-only walk:
+ *   UNIFORM (0)   = legacy — every opponent bias is rng_int(rng, 4), a
+ *                   chance node; ev_sum[b] = E[value | my bias b, opps ~
+ *                   Uniform]. Default; byte-identical to pre-Stage-1.
+ *   MEANFIELD (1) = each opponent samples its bias by regret matching over
+ *                   a per-opponent-slot mix maintained in the bias-regret
+ *                   sidecar (mccfr_bias_regrets.{c,h}); ev_sum[b] = E[value
+ *                   | my bias b, opps playing their learned bias mix]. */
+#define BP_BIAS_MODE_UNIFORM    0
+#define BP_BIAS_MODE_MEANFIELD  1
 
 /* BPAction — single emitted action from the trainer's
  * generate_actions(). Promoted to the header in Phase R Block B.3
@@ -378,6 +394,28 @@ typedef struct {
      *
      * Default 0 (single sampled bias per visit — legacy behavior). */
     int cont_ev_all_biases;
+
+    /* Stage 1 (2026-07-01) — mean-field opponent-bias-as-action mode.
+     *
+     * cont_ev_bias_mode ∈ {BP_BIAS_MODE_UNIFORM, BP_BIAS_MODE_MEANFIELD}:
+     *   UNIFORM (0, default): opponents' boundary bias is rng_int(rng, 4)
+     *       (a chance node) — BYTE-IDENTICAL to pre-Stage-1. The mean-field
+     *       code paths short-circuit and consume NO extra RNG.
+     *   MEANFIELD (1): at the HEADS branches each opponent's bias is sampled
+     *       by regret matching over its bias_regrets sidecar slot (uniform
+     *       fallback when the slot is unseen or all-regrets<=0), and the
+     *       sampled opponents' regrets are updated after the sweep from the
+     *       realized boundary value. The traverser still sweeps all 4 biases.
+     *
+     * Set via bp_set_cont_ev_bias_mode / env BPS_CONT_EV_BIAS_MODE. */
+    int cont_ev_bias_mode;
+
+    /* Stage 1 — per-opponent-slot bias-regret sidecar (mean-field state).
+     * Allocated ONLY when cont_ev_bias_mode == BP_BIAS_MODE_MEANFIELD, at
+     * the same time as (and to the same requested capacity as) the cont_ev
+     * table. NEVER serialized — transient training state whose effect is
+     * baked into the cont_ev ev_sum values. Free'd by bp_free. */
+    BPBiasRegretTable bias_regrets_table;
 } BPSolver;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -489,6 +527,27 @@ BP_EXPORT int bp_set_cont_strat_prob(BPSolver *s, float prob);
  * Returns 0 on success, -1 on invalid args.
  */
 BP_EXPORT int bp_set_cont_ev_table_size(BPSolver *s, int64_t size_hint);
+
+/**
+ * Stage 1 (2026-07-01): set the opponent-bias-as-action mode for the
+ * boundary EV walk. See docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md Unit 2 and
+ * PLURIBUS_EXACT_CONFORMANCE_SPEC §Gap 2.
+ *
+ *   mode = BP_BIAS_MODE_UNIFORM (0, default) → legacy: opponents' bias drawn
+ *          uniformly (rng_int). Byte-identical to pre-Stage-1 on every iter.
+ *   mode = BP_BIAS_MODE_MEANFIELD (1) → opponents sample their bias by regret
+ *          matching over the per-slot bias_regrets sidecar; the sidecar table
+ *          is lazily allocated here (to cont_ev_table_size_hint, or the spec
+ *          default) so it must be sized via bp_set_cont_ev_table_size BEFORE
+ *          this call if a non-default capacity is wanted. Idempotent.
+ *
+ * With mode == UNIFORM the mean-field code paths short-circuit before
+ * consuming any RNG — the flag-OFF path is byte-identical to legacy, which
+ * the test_phase_r_regression_smoke contract enforces.
+ *
+ * Returns 0 on success, -1 on invalid solver / unknown mode / OOM.
+ */
+BP_EXPORT int bp_set_cont_ev_bias_mode(BPSolver *s, int mode);
 
 /**
  * Phase R helper: pure dispatch decision for the depth-limit boundary.
