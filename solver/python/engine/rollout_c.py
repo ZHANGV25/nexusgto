@@ -46,6 +46,8 @@ except ImportError:
 _ROLLOUT_MAX_PLAYERS = 6
 # Must match ROLLOUT_MAX_ACTION_HISTORY in src/rollout.h
 _ROLLOUT_MAX_ACTION_HISTORY = 256
+# Must match ROLLOUT_MAX_RAISE_SIZES in src/rollout.h
+_ROLLOUT_MAX_RAISE_SIZES = 8
 
 
 # ─── ctypes structs mirroring src/rollout.h ──────────────────────────────
@@ -366,6 +368,23 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         lib.rollout_reset_cont_ev_turn_boundary_hit_count.argtypes = []
         lib.rollout_reset_cont_ev_turn_boundary_hit_count.restype = None
 
+    # Training bet-vocab setter (bet-vocab desync fix, 2026-07-01). Optional
+    # symbol — hasattr-guarded like the turn-boundary bindings above, so a
+    # pre-fix .so still loads (the caller's set_rollout_train_vocab raises if
+    # the symbol is absent). See src/search/rollout.h.
+    if hasattr(lib, "rollout_set_train_vocab"):
+        lib.rollout_set_train_vocab.argtypes = [
+            ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
+        ]
+        lib.rollout_set_train_vocab.restype = ctypes.c_int32
+    if hasattr(lib, "rollout_get_train_vocab"):
+        lib.rollout_get_train_vocab.argtypes = [
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
+        ]
+        lib.rollout_get_train_vocab.restype = None
+
     lib.rollout_leaf_info_sizeof.argtypes = []
     lib.rollout_leaf_info_sizeof.restype = ctypes.c_int32
 
@@ -593,6 +612,89 @@ def compute_showdown_payoff_c(
         ctypes.c_int32(pot_chips),
         ctypes.c_int32(hero_player),
     ))
+
+
+# ─── Training bet-vocab setter (bet-vocab desync fix, 2026-07-01) ─────────
+
+
+def set_rollout_train_vocab(
+    first_fracs: Sequence[float],
+    subseq_fracs: Sequence[float],
+) -> None:
+    """Set the postflop bet vocabulary the C rollout enumerates.
+
+    The rollout must enumerate the SAME first/subsequent postflop raise sizes
+    the served blueprint was TRAINED with, or its action-index sequence hashes
+    to a key training never stored (all-in mis-key — see
+    docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). The caller reads
+    ``first_fracs`` / ``subseq_fracs`` from the loaded .bps manifest
+    (``postflop_bet_sizes`` / ``subsequent_bet_sizes``) and calls this ONCE at
+    startup, before any rollout.
+
+    Fail-loud: raises RuntimeError if the .so predates the fix (symbol absent),
+    ValueError on an empty/oversized list, and RuntimeError if the C setter
+    rejects the args. Never silently no-ops.
+    """
+    ff = [float(x) for x in first_fracs]
+    sf = [float(x) for x in subseq_fracs]
+    if not ff or len(ff) > _ROLLOUT_MAX_RAISE_SIZES:
+        raise ValueError(
+            f"first_fracs must be 1..{_ROLLOUT_MAX_RAISE_SIZES} sizes, "
+            f"got {ff}"
+        )
+    if not sf or len(sf) > _ROLLOUT_MAX_RAISE_SIZES:
+        raise ValueError(
+            f"subseq_fracs must be 1..{_ROLLOUT_MAX_RAISE_SIZES} sizes, "
+            f"got {sf}"
+        )
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_train_vocab"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_train_vocab — rebuild with the "
+            "bet-vocab desync fix (src/search/rollout.c, 2026-07-01)."
+        )
+    ff_arr = (ctypes.c_float * len(ff))(*ff)
+    sf_arr = (ctypes.c_float * len(sf))(*sf)
+    rc = lib.rollout_set_train_vocab(
+        ctypes.c_int32(len(ff)),
+        ctypes.cast(ff_arr, ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_int32(len(sf)),
+        ctypes.cast(sf_arr, ctypes.POINTER(ctypes.c_float)),
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"rollout_set_train_vocab rejected vocab first={ff} subseq={sf} "
+            f"(rc={rc})"
+        )
+
+
+def get_rollout_train_vocab() -> Tuple[List[float], List[float]]:
+    """Read back the C rollout's currently-configured training vocab.
+
+    Returns (first_fracs, subseq_fracs). Returns the compiled defaults
+    ([0.5, 1.0], [1.0]) if the setter was never called; raises RuntimeError
+    if the .so predates the fix.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_train_vocab"):
+        raise RuntimeError(
+            "rollout.so missing rollout_get_train_vocab — rebuild with the "
+            "bet-vocab desync fix (src/search/rollout.c, 2026-07-01)."
+        )
+    n_first = ctypes.c_int32(0)
+    n_subseq = ctypes.c_int32(0)
+    ff_arr = (ctypes.c_float * _ROLLOUT_MAX_RAISE_SIZES)()
+    sf_arr = (ctypes.c_float * _ROLLOUT_MAX_RAISE_SIZES)()
+    lib.rollout_get_train_vocab(
+        ctypes.byref(n_first),
+        ctypes.cast(ff_arr, ctypes.POINTER(ctypes.c_float)),
+        ctypes.byref(n_subseq),
+        ctypes.cast(sf_arr, ctypes.POINTER(ctypes.c_float)),
+    )
+    return (
+        [float(ff_arr[i]) for i in range(int(n_first.value))],
+        [float(sf_arr[i]) for i in range(int(n_subseq.value))],
+    )
 
 
 # ─── Full subgame entry (API-facing) ─────────────────────────────────────
