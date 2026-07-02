@@ -1228,6 +1228,54 @@ static int bp_boundary_slot_hand_index(const BPSolver *s,
     return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
 }
 
+/* Dual-boundary build (2026-06-25) — TURN-boundary slot hand index.
+ *
+ * Identical to bp_boundary_slot_hand_index (the canonical full-deck pair
+ * index in [0,1326) derived from the traverser's actual hole cards) EXCEPT
+ * the blocking set is the 4-card TURN board (board[0..3]) rather than the
+ * 3-card flop. The pair-index FORMULA is unchanged (it depends only on the
+ * two hole cards, so the same hand yields the same index on flop and turn);
+ * only the turn card is added to the blocked set, so a hand using the turn
+ * card returns -1 ("skip slot accumulation"), mirroring the consumer's
+ * rollout_hand_index_for_turn guard. Street disambiguation lives in the
+ * key-hash (bp_cont_ev_boundary_key_hash), not in this index. */
+static int bp_boundary_slot_hand_index_turn(const BPSolver *s,
+                                            const TraversalState *ts,
+                                            int player) {
+    if (ts->num_board < 4) return -1;
+    int hand_idx = ts->sampled_hands[player];
+    if (hand_idx < 0 || hand_idx >= s->num_hands[player]) return -1;
+    int c0 = s->hands[player][hand_idx][0];
+    int c1 = s->hands[player][hand_idx][1];
+    if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52 || c0 == c1) return -1;
+    for (int b = 0; b < 4; b++) {
+        if (ts->board[b] == c0 || ts->board[b] == c1) return -1;
+    }
+    if (c0 > c1) { int t = c0; c0 = c1; c1 = t; }
+    return c0 * 51 - c0 * (c0 - 1) / 2 + c1 - c0 - 1;
+}
+
+/* Public test wrapper for bp_boundary_slot_hand_index_turn. Builds a
+ * synthetic 4-card-board TraversalState. hand_idx is an index into
+ * s->hands[player], NOT a full-deck pair index (the wrapper derives the
+ * pair index from the cards, same as the flop wrapper). */
+int bp_boundary_slot_hand_index_turn_for_test(const BPSolver *s,
+                                              const int *board,
+                                              int player,
+                                              int hand_idx) {
+    if (!s || !board || player < 0 || player >= BP_MAX_PLAYERS) return -1;
+    if (hand_idx < 0 || hand_idx >= BP_MAX_HANDS) return -1;
+    TraversalState ts;
+    memset(&ts, 0, sizeof(ts));
+    ts.board[0] = board[0];
+    ts.board[1] = board[1];
+    ts.board[2] = board[2];
+    ts.board[3] = board[3];
+    ts.num_board = 4;
+    ts.sampled_hands[player] = hand_idx;
+    return bp_boundary_slot_hand_index_turn(s, &ts, player);
+}
+
 /* Public test wrapper for bp_boundary_slot_hand_index — see header.
  * Builds a synthetic TraversalState the same way the bucket wrapper
  * below does. hand_idx here is an index into s->hands[player] (the
@@ -1518,8 +1566,18 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             }
             int trav_bias = bias_tuple[ts->traverser];
 
-            uint64_t boundary_action_hash = compute_action_hash(
-                ts->action_history, ts->history_len);
+            /* Boundary key action_hash, routed through the canonical
+             * key-hash with the FLOP street. FLOP is the identity salt
+             * (bp_cont_ev_boundary_key_hash returns the raw hash), so this
+             * is BYTE-IDENTICAL to the legacy `compute_action_hash(...)`
+             * call and the existing flop artifact + tests are unaffected.
+             * Routing it through the shared helper makes the producer's key
+             * construction explicit and symmetric with the turn path below
+             * (which salts), and guarantees producer-write == consumer-read
+             * per street via the one canonical function. */
+            uint64_t boundary_action_hash = bp_cont_ev_boundary_key_hash(
+                compute_action_hash(ts->action_history, ts->history_len),
+                BP_CONT_EV_STREET_FLOP);
 
             /* Phase R Step 12 KEY FIX (2026-06-10): the slot key is the
              * traverser's canonical full-deck PAIR INDEX in [0, 1326) —
@@ -1647,6 +1705,129 @@ static float traverse(TraversalState *ts, int acting_order_idx,
              * boundary_ev_only mode — the all-biases flag is refused at
              * init without it. */
             return ev_total / (float)n_rollouts;
+        }
+
+        /* ── Dual-boundary build (2026-06-25): TURN-boundary dispatch ──
+         *
+         * Structurally identical to the FLOP HEADS branch above, one street
+         * later: it fires at end-of-multiway-TURN (num_board==4, n_active>=3)
+         * and the HEADS rollout deals the RIVER (not the turn) and recurses
+         * to a native showdown — the turn's depth-limited leaf at the river
+         * boundary (Pluribus: "second round, >2 players → leaf at start of
+         * round 3", turn_depth_limit=1).
+         *
+         * INDEPENDENT flag (depth_limit_cont_strats_turn) + a SEPARATE
+         * dispatch helper (bp_should_dispatch_to_turn_boundary), so the flop
+         * dispatch matrix + its tests stay byte-untouched. With the turn flag
+         * OFF the helper consumes zero RNG → byte-identity preserved.
+         *
+         * Slot key: the action_hash is salted with the TURN street
+         * (bp_cont_ev_boundary_key_hash), and the bucket is the turn-board
+         * (4-card-blocked) canonical pair index — both matching exactly what
+         * the consumer (rollout.c) computes at the turn boundary. */
+        if (bp_should_dispatch_to_turn_boundary(ts->num_board, n_active,
+                                                s->depth_limit_cont_strats_turn,
+                                                s->cont_strat_prob,
+                                                ts->rng)) {
+            int bias_tuple_t[BP_MAX_PLAYERS];
+            for (int p = 0; p < BP_MAX_PLAYERS; p++) bias_tuple_t[p] = -1;
+            for (int p = 0; p < NP; p++) {
+                if (ts->active[p])
+                    bias_tuple_t[p] = rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
+            }
+            int trav_bias_t = bias_tuple_t[ts->traverser];
+
+            uint64_t boundary_action_hash_t = bp_cont_ev_boundary_key_hash(
+                compute_action_hash(ts->action_history, ts->history_len),
+                BP_CONT_EV_STREET_TURN);
+
+            int trav_bucket_t = bp_boundary_slot_hand_index_turn(
+                s, ts, ts->traverser);
+
+            BPContEVEntry *cb_slot_t = NULL;
+            if (s->cont_ev_table.entries != NULL && trav_bias_t >= 0 &&
+                ts->active[ts->traverser] && trav_bucket_t >= 0) {
+                cb_slot_t = bp_cont_ev_find_or_create(&s->cont_ev_table,
+                                                       boundary_action_hash_t,
+                                                       ts->traverser,
+                                                       trav_bucket_t);
+            }
+
+            /* Blocked set + river-card pool (mirror the legacy river deal). */
+            int blocked_t[52] = {0};
+            for (int b = 0; b < ts->num_board; b++) blocked_t[ts->board[b]] = 1;
+            for (int p = 0; p < NP; p++) {
+                if (!ts->active[p]) continue;
+                int hh = ts->sampled_hands[p];
+                blocked_t[s->hands[p][hh][0]] = 1;
+                blocked_t[s->hands[p][hh][1]] = 1;
+            }
+            int valid_t[52], nv_t = 0;
+            for (int c = 0; c < 52; c++) if (!blocked_t[c]) valid_t[nv_t++] = c;
+            if (nv_t == 0) return 0.0f;
+
+            /* All-biases sweep, identical semantics to the flop branch. */
+            int n_rollouts_t = (s->cont_ev_all_biases && cb_slot_t != NULL)
+                ? BP_CONT_EV_NUM_BIASES : 1;
+
+            float ev_total_t = 0.0f;
+            for (int ri = 0; ri < n_rollouts_t; ri++) {
+                if (ri > 0) {
+                    for (int p = 0; p < NP; p++) {
+                        if (ts->active[p])
+                            bias_tuple_t[p] =
+                                rng_int(ts->rng, BP_CONT_EV_NUM_BIASES);
+                    }
+                }
+                if (n_rollouts_t == BP_CONT_EV_NUM_BIASES) {
+                    trav_bias_t = ri;
+                    bias_tuple_t[ts->traverser] = ri;
+                }
+
+                TraversalState next = *ts;
+                memset(next.bets, 0, sizeof(next.bets));
+                memset(next.has_acted, 0, sizeof(next.has_acted));
+                next.num_raises = 0;
+                for (int p = 0; p < BP_MAX_PLAYERS; p++)
+                    next.cont_bias_per_player[p] = bias_tuple_t[p];
+
+                /* Deal river card; canonicalize via the existing suit_map. */
+                int dealt = valid_t[rng_int(ts->rng, nv_t)];
+                next.board[next.num_board++] = dealt;
+                if (next.num_canon_board < 5) {
+                    int rank = dealt >> 2, suit = dealt & 3;
+                    int canon_suit = (next.suit_map[suit] >= 0)
+                        ? next.suit_map[suit] : suit;
+                    next.canon_board[next.num_canon_board++] =
+                        rank * 4 + canon_suit;
+                }
+
+                /* River bucket cache (mirrors the legacy river-deal path
+                 * at the num_board==5 branch). */
+                if (next.num_board == 5) {
+                    for (int p = 0; p < NP; p++) {
+                        next.river_bucket[p] = -1;
+                        if (!next.active[p]) continue;
+                        int ph = next.sampled_hands[p];
+                        int c0 = s->hands[p][ph][0], c1 = s->hands[p][ph][1];
+                        next.river_bucket[p] =
+                            compute_river_bucket(s, next.board, c0, c1);
+                    }
+                }
+
+                float boundary_ev = traverse(&next, 0,
+                                              acting_order, num_in_order);
+
+                if (cb_slot_t != NULL) {
+                    bp_cont_ev_atomic_add_f32(&cb_slot_t->ev_sum[trav_bias_t],
+                                               boundary_ev);
+                    __atomic_fetch_add(&cb_slot_t->ev_count[trav_bias_t], 1,
+                                        __ATOMIC_RELAXED);
+                }
+                ev_total_t += boundary_ev;
+            }
+
+            return ev_total_t / (float)n_rollouts_t;
         }
 
         /* Build blocked set: board cards + all active players' cards */
@@ -2884,6 +3065,7 @@ int bp_init_ex(BPSolver *s, int num_players,
      * matters if a caller subsequently sets depth_limit_cont_strats=1
      * without also setting cont_strat_prob. */
     s->depth_limit_cont_strats = 0;
+    s->depth_limit_cont_strats_turn = 0;  /* dual-boundary: turn off by default */
     s->cont_strat_prob = 0.5f;
     /* Block A.2: cont_ev_table un-allocated by default; lazy alloc in
      * bp_set_depth_limit_cont_strats. memset above zeroed
@@ -2973,6 +3155,7 @@ int bp_init_unified(BPSolver *s, int num_players,
      * dispatch helper short-circuits and traverse() behaves
      * byte-identically to legacy. */
     s->depth_limit_cont_strats = 0;
+    s->depth_limit_cont_strats_turn = 0;  /* dual-boundary: turn off by default */
     s->cont_strat_prob = 0.5f;
     /* Block A.2: cont_ev_table un-allocated by default; lazy alloc
      * in bp_set_depth_limit_cont_strats. */
@@ -4177,8 +4360,14 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                  * loaded ev_sums each discount tick. The flag is the
                  * authoritative "is Phase R producing fresh slots this
                  * run?" signal — if it's OFF, the table is read-only
-                 * (loaded-from-disk) and discount must NOT apply. */
-                if (s->depth_limit_cont_strats) {
+                 * (loaded-from-disk) and discount must NOT apply.
+                 *
+                 * Dual-boundary build: discount also applies when the TURN
+                 * boundary is producing fresh slots (depth_limit_cont_strats
+                 * _turn). The table is shared, so either producing flag means
+                 * "fresh slots this run → discount." */
+                if (s->depth_limit_cont_strats ||
+                    s->depth_limit_cont_strats_turn) {
                     #ifdef _OPENMP
                     #pragma omp single nowait
                     #endif

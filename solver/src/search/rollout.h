@@ -410,6 +410,16 @@ BPS_EXPORT void rollout_add_observability(
 BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t);
 BPS_EXPORT const BPContEVTable *rollout_get_cont_ev_table(void);
 
+/* SYNTHETIC mode (DEBUG / MEASUREMENT ONLY — default OFF). When ON, a
+ * boundary MISS/EMPTY_BIAS is filled with a dummy finite EV (keyed identically
+ * to the query) instead of failing loud, so the armed-RESIDUAL latency probe
+ * can measure the cont_ev-armed wall-clock without a populated walk artifact.
+ * Applies to BOTH the flop and turn boundaries. The real (synthetic OFF) path
+ * is unchanged and still fail-loud. NEVER enable in any served/production
+ * path — synthetic EVs are dummies (0.0). */
+BPS_EXPORT void rollout_set_cont_ev_synthetic(int enabled);
+BPS_EXPORT int  rollout_get_cont_ev_synthetic(void);
+
 /* Enable / disable the boundary lookup. When disabled (default), the
  * rollout runs legacy turn + river simulation regardless of whether
  * a cont_ev_table is set. Process-global; set once at startup. */
@@ -429,6 +439,33 @@ BPS_EXPORT void rollout_reset_cont_ev_boundary_hit_count(void);
  * (which fails loud) still counts here but not in the hit count. The reset
  * above clears both counters. hit_rate = hits / attempts. */
 BPS_EXPORT void rollout_get_cont_ev_boundary_attempt_count(uint64_t *out_attempts);
+
+/* ── Dual-boundary build (2026-06-25): TURN-boundary consumer ──────────
+ *
+ * Mirror of the flop consumer above, one street later. When enabled, the
+ * rollout short-circuits at the end-of-multiway-TURN boundary
+ * (street == ROLLOUT_STREET_TURN, n_board == 4, >= 3 live) instead of
+ * dealing the river: it queries the SAME shared cont_ev_table (set via
+ * rollout_set_cont_ev_table) with the TURN street salt + the 4-card turn
+ * hand index, and returns the uniform mean over the 4 biases. Same
+ * fail-loud contract on MISS/EMPTY_BIAS/INVALID.
+ *
+ * INDEPENDENT of the flop flag — either, both, or neither may be enabled.
+ * Default OFF; flag-OFF is byte-identical to the legacy river rollout.
+ * SEPARATE turn hit/attempt counters keep the per-boundary hit-rate
+ * unambiguous (the flop counters are NOT touched by the turn path). */
+BPS_EXPORT void rollout_set_use_cont_ev_at_turn_boundary(int enabled);
+BPS_EXPORT int  rollout_get_use_cont_ev_at_turn_boundary(void);
+BPS_EXPORT void rollout_get_cont_ev_turn_boundary_hit_count(uint64_t *out_hits);
+BPS_EXPORT void rollout_get_cont_ev_turn_boundary_attempt_count(uint64_t *out_attempts);
+BPS_EXPORT void rollout_reset_cont_ev_turn_boundary_hit_count(void);
+
+/* Test hook: the EXACT static turn hand-index the live consumer uses.
+ * Exposed so the key-alignment test asserts against the real consumer
+ * code path. board = 4 turn cards. Returns the canonical pair index in
+ * [0,1326) or -1 (blocked/out-of-range). */
+BPS_EXPORT int rollout_hand_index_for_turn_test(const int32_t *board,
+                                                int32_t c0, int32_t c1);
 
 /* ── Bucket-miss tolerance gate ─────────────────────────────────────── */
 

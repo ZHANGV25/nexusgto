@@ -496,6 +496,56 @@ $(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.
 test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
 	./$(BUILD_DIR)/test_rollout_cont_ev_boundary
 
+# ── Dual-boundary build (2026-06-25): TURN-boundary dispatch helper ──
+# Pure helper (mccfr_phase_r.c) tested in isolation. Mirrors
+# test_phase_r_dispatch for bp_should_dispatch_to_turn_boundary AND re-pins
+# that the FLOP helper is byte-untouched at num_board==4. Mac-runnable, <1s.
+$(BUILD_DIR)/test_turn_dispatch: tests/test_turn_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_turn_dispatch.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c -o $@ $(LDFLAGS) -lpthread
+
+test_turn_dispatch: $(BUILD_DIR)/test_turn_dispatch
+	./$(BUILD_DIR)/test_turn_dispatch
+
+# ── Dual-boundary build: TURN-boundary KEY ALIGNMENT (anti-100%-MISS) ──
+# THE key-drift gate: proves producer-write == consumer-read at the turn
+# boundary using the REAL functions (not re-typed copies), plus FLOP/TURN
+# key disjointness and an end-to-end table round-trip. Links the trainer
+# (producer index wrapper) + rollout (consumer index hook) + table.
+$(BUILD_DIR)/test_turn_boundary_key_alignment: tests/test_turn_boundary_key_alignment.c \
+        $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_turn_boundary_key_alignment.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_turn_boundary_key_alignment: $(BUILD_DIR)/test_turn_boundary_key_alignment
+	./$(BUILD_DIR)/test_turn_boundary_key_alignment
+
+# ── Dual-boundary build: TURN-boundary consumer contract (rollout) ──
+# Mirror of test_rollout_cont_ev_boundary at the turn boundary: happy path
+# (uniform mean), MISS/EMPTY_BIAS fail-loud, flag orthogonality.
+$(BUILD_DIR)/test_rollout_cont_ev_turn_boundary: tests/test_rollout_cont_ev_turn_boundary.c \
+        $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_turn_boundary.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_rollout_cont_ev_turn_boundary: $(BUILD_DIR)/test_rollout_cont_ev_turn_boundary
+	./$(BUILD_DIR)/test_rollout_cont_ev_turn_boundary
+
 # ── Standalone CEVS cache round-trip (Step 15) ──
 # Self-contained — links only against mccfr_cont_ev_table.c.
 $(BUILD_DIR)/test_cont_ev_standalone_roundtrip: \
@@ -519,10 +569,22 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_phase_r_discount_gate test_b3_encoding_alignment \
                   test_b3_bucket_alignment test_phase_r_boundary_bucket \
                   test_rollout_cont_ev_boundary \
-                  test_cont_ev_standalone_roundtrip
+                  test_cont_ev_standalone_roundtrip \
+                  test_turn_all
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════"
-	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Sess 11 + Sess 14 — green"
+	@echo "  Phase R Block A + B.1 + B.2 + B.3 + Sess 11 + Sess 14"
+	@echo "  + dual-boundary (turn) — green"
+	@echo "═══════════════════════════════════════════════════════════"
+
+# ── Dual-boundary (turn) combined target ──
+# The three turn-boundary tests. test_turn_boundary_key_alignment is the
+# anti-100%-MISS gate (producer-write == consumer-read).
+test_turn_all: test_turn_dispatch test_turn_boundary_key_alignment \
+               test_rollout_cont_ev_turn_boundary
+	@echo ""
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "  Dual-boundary (turn) — dispatch + key-alignment + consumer — green"
 	@echo "═══════════════════════════════════════════════════════════"
 
 clean:

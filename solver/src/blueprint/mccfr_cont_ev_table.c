@@ -54,6 +54,26 @@ static inline uint64_t cev_compute_slot_hash(uint64_t action_hash,
     return h;
 }
 
+/* Boundary-street disambiguator (see header). FLOP = identity (raw
+ * action_hash, byte-compat with the legacy flop artifact + tests); TURN
+ * folds a fixed 64-bit salt in via the SAME cev_hash_combine the slot
+ * hash uses, so turn keys are structurally disjoint from flop keys for
+ * the same (player, bucket). This is the single canonical key-hash both
+ * the producer and the consumer call — they cannot drift.
+ *
+ * The salt is an arbitrary fixed constant; its only requirement is to be
+ * distinct enough that mixing it in moves the hash. Do NOT change it once
+ * a turn artifact has been written, or every turn slot MISSes. */
+#define BP_CONT_EV_TURN_SALT 0x7531ECA8B96D420FULL  /* fixed; do not change */
+
+uint64_t bp_cont_ev_boundary_key_hash(uint64_t action_hash, int street) {
+    if (street == BP_CONT_EV_STREET_TURN) {
+        return cev_hash_combine(action_hash, BP_CONT_EV_TURN_SALT);
+    }
+    /* FLOP (or any other value): identity — legacy byte-compat. */
+    return action_hash;
+}
+
 /* Round n up to the next prime. Same trick as info_table_init
  * (mccfr_blueprint.c:565). Fast for the size range we care about
  * (1<<10 .. 1<<27); trial-division is fine. */

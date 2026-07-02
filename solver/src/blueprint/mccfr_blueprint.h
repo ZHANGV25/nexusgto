@@ -232,6 +232,26 @@ typedef struct {
     int depth_limit_cont_strats;
     float cont_strat_prob;
 
+    /* Dual-boundary build (2026-06-25): TURN-boundary dispatch, parallel
+     * to depth_limit_cont_strats (the FLOP one above).
+     *
+     * depth_limit_cont_strats_turn:
+     *   0 = no turn-boundary dispatch (default; the FLOP path and all
+     *       existing checkpoints/tests are byte-unaffected).
+     *   1 = at end-of-multiway-TURN (num_board==4, n_active>=3), with
+     *       probability cont_strat_prob, terminate the recursion, deal the
+     *       river, roll out to showdown under bias-reweighted σ̄, and
+     *       accumulate to the cont_ev slot table keyed with the TURN street
+     *       salt (bp_cont_ev_boundary_key_hash). Mirrors the flop HEADS
+     *       branch one street later (river leaf instead of turn leaf).
+     *
+     * This flag is INDEPENDENT of depth_limit_cont_strats: either, both, or
+     * neither may be on. The same byte-identity invariant holds — with this
+     * flag 0 the turn-dispatch helper returns 0 without consuming RNG, so a
+     * turn-flag-OFF run is byte-equivalent to legacy. cont_strat_prob is
+     * shared (one knob governs the HEADS probability at both boundaries). */
+    int depth_limit_cont_strats_turn;
+
     /* Phase R Block A.2 — boundary EV slot table.
      *
      * Allocated lazily on bp_set_depth_limit_cont_strats(s, 1) using
@@ -496,6 +516,44 @@ BP_EXPORT int bp_set_cont_ev_table_size(BPSolver *s, int64_t size_hint);
 BP_EXPORT int bp_should_dispatch_to_boundary(int num_board, int n_active,
                                               int flag, float prob,
                                               uint64_t *rng_state);
+
+/**
+ * Dual-boundary build (2026-06-25): enable/disable the TURN-boundary
+ * dispatch, parallel to bp_set_depth_limit_cont_strats (the FLOP one).
+ * INDEPENDENT flag — either, both, or neither boundary may be armed.
+ *
+ * enabled = 0 → no turn-boundary dispatch (default; flop path + existing
+ *               checkpoints/tests byte-unaffected).
+ * enabled = 1 → at end-of-multiway-TURN (num_board==4, n_active>=3),
+ *               coin-flip on cont_strat_prob, HEADS deals the river and
+ *               rolls out to showdown, accumulating to the cont_ev table
+ *               with the TURN street salt.
+ *
+ * Like the flop setter, this lazily allocates the cont_ev_table on first
+ * enable (idempotent if already allocated by the flop path). With
+ * enabled=0 the turn-dispatch helper consumes zero RNG (byte-identity).
+ */
+BP_EXPORT int bp_set_depth_limit_cont_strats_turn(BPSolver *s, int enabled);
+
+/**
+ * Dual-boundary build: the TURN analogue of bp_should_dispatch_to_boundary.
+ * Returns 1 iff the trainer should TERMINATE at the end-of-TURN multiway
+ * boundary (HEADS — deal river, roll out, accumulate). Returns 0 otherwise.
+ *
+ * Pure function. Same contract as the flop helper one street later:
+ *   - num_board != 4 → return 0 (only end-of-turn is a turn boundary).
+ *   - n_active < 3   → return 0 (HU/2p turn continues to showdown).
+ *   - flag == 0      → return 0 WITHOUT touching *rng_state (byte-identity).
+ *   - else coin-flip on `prob` consuming exactly one RNG draw (prob in
+ *     (0,1)); prob<=0 → 0, prob>=1 → 1, neither consumes RNG.
+ *
+ * Kept structurally separate from the flop helper so the flop dispatch
+ * matrix + its tests (which assert num_board==4 NEVER dispatches) stay
+ * byte-identical.
+ */
+BP_EXPORT int bp_should_dispatch_to_turn_boundary(int num_board, int n_active,
+                                                   int flag, float prob,
+                                                   uint64_t *rng_state);
 
 /**
  * Phase R Block A.2 — pure-math cont-bias reweighting helper.
@@ -915,6 +973,23 @@ BP_EXPORT int bp_boundary_slot_hand_index_for_test(const BPSolver *s,
                                                    const int *board,
                                                    int player,
                                                    int hand_idx);
+
+/**
+ * Dual-boundary build (2026-06-25) — TURN analogue of the above. Same
+ * canonical full-deck pair-index encoding, but the blocking set is the
+ * 4-card TURN board (board[0..3]); a hand using the turn card returns -1.
+ * The index VALUE is identical to the flop wrapper for the same hole cards
+ * (the formula depends only on the two hole cards) — street disambiguation
+ * lives in the key-hash, not in this index.
+ *
+ * Args:
+ *   board — 4 dealt board cards (flop + turn, raw).
+ * Returns: ≥0 canonical pair index in [0,1326); -1 on out-of-range/blocked.
+ */
+BP_EXPORT int bp_boundary_slot_hand_index_turn_for_test(const BPSolver *s,
+                                                        const int *board,
+                                                        int player,
+                                                        int hand_idx);
 
 #ifdef __cplusplus
 }
