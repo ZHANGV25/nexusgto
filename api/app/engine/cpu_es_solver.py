@@ -116,6 +116,10 @@ class CpuEsSolver:
         self._extract_leaf_info = None
         self._build_labels = None
         self._StreetSolverGPU = None
+        # Trained postflop bet vocab from the .bps manifest (bet-vocab desync
+        # fix). Set in _init from the loaded blueprint's manifest footer.
+        self._train_postflop_sizes: Optional[List[float]] = None
+        self._train_subsequent_sizes: Optional[List[float]] = None
         self._cev_holder = None  # A3: kept alive iff NEXUS_A3_CONT_EV=1
         self._last_cont_ev_stats = None  # A3: {hits, attempts} from last solve
         self._last_cont_ev_turn_stats = None  # dual-boundary: turn {hits,attempts}
@@ -179,6 +183,25 @@ class CpuEsSolver:
         self._snapshot_tree = snapshot_tree
         self._extract_leaf_info = extract_leaf_info_from_tree
 
+        # ── Bet-vocab desync fix (2026-07-01) ──
+        # The leaf-history encoder AND the C rollout must enumerate the SAME
+        # postflop bet vocab the served blueprint was TRAINED with, or every
+        # flop all-in line mis-keys → uniform fallback → over-bet
+        # (docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). The single source of
+        # truth is the loaded .bps manifest footer. Read it once here (fail
+        # loud if absent — mirrors strategy_source.py:199-206) and push it into
+        # the isolated es_resolver_real rollout via the C setter BEFORE any
+        # rollout runs. extract_leaf_info_from_tree gets the same vocab at each
+        # solve (see solve()).
+        self._train_postflop_sizes, self._train_subsequent_sizes = \
+            self._read_manifest_bet_vocab()
+        rc.set_rollout_train_vocab(
+            self._train_postflop_sizes, self._train_subsequent_sizes)
+        logger.info(
+            "CpuEsSolver: rollout train-vocab set from manifest — "
+            "postflop=%s subsequent=%s",
+            self._train_postflop_sizes, self._train_subsequent_sizes)
+
         # ── A3 (default OFF): load the cont_ev boundary table THROUGH es_lib ──
         # The table pointer must be valid in the SAME DLL that runs the construct
         # rollouts (es_resolver_real), so we bind bp_cont_ev_load_standalone on
@@ -191,6 +214,30 @@ class CpuEsSolver:
             self._load_cont_ev_table(rc, es_lib)
 
         self._ready = True
+
+    def _read_manifest_bet_vocab(self) -> Tuple[List[float], List[float]]:
+        """Read the trained postflop bet vocab from the loaded .bps manifest.
+
+        The manifest footer (postflop_bet_sizes / subsequent_bet_sizes) is the
+        single source of truth for what the served blueprint was trained with.
+        Fail loud if postflop_bet_sizes is absent — never fall back to a
+        hardcoded constant (mirrors the strategy_source.py:199-206 vocab
+        guard). subsequent_bet_sizes defaults to the C-side [1.0] only when the
+        manifest predates that field (older exporters), and only after the
+        first-raise vocab came from the manifest.
+        """
+        meta = self._blueprint.get_metadata() or {}
+        postflop = meta.get("postflop_bet_sizes")
+        if not postflop:
+            raise RuntimeError(
+                "CpuEsSolver: loaded blueprint manifest has no "
+                "'postflop_bet_sizes' — cannot key the leaf encoder/rollout to "
+                "the trained vocab. Refusing to fall back to a hardcoded "
+                "[0.5,1.0] (bet-vocab desync guard, "
+                "docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md)."
+            )
+        subsequent = meta.get("subsequent_bet_sizes") or [1.0]
+        return ([float(x) for x in postflop], [float(x) for x in subsequent])
 
     def _load_cont_ev_table(self, rc, es_lib) -> None:
         """A3: load the standalone .cev artifact through es_resolver_real and
@@ -464,8 +511,15 @@ class CpuEsSolver:
                 table = np.zeros((0, n_players, max_h), dtype=np.float32)
                 construct_s = 0.0
             else:
+                # Encode the per-leaf flop history under the TRAINED manifest
+                # vocab (bet-vocab desync fix) — NOT the subgame/tree-build
+                # sizes and NOT the module default [0.5,1.0]. The C rollout was
+                # already pinned to the same vocab at _init via the setter, so
+                # the encoded indices and the rollout's classify agree.
                 leaf_infos = self._extract_leaf_info(
-                    gpu._tree, num_players=n_players)
+                    gpu._tree, num_players=n_players,
+                    postflop_bet_sizes=self._train_postflop_sizes,
+                    subsequent_bet_sizes=self._train_subsequent_sizes)
                 if not leaf_infos:
                     raise RuntimeError("no leaf infos extracted from tree")
 
