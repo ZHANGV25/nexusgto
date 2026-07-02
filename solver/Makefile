@@ -496,6 +496,28 @@ $(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.
 test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
 	./$(BUILD_DIR)/test_rollout_cont_ev_boundary
 
+# ── Unit 3 (Stage-1 mean-field, 2026-07-01): bias-as-hero-action consumer ──
+# Rigged slot where bias 2's EV dominates: with bias-action ON the returned
+# leaf value converges toward EV_2 over repeated queries (and equals the
+# uniform mean with the flag OFF, same slot); regret persistence + reset.
+# Same link line as test_rollout_cont_ev_boundary. Mac-runnable, ~<1s.
+# EC2 harness: add to EXTRA_C_TESTS as `test_rollout_cont_ev_bias_action`.
+$(BUILD_DIR)/test_rollout_cont_ev_bias_action: tests/test_rollout_cont_ev_bias_action.c \
+        $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+        $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_bias_action.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    -o $@ $(LDFLAGS) -lpthread
+
+test_rollout_cont_ev_bias_action: $(BUILD_DIR)/test_rollout_cont_ev_bias_action
+	./$(BUILD_DIR)/test_rollout_cont_ev_bias_action
+
 # ── Dual-boundary build (2026-06-25): TURN-boundary dispatch helper ──
 # Pure helper (mccfr_phase_r.c) tested in isolation. Mirrors
 # test_phase_r_dispatch for bp_should_dispatch_to_turn_boundary AND re-pins
@@ -603,6 +625,7 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_phase_r_discount_gate test_b3_encoding_alignment \
                   test_b3_bucket_alignment test_phase_r_boundary_bucket \
                   test_rollout_cont_ev_boundary \
+                  test_rollout_cont_ev_bias_action \
                   test_cont_ev_standalone_roundtrip \
                   test_turn_all \
                   test_meanfield_all

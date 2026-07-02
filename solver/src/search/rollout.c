@@ -164,6 +164,167 @@ static int rollout_cont_ev_synth_fill(uint64_t key_ah, int player,
     return 1;
 }
 
+/* ── Unit 3 (Stage-1 mean-field): bias-as-hero-action consumer mode ─────
+ *
+ * docs/STAGE1_MEANFIELD_PLAN_2026-07-01.md §"Unit 3", docs/PLURIBUS_EXACT_
+ * CONFORMANCE_SPEC_2026-06-26.md §Gap 2. Default OFF = legacy uniform mean
+ * (byte-identical to the pre-Unit-3 consumer). When ON, at a cont_ev hit
+ * the consumer treats the querying player's 4 stored per-bias EVs as a
+ * CFR-SELECTABLE action at the leaf: it regret-matches over the 4 EVs,
+ * returns the regret-matched MIXTURE value (Σ p_b·EV_b), and updates the
+ * per-infoset regrets toward the realized per-bias EVs. All 4 EVs are
+ * already in the slot — no extra rollouts.
+ *
+ * PER-INFOSET, NOT PER-VISIT: the selection is regret-matched from a
+ * PERSISTENT regret store keyed by (leaf slot key, querying player), so
+ * the mixture converges toward the best (equilibrium) bias across the
+ * repeated queries of a solve — instead of re-randomizing every visit
+ * (which would just be per-visit noise). The store persists within a
+ * solve and is RESET per solve (rollout_reset_cont_ev_bias_regrets),
+ * mirroring the hit-counter reset lifecycle.
+ *
+ * Store: a BPContEVTable repurposed as the regret accumulator — its
+ * ev_sum[4] float slots hold the 4 per-bias regrets, ev_count[4] the
+ * per-bias visit counts; keyed by (bah, hidx, player) EXACTLY like the
+ * value-table query, so flop/turn regret slots are disjoint by the same
+ * street-salted bah the value query uses. Lazily allocated on first hit
+ * in bias-action mode; freed at reset/teardown. Lock-free (the table's
+ * CAS find_or_create + atomic float add) so it is safe under the
+ * construct's `#pragma omp parallel for`. Worst-case memory:
+ * ~n_slots_touched × (BPContEVEntry ≈ 4 float regrets + 4 int64 counts +
+ * key/CAS ≈ 64 B/slot); table_size is prime-promoted to 2× the requested
+ * capacity, so ≈ n_leaf_infosets × players × 64 B, lazily grown only for
+ * slots actually queried in bias-action mode. */
+#define ROLLOUT_BIAS_ACTION_TABLE_INIT 65536  /* initial slot capacity (grown lazily) */
+
+static int g_rollout_cont_ev_bias_action = 0;
+
+/* Persistent per-solve regret store. NULL until the first bias-action hit
+ * lazily allocates it. Protected for lazy-alloc by a CAS on the pointer so
+ * concurrent OMP workers publish exactly one table. */
+static BPContEVTable *g_rollout_bias_regrets = NULL;
+
+/* Observability: how many bias-action mixtures were returned (per solve;
+ * process-global atomic like the hit counters). */
+static volatile uint64_t g_rollout_bias_action_selects = 0;
+
+BPS_EXPORT void rollout_set_cont_ev_bias_action(int enabled) {
+    g_rollout_cont_ev_bias_action = enabled ? 1 : 0;
+}
+
+BPS_EXPORT int rollout_get_cont_ev_bias_action(void) {
+    return g_rollout_cont_ev_bias_action;
+}
+
+/* Number of bias-action mixtures returned since the last reset (per solve). */
+BPS_EXPORT void rollout_get_cont_ev_bias_action_stats(uint64_t *out_selects) {
+    if (out_selects)
+        *out_selects = __atomic_load_n(&g_rollout_bias_action_selects,
+                                       __ATOMIC_RELAXED);
+}
+
+/* Free the persistent bias-regret store and zero the select counter. Call
+ * per solve (before or after) so the regret state does not leak across
+ * solves — the same lifecycle the hit-counters use
+ * (rollout_reset_cont_ev_boundary_hit_count). Idempotent; safe when the
+ * store was never allocated. Not thread-safe against concurrent hits — call
+ * only when no rollout is running (between solves), exactly as the hit-count
+ * reset is called. */
+BPS_EXPORT void rollout_reset_cont_ev_bias_regrets(void) {
+    BPContEVTable *t = __atomic_exchange_n(&g_rollout_bias_regrets,
+                                           NULL, __ATOMIC_ACQ_REL);
+    if (t != NULL) {
+        bp_cont_ev_free(t);
+        free(t);
+    }
+    __atomic_store_n(&g_rollout_bias_action_selects, 0, __ATOMIC_RELAXED);
+}
+
+/* Lazily allocate (once) and return the persistent bias-regret store, or
+ * NULL if allocation failed. Lock-free publish via CAS: the first worker to
+ * install a non-NULL table wins; losers free their spare and use the winner's.
+ * This runs on the cont_ev hot path but only the FIRST hit per solve pays the
+ * allocation; all later hits take the fast non-NULL load. */
+static BPContEVTable *rollout_bias_regrets_get(void) {
+    BPContEVTable *t = __atomic_load_n(&g_rollout_bias_regrets, __ATOMIC_ACQUIRE);
+    if (t != NULL) return t;
+    BPContEVTable *fresh = (BPContEVTable *)calloc(1, sizeof(BPContEVTable));
+    if (fresh == NULL) return NULL;
+    if (bp_cont_ev_init(fresh, ROLLOUT_BIAS_ACTION_TABLE_INIT) != 0) {
+        free(fresh);
+        return NULL;
+    }
+    BPContEVTable *expected = NULL;
+    if (__atomic_compare_exchange_n(&g_rollout_bias_regrets, &expected, fresh,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return fresh;  /* we won the publish */
+    }
+    /* Another worker published first — discard ours, use theirs. */
+    bp_cont_ev_free(fresh);
+    free(fresh);
+    return expected;
+}
+
+/* Regret-matched selection over a slot's 4 stored per-bias EVs, and the
+ * matching regret update — the per-infoset CFR selection at the leaf.
+ *
+ * Inputs: the 4 realized per-bias EVs `ev[4]` (already read from the value
+ * table), and the regret slot key (key_ah = already-street-salted bah,
+ * player, bucket = hidx). Returns 0 and writes the regret-matched mixture
+ * value Σ p_b·EV_b to *out_value; returns -1 if the store could not be
+ * allocated (caller fails loud).
+ *
+ * Regret matching (standard): p_b ∝ max(regret_b, 0); when no regret is
+ * positive, p_b = 1/4 uniform. The returned value is the mixture under p.
+ * Regret update: regret_b += EV_b − returned_value (counterfactual regret
+ * of bias b against the played mixture), accumulated into the PERSISTENT
+ * store so repeated visits push the mixture toward the best bias.
+ *
+ * Concurrency: reads the slot's current regrets, computes p from a local
+ * snapshot, then atomically adds the per-bias regret deltas. Under the
+ * construct's OMP parallelism two workers may interleave read/update on the
+ * same slot — this is standard Hogwild MCCFR regret slop (the same tolerance
+ * the trainer's per-action regret update relies on), not a correctness bug:
+ * the fixed point is unchanged, only the transient convergence is noisier. */
+static int rollout_bias_action_select(const float ev[BP_CONT_EV_NUM_BIASES],
+                                      uint64_t key_ah, int player, int bucket,
+                                      float *out_value) {
+    BPContEVTable *store = rollout_bias_regrets_get();
+    if (store == NULL) return -1;
+    BPContEVEntry *e = bp_cont_ev_find_or_create(store, key_ah, player, bucket);
+    if (e == NULL) return -1;
+
+    /* Snapshot the current regrets and derive the regret-matched mixture. */
+    float pos_sum = 0.0f;
+    float p[BP_CONT_EV_NUM_BIASES];
+    for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++) {
+        float r = e->ev_sum[b];
+        float pr = (r > 0.0f) ? r : 0.0f;
+        p[b] = pr;
+        pos_sum += pr;
+    }
+    if (pos_sum > 0.0f) {
+        for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++) p[b] /= pos_sum;
+    } else {
+        for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++)
+            p[b] = 1.0f / (float)BP_CONT_EV_NUM_BIASES;
+    }
+
+    float mixture = 0.0f;
+    for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++) mixture += p[b] * ev[b];
+
+    /* Regret update toward the realized per-bias EVs (no extra rollouts —
+     * ev[] is already the table-read value for all 4 biases). */
+    for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++) {
+        bp_cont_ev_atomic_add_f32(&e->ev_sum[b], ev[b] - mixture);
+        e->ev_count[b]++;  /* visit count (Hogwild-tolerant int increment) */
+    }
+
+    __atomic_add_fetch(&g_rollout_bias_action_selects, 1, __ATOMIC_RELAXED);
+    *out_value = mixture;
+    return 0;
+}
+
 BPS_EXPORT void rollout_set_use_cont_ev_at_flop_boundary(int enabled) {
     g_rollout_use_cont_ev_at_flop_boundary = enabled ? 1 : 0;
 }
@@ -1301,6 +1462,9 @@ street_closed:
             }
             float ev_acc = 0.0f;
             int n_ok = 0;
+            /* Keep the per-bias EVs for the bias-action selector (Unit 3);
+             * on the legacy uniform-mean path they are unused. */
+            float ev_by_bias[BP_CONT_EV_NUM_BIASES] = {0};
             for (int bias = 0; bias < BP_CONT_EV_NUM_BIASES; bias++) {
                 float ev = 0.0f;
                 BPBoundaryEVStatus st = bp_query_boundary_ev(
@@ -1308,6 +1472,7 @@ street_closed:
                     hero_player, hidx, bias, &ev);
                 if (st == BP_BOUNDARY_EV_OK) {
                     ev_acc += ev;
+                    ev_by_bias[bias] = ev;
                     n_ok++;
                 } else if ((st == BP_BOUNDARY_EV_MISS
                             || st == BP_BOUNDARY_EV_EMPTY_BIAS)
@@ -1315,6 +1480,7 @@ street_closed:
                                                          hidx, bias)) {
                     /* SYNTHETIC (DEBUG/MEASUREMENT): dummy 0.0 filled; treat OK. */
                     ev_acc += 0.0f;
+                    ev_by_bias[bias] = 0.0f;
                     n_ok++;
                 } else {
                     const char *st_name =
@@ -1330,9 +1496,25 @@ street_closed:
                     return -1;
                 }
             }
-            /* All 4 biases OK — uniform mean integrates over the
-             * producer's MCCFR-uniform bias sampling distribution. */
-            *out_payoff = ev_acc / (float)n_ok;
+            if (g_rollout_cont_ev_bias_action) {
+                /* Unit 3 (Gap 2): regret-matched bias-as-hero-action at the
+                 * leaf, per infoset. All 4 EVs are already read above — the
+                 * selector returns the regret-matched mixture and updates the
+                 * persistent per-infoset regret store. Keyed by the SAME
+                 * (bah, hidx, player) the value query used. */
+                if (rollout_bias_action_select(ev_by_bias, bah, hero_player,
+                                               hidx, out_payoff) != 0) {
+                    rollout_set_error(street, num_players,
+                        "cont_ev_table boundary: bias-action regret store "
+                        "allocation failed (ah=0x%016llx player=%d hand_idx=%d)",
+                        (unsigned long long)bah, (int)hero_player, hidx);
+                    return -1;
+                }
+            } else {
+                /* All 4 biases OK — uniform mean integrates over the
+                 * producer's MCCFR-uniform bias sampling distribution. */
+                *out_payoff = ev_acc / (float)n_ok;
+            }
             __atomic_add_fetch(&g_rollout_cont_ev_boundary_hits, 1,
                                __ATOMIC_RELAXED);
             return 0;
@@ -1381,6 +1563,7 @@ street_closed:
             }
             float ev_acc_t = 0.0f;
             int n_ok_t = 0;
+            float ev_by_bias_t[BP_CONT_EV_NUM_BIASES] = {0};
             for (int bias = 0; bias < BP_CONT_EV_NUM_BIASES; bias++) {
                 float ev = 0.0f;
                 BPBoundaryEVStatus st = bp_query_boundary_ev(
@@ -1388,6 +1571,7 @@ street_closed:
                     hero_player, hidx_t, bias, &ev);
                 if (st == BP_BOUNDARY_EV_OK) {
                     ev_acc_t += ev;
+                    ev_by_bias_t[bias] = ev;
                     n_ok_t++;
                 } else if ((st == BP_BOUNDARY_EV_MISS
                             || st == BP_BOUNDARY_EV_EMPTY_BIAS)
@@ -1397,6 +1581,7 @@ street_closed:
                      * Keyed with the TURN-salted bah_t so synthetic turn slots
                      * stay disjoint from flop slots. */
                     ev_acc_t += 0.0f;
+                    ev_by_bias_t[bias] = 0.0f;
                     n_ok_t++;
                 } else {
                     const char *st_name =
@@ -1412,7 +1597,22 @@ street_closed:
                     return -1;
                 }
             }
-            *out_payoff = ev_acc_t / (float)n_ok_t;
+            if (g_rollout_cont_ev_bias_action) {
+                /* Unit 3 (Gap 2): TURN-boundary regret-matched bias-as-hero-
+                 * action, per infoset — same selector as the flop block, keyed
+                 * by the TURN-salted bah_t so turn regret slots stay disjoint
+                 * from flop slots. */
+                if (rollout_bias_action_select(ev_by_bias_t, bah_t, hero_player,
+                                               hidx_t, out_payoff) != 0) {
+                    rollout_set_error(street, num_players,
+                        "cont_ev_table TURN boundary: bias-action regret store "
+                        "allocation failed (ah=0x%016llx player=%d hand_idx=%d)",
+                        (unsigned long long)bah_t, (int)hero_player, hidx_t);
+                    return -1;
+                }
+            } else {
+                *out_payoff = ev_acc_t / (float)n_ok_t;
+            }
             __atomic_add_fetch(&g_rollout_cont_ev_turn_boundary_hits, 1,
                                __ATOMIC_RELAXED);
             return 0;
