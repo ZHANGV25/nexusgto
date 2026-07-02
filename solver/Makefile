@@ -507,12 +507,12 @@ $(BUILD_DIR)/test_rollout_cont_ev_bias_action: tests/test_rollout_cont_ev_bias_a
         $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
-        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
-        $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_bias_action.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
-	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
 
 test_rollout_cont_ev_bias_action: $(BUILD_DIR)/test_rollout_cont_ev_bias_action
