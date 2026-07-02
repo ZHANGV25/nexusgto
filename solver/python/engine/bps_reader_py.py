@@ -1245,8 +1245,11 @@ class BPSReaderC:
             num_threads: OpenMP threads
             num_players: 2-6
             small_blind, big_blind, initial_stack: game parameters
-            postflop_bet_sizes: first-raise pot fractions (default Pluribus)
-            subsequent_bet_sizes: re-raise pot fractions (default Pluribus)
+            postflop_bet_sizes: first-raise pot fractions. When None, read
+                from the loaded .bps manifest (postflop_bet_sizes); fail-loud
+                if the manifest lacks it (no hardcoded fallback).
+            subsequent_bet_sizes: re-raise pot fractions. When None, read from
+                the manifest (subsequent_bet_sizes), else the C-side [1.0].
             preflop_tiers: list of up to 4 lists of bet fractions per tier
             preflop_max_raises: cap on preflop raises
             turn_centroids: [k, 3] array of turn k-means centroids
@@ -1272,11 +1275,34 @@ class BPSReaderC:
                 "bps_ev_walk after updating src/bps_ev_walk.c."
             )
 
-        # Defaults: Pluribus bet sizes
+        # Postflop bet vocab: derive from the loaded .bps MANIFEST, never a
+        # hardcoded [0.5,1.0]. The manifest footer (postflop_bet_sizes /
+        # subsequent_bet_sizes) is the single source of truth for what the
+        # blueprint was trained with — an EV walk on a divergent vocab keys the
+        # wrong nodes exactly like the leaf-encoder desync
+        # (docs/BET_VOCAB_DESYNC_FINDING_2026-06-26.md). Fail loud if a caller
+        # passes nothing AND the manifest lacks the field, rather than silently
+        # falling back to a constant.
+        meta = self._metadata or {}
         if postflop_bet_sizes is None:
-            postflop_bet_sizes = [0.5, 1.0]
+            postflop_bet_sizes = meta.get("postflop_bet_sizes")
+            if not postflop_bet_sizes:
+                raise ValueError(
+                    "compute_evs: postflop_bet_sizes not supplied and the "
+                    "loaded .bps manifest has no 'postflop_bet_sizes' field. "
+                    "Refusing to fall back to a hardcoded vocab (bet-vocab "
+                    "desync guard) — pass the trained vocab explicitly."
+                )
+            postflop_bet_sizes = list(postflop_bet_sizes)
         if subsequent_bet_sizes is None:
-            subsequent_bet_sizes = [1.0]
+            subsequent_bet_sizes = meta.get("subsequent_bet_sizes")
+            if not subsequent_bet_sizes:
+                # subsequent is fixed at [1.0] on the C side; use that when the
+                # manifest predates the field (older exporters), but only after
+                # the first-raise vocab came from the manifest above.
+                subsequent_bet_sizes = [1.0]
+            else:
+                subsequent_bet_sizes = list(subsequent_bet_sizes)
         if preflop_tiers is None:
             # Pluribus-style tiered preflop sizing
             preflop_tiers = [
