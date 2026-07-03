@@ -121,6 +121,23 @@ def _cont_ev_bias_action_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _cont_ev_miss_fallback_enabled() -> bool:
+    """Stage-2' pinned-tail MISS fallback — MEASUREMENT ONLY, DEFAULT OFF.
+    When set (NEXUS_CONT_EV_MISS_FALLBACK=1), an ARMED cont_ev boundary query
+    whose slot is MISS/EMPTY_BIAS sends that ONE rollout down the legacy live
+    playout instead of failing loud (INVALID still fails loud). Exists so the
+    Stage-2 equity gate / mix-delta can run against tables that cover ~69% of
+    the exhaustive key manifest (the power-law tail is unreachable by traffic
+    walking — docs/STAGE2_GATE_RESULTS_2026-07-02.md): with the same
+    master_seed, a key missing in BOTH A/B tables produces a bit-identical
+    fallback value in both arms (per-(leaf,combo) RNG), pinning the tail to
+    common ground truth. NEVER enable in the served path — serving keeps the
+    fail-loud contract (a serve-time fallback would pay the live rollout per
+    uncovered query and destroy the armed latency win)."""
+    v = os.environ.get("NEXUS_CONT_EV_MISS_FALLBACK", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -637,6 +654,21 @@ class CpuEsSolver:
                     rc.reset_cont_ev_bias_regrets()
                     rc.set_cont_ev_bias_action(True)
 
+                # ── Stage-2' pinned-tail MISS fallback (MEASUREMENT ONLY,
+                # default OFF): armed iff a boundary is armed AND the env flag
+                # is set AND the .so has the symbol. rc.set_cont_ev_miss_
+                # fallback raises on a pre-Stage-2' .so (fail-loud: a
+                # measurement that asked for fallback must not silently run
+                # fail-loud and crash the gate an hour in). When off, the C
+                # global is never touched (byte-identical legacy path). ──
+                miss_fallback_armed = (
+                    (a3_armed or a3_turn_armed)
+                    and _cont_ev_miss_fallback_enabled()
+                )
+                if miss_fallback_armed:
+                    rc.reset_cont_ev_fallback_counts()
+                    rc.set_cont_ev_miss_fallback(True)
+
                 # DIAG (NEXUS_ES_DIAG=1): reset the rollout blueprint-miss counters
                 # before the construct so we can read the miss-rate after. A high
                 # blueprint miss-rate -> the turn/river CONTINUATION falls back to
@@ -753,6 +785,9 @@ class CpuEsSolver:
                             "attempts": int(attempts),
                             "hit_rate": (hits / attempts) if attempts else 0.0,
                         }
+                        if miss_fallback_armed:
+                            self._last_cont_ev_stats["fallbacks"] = int(
+                                rc.get_cont_ev_fallback_count())
                         logger.info(
                             "CpuEsSolver A3: cont_ev boundary hits=%d attempts=%d "
                             "hit_rate=%.4f", hits, attempts,
@@ -769,10 +804,25 @@ class CpuEsSolver:
                             "attempts": int(t_att),
                             "hit_rate": (t_hits / t_att) if t_att else 0.0,
                         }
+                        if miss_fallback_armed:
+                            self._last_cont_ev_turn_stats["fallbacks"] = int(
+                                rc.get_cont_ev_turn_fallback_count())
                         logger.info(
                             "CpuEsSolver dual-boundary: cont_ev TURN hits=%d "
                             "attempts=%d hit_rate=%.4f", t_hits, t_att,
                             self._last_cont_ev_turn_stats["hit_rate"])
+                    if miss_fallback_armed:
+                        # Symmetric disarm — MUST happen in finally so the
+                        # measurement-only fallback can never leak into a
+                        # subsequent (potentially served) solve.
+                        rc.set_cont_ev_miss_fallback(False)
+                        logger.info(
+                            "CpuEsSolver Stage-2': pinned-tail fallback "
+                            "flop=%d turn=%d (of attempts flop=%d turn=%d)",
+                            rc.get_cont_ev_fallback_count(),
+                            rc.get_cont_ev_turn_fallback_count(),
+                            (self._last_cont_ev_stats or {}).get("attempts", 0),
+                            (self._last_cont_ev_turn_stats or {}).get("attempts", 0))
                     if bias_action_armed:
                         # Symmetric disarm + snapshot for the bias-action mode.
                         # MUST happen in finally so an exception cannot leave the
