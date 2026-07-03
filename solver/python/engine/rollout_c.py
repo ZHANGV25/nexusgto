@@ -387,6 +387,31 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         lib.rollout_reset_cont_ev_bias_regrets.argtypes = []
         lib.rollout_reset_cont_ev_bias_regrets.restype = None
 
+    # Stage-2' pinned-tail MISS fallback (2026-07-03, MEASUREMENT ONLY,
+    # default OFF): on MISS/EMPTY_BIAS the querying rollout falls through to
+    # the legacy live playout instead of failing loud. Optional symbols —
+    # hasattr-guarded like the turn/bias-action bindings above. See
+    # src/search/rollout.h "Stage-2' pinned-tail" block.
+    if hasattr(lib, "rollout_set_cont_ev_miss_fallback"):
+        lib.rollout_set_cont_ev_miss_fallback.argtypes = [ctypes.c_int]
+        lib.rollout_set_cont_ev_miss_fallback.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_miss_fallback"):
+        lib.rollout_get_cont_ev_miss_fallback.argtypes = []
+        lib.rollout_get_cont_ev_miss_fallback.restype = ctypes.c_int
+    if hasattr(lib, "rollout_get_cont_ev_fallback_count"):
+        lib.rollout_get_cont_ev_fallback_count.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_fallback_count.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_turn_fallback_count"):
+        lib.rollout_get_cont_ev_turn_fallback_count.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64)
+        ]
+        lib.rollout_get_cont_ev_turn_fallback_count.restype = None
+    if hasattr(lib, "rollout_reset_cont_ev_fallback_counts"):
+        lib.rollout_reset_cont_ev_fallback_counts.argtypes = []
+        lib.rollout_reset_cont_ev_fallback_counts.restype = None
+
     # Training bet-vocab setter (bet-vocab desync fix, 2026-07-01). Optional
     # symbol — hasattr-guarded like the turn-boundary bindings above, so a
     # pre-fix .so still loads (the caller's set_rollout_train_vocab raises if
@@ -1381,6 +1406,73 @@ def reset_cont_ev_bias_regrets() -> None:
     if not hasattr(lib, "rollout_reset_cont_ev_bias_regrets"):
         return
     lib.rollout_reset_cont_ev_bias_regrets()
+
+
+# ── Stage-2' pinned-tail MISS fallback wrappers (MEASUREMENT ONLY) ────────
+#
+# Default OFF (fail-loud serving contract unchanged). When ON, a cont_ev
+# boundary query whose slot is MISS/EMPTY_BIAS sends that ONE rollout down
+# the legacy live playout instead of raising; INVALID still fails loud.
+# Per-(leaf, combo) RNG derivation makes the fallback deterministic and
+# arm-identical when both A/B tables miss the same key (the pinned tail).
+# See src/search/rollout.h "Stage-2' pinned-tail" block.
+
+
+def set_cont_ev_miss_fallback(enabled: bool) -> None:
+    """Enable / disable the pinned-tail MISS fallback (default OFF).
+
+    Fail-loud: raises RuntimeError if the .so predates the Stage-2' change —
+    a measurement that asked for fallback must not silently run fail-loud
+    (the gate would crash mid-solve an hour in, not judge).
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_cont_ev_miss_fallback"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_cont_ev_miss_fallback — rebuild "
+            "with the Stage-2' pinned-tail changes (src/search/rollout.c, "
+            "2026-07-03)."
+        )
+    lib.rollout_set_cont_ev_miss_fallback(1 if enabled else 0)
+
+
+def get_cont_ev_miss_fallback() -> bool:
+    """Whether the pinned-tail MISS fallback is enabled (False on a .so that
+    predates Stage-2')."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_miss_fallback"):
+        return False
+    return bool(lib.rollout_get_cont_ev_miss_fallback())
+
+
+def get_cont_ev_fallback_count() -> int:
+    """FLOP-boundary rollouts that fell back to the live playout since the
+    last reset. 0 on a pre-Stage-2' .so."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_fallback_count"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_fallback_count(ctypes.byref(out))
+    return int(out.value)
+
+
+def get_cont_ev_turn_fallback_count() -> int:
+    """TURN-boundary rollouts that fell back to the live playout since the
+    last reset. 0 on a pre-Stage-2' .so."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_turn_fallback_count"):
+        return 0
+    out = ctypes.c_uint64(0)
+    lib.rollout_get_cont_ev_turn_fallback_count(ctypes.byref(out))
+    return int(out.value)
+
+
+def reset_cont_ev_fallback_counts() -> None:
+    """Zero both per-boundary fallback counters (call between solves, same
+    lifecycle as the hit-count resets). No-op on a pre-Stage-2' .so."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_reset_cont_ev_fallback_counts"):
+        return
+    lib.rollout_reset_cont_ev_fallback_counts()
 
 
 # ── BPR5 trailer loader (mccfr_blueprint.so) ────────────────────────────

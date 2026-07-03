@@ -564,6 +564,35 @@ BPS_EXPORT void rollout_get_cont_ev_turn_boundary_hit_count(uint64_t *out_hits);
 BPS_EXPORT void rollout_get_cont_ev_turn_boundary_attempt_count(uint64_t *out_attempts);
 BPS_EXPORT void rollout_reset_cont_ev_turn_boundary_hit_count(void);
 
+/* ── Stage-2' pinned-tail MISS fallback (MEASUREMENT ONLY — default OFF) ──
+ *
+ * When enabled, a cont_ev boundary query whose slot is MISS/EMPTY_BIAS does
+ * NOT fail loud: that ONE rollout falls through to the legacy live playout
+ * (deal next street + blueprint continuation), exactly as if the boundary
+ * were not armed for that query. INVALID still fails loud (structural
+ * corruption is never papered over). Applies to both boundaries.
+ *
+ * Why this is measurement-sound: the construct's RNG is per-(leaf, combo)
+ * splitmix64 derived from master_seed (see compute_subgame_leaf_values_
+ * sampled_c) — so with the SAME master_seed, a key that misses in BOTH
+ * tables of a Stage-2 A/B produces a BIT-IDENTICAL fallback value in both
+ * arms (the tail is "pinned" to common ground truth and contributes zero
+ * to the measured delta). The uncovered tail is 31% of the equity gate's
+ * key space (power-law, unreachable by traffic walking — see
+ * STAGE2_GATE_RESULTS_2026-07-02.md), so without this mode the gate cannot
+ * run at all; with it, the delta cleanly isolates covered-key semantics.
+ *
+ * SERVING: never enable this in the served path. The serving contract
+ * remains fail-loud; a hybrid fallback at serve time would pay the live
+ * rollout on every uncovered query and destroy the armed latency win.
+ * Per-boundary fallback counters make the substitution observable
+ * (fallbacks = attempts − hits on this mode's runs). */
+BPS_EXPORT void rollout_set_cont_ev_miss_fallback(int enabled);
+BPS_EXPORT int  rollout_get_cont_ev_miss_fallback(void);
+BPS_EXPORT void rollout_get_cont_ev_fallback_count(uint64_t *out_fallbacks);
+BPS_EXPORT void rollout_get_cont_ev_turn_fallback_count(uint64_t *out_fallbacks);
+BPS_EXPORT void rollout_reset_cont_ev_fallback_counts(void);
+
 /* Test hook: the EXACT static turn hand-index the live consumer uses.
  * Exposed so the key-alignment test asserts against the real consumer
  * code path. board = 4 turn cards. Returns the canonical pair index in

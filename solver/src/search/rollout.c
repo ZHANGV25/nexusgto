@@ -120,6 +120,41 @@ static volatile uint64_t g_rollout_cont_ev_boundary_attempts = 0;
 static volatile uint64_t g_rollout_cont_ev_turn_boundary_hits = 0;
 static volatile uint64_t g_rollout_cont_ev_turn_boundary_attempts = 0;
 
+/* Stage-2' pinned-tail MISS fallback (MEASUREMENT ONLY — default OFF; see
+ * rollout.h). On MISS/EMPTY_BIAS the querying rollout falls through to the
+ * legacy live playout instead of failing loud; INVALID stays fail-loud.
+ * Per-(leaf,combo) RNG derivation makes the fallback value deterministic and
+ * arm-identical when both A/B tables miss the same key. Fallback counters are
+ * process-global atomics for the same OMP-worker reason as the hit counters. */
+static int g_rollout_cont_ev_miss_fallback = 0;
+static volatile uint64_t g_rollout_cont_ev_fallback_count = 0;       /* flop */
+static volatile uint64_t g_rollout_cont_ev_turn_fallback_count = 0;  /* turn */
+
+BPS_EXPORT void rollout_set_cont_ev_miss_fallback(int enabled) {
+    g_rollout_cont_ev_miss_fallback = enabled ? 1 : 0;
+}
+
+BPS_EXPORT int rollout_get_cont_ev_miss_fallback(void) {
+    return g_rollout_cont_ev_miss_fallback;
+}
+
+BPS_EXPORT void rollout_get_cont_ev_fallback_count(uint64_t *out_fallbacks) {
+    if (out_fallbacks)
+        *out_fallbacks = __atomic_load_n(&g_rollout_cont_ev_fallback_count,
+                                         __ATOMIC_RELAXED);
+}
+
+BPS_EXPORT void rollout_get_cont_ev_turn_fallback_count(uint64_t *out_fallbacks) {
+    if (out_fallbacks)
+        *out_fallbacks = __atomic_load_n(&g_rollout_cont_ev_turn_fallback_count,
+                                         __ATOMIC_RELAXED);
+}
+
+BPS_EXPORT void rollout_reset_cont_ev_fallback_counts(void) {
+    __atomic_store_n(&g_rollout_cont_ev_fallback_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rollout_cont_ev_turn_fallback_count, 0, __ATOMIC_RELAXED);
+}
+
 BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t) {
     g_rollout_cont_ev_table = t;
     /* The underlying table object is mutable (the loader populates it); the
@@ -1462,6 +1497,7 @@ street_closed:
             }
             float ev_acc = 0.0f;
             int n_ok = 0;
+            int cev_fell_back = 0;
             /* Keep the per-bias EVs for the bias-action selector (Unit 3);
              * on the legacy uniform-mean path they are unused. */
             float ev_by_bias[BP_CONT_EV_NUM_BIASES] = {0};
@@ -1482,6 +1518,16 @@ street_closed:
                     ev_acc += 0.0f;
                     ev_by_bias[bias] = 0.0f;
                     n_ok++;
+                } else if (g_rollout_cont_ev_miss_fallback
+                           && (st == BP_BOUNDARY_EV_MISS
+                               || st == BP_BOUNDARY_EV_EMPTY_BIAS)) {
+                    /* Stage-2' pinned-tail (MEASUREMENT ONLY, default OFF):
+                     * an uncovered key sends THIS rollout down the legacy live
+                     * playout instead of failing loud. Partial bias reads are
+                     * discarded — all-4-or-fallback, never a mixed-source
+                     * value. INVALID never takes this branch. */
+                    cev_fell_back = 1;
+                    break;
                 } else {
                     const char *st_name =
                         (st == BP_BOUNDARY_EV_EMPTY_BIAS) ? "EMPTY_BIAS" :
@@ -1496,6 +1542,14 @@ street_closed:
                     return -1;
                 }
             }
+            if (cev_fell_back) {
+                /* Fall through past the short-circuit: the legacy next-street
+                 * dealing below produces this rollout's leaf value. hits is NOT
+                 * incremented (attempts was) — hit_rate exposes the fallback
+                 * fraction; the dedicated counter makes it directly readable. */
+                __atomic_add_fetch(&g_rollout_cont_ev_fallback_count, 1,
+                                   __ATOMIC_RELAXED);
+            } else {
             if (g_rollout_cont_ev_bias_action) {
                 /* Unit 3 (Gap 2): regret-matched bias-as-hero-action at the
                  * leaf, per infoset. All 4 EVs are already read above — the
@@ -1518,6 +1572,7 @@ street_closed:
             __atomic_add_fetch(&g_rollout_cont_ev_boundary_hits, 1,
                                __ATOMIC_RELAXED);
             return 0;
+            }
         }
 
         /* ── Dual-boundary build (2026-06-25): TURN-boundary short-circuit ──
@@ -1563,6 +1618,7 @@ street_closed:
             }
             float ev_acc_t = 0.0f;
             int n_ok_t = 0;
+            int cev_turn_fell_back = 0;
             float ev_by_bias_t[BP_CONT_EV_NUM_BIASES] = {0};
             for (int bias = 0; bias < BP_CONT_EV_NUM_BIASES; bias++) {
                 float ev = 0.0f;
@@ -1583,6 +1639,14 @@ street_closed:
                     ev_acc_t += 0.0f;
                     ev_by_bias_t[bias] = 0.0f;
                     n_ok_t++;
+                } else if (g_rollout_cont_ev_miss_fallback
+                           && (st == BP_BOUNDARY_EV_MISS
+                               || st == BP_BOUNDARY_EV_EMPTY_BIAS)) {
+                    /* Stage-2' pinned-tail (MEASUREMENT ONLY, default OFF):
+                     * uncovered turn key → legacy river playout for THIS
+                     * rollout. All-4-or-fallback; INVALID never lands here. */
+                    cev_turn_fell_back = 1;
+                    break;
                 } else {
                     const char *st_name =
                         (st == BP_BOUNDARY_EV_EMPTY_BIAS) ? "EMPTY_BIAS" :
@@ -1597,6 +1661,11 @@ street_closed:
                     return -1;
                 }
             }
+            if (cev_turn_fell_back) {
+                /* Fall through to the river dealing below; hits NOT bumped. */
+                __atomic_add_fetch(&g_rollout_cont_ev_turn_fallback_count, 1,
+                                   __ATOMIC_RELAXED);
+            } else {
             if (g_rollout_cont_ev_bias_action) {
                 /* Unit 3 (Gap 2): TURN-boundary regret-matched bias-as-hero-
                  * action, per infoset — same selector as the flop block, keyed
@@ -1616,6 +1685,7 @@ street_closed:
             __atomic_add_fetch(&g_rollout_cont_ev_turn_boundary_hits, 1,
                                __ATOMIC_RELAXED);
             return 0;
+            }
         }
 
         /* Deal next street */
