@@ -285,6 +285,25 @@ def canonical_flop_chips(
                 f"seats {sorted(live_seats)} do not match the live players "
                 f"of the replayed 3-bet line {sorted(replay_live)}"
             )
+    if raises_seen == 1:
+        # Single-raised pot: the replayed live set must BE the seats the
+        # caller claims reach the flop — the same invariant the limped
+        # (raises_seen==0) and 3-bet (==2) branches above enforce. This
+        # branch historically had NO check, which let every A3/Stage-2
+        # harness spot since 2026-06-12 silently build a FICTIONAL state
+        # (all six seats "live" over the heads-up prefix [2,0,0,0,0,1]):
+        # its blueprint/boundary keys encode lines the trainer can never
+        # traverse, so every cont_ev query 0-hit every walk table (the
+        # Stage-2 hash-disjunction root cause, 2026-07-03).
+        replay_live = {
+            pos for pos in _PREFLOP_ORDER
+            if pos not in folded and pos in acted
+        }
+        if replay_live != live_seats:
+            raise ValueError(
+                f"seats {sorted(live_seats)} do not match the live players "
+                f"of the replayed single-raise line {sorted(replay_live)}"
+            )
 
     # Per-slot stacks, SB-first over the LIVE seats (matches new_postflop_state
     # slot ordering). Each live seat invested bets[pos]; folded seats aren't at
