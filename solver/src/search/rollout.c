@@ -1482,6 +1482,14 @@ street_closed:
             __atomic_add_fetch(&g_rollout_cont_ev_boundary_attempts, 1,
                                __ATOMIC_RELAXED);
             uint64_t bah = bp_compute_action_hash(game_history, gah_len);
+            /* Boundary slot key player = the FULL SEAT. The producer keys
+             * slots by ts->traverser, which in the always-6p trainer IS the
+             * seat (mccfr_blueprint.c:1694-1697). Querying by the compact
+             * hero index only coincided on 6-entry spots where compact==seat;
+             * any spot with preflop folders would MISS every slot — the same
+             * class as the 2026-06-16 wrong-seat fix at the blueprint
+             * strategy lookup above (rollout.c:1301). */
+            int32_t hero_seat = player_seats[hero_player];
             int hidx = rollout_hand_index_for_flop(
                 board,
                 sampled_hands_c0[hero_player],
@@ -1505,14 +1513,14 @@ street_closed:
                 float ev = 0.0f;
                 BPBoundaryEVStatus st = bp_query_boundary_ev(
                     g_rollout_cont_ev_table, bah,
-                    hero_player, hidx, bias, &ev);
+                    hero_seat, hidx, bias, &ev);
                 if (st == BP_BOUNDARY_EV_OK) {
                     ev_acc += ev;
                     ev_by_bias[bias] = ev;
                     n_ok++;
                 } else if ((st == BP_BOUNDARY_EV_MISS
                             || st == BP_BOUNDARY_EV_EMPTY_BIAS)
-                           && rollout_cont_ev_synth_fill(bah, hero_player,
+                           && rollout_cont_ev_synth_fill(bah, hero_seat,
                                                          hidx, bias)) {
                     /* SYNTHETIC (DEBUG/MEASUREMENT): dummy 0.0 filled; treat OK. */
                     ev_acc += 0.0f;
@@ -1538,7 +1546,7 @@ street_closed:
                         "cont_ev_table boundary: status=%s ah=0x%016llx "
                         "player=%d hand_idx=%d bias=%d",
                         st_name, (unsigned long long)bah,
-                        (int)hero_player, hidx, bias);
+                        (int)hero_seat, hidx, bias);
                     return -1;
                 }
             }
@@ -1556,12 +1564,12 @@ street_closed:
                  * selector returns the regret-matched mixture and updates the
                  * persistent per-infoset regret store. Keyed by the SAME
                  * (bah, hidx, player) the value query used. */
-                if (rollout_bias_action_select(ev_by_bias, bah, hero_player,
+                if (rollout_bias_action_select(ev_by_bias, bah, hero_seat,
                                                hidx, out_payoff) != 0) {
                     rollout_set_error(street, num_players,
                         "cont_ev_table boundary: bias-action regret store "
                         "allocation failed (ah=0x%016llx player=%d hand_idx=%d)",
-                        (unsigned long long)bah, (int)hero_player, hidx);
+                        (unsigned long long)bah, (int)hero_seat, hidx);
                     return -1;
                 }
             } else {
@@ -1602,6 +1610,9 @@ street_closed:
             uint64_t bah_t = bp_cont_ev_boundary_key_hash(
                 bp_compute_action_hash(game_history, gah_len),
                 BP_CONT_EV_STREET_TURN);
+            /* FULL SEAT for the slot key — same contract as the flop block
+             * above (producer keys ts->traverser == seat). */
+            int32_t hero_seat_t = player_seats[hero_player];
             int hidx_t = rollout_hand_index_for_turn(
                 board,
                 sampled_hands_c0[hero_player],
@@ -1624,14 +1635,14 @@ street_closed:
                 float ev = 0.0f;
                 BPBoundaryEVStatus st = bp_query_boundary_ev(
                     g_rollout_cont_ev_table, bah_t,
-                    hero_player, hidx_t, bias, &ev);
+                    hero_seat_t, hidx_t, bias, &ev);
                 if (st == BP_BOUNDARY_EV_OK) {
                     ev_acc_t += ev;
                     ev_by_bias_t[bias] = ev;
                     n_ok_t++;
                 } else if ((st == BP_BOUNDARY_EV_MISS
                             || st == BP_BOUNDARY_EV_EMPTY_BIAS)
-                           && rollout_cont_ev_synth_fill(bah_t, hero_player,
+                           && rollout_cont_ev_synth_fill(bah_t, hero_seat_t,
                                                          hidx_t, bias)) {
                     /* SYNTHETIC (DEBUG/MEASUREMENT): dummy 0.0 filled; treat OK.
                      * Keyed with the TURN-salted bah_t so synthetic turn slots
@@ -1657,7 +1668,7 @@ street_closed:
                         "cont_ev_table TURN boundary: status=%s ah=0x%016llx "
                         "player=%d hand_idx=%d bias=%d",
                         st_name, (unsigned long long)bah_t,
-                        (int)hero_player, hidx_t, bias);
+                        (int)hero_seat_t, hidx_t, bias);
                     return -1;
                 }
             }
@@ -1671,12 +1682,12 @@ street_closed:
                  * action, per infoset — same selector as the flop block, keyed
                  * by the TURN-salted bah_t so turn regret slots stay disjoint
                  * from flop slots. */
-                if (rollout_bias_action_select(ev_by_bias_t, bah_t, hero_player,
+                if (rollout_bias_action_select(ev_by_bias_t, bah_t, hero_seat_t,
                                                hidx_t, out_payoff) != 0) {
                     rollout_set_error(street, num_players,
                         "cont_ev_table TURN boundary: bias-action regret store "
                         "allocation failed (ah=0x%016llx player=%d hand_idx=%d)",
-                        (unsigned long long)bah_t, (int)hero_player, hidx_t);
+                        (unsigned long long)bah_t, (int)hero_seat_t, hidx_t);
                     return -1;
                 }
             } else {

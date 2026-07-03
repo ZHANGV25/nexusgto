@@ -352,6 +352,22 @@ $(BUILD_DIR)/test_cont_ev_key: tests/test_cont_ev_key.c \
 test_cont_ev_key: $(BUILD_DIR)/test_cont_ev_key
 	./$(BUILD_DIR)/test_cont_ev_key
 
+# ── history→hash contract (2026-07-03): producer trainer-token emission vs
+# consumer engine-assembled game_history over REAL canonical lines, plus the
+# negative control pinning the pre-fix harness spot as game-impossible. The
+# missing test class behind the Stage-2 hash disjunction. Deterministic, <1s.
+$(BUILD_DIR)/test_cont_ev_history_hash_contract: tests/test_cont_ev_history_hash_contract.c \
+        $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+        $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+        $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_cont_ev_history_hash_contract.c \
+	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
+	    -o $@ $(LDFLAGS)
+
+test_cont_ev_history_hash_contract: $(BUILD_DIR)/test_cont_ev_history_hash_contract
+	./$(BUILD_DIR)/test_cont_ev_history_hash_contract
+
 # ── Phase R Block B.1+B.2: end-to-end save → load → query parity ──
 # 5K-iter trainer drive with prob=1.0; capture one populated slot's
 # (ev_sum, ev_count); save+load; query via bp_query_boundary_ev; assert
