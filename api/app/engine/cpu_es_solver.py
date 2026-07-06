@@ -1085,6 +1085,36 @@ class CpuEsSolver:
                             raw[h] = strat
                 all_by_player[p_idx] = raw
 
+            # OBSERVABILITY STASH (2026-07-05, latency ladder): construct/solve
+            # walls + tree shape for the LAST solve, as instance attributes —
+            # the same read-only convention as _last_cont_ev_stats. Offline
+            # measurement harnesses read this instead of parsing the log line
+            # below (full float precision; num_chance_nodes is the per-arm
+            # proof of which POKER_SEARCH_DEPTH mode actually built the tree).
+            # Pure stash, no behavior change.
+            self._last_solve_stats = {
+                "n_players": n_players,
+                "street": street,
+                "construct_s": float(construct_s),
+                "solve_s": float(solve_s),
+                "iterations": int(iterations),
+                "num_rollouts": int(num_rollouts),
+                "master_seed": int(master_seed),
+                "vec_mode": int(vec_mode),
+                "readout": readout,
+                "num_threads": int(num_threads),
+                # reach mode ignores num_threads in C (single-threaded pass)
+                "eff_threads": 1 if use_reach else int(_eff_threads),
+                "use_reach": bool(use_reach),
+                "num_nodes": int(_nn),
+                "num_leaf_nodes": int(n_leaf_nodes),
+                "num_leaves": int(n_leaves),
+                "num_chance_nodes": int(getattr(gpu._tree, "num_chance_nodes", 0)),
+                "num_decision_nodes": int(
+                    getattr(gpu._tree, "num_decision_nodes", 0)),
+                "max_depth": int(getattr(gpu._tree, "max_depth", 0)),
+            }
+
             logger.info(
                 "CpuEsSolver solve: %dp %s construct=%.1fs solve=%.1fs "
                 "(%d iters, %s threads, off-lock)",
