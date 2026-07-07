@@ -593,6 +593,32 @@ BPS_EXPORT void rollout_get_cont_ev_fallback_count(uint64_t *out_fallbacks);
 BPS_EXPORT void rollout_get_cont_ev_turn_fallback_count(uint64_t *out_fallbacks);
 BPS_EXPORT void rollout_reset_cont_ev_fallback_counts(void);
 
+/* ── Stage-3 per-spot exhaustive FILL mode (STAGE3_FILL_V1 — default OFF) ──
+ *
+ * MEASUREMENT/BUILD ONLY. When ON and a cont_ev boundary is armed, a boundary
+ * query does NOT read/short-circuit: the slot is find_or_create'd under the
+ * EXACT read-path key (full seat; TURN-salted hash at the turn boundary; the
+ * INVALID hand-index case still fails loud — no bucket=-1 slot is ever
+ * inserted) and THIS rollout runs the same legacy live playout the
+ * miss-fallback uses. The rollout's terminal hero-perspective payoff is then
+ * atomically accumulated into ALL FOUR bias lanes of the slot (ev_sum[b] +=
+ * payoff, ev_count[b] += 1 — same atomics as the trainer's boundary
+ * accumulate) and the street's fill counter is bumped once per fill rollout.
+ * `hits` is never incremented; `attempts` increments exactly as on the read
+ * path, so attempts == fill_count on a pure fill pass.
+ *
+ * Precedence when multiple modes are set: FILL > synthetic > miss-fallback.
+ * The driver arms ONE street per fill pass; a rollout crossing armed FLOP and
+ * armed TURN boundaries in fill mode fails loud (driver-contract violation).
+ * find_or_create is the trainer's lock-free CAS insert, and the accumulates
+ * are the trainer's Hogwild atomics, so fill is safe under the construct's
+ * OMP parallelism. SERVING: never enable — the serving contract stays
+ * read-only fail-loud. */
+BPS_EXPORT void     rollout_set_cont_ev_fill(int enable);
+BPS_EXPORT uint64_t rollout_get_cont_ev_fill_flop_count(void);
+BPS_EXPORT uint64_t rollout_get_cont_ev_fill_turn_count(void);
+BPS_EXPORT void     rollout_reset_cont_ev_fill_counts(void);
+
 /* Test hook: the EXACT static turn hand-index the live consumer uses.
  * Exposed so the key-alignment test asserts against the real consumer
  * code path. board = 4 turn cards. Returns the canonical pair index in

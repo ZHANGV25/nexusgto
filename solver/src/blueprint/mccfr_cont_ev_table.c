@@ -465,6 +465,7 @@ int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots) {
         return -1;
     }
 
+    int64_t dup_keys = 0;
     for (int64_t i = 0; i < n_slots; i++) {
         int player, bucket;
         uint64_t action_hash;
@@ -484,6 +485,7 @@ int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots) {
             return -1;
         }
 
+        int64_t n_before = t->num_entries;
         BPContEVEntry *e = bp_cont_ev_find_or_create(t, action_hash,
                                                       player, bucket);
         if (e == NULL) {
@@ -492,8 +494,26 @@ int bp_cont_ev_read_trailer_slots(FILE *f, BPContEVTable *t, int64_t n_slots) {
                     "slot %lld/%lld\n", (long long)i, (long long)n_slots);
             return -1;
         }
-        memcpy(e->ev_sum,   ev_sum_buf,   sizeof(ev_sum_buf));
-        memcpy(e->ev_count, ev_count_buf, sizeof(ev_count_buf));
+        if (t->num_entries == n_before) {
+            /* Duplicate key in the file (the writer's rare concurrent-insert
+             * dup window can split one key's samples across two records).
+             * ACCUMULATE instead of last-write-wins overwrite: both records
+             * are valid sample sets for the same key, and a silent overwrite
+             * would serve an EV backed by a fraction of the samples. */
+            dup_keys++;
+            for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++) {
+                e->ev_sum[b]   += ev_sum_buf[b];
+                e->ev_count[b] += ev_count_buf[b];
+            }
+        } else {
+            memcpy(e->ev_sum,   ev_sum_buf,   sizeof(ev_sum_buf));
+            memcpy(e->ev_count, ev_count_buf, sizeof(ev_count_buf));
+        }
+    }
+    if (dup_keys > 0) {
+        fprintf(stderr,
+                "[cev] read_trailer_slots: %lld duplicate key(s) merged "
+                "(accumulated, not overwritten)\n", (long long)dup_keys);
     }
     return 0;
 }

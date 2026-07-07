@@ -412,6 +412,26 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
         lib.rollout_reset_cont_ev_fallback_counts.argtypes = []
         lib.rollout_reset_cont_ev_fallback_counts.restype = None
 
+    # Stage-3 per-spot exhaustive FILL mode (STAGE3_FILL_V1, 2026-07-06,
+    # MEASUREMENT/BUILD ONLY, default OFF): an armed boundary query grows the
+    # table (find_or_create) and accumulates the legacy live-playout payoff
+    # into all 4 bias lanes instead of reading/short-circuiting. Optional
+    # symbols — hasattr-guarded like the miss-fallback bindings above. NOTE:
+    # the fill counter getters RETURN uint64 (no out-pointer), per the
+    # Stage-3 contract. See src/search/rollout.h "Stage-3 FILL" block.
+    if hasattr(lib, "rollout_set_cont_ev_fill"):
+        lib.rollout_set_cont_ev_fill.argtypes = [ctypes.c_int]
+        lib.rollout_set_cont_ev_fill.restype = None
+    if hasattr(lib, "rollout_get_cont_ev_fill_flop_count"):
+        lib.rollout_get_cont_ev_fill_flop_count.argtypes = []
+        lib.rollout_get_cont_ev_fill_flop_count.restype = ctypes.c_uint64
+    if hasattr(lib, "rollout_get_cont_ev_fill_turn_count"):
+        lib.rollout_get_cont_ev_fill_turn_count.argtypes = []
+        lib.rollout_get_cont_ev_fill_turn_count.restype = ctypes.c_uint64
+    if hasattr(lib, "rollout_reset_cont_ev_fill_counts"):
+        lib.rollout_reset_cont_ev_fill_counts.argtypes = []
+        lib.rollout_reset_cont_ev_fill_counts.restype = None
+
     # Training bet-vocab setter (bet-vocab desync fix, 2026-07-01). Optional
     # symbol — hasattr-guarded like the turn-boundary bindings above, so a
     # pre-fix .so still loads (the caller's set_rollout_train_vocab raises if
@@ -1473,6 +1493,63 @@ def reset_cont_ev_fallback_counts() -> None:
     if not hasattr(lib, "rollout_reset_cont_ev_fallback_counts"):
         return
     lib.rollout_reset_cont_ev_fallback_counts()
+
+
+# ── Stage-3 per-spot exhaustive FILL wrappers (STAGE3_FILL_V1) ────────────
+#
+# MEASUREMENT/BUILD ONLY, default OFF. When ON and a cont_ev boundary is
+# armed, a boundary query find_or_creates the slot and accumulates the legacy
+# live-playout terminal payoff into all 4 bias lanes instead of reading /
+# short-circuiting; the street's fill counter is bumped once per fill rollout
+# (`hits` never increments; `attempts` increments as on the read path).
+# Precedence: FILL > synthetic > miss-fallback. The driver arms ONE street
+# per fill pass. See src/search/rollout.h "Stage-3 FILL" block.
+
+
+def set_cont_ev_fill(enabled: bool) -> None:
+    """Enable / disable Stage-3 exhaustive fill mode (default OFF).
+
+    Fail-loud: raises RuntimeError if the .so predates the Stage-3 fill
+    change — a fill pass that silently ran read-mode would fail loud an hour
+    in on the first MISS instead of growing the table.
+    """
+    lib = _lib()
+    if not hasattr(lib, "rollout_set_cont_ev_fill"):
+        raise RuntimeError(
+            "rollout.so missing rollout_set_cont_ev_fill — rebuild with the "
+            "Stage-3 fill changes (src/search/rollout.c, 2026-07-06)."
+        )
+    lib.rollout_set_cont_ev_fill(1 if enabled else 0)
+
+
+def get_cont_ev_fill_flop_count() -> int:
+    """FLOP-boundary fill samples accumulated since the last reset (one per
+    rollout that entered fill mode at the flop boundary). 0 on a pre-Stage-3
+    .so."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_fill_flop_count"):
+        return 0
+    return int(lib.rollout_get_cont_ev_fill_flop_count())
+
+
+def get_cont_ev_fill_turn_count() -> int:
+    """TURN-boundary fill samples accumulated since the last reset (one per
+    rollout that entered fill mode at the turn boundary). 0 on a pre-Stage-3
+    .so."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_get_cont_ev_fill_turn_count"):
+        return 0
+    return int(lib.rollout_get_cont_ev_fill_turn_count())
+
+
+def reset_cont_ev_fill_counts() -> None:
+    """Zero both per-boundary fill counters (call between fill passes, same
+    lifecycle as the hit/fallback-count resets). No-op on a pre-Stage-3
+    .so."""
+    lib = _lib()
+    if not hasattr(lib, "rollout_reset_cont_ev_fill_counts"):
+        return
+    lib.rollout_reset_cont_ev_fill_counts()
 
 
 # ── BPR5 trailer loader (mccfr_blueprint.so) ────────────────────────────

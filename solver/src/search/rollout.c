@@ -155,6 +155,66 @@ BPS_EXPORT void rollout_reset_cont_ev_fallback_counts(void) {
     __atomic_store_n(&g_rollout_cont_ev_turn_fallback_count, 0, __ATOMIC_RELAXED);
 }
 
+/* ── Stage-3 per-spot exhaustive FILL mode (STAGE3_FILL_V1 — default OFF) ──
+ *
+ * MEASUREMENT/BUILD ONLY. When ON and a cont_ev boundary is armed, a boundary
+ * query does NOT read/short-circuit: it find_or_creates the slot (keyed
+ * IDENTICALLY to the read path — full seat, street-salted hash on turn) and
+ * lets THIS rollout run the SAME legacy live playout the miss-fallback uses;
+ * the rollout's terminal hero-perspective payoff is then accumulated into ALL
+ * FOUR bias lanes of the slot (the fill playout is bias-uniform — there is no
+ * per-bias continuation here, so each lane receives the same sample stream)
+ * and the street's fill counter is bumped once. `hits` is NEVER incremented;
+ * `attempts` increments exactly as on the read path. Precedence when multiple
+ * modes are set: FILL > synthetic > miss-fallback (the driver never combines
+ * them). Fill counters are process-global atomics for the same OMP-worker
+ * reason as the hit counters. */
+static int g_rollout_cont_ev_fill = 0;
+static volatile uint64_t g_rollout_cont_ev_fill_flop_count = 0;
+static volatile uint64_t g_rollout_cont_ev_fill_turn_count = 0;
+
+BPS_EXPORT void rollout_set_cont_ev_fill(int enable) {
+    g_rollout_cont_ev_fill = enable ? 1 : 0;
+}
+
+BPS_EXPORT uint64_t rollout_get_cont_ev_fill_flop_count(void) {
+    return __atomic_load_n(&g_rollout_cont_ev_fill_flop_count,
+                           __ATOMIC_RELAXED);
+}
+
+BPS_EXPORT uint64_t rollout_get_cont_ev_fill_turn_count(void) {
+    return __atomic_load_n(&g_rollout_cont_ev_fill_turn_count,
+                           __ATOMIC_RELAXED);
+}
+
+BPS_EXPORT void rollout_reset_cont_ev_fill_counts(void) {
+    __atomic_store_n(&g_rollout_cont_ev_fill_flop_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rollout_cont_ev_fill_turn_count, 0, __ATOMIC_RELAXED);
+}
+
+/* Stage-3 FILL commit: accumulate one rollout's realized continuation payoff
+ * (hero-perspective chips — the exact value the un-armed leaf path returns
+ * for this rollout sample) into all four bias lanes of the pending slot, and
+ * bump the street's fill counter once. Uses the SAME atomics the trainer's
+ * boundary accumulate uses (mccfr_blueprint.c:1815-1820: CAS float add for
+ * ev_sum, relaxed __atomic_fetch_add for the int64 ev_count), so it is safe
+ * under the construct's `#pragma omp parallel for` Hogwild workers.
+ * boundary_street is BP_CONT_EV_STREET_FLOP or _TURN. */
+static void rollout_cont_ev_fill_commit(BPContEVEntry *e, int boundary_street,
+                                        float payoff) {
+    for (int b = 0; b < BP_CONT_EV_NUM_BIASES; b++) {
+        bp_cont_ev_atomic_add_f32(&e->ev_sum[b], payoff);
+        __atomic_fetch_add(&e->ev_count[b], 1, __ATOMIC_RELAXED);
+    }
+    if (boundary_street == BP_CONT_EV_STREET_TURN) {
+        __atomic_add_fetch(&g_rollout_cont_ev_fill_turn_count, 1,
+                           __ATOMIC_RELAXED);
+    } else {
+        __atomic_add_fetch(&g_rollout_cont_ev_fill_flop_count, 1,
+                           __ATOMIC_RELAXED);
+    }
+}
+
 BPS_EXPORT void rollout_set_cont_ev_table(const BPContEVTable *t) {
     g_rollout_cont_ev_table = t;
     /* The underlying table object is mutable (the loader populates it); the
@@ -1167,6 +1227,13 @@ int rollout_simulate_one(
     int32_t street = leaf_street;
     int32_t first_iter = 1;
 
+    /* Stage-3 FILL pending state: set when an armed boundary block entered
+     * fill mode below; committed exactly once at this rollout's terminal
+     * payoff (fold-out or showdown). Streets advance monotonically, so each
+     * boundary can fire at most once per rollout. */
+    BPContEVEntry *cev_fill_slot = NULL;
+    int cev_fill_street = 0;  /* BP_CONT_EV_STREET_FLOP or _TURN when set */
+
     while (1) {
         /* If every live player has gone all-in (no chips left), there
          * is no more betting action possible. Skip straight to chance /
@@ -1503,6 +1570,29 @@ street_closed:
                     (int)board[0], (int)board[1], (int)board[2]);
                 return -1;
             }
+            if (g_rollout_cont_ev_fill) {
+                /* STAGE3_FILL_V1: grow-don't-read. find_or_create the slot
+                 * under the EXACT read-path key (bah, full seat, flop hidx;
+                 * the hidx<0 fail-loud above guarantees no bucket=-1 slot is
+                 * ever inserted), then fall through — NO short-circuit, NO
+                 * hits — to the same legacy turn+river playout the
+                 * miss-fallback uses. The terminal payoff is committed into
+                 * all 4 bias lanes via rollout_cont_ev_fill_commit. Takes
+                 * precedence over synthetic and miss-fallback (else-branch
+                 * below is skipped entirely). */
+                BPContEVEntry *fe = bp_cont_ev_find_or_create(
+                    g_rollout_cont_ev_table_mut, bah, hero_seat, hidx);
+                if (fe == NULL) {
+                    rollout_set_error(street, num_players,
+                        "cont_ev fill: find_or_create failed (table "
+                        "unallocated or saturated) ah=0x%016llx player=%d "
+                        "hand_idx=%d",
+                        (unsigned long long)bah, (int)hero_seat, hidx);
+                    return -1;
+                }
+                cev_fill_slot = fe;
+                cev_fill_street = BP_CONT_EV_STREET_FLOP;
+            } else {
             float ev_acc = 0.0f;
             int n_ok = 0;
             int cev_fell_back = 0;
@@ -1581,6 +1671,7 @@ street_closed:
                                __ATOMIC_RELAXED);
             return 0;
             }
+            }  /* !g_rollout_cont_ev_fill */
         }
 
         /* ── Dual-boundary build (2026-06-25): TURN-boundary short-circuit ──
@@ -1627,6 +1718,34 @@ street_closed:
                     (int)board[3]);
                 return -1;
             }
+            if (g_rollout_cont_ev_fill) {
+                /* STAGE3_FILL_V1, TURN mirror of the flop fill branch above:
+                 * find_or_create under the read-path key (TURN-salted bah_t,
+                 * full seat, 4-card turn hidx), no short-circuit, no hits;
+                 * terminal payoff committed into all 4 lanes. The driver arms
+                 * ONE street per fill pass — a rollout that already entered
+                 * fill at the flop boundary reaching an armed turn boundary
+                 * is a driver-contract violation, so fail loud rather than
+                 * double-commit or silently skip. */
+                if (cev_fill_slot != NULL) {
+                    rollout_set_error(street, num_players,
+                        "cont_ev fill: both flop and turn boundaries armed in "
+                        "one rollout (driver arms one street per fill pass)");
+                    return -1;
+                }
+                BPContEVEntry *fe_t = bp_cont_ev_find_or_create(
+                    g_rollout_cont_ev_table_mut, bah_t, hero_seat_t, hidx_t);
+                if (fe_t == NULL) {
+                    rollout_set_error(street, num_players,
+                        "cont_ev fill: TURN find_or_create failed (table "
+                        "unallocated or saturated) ah=0x%016llx player=%d "
+                        "hand_idx=%d",
+                        (unsigned long long)bah_t, (int)hero_seat_t, hidx_t);
+                    return -1;
+                }
+                cev_fill_slot = fe_t;
+                cev_fill_street = BP_CONT_EV_STREET_TURN;
+            } else {
             float ev_acc_t = 0.0f;
             int n_ok_t = 0;
             int cev_turn_fell_back = 0;
@@ -1697,6 +1816,7 @@ street_closed:
                                __ATOMIC_RELAXED);
             return 0;
             }
+            }  /* !g_rollout_cont_ev_fill */
         }
 
         /* Deal next street */
@@ -1739,6 +1859,11 @@ street_closed:
         } else {
             *out_payoff = -(float)bets[hero_player];
         }
+        /* Stage-3 FILL: this rollout entered fill mode at an armed boundary
+         * above — commit its terminal payoff (exactly once per rollout). */
+        if (cev_fill_slot != NULL)
+            rollout_cont_ev_fill_commit(cev_fill_slot, cev_fill_street,
+                                        *out_payoff);
         return 0;
     }
 
@@ -1779,6 +1904,10 @@ street_closed:
     *out_payoff = rollout_compute_showdown_payoff_c(
         full_board, hands_c0, hands_c1, num_players,
         active, bets, pot, hero_player);
+    /* Stage-3 FILL: commit the showdown payoff (exactly once per rollout). */
+    if (cev_fill_slot != NULL)
+        rollout_cont_ev_fill_commit(cev_fill_slot, cev_fill_street,
+                                    *out_payoff);
     return 0;
 }
 
