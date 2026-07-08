@@ -114,6 +114,128 @@ ITERATIONS_MIN = 50
 ITERATIONS_MAX = 50_000_000
 
 
+# ── cont_ev serving policy (Step E default flip, 2026-07-08) ────────────────
+# DECISION (2026-07-08): serving default ON for PRE-FILLED spots. Basis:
+# Step D recorded a GO recommendation on arming cont_ev for spots that have
+# a filled boundary table — the 6p mix-level ENSEMBLE gate PASSED both streets
+# on fresh K=3 fills at the served config, the 3p mix-instability was priced as
+# EV-FREE by the value-level EV-loss gate (both boundaries PASS), and coverage
+# (hit 1.0 fail-loud) + latency (6.3/7.0s armed at 6p served config, Step B)
+# were long proven. See docs/STAGE3_EV_GATE_2026-07-08.md (§Consequences),
+# docs/STAGE3_ENSEMBLE_GATE_2026-07-08.md, docs/CONT_EV_SERVING_POLICY_2026-07-08.md.
+#
+# WHAT "default ON for pre-filled spots" MEANS, honestly and minimally:
+# arming cont_ev requires a boundary TABLE for the spot being served. Today's
+# engine mechanism is ONE table per engine process (NEXUS_A3_CEV_PATH names a
+# single .cev; CpuEsSolver loads it at construction iff NEXUS_A3_CONT_EV=1 and
+# arms the per-solve boundary via its own predicate — cpu_es_solver.py:257-259,
+# 615-639). Filled tables exist for the two pinned Stage-3 spots only. So the
+# POLICY this constant declares is: "arm cont_ev serving whenever a valid
+# boundary-table artifact is configured for this engine process." It does NOT
+# add multi-spot table routing or a catalog registry (pilot-phase work; see
+# docs/SPOT_CATALOG_ECONOMICS_2026-07-08.md) — with the current one-table
+# mechanism, a process configured with a spot's .cev serves that spot armed and
+# every other spot un-armed (the boundary predicate simply never fires without
+# a matching key; MISS is fail-loud in the served path — no silent live-rollout
+# fallback, preserving the armed latency win).
+#
+# DEFAULT OFF absent configuration: a bare production engine (no NEXUS_A3_*
+# env) constructs exactly as the shipped path always has — byte-identical, no
+# cont_ev. The default flip is realized by CONFIGURING an engine process with a
+# validated table (NEXUS_A3_CONT_EV=1 + NEXUS_A3_CEV_PATH), which is what this
+# policy sanctions and documents; it does not silently arm an unconfigured
+# process. FAIL-LOUD is preserved end-to-end: a configured-but-missing/invalid
+# path raises at construction (cpu_es_solver._load_cont_ev_table), and an armed
+# boundary MISS raises in the served path (fail-loud contract unchanged).
+CONT_EV_SERVING_POLICY = (
+    "arm cont_ev serving whenever a valid boundary-table artifact is "
+    "configured for this engine process (NEXUS_A3_CONT_EV=1 + a readable "
+    "NEXUS_A3_CEV_PATH); default OFF when unconfigured; fail-loud on a "
+    "configured-but-invalid path and on an armed-boundary MISS"
+)
+CONT_EV_SERVING_POLICY_SOURCE = "docs/CONT_EV_SERVING_POLICY_2026-07-08.md"
+# Env contract (read-only reflection of cpu_es_solver's construction-time
+# reads — the single source of truth stays in cpu_es_solver._a3_cont_ev_enabled
+# and _load_cont_ev_table; this helper only REPORTS the resolved policy so the
+# provider can log/validate it at startup without duplicating the enable logic).
+CONT_EV_ENABLE_ENV = "NEXUS_A3_CONT_EV"
+CONT_EV_TABLE_PATH_ENV = "NEXUS_A3_CEV_PATH"
+CONT_EV_TURN_ENABLE_ENV = "NEXUS_A3_CONT_EV_TURN"
+
+
+@dataclass(frozen=True)
+class ContEvServingDecision:
+    """The resolved cont_ev serving policy for one engine process (immutable).
+
+    A pure reflection of the environment contract — computing it has NO side
+    effects and does NOT construct or arm anything. The provider logs it at
+    construction and MAY assert `not error` to fail loud early (before the
+    12GB blueprint load) on a misconfiguration; the authoritative fail-loud
+    still lives in CpuEsSolver._load_cont_ev_table.
+    """
+
+    armed: bool               # True iff enable flag set AND a readable table path
+    enable_flag: bool         # NEXUS_A3_CONT_EV truthy
+    turn_enable_flag: bool    # NEXUS_A3_CONT_EV_TURN truthy (turn boundary too)
+    table_path: Optional[str]  # NEXUS_A3_CEV_PATH value (may be missing/invalid)
+    reason: str               # human-readable one-liner for the startup log
+    error: Optional[str] = None  # set iff configured-but-invalid (fail-loud hook)
+
+
+def _truthy_env(name: str) -> bool:
+    """Match cpu_es_solver's construction-time predicate byte-for-byte
+    (cpu_es_solver._a3_cont_ev_enabled / _a3_cont_ev_turn_enabled): first char
+    in {1,t,T,y,Y}."""
+    import os as _os
+    return _os.environ.get(name, "")[:1] in ("1", "t", "T", "y", "Y")
+
+
+def resolve_cont_ev_serving(env: Optional[Dict[str, str]] = None) -> ContEvServingDecision:
+    """Resolve CONT_EV_SERVING_POLICY from the environment.
+
+    Injectable `env` (defaults to os.environ) so the wiring is unit-testable
+    without mutating process state. Reflects — never duplicates — the enable
+    logic in cpu_es_solver: enable flag + a readable table path => armed;
+    enable flag + missing/unreadable path => armed-intent with `error` set (the
+    provider can fail loud early); no enable flag => disarmed (default OFF).
+    """
+    import os as _os
+    e = _os.environ if env is None else env
+    enable = (e.get(CONT_EV_ENABLE_ENV, "")[:1] in ("1", "t", "T", "y", "Y"))
+    turn_enable = (e.get(CONT_EV_TURN_ENABLE_ENV, "")[:1]
+                   in ("1", "t", "T", "y", "Y"))
+    path = e.get(CONT_EV_TABLE_PATH_ENV) or None
+    if not enable:
+        return ContEvServingDecision(
+            armed=False, enable_flag=False, turn_enable_flag=turn_enable,
+            table_path=path,
+            reason="cont_ev serving DISARMED (default OFF — "
+                   f"{CONT_EV_ENABLE_ENV} not set)")
+    # Enable flag set: a table path is now MANDATORY and must exist.
+    import os.path as _osp
+    if not path:
+        return ContEvServingDecision(
+            armed=False, enable_flag=True, turn_enable_flag=turn_enable,
+            table_path=None,
+            reason=f"{CONT_EV_ENABLE_ENV} set but {CONT_EV_TABLE_PATH_ENV} "
+                   "missing",
+            error=f"{CONT_EV_ENABLE_ENV}=1 requires {CONT_EV_TABLE_PATH_ENV} "
+                  "to name a boundary-table .cev")
+    if not _osp.isfile(path):
+        return ContEvServingDecision(
+            armed=False, enable_flag=True, turn_enable_flag=turn_enable,
+            table_path=path,
+            reason=f"{CONT_EV_TABLE_PATH_ENV}={path!r} is not a readable file",
+            error=f"{CONT_EV_TABLE_PATH_ENV}={path!r} not found — cont_ev "
+                  "serving cannot arm without its boundary table")
+    boundaries = "flop+turn" if turn_enable else "flop"
+    return ContEvServingDecision(
+        armed=True, enable_flag=True, turn_enable_flag=turn_enable,
+        table_path=path,
+        reason=f"cont_ev serving ARMED ({boundaries}) from table {path!r} "
+               f"per CONT_EV_SERVING_POLICY ({CONT_EV_SERVING_POLICY_SOURCE})")
+
+
 @dataclass(frozen=True)
 class LiveSolveConfig:
     """One live re-solve configuration (immutable)."""
