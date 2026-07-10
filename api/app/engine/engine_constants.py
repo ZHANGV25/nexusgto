@@ -161,6 +161,12 @@ CONT_EV_SERVING_POLICY_SOURCE = "docs/CONT_EV_SERVING_POLICY_2026-07-08.md"
 CONT_EV_ENABLE_ENV = "NEXUS_A3_CONT_EV"
 CONT_EV_TABLE_PATH_ENV = "NEXUS_A3_CEV_PATH"
 CONT_EV_TURN_ENABLE_ENV = "NEXUS_A3_CONT_EV_TURN"
+# Measurement-only (Stage-2' pinned-tail): quietly downgrades an ARMED boundary
+# MISS to a legacy live playout (cpu_es_solver._cont_ev_miss_fallback_enabled).
+# Named here ONLY so the serving provider can REJECT it whenever serving arms a
+# boundary (single-table or catalog) — a served MISS must stay fail-loud. The
+# cont_ev catalog package itself never references it (tested invariant).
+CONT_EV_MISS_FALLBACK_ENV = "NEXUS_CONT_EV_MISS_FALLBACK"
 
 # ── cont_ev CATALOG serving policy (multi-spot routing, 2026-07-08) ──────────
 # SUPERSEDES the single-table policy above for the pilot: instead of ONE table per
