@@ -161,6 +161,37 @@ CONT_EV_SERVING_POLICY_SOURCE = "docs/CONT_EV_SERVING_POLICY_2026-07-08.md"
 CONT_EV_ENABLE_ENV = "NEXUS_A3_CONT_EV"
 CONT_EV_TABLE_PATH_ENV = "NEXUS_A3_CEV_PATH"
 CONT_EV_TURN_ENABLE_ENV = "NEXUS_A3_CONT_EV_TURN"
+# Measurement-only (Stage-2' pinned-tail): quietly downgrades an ARMED boundary
+# MISS to a legacy live playout (cpu_es_solver._cont_ev_miss_fallback_enabled).
+# Named here ONLY so the serving provider can REJECT it whenever serving arms a
+# boundary (single-table or catalog) — a served MISS must stay fail-loud. The
+# cont_ev catalog package itself never references it (tested invariant).
+CONT_EV_MISS_FALLBACK_ENV = "NEXUS_CONT_EV_MISS_FALLBACK"
+
+# ── cont_ev CATALOG serving policy (multi-spot routing, 2026-07-08) ──────────
+# SUPERSEDES the single-table policy above for the pilot: instead of ONE table per
+# process (NEXUS_A3_CEV_PATH), a MANIFEST maps many pre-filled spots to their .cev
+# artifacts and a per-hand router (app/engine/cont_ev/) arms the RIGHT one — or
+# serves un-armed for a spot not in the catalog. Additive + OPT-IN: default OFF
+# (no CONT_EV_CATALOG_MANIFEST) is byte-identical to the single-table default-OFF
+# path. The catalog and the single-table NEXUS_A3_CEV_PATH are MUTUALLY EXCLUSIVE
+# (two arming mechanisms cannot share the one process-global rollout pointer). The
+# resolver + decision live in app/engine/cont_ev/catalog_config.py (kept out of
+# this module to avoid importing the manifest loader here); these names are the
+# authoritative env-var strings + the policy doc constant, alongside the
+# single-table names above. NEXUS_CONT_EV_MISS_FALLBACK is DELIBERATELY not part
+# of the catalog surface (measurement-only; a served MISS stays fail-loud).
+# See app/engine/cont_ev/ and docs/CONT_EV_CATALOG_ROUTING_2026-07-08.md.
+CONT_EV_CATALOG_POLICY = (
+    "when CONT_EV_CATALOG_MANIFEST names a valid manifest, route each hand to its "
+    "pre-filled cont_ev table (canonical flop texture + preflop-prefix + "
+    "n_players); serve un-armed for spots not in the catalog; preserve fail-loud "
+    "on an in-catalog boundary MISS; default OFF when unconfigured"
+)
+CONT_EV_CATALOG_POLICY_SOURCE = "docs/CONT_EV_CATALOG_ROUTING_2026-07-08.md"
+CONT_EV_CATALOG_MANIFEST_ENV = "CONT_EV_CATALOG_MANIFEST"  # path to manifest JSON
+CONT_EV_CATALOG_MODE_ENV = "CONT_EV_CATALOG_MODE"          # 'resident'|'lazy'
+CONT_EV_CATALOG_LRU_CAP_ENV = "CONT_EV_CATALOG_LRU_CAP"    # int, lazy mode only
 
 
 @dataclass(frozen=True)

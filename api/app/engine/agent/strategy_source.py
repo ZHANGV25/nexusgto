@@ -15,6 +15,7 @@ All three feed the SAME sampling loop in agent.py.
 from __future__ import annotations
 
 import abc
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -417,31 +418,48 @@ class LiveResolveSource(StrategySource):
         add_allin = bool(state.add_explicit_allin)
 
         hero_idx = inputs["hero_player_idx"]
-        try:
-            all_by_player = engine.solve(
-                board_strs=inputs["board_strs"],
+        # cont_ev CATALOG routing (multi-spot, 2026-07-08): when the engine has a
+        # catalog router attached (engine.cont_ev_router — only when
+        # CONT_EV_CATALOG_MANIFEST is configured), route this solve to the right
+        # pre-filled table under the router's lock (arm -> solve -> restore as one
+        # unit). When no router is attached (default OFF), the nullcontext branch
+        # runs the identical engine.solve — byte-identical to the shipped path.
+        _router = getattr(engine, "cont_ev_router", None)
+        if _router is not None:
+            _arm_cm = _router.arm_for_solve(
+                engine,
                 board_ints=inputs["board_ints"],
-                player_ranges=inputs["player_ranges"],
-                positions_sorted=inputs["positions_sorted"],
-                player_seats=inputs["player_seats"],
-                pot_bb=inputs["pot_bb"],
-                stack_bb=inputs["stack_bb"],
-                bet_sizes=bet_sizes,
-                subsequent_bet_sizes=subsequent,
-                add_explicit_allin=add_allin,
                 game_action_indices=inputs["game_action_indices"],
-                iterations=self._iterations,
-                num_threads=self._num_threads,
-                num_rollouts=self._num_rollouts,
-                cache_k=self._cache_k,
-                vec_mode=1 if self._vec_mode else 0,
-                readout=self._readout,
-                hero_replay={
-                    "player_idx": hero_idx,
-                    "street_actions": inputs["street_actions"],
-                    "expected_actions": inputs["n_legal"],
-                },
+                n_players=len(inputs["player_seats"]),
             )
+        else:
+            _arm_cm = contextlib.nullcontext()
+        try:
+            with _arm_cm:
+                all_by_player = engine.solve(
+                    board_strs=inputs["board_strs"],
+                    board_ints=inputs["board_ints"],
+                    player_ranges=inputs["player_ranges"],
+                    positions_sorted=inputs["positions_sorted"],
+                    player_seats=inputs["player_seats"],
+                    pot_bb=inputs["pot_bb"],
+                    stack_bb=inputs["stack_bb"],
+                    bet_sizes=bet_sizes,
+                    subsequent_bet_sizes=subsequent,
+                    add_explicit_allin=add_allin,
+                    game_action_indices=inputs["game_action_indices"],
+                    iterations=self._iterations,
+                    num_threads=self._num_threads,
+                    num_rollouts=self._num_rollouts,
+                    cache_k=self._cache_k,
+                    vec_mode=1 if self._vec_mode else 0,
+                    readout=self._readout,
+                    hero_replay={
+                        "player_idx": hero_idx,
+                        "street_actions": inputs["street_actions"],
+                        "expected_actions": inputs["n_legal"],
+                    },
+                )
         except Exception as e:
             # Known abstraction-surface limits (tree raise cap, real-chips
             # action-set divergence, unvalidated vocab shape) are surfaced
