@@ -125,6 +125,8 @@ def test_ab_group_is_hero_minus_mean_field_and_rotates_all_seats():
     assert seen_hero_seats == [0, 1, 2, 3, 4, 5]
     assert group.paired_differential_chips == 60.0  # 50 - mean([-10] * 5)
     assert all(rotation.seat_differential_chips == 60.0 for rotation in group.rotations)
+    # Headline metric: hero's own net chips, exactly the differential / 1.2.
+    assert group.hero_net_chips_per_hand == 50.0
 
 
 def test_session_rotation_order_advances_with_group_index():
@@ -239,8 +241,10 @@ def test_epsilon_mode_has_negative_known_sign_in_synthetic_power_check():
     )
 
     assert all(group.paired_differential_chips == -60.0 for group in run.groups)
-    assert run.summary["mean_bb_per_100"] == -60.0
-    assert run.summary["ci95_bb_per_100"] == [-60.0, -60.0]
+    # Headline bb/100 is hero NET (-50 chips/hand), not the -60 differential.
+    assert all(group.hero_net_chips_per_hand == -50.0 for group in run.groups)
+    assert run.summary["mean_bb_per_100"] == -50.0
+    assert run.summary["ci95_bb_per_100"] == [-50.0, -50.0]
 
 
 @pytest.mark.parametrize("epsilon", [float("nan"), float("inf"), float("-inf")])
@@ -353,7 +357,11 @@ def test_cli_boundary_writes_artifacts_and_final_summary(monkeypatch, tmp_path, 
     monkeypatch.setattr(
         runner,
         "_lookup_factories",
-        lambda _args: (lambda _seed: _CheckCallPolicy(), None),
+        lambda _args: (
+            lambda _seed: _CheckCallPolicy(),
+            None,
+            {"blueprint_a": "stub-a.bps", "blueprint_b": None},
+        ),
     )
     out = tmp_path / "cli"
     exit_code = runner.main(
@@ -367,6 +375,81 @@ def test_cli_boundary_writes_artifacts_and_final_summary(monkeypatch, tmp_path, 
     assert exit_code == 0
     assert (out / "deal_groups.jsonl").is_file()
     assert (out / "summary.json").is_file()
+    assert not (out / "deal_groups.jsonl.partial").exists()
     assert stdout[-1].startswith("MATCH_SUMMARY ")
     printed = json.loads(stdout[-1].removeprefix("MATCH_SUMMARY "))
     assert printed == json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    # The summary must record which blueprints played, and a single deal
+    # group must not report a zero-width confidence interval.
+    assert printed["blueprint_a"] == "stub-a.bps"
+    assert printed["blueprint_b"] is None
+    assert printed["stderr_bb_per_100"] is None
+    assert printed["ci95_bb_per_100"] is None
+    assert "no variance estimate" in printed["ci_note"]
+
+
+def test_ab_mode_refuses_to_default_blueprint_b_to_a(monkeypatch, tmp_path):
+    blueprint_a = tmp_path / "a.bps"
+    blueprint_a.write_bytes(b"stub")
+    monkeypatch.delenv("AGENT_BLUEPRINT_B_PATH", raising=False)
+    args = runner._parse_args(
+        [
+            "--mode", "ab", "--deals", "1", "--master-seed", "0",
+            "--out", str(tmp_path / "out"),
+            "--blueprint-a", str(blueprint_a),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="refusing to silently fall back"):
+        runner._lookup_factories(args)
+
+
+def test_summary_statistics_pin_nonzero_variance_and_bb_conversion(monkeypatch):
+    # Hero nets +50/+100/+150 chips per hand in three groups; the five field
+    # seats split the loss evenly, so every hand conserves chips exactly.
+    hero_values = (50, 100, 150)
+    calls = {"n": 0}
+
+    def play(_deal, policies):
+        group = calls["n"] // 6
+        calls["n"] += 1
+        hero = next(seat for seat, policy in enumerate(policies) if policy.label == "A")
+        value = hero_values[group]
+        deltas = [-(value // 5)] * 6
+        deltas[hero] = value
+        return runner.PlayedHand(
+            deltas=tuple(deltas),
+            action_count=1,
+            terminal="synthetic",
+            went_to_showdown=False,
+        )
+
+    groups = [
+        runner.play_deal_group(
+            _fixed_deal(),
+            group_index=group_index,
+            mode="ab",
+            master_seed=1,
+            a_factory=lambda _seed: _LabelPolicy("A"),
+            b_factory=lambda _seed: _LabelPolicy("B"),
+            hand_player=play,
+        )
+        for group_index in range(3)
+    ]
+
+    summary = runner.summarize_groups(groups, mode="ab", master_seed=1, epsilon=0.05)
+
+    # Hand-computed: mean 100 chips, std(ddof=1) of (50, 100, 150) = 50,
+    # stderr = 50/sqrt(3) = 28.867513...; BIG_BLIND=100 makes bb/100 = chips.
+    assert summary["mean_hero_net_chips_per_hand"] == 100.0
+    assert summary["mean_bb_per_100"] == 100.0
+    assert summary["stderr_bb_per_100"] == 28.8675
+    assert summary["ci95_bb_per_100"] == [43.4197, 156.5803]
+    assert summary["mean_paired_differential_chips_per_hand"] == 120.0
+
+    # Mutation-test the bb conversion itself: halving BIG_BLIND must double
+    # the reported bb/100 (a dropped or inverted conversion cannot pass).
+    monkeypatch.setattr(runner, "BIG_BLIND", 50)
+    rescaled = runner.summarize_groups(groups, mode="ab", master_seed=1, epsilon=0.05)
+    assert rescaled["mean_bb_per_100"] == 200.0
+    assert rescaled["stderr_bb_per_100"] == 57.735

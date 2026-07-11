@@ -57,8 +57,7 @@ for _p in (_PS_PATH, str(Path(_PS_PATH) / "python")):
 import numpy as np  # noqa: E402
 
 
-BIG_BLIND = 100
-INITIAL_STACK = 10_000
+BIG_BLIND = 100  # must equal SHIPPED_PREFLOP_RULES.big_blind; checked per hand
 SEAT_NAMES = ("SB", "BB", "UTG", "MP", "CO", "BTN")
 N_SEATS = len(SEAT_NAMES)
 BUTTON_SEAT = 5
@@ -194,6 +193,17 @@ class DealGroupResult:
     def paired_differential_chips(self) -> float:
         # Each arm divides by five field seats; the group then averages six arms.
         return self.paired_numerator / float((N_SEATS - 1) * N_SEATS)
+
+    @property
+    def hero_net_chips_per_hand(self) -> float:
+        # Under the enforced zero-sum invariant field_sum == -hero_delta, so
+        # each arm's numerator (N-1)*hero - field_sum equals N*hero.  Dividing
+        # the group numerator by N*N therefore gives mean hero NET chips per
+        # hand -- the conventional own-winnings quantity behind bb/100.  The
+        # paired seat differential above is exactly (N/(N-1)) = 1.2x this
+        # number; reporting the differential as bb/100 would overstate a true
+        # edge by 20%.
+        return self.paired_numerator / float(N_SEATS * N_SEATS)
 
     @property
     def action_count(self) -> int:
@@ -450,13 +460,30 @@ def summarize_groups(
     if not groups:
         raise ValueError("at least one deal group is required")
     values = np.asarray(
+        [group.hero_net_chips_per_hand for group in groups], dtype=np.float64
+    )
+    differentials = np.asarray(
         [group.paired_differential_chips for group in groups], dtype=np.float64
     )
     n = len(values)
     mean = float(values.mean())
-    std = float(values.std(ddof=1)) if n > 1 else 0.0
-    stderr = std / math.sqrt(n) if n > 0 else 0.0
     to_bb100 = 100.0 / BIG_BLIND
+    if n > 1:
+        std = float(values.std(ddof=1))
+        stderr: Optional[float] = std / math.sqrt(n)
+        stderr_bb: Optional[float] = round(stderr * to_bb100, 4)
+        ci_bb: Optional[List[float]] = [
+            round((mean - 1.96 * stderr) * to_bb100, 4),
+            round((mean + 1.96 * stderr) * to_bb100, 4),
+        ]
+        ci_note = None
+    else:
+        # A single deal group has no between-group variance to estimate; a
+        # zero-width CI here would misread as certainty.
+        stderr = None
+        stderr_bb = None
+        ci_bb = None
+        ci_note = "n < 2 deal groups: no variance estimate; run more deals"
     decisions = sum(group.action_count for group in groups)
     fallbacks = sum(group.fallback_count for group in groups)
     return {
@@ -471,19 +498,27 @@ def summarize_groups(
         "decisions": decisions,
         "fallback_count": fallbacks,
         "fallback_rate": fallbacks / decisions if decisions else 0.0,
-        "mean_paired_chips_per_hand": round(mean, 6),
-        "stderr_paired_chips": round(stderr, 6),
+        "mean_hero_net_chips_per_hand": round(mean, 6),
+        "stderr_hero_net_chips_per_hand": (
+            round(stderr, 6) if stderr is not None else None
+        ),
+        "mean_paired_differential_chips_per_hand": round(
+            float(differentials.mean()), 6
+        ),
+        "differential_identity": (
+            "paired seat differential = (N/(N-1)) x hero net under the enforced "
+            "zero-sum invariant; 1.2x at N=6. Headline bb/100 uses HERO NET."
+        ),
         "mean_bb_per_100": round(mean * to_bb100, 4),
-        "stderr_bb_per_100": round(stderr * to_bb100, 4),
-        "ci95_bb_per_100": [
-            round((mean - 1.96 * stderr) * to_bb100, 4),
-            round((mean + 1.96 * stderr) * to_bb100, 4),
-        ],
+        "stderr_bb_per_100": stderr_bb,
+        "ci95_bb_per_100": ci_bb,
+        "ci_note": ci_note,
         "independent_unit": "six-arm duplicate-deck deal group",
         "scope": "full-hand 6-max; six counterfactual seat arms per nominal session hand",
         "interpretation": (
-            "Paired realized-EV seat differential with duplicate cards, seat rotation and "
-            "common policy RNGs. Not exploitability, GTO distance, or a best response."
+            "Hero's realized net winnings per hand (bb/100) with duplicate cards, "
+            "seat rotation and common policy RNGs. Not exploitability, GTO "
+            "distance, or a best response."
         ),
         "power_check_expected_sign": (
             "negative: epsilon-perturbed A should underperform the unperturbed A field"
@@ -502,8 +537,13 @@ def run_match(
     b_factory: Optional[PolicyFactory] = None,
     epsilon: float = 0.05,
     hand_player: Optional[HandPlayer] = None,
+    on_group: Optional[Callable[[DealGroupResult], None]] = None,
 ) -> MatchRun:
-    """Run ``deals`` independent groups (six full duplicate arms per group)."""
+    """Run ``deals`` independent groups (six full duplicate arms per group).
+
+    ``on_group`` fires after each completed group; the CLI uses it for
+    per-group progress and crash-safe partial persistence.
+    """
 
     if deals <= 0:
         raise ValueError("deals must be positive")
@@ -512,19 +552,30 @@ def run_match(
     epsilon = _validate_epsilon(epsilon)
     player = hand_player or play_full_hand
     deal_rng = np.random.default_rng(master_seed)
-    groups = tuple(
-        play_deal_group(
-            deal_from_rng(deal_rng),
-            group_index=group_index,
-            mode=mode,
-            master_seed=master_seed,
-            a_factory=a_factory,
-            b_factory=b_factory,
-            epsilon=epsilon,
-            hand_player=player,
-        )
-        for group_index in range(deals)
-    )
+    collected: List[DealGroupResult] = []
+    for group_index in range(deals):
+        deal = deal_from_rng(deal_rng)
+        try:
+            group = play_deal_group(
+                deal,
+                group_index=group_index,
+                mode=mode,
+                master_seed=master_seed,
+                a_factory=a_factory,
+                b_factory=b_factory,
+                epsilon=epsilon,
+                hand_player=player,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"deal group {group_index}/{deals} failed "
+                f"(mode={mode}, master_seed={master_seed}, "
+                f"deal={deal.as_dict()}): {exc}"
+            ) from exc
+        if on_group is not None:
+            on_group(group)
+        collected.append(group)
+    groups = tuple(collected)
     summary = summarize_groups(
         groups, mode=mode, master_seed=master_seed, epsilon=epsilon
     )
@@ -546,6 +597,13 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
     from app.engine.agent.settlement import settle_hand
 
     pre = play_preflop(policies, deal.hole_cards)
+    rules_big_blind = int(pre.rules.big_blind)
+    if rules_big_blind != BIG_BLIND:
+        raise AssertionError(
+            f"run_match BIG_BLIND={BIG_BLIND} disagrees with shipped preflop "
+            f"rules big_blind={rules_big_blind}; the bb/100 conversion would "
+            "be mis-scaled"
+        )
     prefix = tuple(int(action) for action in pre.preflop_prefix)
     contributions = [int(value) for value in pre.contributions]
     folded = [not bool(value) for value in pre.active]
@@ -662,19 +720,37 @@ def write_match(run: MatchRun, out_dir: Union[str, Path]) -> Tuple[Path, Path]:
     return groups_path, summary_path
 
 
-def _lookup_factories(args: argparse.Namespace) -> Tuple[PolicyFactory, Optional[PolicyFactory]]:
-    """Construct shared LOOKUP sources and cheap per-hand seeded PokerAgents."""
+def _lookup_factories(
+    args: argparse.Namespace,
+) -> Tuple[PolicyFactory, Optional[PolicyFactory], Dict[str, Optional[str]]]:
+    """Construct shared LOOKUP sources and cheap per-hand seeded PokerAgents.
 
-    from app.engine.agent.agent import PokerAgent
-    from app.engine.agent.modes import ModeConfig
-    from app.engine.agent.strategy_source import LookupSource
+    Returns the two factories plus the resolved absolute blueprint paths so
+    the run summary records exactly which artifacts played.
+
+    Path validation runs BEFORE the app imports so misconfiguration fails
+    fast without touching blueprint machinery.
+    """
 
     a_path = args.blueprint_a or os.environ.get("AGENT_BLUEPRINT_PATH")
     if not a_path or not Path(a_path).is_file():
         raise ValueError("set --blueprint-a or AGENT_BLUEPRINT_PATH to the 8.05B .bps")
-    b_path = args.blueprint_b or os.environ.get("AGENT_BLUEPRINT_B_PATH") or a_path
-    if args.mode == "ab" and not Path(b_path).is_file():
-        raise ValueError("--blueprint-b / AGENT_BLUEPRINT_B_PATH is not a file")
+    if args.mode == "ab":
+        b_path = args.blueprint_b or os.environ.get("AGENT_BLUEPRINT_B_PATH")
+        if not b_path:
+            raise ValueError(
+                "mode 'ab' requires --blueprint-b or AGENT_BLUEPRINT_B_PATH; "
+                "refusing to silently fall back to blueprint A (that would run "
+                "A-vs-A labeled as A-vs-B)"
+            )
+        if not Path(b_path).is_file():
+            raise ValueError("--blueprint-b / AGENT_BLUEPRINT_B_PATH is not a file")
+    else:
+        b_path = a_path
+
+    from app.engine.agent.agent import PokerAgent
+    from app.engine.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LookupSource
 
     a_source = LookupSource(
         ModeConfig(mode="LOOKUP", blueprint_path=str(a_path), uniform_on_miss=True)
@@ -697,7 +773,11 @@ def _lookup_factories(args: argparse.Namespace) -> Tuple[PolicyFactory, Optional
         )
         return PokerAgent(source=b_source, config=cfg)
 
-    return a_factory, b_factory if args.mode == "ab" else None
+    blueprint_paths: Dict[str, Optional[str]] = {
+        "blueprint_a": os.path.abspath(str(a_path)),
+        "blueprint_b": os.path.abspath(str(b_path)) if args.mode == "ab" else None,
+    }
+    return a_factory, b_factory if args.mode == "ab" else None, blueprint_paths
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -722,16 +802,49 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     try:
-        a_factory, b_factory = _lookup_factories(args)
-        run = run_match(
-            deals=args.deals,
-            mode=args.mode,
-            master_seed=args.master_seed,
-            epsilon=args.epsilon,
-            a_factory=a_factory,
-            b_factory=b_factory,
-        )
+        a_factory, b_factory, blueprint_paths = _lookup_factories(args)
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        # Crash-safe partials: every completed group is appended and flushed
+        # immediately, so a crash or spot-death at group N-1 of N keeps the
+        # first N-1 groups on disk instead of discarding the whole run.
+        partial_path = out / "deal_groups.jsonl.partial"
+        record_epsilon = args.epsilon if args.mode == "epsilon" else None
+        completed = {"n": 0}
+        with partial_path.open("w", encoding="utf-8", newline="\n") as partial:
+
+            def on_group(group: DealGroupResult) -> None:
+                json.dump(
+                    group.as_dict(
+                        mode=args.mode,
+                        master_seed=args.master_seed,
+                        epsilon=record_epsilon,
+                    ),
+                    partial,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                partial.write("\n")
+                partial.flush()
+                completed["n"] += 1
+                print(
+                    f"[match] group {completed['n']}/{args.deals} complete",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            run = run_match(
+                deals=args.deals,
+                mode=args.mode,
+                master_seed=args.master_seed,
+                epsilon=args.epsilon,
+                a_factory=a_factory,
+                b_factory=b_factory,
+                on_group=on_group,
+            )
+        run = MatchRun(groups=run.groups, summary={**run.summary, **blueprint_paths})
         groups_path, summary_path = write_match(run, args.out)
+        partial_path.unlink(missing_ok=True)
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
