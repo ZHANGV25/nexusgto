@@ -307,6 +307,17 @@ def test_aggressive_real_hand_merges_contributions_and_folded_statuses():
 
 def test_stub_agents_play_at_least_100_full_showdown_hands_through_real_states():
     # 17 independent groups x 6 duplicate rotations = 102 complete 6-max hands.
+    # Snapshot-compare sys.modules: earlier blueprint-gated tests legitimately
+    # load the reader on EC2 (AGENT_BLUEPRINT_PATH set), so assert only that
+    # THIS stub run loads no blueprint or native-solver machinery itself.
+    def _heavy_modules():
+        return {
+            name
+            for name in sys.modules
+            if "bps_reader" in name or "street_solver_gpu" in name
+        }
+
+    heavy_before = _heavy_modules()
     run = runner.run_match(
         deals=17,
         mode="aa",
@@ -321,8 +332,7 @@ def test_stub_agents_play_at_least_100_full_showdown_hands_through_real_states()
     assert all(sum(hand.deltas) == 0 for hand in hands)
     assert all(hand.action_count > 6 for hand in hands)
     assert all(group.paired_differential_chips == 0.0 for group in run.groups)
-    assert "engine.bps_reader_py" not in sys.modules
-    assert "street_solver_gpu" not in sys.modules
+    assert _heavy_modules() == heavy_before
 
 
 def test_jsonl_group_records_and_summary_are_deterministic(tmp_path):

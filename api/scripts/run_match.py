@@ -5,10 +5,12 @@ WHAT THIS NUMBER MEASURES
 For each independently dealt deck, the same six hole-card packets and board are
 replayed in six counterfactual arms.  One designated "hero" policy is evaluated
 in every fixed FULL_SEAT position (SB, BB, UTG, MP, CO, BTN); the other five
-seats use the field policy.  An arm's seat differential is hero net chips minus
-mean field-seat net chips.  The six arms are paired into ONE independent
-deal-group observation, with mean, standard error and a normal-approximation
-95% confidence interval reported in bb/100 (BB=100).
+seats use the field policy.  The six arms are paired into ONE independent
+deal-group observation.  The HEADLINE metric is hero's own NET chips per hand
+(mean, standard error, normal-approximation 95% CI, reported in bb/100 with
+BB=100).  The paired seat differential (hero minus mean field seat) is also
+recorded; under the enforced zero-sum invariant it equals exactly
+(N/(N-1)) = 1.2x hero net and must NOT be read as bb/100.
 
 The three modes are: ``aa`` (A against identical A, an exact plumbing null),
 ``epsilon`` (an epsilon-perturbed A against five unperturbed A seats), and
@@ -234,6 +236,7 @@ class DealGroupResult:
             "deal": self.deal.as_dict(),
             "rotations": [rotation.as_dict() for rotation in self.rotations],
             "paired_differential_chips": self.paired_differential_chips,
+            "hero_net_chips_per_hand": self.hero_net_chips_per_hand,
             "decisions": self.action_count,
             "fallback_count": self.fallback_count,
             "fallback_rate": (
@@ -549,6 +552,8 @@ def run_match(
         raise ValueError("deals must be positive")
     if master_seed < 0:
         raise ValueError("master_seed must be non-negative")
+    if mode not in VALID_MODES:
+        raise ValueError(f"unknown mode {mode!r}; expected one of {VALID_MODES}")
     epsilon = _validate_epsilon(epsilon)
     player = hand_player or play_full_hand
     deal_rng = np.random.default_rng(master_seed)
@@ -810,29 +815,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # first N-1 groups on disk instead of discarding the whole run.
         partial_path = out / "deal_groups.jsonl.partial"
         record_epsilon = args.epsilon if args.mode == "epsilon" else None
-        completed = {"n": 0}
-        with partial_path.open("w", encoding="utf-8", newline="\n") as partial:
+        progress: Dict[str, object] = {"n": 0, "fh": None}
 
-            def on_group(group: DealGroupResult) -> None:
-                json.dump(
-                    group.as_dict(
-                        mode=args.mode,
-                        master_seed=args.master_seed,
-                        epsilon=record_epsilon,
-                    ),
-                    partial,
-                    sort_keys=True,
-                    separators=(",", ":"),
+        def on_group(group: DealGroupResult) -> None:
+            # Lazy open: a run that fails before its FIRST completed group
+            # never touches the partial file, so a bad re-run into the same
+            # --out cannot truncate a previous crash's salvageable groups.
+            if progress["fh"] is None:
+                progress["fh"] = partial_path.open(
+                    "w", encoding="utf-8", newline="\n"
                 )
-                partial.write("\n")
-                partial.flush()
-                completed["n"] += 1
-                print(
-                    f"[match] group {completed['n']}/{args.deals} complete",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            fh = progress["fh"]
+            json.dump(
+                group.as_dict(
+                    mode=args.mode,
+                    master_seed=args.master_seed,
+                    epsilon=record_epsilon,
+                ),
+                fh,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            fh.write("\n")
+            fh.flush()
+            progress["n"] = int(progress["n"]) + 1
+            print(
+                f"[match] group {progress['n']}/{args.deals} complete",
+                file=sys.stderr,
+                flush=True,
+            )
 
+        try:
             run = run_match(
                 deals=args.deals,
                 mode=args.mode,
@@ -842,6 +855,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 b_factory=b_factory,
                 on_group=on_group,
             )
+        finally:
+            if progress["fh"] is not None:
+                progress["fh"].close()
         run = MatchRun(groups=run.groups, summary={**run.summary, **blueprint_paths})
         groups_path, summary_path = write_match(run, args.out)
         partial_path.unlink(missing_ok=True)
