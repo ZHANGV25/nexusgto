@@ -154,11 +154,15 @@ def _result(
     gross = tuple(int(chips) for chips in awards)
     contrib = tuple(int(chips) for chips in contributions)
     pot = sum(contrib)
-    assert sum(gross) == pot, (
-        f"settlement failed to award the whole pot: awards={sum(gross)} pot={pot}"
-    )
+    # Explicit raises, not bare asserts: these are the module's financial
+    # conservation invariants and must survive python -O.
+    if sum(gross) != pot:
+        raise AssertionError(
+            f"settlement failed to award the whole pot: awards={sum(gross)} pot={pot}"
+        )
     deltas = tuple(gross[i] - contrib[i] for i in range(len(gross)))
-    assert sum(deltas) == 0, f"settlement did not conserve chips: deltas={deltas}"
+    if sum(deltas) != 0:
+        raise AssertionError(f"settlement did not conserve chips: deltas={deltas}")
     return SettlementResult(
         awards=gross,
         deltas=deltas,
