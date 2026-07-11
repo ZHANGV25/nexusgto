@@ -28,6 +28,7 @@ from app.engine.agent.game_state import GameState
 from app.engine.agent.key_builder import build_key
 from app.engine.agent.live_resolve_adapter import LiveResolveUnsupported
 from app.engine.agent.modes import ModeConfig
+from app.engine.agent.preflop_range import hand_class_169
 
 # Re-export so callers can `from app.engine.agent.strategy_source import
 # LiveResolveUnsupported` alongside LiveResolveSource (the public seam).
@@ -125,15 +126,47 @@ class LookupSource(StrategySource):
         self._meta_postflop = tuple(meta.get("postflop_bet_sizes", ()) or ())
         self._meta_subsequent = tuple(meta.get("subsequent_bet_sizes", ()) or ())
         self._meta_add_allin = bool(int(meta.get("add_explicit_allin", 0) or 0))
+        raw_preflop_tiers = meta.get("preflop_tiers", {}) or {}
+        tier_items = tuple(sorted(
+            (int(level), tuple(float(size) for size in sizes))
+            for level, sizes in raw_preflop_tiers.items()
+        ))
+        if len({level for level, _sizes in tier_items}) != len(tier_items):
+            raise ValueError(
+                "blueprint preflop_tiers has duplicate normalized level indices"
+            )
+        self._meta_preflop_tier_items = tier_items
+        self._meta_preflop_max_raises = int(
+            meta.get("preflop_max_raises", 0) or 0
+        )
+        self._meta_has_add_allin = "add_explicit_allin" in meta
+        raw_blinds = meta.get("blinds", ()) or ()
+        self._meta_blinds = tuple(float(chips) for chips in raw_blinds)
+        if self._meta_blinds and len(self._meta_blinds) != 2:
+            raise ValueError(
+                f"blueprint blinds metadata must be [SB, BB], got {raw_blinds!r}"
+            )
+        self._meta_initial_stack = (
+            float(meta["initial_stack"]) if "initial_stack" in meta else None
+        )
+        self._meta_num_players = (
+            float(meta["num_players"]) if "num_players" in meta else None
+        )
 
     def _bucket(self, state: GameState, hero_cards: HeroCards) -> int:
         c0, c1 = hero_cards
         board = list(state.board)
+        if state.street == 0:
+            if board:
+                raise ValueError("street-0 blueprint lookup requires board=[]")
+            return hand_class_169(c0, c1)
         if state.street == 1:
             return self._reader.hand_to_bucket(board[:3], c0, c1)
         if state.street == 2:
             return self._reader.hand_to_bucket_turn(board[:4], c0, c1)
-        return self._reader.hand_to_bucket_river(board[:5], c0, c1)
+        if state.street == 3:
+            return self._reader.hand_to_bucket_river(board[:5], c0, c1)
+        raise ValueError(f"unsupported blueprint street {state.street}")
 
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
         self._assert_vocab_matches(state)
@@ -152,6 +185,17 @@ class LookupSource(StrategySource):
             return self._on_miss(n_legal)
 
         arr = np.asarray(strat, dtype=np.float64)
+
+        # A canonical preflop state is generated from the exact same tiered
+        # vocabulary as the trainer. Unlike observed postflop play below,
+        # there is no real-chip abstraction gap that can safely prune only a
+        # raise tail: any length difference is a state/metadata bug.
+        if key.street == 0 and len(arr) != n_legal:
+            raise ValueError(
+                f"preflop action-count mismatch at {key.as_tuple()}: "
+                f"blueprint stores {len(arr)} actions but state says "
+                f"n_legal={n_legal}"
+            )
         if arr.sum() <= 0.0:
             return self._on_miss(n_legal)
 
@@ -195,6 +239,53 @@ class LookupSource(StrategySource):
         Only enforced when the blueprint actually carries the metadata fields
         (some test readers don't); a missing field is skipped, not failed.
         """
+        if state.street == 0:
+            state_tiers = tuple(
+                tuple(float(size) for size in tier)
+                for tier in state.preflop_tiers
+            )
+            state_tier_items = tuple(enumerate(state_tiers))
+            mismatch = bool(
+                self._meta_preflop_tier_items
+                and state_tier_items != self._meta_preflop_tier_items
+            )
+            mismatch = mismatch or bool(
+                self._meta_preflop_max_raises
+                and state.preflop_max_raises
+                != self._meta_preflop_max_raises
+            )
+            mismatch = mismatch or bool(
+                self._meta_has_add_allin
+                and bool(state.add_explicit_allin) != self._meta_add_allin
+            )
+            mismatch = mismatch or bool(
+                self._meta_blinds
+                and (state.small_blind, state.big_blind) != self._meta_blinds
+            )
+            mismatch = mismatch or bool(
+                self._meta_initial_stack is not None
+                and state.initial_stack != self._meta_initial_stack
+            )
+            mismatch = mismatch or bool(
+                self._meta_num_players is not None
+                and self._meta_num_players != 6
+            )
+            if mismatch:
+                raise ValueError(
+                    "PreflopState vocab does not match the loaded blueprint: "
+                    f"state tiers={state_tiers} max_raises="
+                    f"{state.preflop_max_raises} allin="
+                    f"{state.add_explicit_allin} blinds="
+                    f"{(state.small_blind, state.big_blind)} initial_stack="
+                    f"{state.initial_stack} num_players=6 vs blueprint tiers="
+                    f"{self._meta_preflop_tier_items} max_raises="
+                    f"{self._meta_preflop_max_raises} allin="
+                    f"{self._meta_add_allin} blinds={self._meta_blinds} "
+                    f"initial_stack={self._meta_initial_stack} "
+                    f"num_players={self._meta_num_players}."
+                )
+            return
+
         if self._meta_postflop and (
             tuple(state.postflop_bet_sizes) != self._meta_postflop
             or tuple(state.subsequent_bet_sizes) != self._meta_subsequent
