@@ -18,6 +18,7 @@ from app.engine.agent.live_resolve_adapter import (
     labels_to_index_freqs,
 )
 from app.engine.agent.live_resolve_ranges import (
+    _legacy_parse_preflop_decisions,
     _parse_canonical_preflop,
     _parse_preflop_decisions,
     _prefix_up_to,
@@ -348,14 +349,251 @@ def test_parse_decisions_limp_lines():
     }
 
 
-def test_parse_decisions_unparsed_shapes_return_none():
-    assert _parse_preflop_decisions([2, 0, 0, 2, 0, 0, 2, 1]) is None  # 4-bet
-    assert _parse_preflop_decisions([2, 1, 0, 0, 0, 2, 1, 1]) is None  # squeeze
-    assert _parse_preflop_decisions([1, 0, 0, 1, 0, 0]) is None  # multi-limp
-    assert _parse_preflop_decisions([3, 0, 0, 0, 0, 1]) is None  # 1.0x open
-    assert _parse_preflop_decisions([0, 0, 0, 3, 0, 2, 1]) is None  # 1.0x open
+def test_parse_decisions_illegal_or_unclosed_returns_none():
+    # Empty prefix — nothing to seed.
     assert _parse_preflop_decisions([]) is None
-    assert _parse_preflop_decisions([0, 0, 0, 2, 0, 3]) is None  # unclosed
+    # Out-of-tree action index (UTG has 4 legal actions; 9 is illegal) — the
+    # shared transition rejects it, so seeding bails to uniform.
+    assert _parse_preflop_decisions([9, 0, 0, 0, 0, 0]) is None
+    # An action AFTER the round already closed (single-open closes at the BB
+    # call; a 7th action is not a legal replay).
+    assert _parse_preflop_decisions([2, 0, 0, 0, 0, 1, 0]) is None
+    # Unclosed line (BTN opens, BB 3-bets, but the opener has not responded) —
+    # the pot is not flop_ready, so it is not a postflop-seeding surface.
+    assert _parse_preflop_decisions([0, 0, 0, 2, 0, 3]) is None
+    # Fold-around (uncontested, 1 live) — never reaches a postflop solve.
+    assert _parse_preflop_decisions([2, 0, 0, 0, 0, 0]) is None
+
+
+# ── GOLDEN equality: the generic extractor reproduces the retired bespoke
+# parser BYTE-FOR-BYTE on the three original shapes (single-open at several
+# caller counts, 3-bet-HU, HU limp-check). The retired parser is kept private
+# as _legacy_parse_preflop_decisions for exactly this comparison.
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        # canonical single-open, varying caller counts:
+        [2, 0, 0, 0, 0, 1],           # open + BB call (1 caller)
+        [2, 0, 0, 1, 0, 1],           # open + BTN call + BB call (2 callers)
+        [2, 1, 1, 1, 0, 1],           # open + 3 flat callers + BB call
+        [0, 0, 2, 0, 0, 1],           # CO open + BB call
+        [0, 0, 0, 0, 2, 1],           # SB open (completes to raise) + BB call
+        # 3-bet heads-up (open -> 3-bet -> folds -> opener calls):
+        [0, 0, 0, 2, 0, 3, 1],        # BTN open / BB 3-bet 1.0x
+        [2, 0, 0, 2, 0, 0, 1],        # UTG open / BTN 3-bet 0.7x, folds after
+        [0, 0, 2, 0, 0, 3, 1],        # CO open / BB 3-bet 1.0x
+        # HU limp-check (single limper -> folds -> BB checks):
+        [1, 0, 0, 0, 0, 0],           # UTG limp
+        [0, 0, 0, 0, 1, 0],           # SB complete
+        [0, 0, 1, 0, 0, 0],           # CO limp
+    ],
+)
+def test_generic_matches_legacy_on_original_shapes(prefix):
+    legacy = _legacy_parse_preflop_decisions(prefix)
+    assert legacy is not None, "test prefix must be a legacy-parsed shape"
+    assert _parse_preflop_decisions(prefix) == legacy
+
+
+def test_generic_matches_legacy_weight_dicts_byte_identical():
+    """Beyond decision-node equality, the WEIGHT DICTS themselves must be
+    byte-identical between the legacy nodes and the generic public API under
+    the same mock get_strategy (single-open opener widening (2, 3) included)."""
+    import numpy as np
+
+    from app.engine.agent.game_state import SEAT_NAME
+    from app.engine.agent.live_resolve_ranges import _weights_array_to_name_dict
+    from app.engine.agent.preflop_range import build_seat_range_weights
+
+    def get_strategy(board, history, player, bucket, street):
+        # A deterministic, node-dependent distribution over 4 slots. bucket is
+        # ignored (same vector for every class) so both paths read identically.
+        seed = (len(history) * 7 + player * 3 + sum(history)) % 4
+        base = [0.1, 0.2, 0.3, 0.4]
+        return [base[(seed + i) % 4] for i in range(4)]
+
+    def legacy_weight_dict(nodes, slot):
+        w = np.ones(169, dtype=np.float64)
+        for hist, idxs in nodes[SEAT_NAME[slot]]:
+            w = w * build_seat_range_weights(
+                get_strategy, action_history=list(hist),
+                player=slot, action_indices=list(idxs),
+            )
+        return _weights_array_to_name_dict(w)
+
+    cases = [
+        ([2, 0, 0, 1, 0, 1], [1, 5, 2]),        # single-open: BB, BTN, UTG
+        ([0, 0, 0, 2, 0, 3, 1], [1, 5]),        # 3-bet HU: BB, BTN
+        ([1, 0, 0, 0, 0, 0], [1, 2]),           # limp-check: BB, UTG
+    ]
+    for prefix, live_slots in cases:
+        legacy_nodes = _legacy_parse_preflop_decisions(prefix)
+        assert legacy_nodes is not None
+        generic = seat_range_weight_dicts(live_slots, prefix, get_strategy)
+        assert generic is not None
+        for slot, gd in zip(live_slots, generic):
+            assert gd == legacy_weight_dict(legacy_nodes, slot)
+
+
+# ── NEW shapes now SEEDED (hand-derived nodes from the shared transition) ──
+
+
+def test_parse_decisions_multi_limp():
+    # UTG limp, MP limp, CO limp, BTN/SB fold, BB check. Each limper records a
+    # call (idx 1) at its own history; BB checks (idx 0) at the option node.
+    assert _parse_preflop_decisions([1, 1, 1, 0, 0, 0]) == {
+        "UTG": [([], (1,))],
+        "MP": [([1], (1,))],
+        "CO": [([1, 1], (1,))],
+        "BB": [([1, 1, 1, 0, 0], (0,))],
+    }
+
+
+def test_parse_decisions_squeeze_limper_call_chained():
+    # UTG open, MP call, CO/BTN/SB fold, BB squeeze (0.7x, idx 2), UTG fold,
+    # MP CALLS the squeeze. MP has TWO decisions chained: the flat call, then
+    # the closing call of the squeeze.
+    assert _parse_preflop_decisions([2, 1, 0, 0, 0, 2, 0, 1]) == {
+        "UTG": [([], (2,))],
+        "MP": [([2], (1,)), ([2, 1, 0, 0, 0, 2, 0], (1,))],
+        "BB": [([2, 1, 0, 0, 0], (2,))],
+    }
+
+
+def test_parse_decisions_multiway_threebet():
+    # UTG open, MP call, CO 3-bet (0.7x, idx 2), BTN/SB/BB fold, UTG call,
+    # MP call. Three live: opener and flat-caller each act twice.
+    assert _parse_preflop_decisions([2, 1, 2, 0, 0, 0, 1, 1]) == {
+        "UTG": [([], (2,)), ([2, 1, 2, 0, 0, 0], (1,))],
+        "MP": [([2], (1,)), ([2, 1, 2, 0, 0, 0, 1], (1,))],
+        "CO": [([2, 1], (2,))],
+    }
+
+
+def test_parse_decisions_capped_4bet():
+    # UTG open, folds, BB 3-bet (idx 2), UTG 4-bet (idx 2 at the one-size tier),
+    # BB call. num_raises hits the cap (3); the last node offers only
+    # [fold, call], so BB's closing call is idx 1.
+    assert _parse_preflop_decisions([2, 0, 0, 0, 0, 2, 2, 1]) == {
+        "UTG": [([], (2,)), ([2, 0, 0, 0, 0, 2], (2,))],
+        "BB": [([2, 0, 0, 0, 0], (2,)), ([2, 0, 0, 0, 0, 2, 2], (1,))],
+    }
+
+
+def test_parse_decisions_limp_raise_includes_limper_closing_call():
+    # UTG limp, MP raise (isolate), CO/BTN/SB fold, BB fold, UTG CALLS the
+    # raise. The limp-raiser confound: UTG's range chains its open-limp (idx 1)
+    # with its closing call of the raise (idx 1).
+    assert _parse_preflop_decisions([1, 2, 0, 0, 0, 0, 1]) == {
+        "UTG": [([], (1,)), ([1, 2, 0, 0, 0, 0], (1,))],
+        "MP": [([1], (2,))],
+    }
+
+
+def test_parse_decisions_one_dot_zero_open_seeded_exact():
+    # A 1.0x open (idx 3) is NOT the canonical single-open shape (that requires
+    # the 0.7x open idx 2), so the opener is seeded with its EXACT index (3),
+    # NOT widened to the 'any raise' (2, 3) convention.
+    assert _parse_preflop_decisions([3, 0, 0, 0, 0, 1]) == {
+        "UTG": [([], (3,))],
+        "BB": [([3, 0, 0, 0, 0], (1,))],
+    }
+
+
+def test_seat_range_weights_multi_limp_hand_derived():
+    # Deterministic mock: P(taken | class) is the same for every class, so the
+    # per-seat weight = the product of the queried slot probabilities.
+    def get_strategy(board, history, player, bucket, street):
+        assert board == [] and street == 0
+        table = {
+            ((), 2): [0.3, 0.5, 0.2, 0.0],              # UTG limp: P(idx1)=0.5
+            ((1,), 3): [0.4, 0.4, 0.2, 0.0],            # MP limp: P(idx1)=0.4
+            ((1, 1), 4): [0.1, 0.6, 0.3, 0.0],          # CO limp: P(idx1)=0.6
+            ((1, 1, 1, 0, 0), 1): [0.8, 0.1, 0.1],      # BB check: P(idx0)=0.8
+        }
+        key = (tuple(history), player)
+        if key not in table:
+            raise AssertionError(f"unexpected node {history} p{player}")
+        return table[key]
+
+    # slot order SB-first for live [UTG, MP, CO, BB] -> seats 2,3,4,1.
+    out = seat_range_weight_dicts([2, 3, 4, 1], [1, 1, 1, 0, 0, 0], get_strategy)
+    assert out is not None
+    utg, mp, co, bb = out
+    assert abs(utg["AA"] - 0.5) < 1e-12
+    assert abs(mp["AA"] - 0.4) < 1e-12
+    assert abs(co["AA"] - 0.6) < 1e-12
+    assert abs(bb["AA"] - 0.8) < 1e-12
+
+
+def test_seat_range_weights_limp_raise_chains_limper_closing_call():
+    # UTG limps then CALLS MP's isolation raise: UTG range = P(limp) x P(call).
+    def get_strategy(board, history, player, bucket, street):
+        table = {
+            ((), 2): [0.2, 0.5, 0.3, 0.0],              # UTG limp: P(idx1)=0.5
+            ((1,), 3): [0.1, 0.2, 0.7, 0.0],            # MP raise: P(idx2)=0.7
+            ((1, 2, 0, 0, 0, 0), 2): [0.3, 0.4, 0.3],   # UTG call: P(idx1)=0.4
+        }
+        key = (tuple(history), player)
+        if key not in table:
+            raise AssertionError(f"unexpected node {history} p{player}")
+        return table[key]
+
+    # live [UTG, MP] -> seats 2, 3 (SB-first order is [2,3] since neither is SB).
+    out = seat_range_weight_dicts([2, 3], [1, 2, 0, 0, 0, 0, 1], get_strategy)
+    assert out is not None
+    utg, mp = out
+    assert abs(utg["AA"] - 0.5 * 0.4) < 1e-12   # chained limp x closing call
+    assert abs(mp["AA"] - 0.7) < 1e-12
+
+
+def test_seat_range_weights_capped_4bet_hand_derived():
+    def get_strategy(board, history, player, bucket, street):
+        table = {
+            ((), 2): [0.2, 0.3, 0.5, 0.0],                 # UTG open: P(idx2)=0.5
+            ((2, 0, 0, 0, 0), 1): [0.4, 0.2, 0.4, 0.0],    # BB 3-bet: P(idx2)=0.4
+            ((2, 0, 0, 0, 0, 2), 2): [0.3, 0.3, 0.4],      # UTG 4-bet: P(idx2)=0.4
+            ((2, 0, 0, 0, 0, 2, 2), 1): [0.1, 0.9],        # BB call: P(idx1)=0.9
+        }
+        key = (tuple(history), player)
+        if key not in table:
+            raise AssertionError(f"unexpected node {history} p{player}")
+        return table[key]
+
+    # live [UTG, BB] -> seats 2, 1 -> SB-first order [1, 2] (BB=1 before UTG=2).
+    out = seat_range_weight_dicts([1, 2], [2, 0, 0, 0, 0, 2, 2, 1], get_strategy)
+    assert out is not None
+    bb, utg = out
+    assert abs(utg["AA"] - 0.5 * 0.4) < 1e-12   # open x 4-bet
+    assert abs(bb["AA"] - 0.4 * 0.9) < 1e-12    # 3-bet x closing call
+
+
+def test_seat_range_weights_zero_mass_seat_returns_none():
+    # A live seat whose read range is entirely zero -> None (fail-safe): every
+    # class reads P(taken)=0, so the seat's weight sums to 0.
+    def get_strategy(board, history, player, bucket, street):
+        if history == [] and player == 2:               # UTG limp: ZERO on idx1
+            return [1.0, 0.0, 0.0, 0.0]
+        if history == [1, 0, 0, 0, 0] and player == 1:  # BB check
+            return [0.7, 0.2, 0.1]
+        raise AssertionError(f"unexpected node {history} p{player}")
+
+    assert seat_range_weight_dicts(
+        [1, 2], [1, 0, 0, 0, 0, 0], get_strategy,
+    ) is None
+
+
+def test_seat_range_weights_unclassifiable_live_seat_returns_none():
+    # A live slot with no recorded decision cannot be classified -> None. Here
+    # we pass a slot (BTN=5) that is NOT live in an UTG-limp pot, so
+    # decisions.get("BTN") is None and the whole seeding bails to uniform.
+    def get_strategy(board, history, player, bucket, street):
+        return [0.25, 0.25, 0.25, 0.25]
+
+    assert seat_range_weight_dicts(
+        [1, 2, 5], [1, 0, 0, 0, 0, 0], get_strategy,
+    ) is None
 
 
 def test_seat_range_weights_threebet_chain_rule_product():
@@ -396,12 +634,18 @@ def test_seat_range_weights_limp_check_uses_bb_check_index_0():
     assert abs(utg["AA"] - 0.6) < 1e-12
 
 
-def test_seat_range_weights_unparsed_shape_returns_none():
+def test_seat_range_weights_illegal_prefix_returns_none():
+    # An illegal / out-of-tree prefix (the shared transition rejects the index)
+    # bails to uniform WITHOUT ever reading sigma-bar.
     def get_strategy(*a):  # pragma: no cover - must not be queried
-        raise AssertionError("no sigma read for an unparsed shape")
+        raise AssertionError("no sigma read for an illegal prefix")
 
     assert seat_range_weight_dicts(
-        [1, 5], [0, 0, 0, 2, 0, 2, 2, 1], get_strategy,  # 4-bet
+        [1, 5], [7, 0, 0, 0, 0, 0], get_strategy,  # index 7 illegal at UTG
+    ) is None
+    # An unclosed (not flop_ready) line likewise seeds nothing.
+    assert seat_range_weight_dicts(
+        [1, 5], [0, 0, 0, 2, 0, 3], get_strategy,
     ) is None
 
 
