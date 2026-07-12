@@ -22,7 +22,6 @@ multi-size raise trees beyond POSTFLOP_MAX_RAISES are out of scope (plan §6).
 from __future__ import annotations
 
 import math
-import struct
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
@@ -35,6 +34,13 @@ from app.engine.agent.action_vocab import (
     DEFAULT_SUBSEQUENT_BET_SIZES,
     legal_categories_chips,
     raise_to_amount,
+)
+from app.engine.agent.preflop_play import (
+    PreflopReplayError,
+    PreflopRules,
+    SHIPPED_PREFLOP_RULES,
+    preflop_raise_amount_f32 as _trainer_preflop_raise_amount_f32,
+    replay_preflop,
 )
 
 from engine.rollout import ActionCategory  # type: ignore[import-untyped]
@@ -103,18 +109,14 @@ def preflop_raise_amount_f32(
     Postflop sizes (0.75, 1.0) are exactly representable in binary, so the
     double-based raise_to_amount never diverges postflop and stays unchanged.
     """
-    f = struct.unpack("f", struct.pack("f", float(frac)))[0]
-    base = pot if to_call == 0 else pot + to_call
-    prod = int(struct.unpack("f", struct.pack("f", f * base))[0])
-    ba = prod if to_call == 0 else to_call + prod
-    if ba >= stack:
-        ba = stack
-    return ba
+    return _trainer_preflop_raise_amount_f32(frac, pot, to_call, stack)
 
 
 def canonical_flop_chips(
     preflop_prefix: List[int],
     seats: List[str],
+    *,
+    rules: Optional[PreflopRules] = None,
 ) -> Tuple[int, Tuple[int, ...]]:
     """Derive the flop-entry (pot, per-slot stacks) for a canonical preflop line.
 
@@ -124,7 +126,8 @@ def canonical_flop_chips(
     index 2, the 1.0x size for the index-3 3-bet — then returns the pot and
     the per-slot (SB-first over `seats`) remaining stacks.
 
-    Supported (capture-verified) shapes:
+    With ``rules=None`` (the backward-compatible default), supported
+    capture-verified shapes are:
       * single open + flat callers — VERIFIED (600, (9725,9725)) 2p and
         (875, (9725,9725,9725)) 3p, matching the blueprint σ̄ length along
         the raise-war line (2026-06-04).
@@ -146,17 +149,59 @@ def canonical_flop_chips(
         restricted to the three verified HU lines upstream
         (preflop_constructor only emits those); this layer derives chips
         for any closed limp-check prefix.
+      * Historical compatibility: the legacy walker also accepts a closed
+        limp-then-single-raise/isolation line as its single-raised branch,
+        despite older prose calling every limp-raise unsupported. That
+        accepted behavior is intentionally preserved.
+
+    With explicit ``rules``, the shared trainer-generic replay accepts every
+    closed prefix in that tiered vocabulary (including 1.0x opens, isolation
+    raises, squeezes, multiway 3-bets, and capped 4-bets). It still rejects an
+    invalid action index, an unclosed prefix, a live-seat mismatch, or an
+    uncontested hand (there is no flop entry).
 
     Raises:
-        CanonicalChipsUnsupported: a non-canonical preflop shape (limp-raise,
-            4bet+, a 1.0x open, an out-of-vocab raise index, 3-bet pot that
-            isn't heads-up, an unclosed limped pot) — chips can't be derived
-            without new ground truth.
+        CanonicalChipsUnsupported: with ``rules=None``, a non-canonical
+            preflop shape (4bet+, a 1.0x open, an out-of-vocab raise index,
+            a 3-bet pot that isn't heads-up, or an unclosed limped pot); with
+            explicit ``rules``, a prefix that cannot close
+            through that trainer vocabulary or has no flop entry.
     """
     for s in seats:
         if s not in FULL_SEAT:
             raise ValueError(f"unknown position {s!r}")
     live_seats = set(seats)
+
+    # Opt-in trainer-generic replay for the shipped game-loop vocabulary.
+    # The no-rules path below intentionally retains its capture-limited
+    # rejection contract (index-3 opens, 4-bets, squeezes/multiway 3-bets).
+    # there is no second chip-arithmetic implementation to drift.
+    if rules is not None:
+        if rules != SHIPPED_PREFLOP_RULES:
+            raise CanonicalChipsUnsupported(
+                "generic flop-entry validation supports only "
+                "SHIPPED_PREFLOP_RULES"
+            )
+        try:
+            replayed = replay_preflop(
+                preflop_prefix, rules, require_terminal=True
+            )
+        except PreflopReplayError as exc:
+            raise CanonicalChipsUnsupported(str(exc)) from exc
+        if replayed.uncontested:
+            raise CanonicalChipsUnsupported(
+                "preflop ended uncontested; no flop-entry state exists"
+            )
+        replay_live = set(replayed.live_seat_names)
+        if replay_live != live_seats:
+            raise ValueError(
+                f"seats {sorted(live_seats)} do not match the live players "
+                f"of the replayed preflop line {sorted(replay_live)}"
+            )
+        order = sorted(live_seats, key=lambda seat: FULL_SEAT[seat])
+        return replayed.pot, tuple(
+            replayed.stacks[FULL_SEAT[seat]] for seat in order
+        )
 
     # Per-position street commitment (preflop). Blinds posted first.
     bets: Dict[str, int] = {pos: 0 for pos in _PREFLOP_ORDER}
