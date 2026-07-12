@@ -185,6 +185,16 @@ class PreflopState:
         return self.bets
 
     @property
+    def street_bets(self) -> Tuple[int, ...]:
+        """GameState-compatible cache-key view of preflop commitments."""
+        return self.bets
+
+    @property
+    def current_bet(self) -> int:
+        """GameState-compatible maximum live preflop commitment."""
+        return _max_live_bet(self)
+
+    @property
     def preflop_tiers(self) -> Tuple[Tuple[float, ...], ...]:
         return self.rules.tiers
 
