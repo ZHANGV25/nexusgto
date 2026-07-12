@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 # normal solves. See solve().
 _ENV_MUTATION_LOCK = threading.Lock()
 
+# Per-leaf flop-history buffer width the C real-oracle (es_real_oracle.c)
+# copies — MUST equal ESRO_MAX_FLOP_HIST in poker-solver
+# (python/es_resolver/run_real_spot_c.py:35, the validated caller). Only used
+# on the NEXUS_LEAF_ROLLOUT construct path.
+_ESRO_MAX_FLOP_HIST = 256
+
 
 class ReplayUnsupported(Exception):
     """The solved tree cannot faithfully represent this mid-street entry.
@@ -138,6 +144,38 @@ def _cont_ev_miss_fallback_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _leaf_rollout_enabled() -> bool:
+    """LAZY per-visited-leaf rollout leaf-value oracle — DEFAULT OFF. When
+    unset/0 the solve constructs its leaf values EAGERLY (the shipped path:
+    compute_subgame_leaf_values_sampled_c fills a full table, then
+    CSolver.from_table) and this engine behaves BYTE-IDENTICALLY to the
+    shipped path — not a single behavioral or timing-path change.
+
+    When set (NEXUS_LEAF_ROLLOUT=1), the solve SKIPS the eager fill entirely
+    and constructs the solver via CSolver.from_real_oracle (poker-solver
+    es_real_oracle.c): per-visited-leaf rollout with a Hogwild-safe cache, the
+    blueprint continuation queried live in C, no Python in the hot path. This
+    is the LATENCY alternative to the ~27min eager exhaustive fill at 6p (the
+    fill is >=99.7% of solve time; the lazy oracle only rolls out the leaves
+    the CFR walk actually visits).
+
+    This is the CACHED all-hands variant of the oracle (leaf values are
+    strategy-independent, filled once on first hit averaged over cache_k bias
+    samples x num_rollouts), so it is safe in BOTH scalar and vec traverser
+    modes — this pass does NOT force scalar. (The fresh-bias-per-visit variant
+    — the fidelity pass, later — WILL require scalar; see the mode note at the
+    construction site.)
+
+    ROLLOUT MODE BYPASSES the eager per-leaf construct, so anything that
+    modifies THAT construct is structurally incompatible and MUST fail loud
+    rather than half-apply — see the interaction guards at the construction
+    site (cont_ev boundary arming NEXUS_A3_CONT_EV / _TURN / bias-action /
+    miss-fallback, and 2p NEXUS_LEAF_RANGE_CONDITIONING). DEFAULT OFF keeps the
+    served path (byte-golden-tested) untouched until this is EC2-validated."""
+    v = os.environ.get("NEXUS_LEAF_ROLLOUT", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -168,6 +206,10 @@ class CpuEsSolver:
         # {selects, semantics} snapshot from the last bias-action solve.
         self._last_cont_ev_bias_action_stats = None
         self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
+        # NEXUS_LEAF_ROLLOUT: {leaf_fills, cache_hits, rollout_sims, oracle_errors}
+        # from the last lazy-oracle solve (es_real_oracle_stats2). None on the
+        # eager (default) path — _last_solve_stats.leaf_mode disambiguates.
+        self._last_leaf_rollout_stats = None
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -594,6 +636,14 @@ class CpuEsSolver:
                     )
                 table = np.zeros((0, n_players, max_h), dtype=np.float32)
                 construct_s = 0.0
+                # Zero-leaf trees (river / in-tree-chance extension) have NO
+                # depth-limit leaves to roll out, so NEXUS_LEAF_ROLLOUT does
+                # not apply here — the empty table drives the native
+                # showdown/fold settle. Record the eager mode + no rollout so
+                # the construct site and stats below stay well-defined.
+                leaf_mode = "table_eager"
+                _leaf_rollout = False
+                _oracle_arrays = None
             else:
                 # Encode the per-leaf flop history under the TRAINED manifest
                 # vocab (bet-vocab desync fix) — NOT the subgame/tree-build
@@ -606,6 +656,109 @@ class CpuEsSolver:
                     subsequent_bet_sizes=self._train_subsequent_sizes)
                 if not leaf_infos:
                     raise RuntimeError("no leaf infos extracted from tree")
+
+                # ── LAZY per-leaf ROLLOUT oracle (NEXUS_LEAF_ROLLOUT, default
+                # OFF) ──────────────────────────────────────────────────────
+                # When OFF (_leaf_rollout False) NOTHING below changes: the
+                # eager arming + compute_subgame_leaf_values_sampled_c fill
+                # runs exactly as shipped (byte-identical). When ON we SKIP the
+                # eager fill entirely and construct CSolver.from_real_oracle at
+                # the solver-construction site — the C oracle rolls out only the
+                # leaves the CFR walk visits (the ~27min 6p exhaustive-fill
+                # bypass; the fill is >=99.7% of solve time). See
+                # _leaf_rollout_enabled() for the full contract.
+                _leaf_rollout = _leaf_rollout_enabled()
+                leaf_mode = "rollout_lazy" if _leaf_rollout else "table_eager"
+
+                if _leaf_rollout:
+                    # ── INTERACTION GUARDS: rollout mode BYPASSES the eager
+                    # per-leaf construct, so any flag that modifies THAT
+                    # construct would be SILENTLY DROPPED. Fail loud rather
+                    # than half-apply (AGENTS.md: explicit raises, no silent
+                    # divergence). ──
+                    #
+                    # (1) cont_ev boundary arming (NEXUS_A3_CONT_EV[_TURN],
+                    # bias-action, miss-fallback). These arm C globals that the
+                    # EAGER rollout's leaf machinery consumes at the flop/turn
+                    # boundary. from_real_oracle drives a DIFFERENT C rollout
+                    # path (es_real_oracle.c) that does not consult those
+                    # globals — so an armed cont_ev boundary would be a no-op
+                    # while the caller believes it is active. The catalog /
+                    # cont_ev routing layer and lazy-rollout serving are
+                    # mutually exclusive leaf-value strategies; refuse the
+                    # ambiguous combination. PRECEDENCE: neither wins — the
+                    # operator must pick one.
+                    _cev_would_arm = (
+                        self._cev_holder is not None
+                        and ((street == "flop" and n_players >= 3)
+                             or (_a3_cont_ev_turn_enabled()
+                                 and street == "turn" and n_players >= 3))
+                    )
+                    if _cev_would_arm:
+                        raise RuntimeError(
+                            "NEXUS_LEAF_ROLLOUT=1 is incompatible with the "
+                            "armed cont_ev boundary (NEXUS_A3_CONT_EV / "
+                            "NEXUS_A3_CONT_EV_TURN): the lazy real-oracle "
+                            "rollout bypasses the eager leaf construct the "
+                            "cont_ev consumer hooks into, so the boundary "
+                            "table would be silently ignored. These are two "
+                            "distinct leaf-value strategies — enable exactly "
+                            "one.")
+                    if _cont_ev_bias_action_enabled():
+                        raise RuntimeError(
+                            "NEXUS_LEAF_ROLLOUT=1 is incompatible with "
+                            "NEXUS_CONT_EV_BIAS_ACTION (it only affects an "
+                            "armed cont_ev boundary, which rollout mode "
+                            "bypasses).")
+                    if _cont_ev_miss_fallback_enabled():
+                        raise RuntimeError(
+                            "NEXUS_LEAF_ROLLOUT=1 is incompatible with "
+                            "NEXUS_CONT_EV_MISS_FALLBACK (cont_ev-only "
+                            "measurement flag; rollout mode has no cont_ev "
+                            "boundary).")
+                    # (2) 2p leaf range-conditioning feeds the EAGER per-leaf
+                    # construct ONLY (it builds per_leaf_ranges consumed by
+                    # compute_subgame_leaf_values_sampled_perleaf_c). The
+                    # real-oracle build takes no per-leaf range argument, so
+                    # conditioning cannot be applied. It DEFAULTS ON at 2p
+                    # flop/turn — reject the combination loud rather than serve
+                    # an un-conditioned (over-bet) 2p answer that the operator
+                    # believes is conditioned. Explicit NEXUS_LEAF_RANGE_
+                    # CONDITIONING=0 is required to run rollout mode at 2p.
+                    _cond_on = os.environ.get(
+                        "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
+                            "0", "f", "F", "n", "N")
+                    if _cond_on and n_players == 2 and street in ("flop", "turn"):
+                        raise RuntimeError(
+                            "NEXUS_LEAF_ROLLOUT=1 at 2p flop/turn requires "
+                            "NEXUS_LEAF_RANGE_CONDITIONING=0: villain-range "
+                            "conditioning feeds the eager per-leaf construct "
+                            "only and cannot be applied to the real-oracle "
+                            "rollout, so leaving it ON (the default) would "
+                            "silently serve the un-conditioned over-bet.")
+
+                    # Build the per-leaf int32 state arrays the real oracle
+                    # copies (mirrors poker-solver run_real_spot_c
+                    # ._extract_leaf_state — the validated caller of this
+                    # oracle). pot/bets/flop_history come from the SAME
+                    # leaf_infos the eager path uses; ACTIVE is read per-leaf
+                    # from the LEAF SSNodes (nd.type==4, active_players).
+                    #
+                    # FIDELITY NOTE (validate on EC2): the eager fill passes a
+                    # GLOBAL active=[True]*n_players to the sampled construct,
+                    # whereas the real oracle uses this PER-LEAF active. This is
+                    # the documented (poker-solver run_real_spot_c:141-145)
+                    # semantic difference between the two oracles — the
+                    # per-leaf active is the more correct quantity (it does not
+                    # deal folded players into the runout); it is NOT a bug in
+                    # this wiring, but it means rollout-mode leaf values are not
+                    # bit-identical to the eager table. Flagged for the EC2 A/B.
+                    _oracle_arrays = self._build_real_oracle_leaf_state(
+                        gpu._tree, leaf_infos, n_players, player_seats)
+                    table = None  # no eager table; from_real_oracle at construct
+                    # construct_s is measured as ~0 by the empty fill block
+                    # below (the real leaf-fill cost is LAZY — folded into
+                    # solve_s as the CFR walk visits leaves).
 
                 # ── A3 (default OFF): arm the cont_ev boundary consumer for
                 # THIS construct iff the flag is on, the table is loaded, and
@@ -743,9 +896,17 @@ class CpuEsSolver:
                             n_players, street, _bm)
 
                 # ── Construct the leaf table (parallel batch, off-lock) ──
+                # In LAZY rollout mode the eager fill is SKIPPED entirely
+                # (table stays None, set above); the try/finally below is a
+                # no-op (all cont_ev disarm branches are gated on *_armed which
+                # are False in rollout mode — the interaction guards above
+                # already rejected any armed-cont_ev + rollout combination), so
+                # construct_s stays 0.0 and we go straight to construction.
                 t0 = time.time()
                 try:
-                    if per_leaf_ranges is not None:
+                    if _leaf_rollout:
+                        pass  # no eager fill; from_real_oracle at construct site
+                    elif per_leaf_ranges is not None:
                         table = rc.compute_subgame_leaf_values_sampled_perleaf_c(
                             leaf_infos=leaf_infos, board=board_ints, street=street,
                             player_hands=player_ranges,
@@ -851,7 +1012,11 @@ class CpuEsSolver:
             # DIAG (NEXUS_ES_DIAG=1): dump leaf-table stats — isolate the 2p-flop
             # uniform-0.5 mystery (is the construct producing action-blind/zero
             # leaf values?). Cheap; off by default.
-            if os.environ.get("NEXUS_ES_DIAG", "")[:1] in ("1", "t", "T", "y", "Y"):
+            if (os.environ.get("NEXUS_ES_DIAG", "")[:1] in ("1", "t", "T", "y", "Y")
+                    and table is not None):
+                # table is None in lazy rollout mode (no eager fill) — skip the
+                # table dump there; the oracle fill/cache stats are logged from
+                # real_oracle_stats() after run() instead.
                 try:
                     import numpy as _np
                     _t = _np.asarray(table)
@@ -878,7 +1043,49 @@ class CpuEsSolver:
                     print(f"CpuEsSolver DIAG: table dump failed: {_e}", file=sys.stderr, flush=True)
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
-            cs = self._CSolver.from_table(gpu._tree, table, n_players, max_h, seed=1)
+            if _leaf_rollout:
+                # LAZY real-blueprint-rollout oracle (NEXUS_LEAF_ROLLOUT=1).
+                # Construct the solver over the SAME tree but with the C
+                # es_real_oracle instead of the eager table: leaf values are
+                # rolled out (blueprint continuation queried live in C) only for
+                # the leaves the CFR walk visits, and CACHED on first hit
+                # (strategy-independent, averaged over cache_k bias samples x
+                # num_rollouts). Parameters are mapped faithfully from what the
+                # eager fill uses today: same blueprint handle, street, stack,
+                # num_rollouts, cache_k (num_samples_k), master_seed. street as
+                # the C oracle's int code (1=flop, 2=turn; rollout does not
+                # apply to river / zero-leaf trees — handled above).
+                #
+                # MODE NOTE (vec/scalar): this is the CACHED all-hands oracle —
+                # each leaf's value is filled ONCE and reused, so it is safe in
+                # BOTH scalar and vec traverser modes and we do NOT force scalar
+                # here (vec_mode flows through unchanged from LiveSolveConfig).
+                # The FRESH-BIAS-PER-VISIT variant (the later fidelity pass —
+                # re-sampling the villain bias on every leaf visit) is NOT cache-
+                # coherent across the vec traverser's simultaneous hands and
+                # WILL require forcing scalar; that is out of scope for this
+                # routing pass.
+                _street_code = 1 if street == "flop" else 2
+                (_ro_n_leaves, _ro_pot, _ro_bets, _ro_active,
+                 _ro_hist, _ro_hist_len, _ro_seats) = _oracle_arrays
+                cs = self._CSolver.from_real_oracle(
+                    gpu._tree,
+                    self._bp_handle.value,  # BPSReader* address (int)
+                    street=_street_code,
+                    stack_chips=stack_chips,
+                    n_leaves=_ro_n_leaves,
+                    max_h=max_h,
+                    pot=_ro_pot, bets=_ro_bets, active=_ro_active,
+                    hist_flat=_ro_hist, hist_len=_ro_hist_len,
+                    player_seats=_ro_seats,
+                    num_rollouts=num_rollouts,
+                    cache_k=cache_k,
+                    master_seed=master_seed,
+                    seed=1,
+                )
+            else:
+                cs = self._CSolver.from_table(
+                    gpu._tree, table, n_players, max_h, seed=1)
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
 
             # In-tree CHANCE handling. A 2p flop/turn tree extends through a chance
@@ -942,6 +1149,34 @@ class CpuEsSolver:
             cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
+
+            # LAZY rollout oracle: snapshot the fill/cache stats AFTER the run
+            # (the leaves were filled on-demand during the walk). None on the
+            # eager path — _last_solve_stats.leaf_mode disambiguates. Guarded so
+            # a stats read can never break a real solve.
+            if _leaf_rollout:
+                try:
+                    _fills, _hits, _sims, _errs = cs.real_oracle_stats()
+                    self._last_leaf_rollout_stats = {
+                        "leaf_fills": int(_fills),
+                        "cache_hits": int(_hits),
+                        "rollout_sims": int(_sims),
+                        "oracle_errors": int(_errs),
+                    }
+                    logger.info(
+                        "CpuEsSolver leaf-rollout: %dp %s fills=%d cache_hits=%d "
+                        "sims=%d errors=%d", n_players, street, _fills, _hits,
+                        _sims, _errs)
+                    if _errs:
+                        # A nonzero oracle error count means some leaf rollout
+                        # failed silently in C (fell back to a default value) —
+                        # surface it so a degraded solve is visible to ops.
+                        logger.warning(
+                            "CpuEsSolver leaf-rollout: %d oracle errors — some "
+                            "leaf values fell back to a default in C", _errs)
+                except Exception as _e:  # never break a real solve for stats
+                    logger.warning("leaf-rollout stats read failed: %s", _e)
+                    self._last_leaf_rollout_stats = None
 
             # BR-GAP EXPOSE (NEXUS_BR_GAP_EXPOSE=1, default OFF). Stash the GENUINE
             # production solve objects (tree snapshot + leaf table + served sigma)
@@ -1095,6 +1330,11 @@ class CpuEsSolver:
             self._last_solve_stats = {
                 "n_players": n_players,
                 "street": street,
+                # leaf-value strategy for THIS solve: "table_eager" (shipped
+                # default: exhaustive fill + from_table) vs "rollout_lazy"
+                # (NEXUS_LEAF_ROLLOUT=1: lazy per-visited-leaf real oracle).
+                "leaf_mode": leaf_mode,
+                "leaf_rollout_stats": self._last_leaf_rollout_stats,
                 "construct_s": float(construct_s),
                 "solve_s": float(solve_s),
                 "iterations": int(iterations),
@@ -1124,6 +1364,74 @@ class CpuEsSolver:
             return all_by_player
         finally:
             gpu._freed = True  # native ss_free_tree hangs on this box; skip it
+
+    def _build_real_oracle_leaf_state(
+        self, ss_tree, leaf_infos, n_players: int, player_seats,
+    ) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+               np.ndarray, np.ndarray]:
+        """Per-leaf flat int32 state arrays for CSolver.from_real_oracle
+        (NEXUS_LEAF_ROLLOUT). Returns
+        (n_leaves, pot, bets, active, hist_flat, hist_len, player_seats).
+
+        Mirrors poker-solver python/es_resolver/run_real_spot_c.py
+        ._extract_leaf_state — the VALIDATED caller of this oracle — but reuses
+        the `leaf_infos` the solve already extracted (via the shared
+        extract_leaf_info_from_tree) instead of re-extracting. pot / bets /
+        flop_history come from those LeafInfo records (the load-bearing
+        flop_history_train, encoded under the trained manifest vocab); ACTIVE is
+        read PER-LEAF from the LEAF SSNodes (nd.type==4 -> active_players).
+        player_seats is the SAME actual-seat vector the eager fill passes (NOT a
+        synthetic arange like the run_real_spot_c smoke test), so the rollout's
+        seat-relative blueprint lookup matches the served spot.
+
+        The C ctx COPIES all arrays, so the numpy buffers here need only outlive
+        the from_real_oracle call. Contiguity/dtype coercion happens in
+        c_solver.from_real_oracle (it re-casts each to C-contiguous int32).
+
+        FIDELITY NOTE: the per-leaf active read here is the oracle's contract
+        and is the more correct quantity than the eager fill's global
+        active=[True]*n_players (which deals folded players into the runout).
+        See the construction-site comment; validate the resulting leaf-value
+        difference on EC2."""
+        n_leaves = int(ss_tree.num_leaves)
+        pot = np.zeros(n_leaves, dtype=np.int32)
+        bets = np.zeros(n_leaves * n_players, dtype=np.int32)
+        active = np.zeros(n_leaves * n_players, dtype=np.int32)
+        hist = np.zeros(n_leaves * _ESRO_MAX_FLOP_HIST, dtype=np.int32)
+        hist_len = np.zeros(n_leaves, dtype=np.int32)
+
+        # Per-leaf active: first LEAF node for each leaf_idx carries the
+        # active_players vector (identical across nodes sharing a leaf_idx).
+        leaf_active: Dict[int, List[int]] = {}
+        for i in range(int(ss_tree.num_nodes)):
+            nd = ss_tree.nodes[i]
+            if nd.type == 4 and nd.leaf_idx >= 0 and nd.leaf_idx not in leaf_active:
+                leaf_active[nd.leaf_idx] = [
+                    int(nd.active_players[p]) for p in range(n_players)]
+
+        for li in leaf_infos:
+            idx = int(li.leaf_idx)
+            if idx < 0 or idx >= n_leaves:
+                continue
+            pot[idx] = int(li.pot)
+            lb = list(li.bets)
+            for p in range(n_players):
+                bets[idx * n_players + p] = int(lb[p]) if p < len(lb) else 0
+            av = leaf_active.get(idx, [1] * n_players)
+            for p in range(n_players):
+                active[idx * n_players + p] = int(av[p])
+            h = list(li.flop_history_train)
+            hl = min(len(h), _ESRO_MAX_FLOP_HIST)
+            for k in range(hl):
+                hist[idx * _ESRO_MAX_FLOP_HIST + k] = int(h[k])
+            hist_len[idx] = hl
+
+        seats = np.ascontiguousarray(list(player_seats), dtype=np.int32)
+        if seats.shape[0] != n_players:
+            raise RuntimeError(
+                f"player_seats has {seats.shape[0]} entries for an "
+                f"{n_players}-player spot (real-oracle seat map mismatch)")
+        return (n_leaves, pot, bets, active, hist, hist_len, seats)
 
     def _first_decision_node_for(self, tree, player_idx: int) -> Optional[int]:
         """The first decision node owned by `player_idx` (BFS order), matching
