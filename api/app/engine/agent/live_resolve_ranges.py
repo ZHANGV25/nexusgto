@@ -182,11 +182,20 @@ def _is_canonical_single_open(preflop_prefix: Sequence[int]) -> bool:
     """True iff the prefix is the legacy canonical single-open shape.
 
     That is EXACTLY what the retired ``_parse_canonical_preflop`` accepted:
-    walking UTG-first, exactly one raise, that raise is the 0.7x open (index 2),
-    and every other action is a fold (0) or a flat call (1) — no re-raise, no
-    3-bet+, no limp-only pot. This is the ONLY shape on which the opener's raise
-    weights are widened to the "any raise" (2, 3) convention.
+    ONE orbit (each of the six seats acts exactly once, so exactly six
+    actions), exactly one raise, that raise is the 0.7x open (index 2), and
+    every other action is a fold (0) or a flat call (1) — no re-raise, no
+    3-bet+, no limp-only pot. This is the ONLY shape on which the opener's
+    raise weights are widened to the "any raise" (2, 3) convention.
+
+    The length check is load-bearing: a limp-raise line ([1,2,0,0,0,0,1] —
+    the limper acts TWICE) has one raise in its first six entries and would
+    otherwise masquerade as a single-open, wrongly widening the raiser's
+    exact (2,) to (2, 3). Limp-raise was never a legacy-served shape, so the
+    widening quirk must not extend to it.
     """
+    if len(preflop_prefix) != len(_PREFLOP_ORDER):
+        return False
     raises_seen = 0
     idx = 0
     n = len(preflop_prefix)
