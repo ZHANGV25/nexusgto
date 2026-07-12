@@ -1198,8 +1198,33 @@ class CpuEsSolver:
                         _a = read_strategy(_ni)
                         if _a is not None:
                             _sigma[_ni] = _a
+                    # LEAF TABLE for the BR-gap best-responder. The EAGER path has
+                    # a materialized `table`; the ROLLOUT path (NEXUS_LEAF_ROLLOUT)
+                    # sets table=None (no eager fill — leaf values live in the C
+                    # oracle's lazy cache). exploitability() needs a dense
+                    # [n_leaves, np, max_h] table either way, so on the rollout
+                    # path read the oracle's cache back (fills-all then copies;
+                    # see CSolver.get_oracle_leaf_table / es_real_oracle.c). A
+                    # None here (older DLL / not a real-oracle solve) is stashed
+                    # explicitly with a marker so the harness reports "rollout
+                    # table unavailable" rather than crashing on table=None.
+                    _br_table = table
+                    _br_table_source = "eager"
+                    if _leaf_rollout:
+                        _br_table = None
+                        _br_table_source = "rollout_oracle"
+                        try:
+                            _br_table = cs.get_oracle_leaf_table()
+                        except Exception as _te:  # never break a real solve
+                            logger.warning(
+                                "BR-gap rollout leaf-table readout failed: %s",
+                                _te)
+                            _br_table = None
+                        if _br_table is None:
+                            _br_table_source = "rollout_oracle_unavailable"
                     self._last_br_gap_objs = {
-                        "tree": _tree_snap, "table": table, "sigma": _sigma,
+                        "tree": _tree_snap, "table": _br_table, "sigma": _sigma,
+                        "table_source": _br_table_source,
                         "n_players": n_players, "street": street,
                         "pot_chips": int(round(pot_bb * scale)),
                     }
