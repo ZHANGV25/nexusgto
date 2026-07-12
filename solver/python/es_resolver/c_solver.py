@@ -338,6 +338,14 @@ class CSolver:
         buf = np.empty(need, dtype=np.float32)
         got = _lib.es_real_oracle_get_leaf_table(
             ctx, buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), need)
+        if got == -2:
+            # A leaf failed to fill during the readout (OOM / all-rollouts-
+            # errored). The C side refused to return a partially-zeroed table
+            # (which would silently bias the BR-gap toward 0). Fail loud.
+            raise RuntimeError(
+                "es_real_oracle_get_leaf_table: a leaf failed to fill (rc=-2) — "
+                "the leaf table would be partially zeroed; refusing to score a "
+                "corrupted BR-gap")
         if got != need:
             raise RuntimeError(
                 f"es_real_oracle_get_leaf_table returned {got}, expected {need} "

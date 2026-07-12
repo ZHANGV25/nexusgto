@@ -224,6 +224,18 @@ ES_EXPORT void *es_make_real_oracle(
     c->n_leaves = n_leaves;
     c->max_h = max_h;
 
+    /* max_h is the cache stride (hands per player). If it were < num_hands[p]
+     * for any player, the all-hands fill clamps to max_h (rollout.c) and the
+     * leaf-table readout's [.., :num_hands] slice would read past the stride
+     * into the next player's row → silently wrong BR-gap (review 2026-07-12 5b).
+     * The caller contract is max_h >= max_p num_hands[p]; enforce it. */
+    for (int _p = 0; _p < np; _p++) {
+        if (max_h < tree->num_hands[_p]) {
+            free(c);
+            return NULL;  /* caller: pass max_h >= max num_hands per player */
+        }
+    }
+
     c->pot = (int *)malloc((size_t)n_leaves * sizeof(int));
     c->bets = (int *)malloc((size_t)n_leaves * np * sizeof(int));
     c->active = (int *)malloc((size_t)n_leaves * np * sizeof(int));
@@ -330,14 +342,23 @@ ES_EXPORT int es_real_oracle_get_leaf_table(void *ctx, float *out,
     if (out == NULL) return need;          /* size query */
     if (out_len < need) return -1;         /* caller buffer too small */
 
-    /* FILL-ALL: bring every not-ready leaf to state 2 before the copy. */
+    /* FILL-ALL: bring every not-ready leaf to state 2 before the copy.
+     * ⭐ Unlike the hot-path lazy fill (which ignores the rc — a rare failed
+     * leaf there is a tolerable degraded serve), the READOUT must NOT hand the
+     * best-responder a leaf that failed to fill: esro_fill_leaf returns -1 on
+     * OOM or all-rollouts-errored, in which case dst[]==0.0 and a zeroed leaf is
+     * indistinguishable from a real zero value → silently biases the BR-gap
+     * toward 0. So track any fill failure and fail the WHOLE readout loud
+     * (return -2) rather than copy a partially-zeroed table (review 2026-07-12
+     * 5a). A leaf already ready (state 2) from the solve is trusted. */
+    int fill_failed = 0;
     for (int leaf_idx = 0; leaf_idx < c->n_leaves; leaf_idx++) {
         int st = atomic_load(&c->cache_state[leaf_idx]);
         if (st != 2) {
             int expected = 0;
             if (atomic_compare_exchange_strong(
                     &c->cache_state[leaf_idx], &expected, 1)) {
-                esro_fill_leaf(c, leaf_idx);
+                if (esro_fill_leaf(c, leaf_idx) != 0) fill_failed = 1;
                 atomic_store(&c->cache_state[leaf_idx], 2);
             } else {
                 /* someone else is filling (or already did) — wait for ready */
@@ -345,6 +366,7 @@ ES_EXPORT int es_real_oracle_get_leaf_table(void *ctx, float *out,
             }
         }
     }
+    if (fill_failed) return -2;  /* a leaf failed to fill; do NOT return zeros */
     memcpy(out, c->cache_val, (size_t)need * sizeof(float));
     return need;
 }
