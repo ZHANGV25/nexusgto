@@ -285,3 +285,66 @@ ES_EXPORT void es_real_oracle_stats2(void *ctx, uint64_t *fills,
     if (sims) *sims = atomic_load(&c->rollout_sims);
     if (errors) *errors = atomic_load(&c->oracle_errors);
 }
+
+/* Cache dimensions, so a caller can size a [n_leaves, np, max_h] buffer before
+ * reading the leaf-value table out. Any out-param may be NULL. */
+ES_EXPORT void es_real_oracle_dims(void *ctx, int *n_leaves, int *np,
+                                   int *max_h) {
+    ESRealOracleCtx *c = (ESRealOracleCtx *)ctx;
+    if (!c) return;
+    if (n_leaves) *n_leaves = c->n_leaves;
+    if (np)       *np       = c->np;
+    if (max_h)    *max_h    = c->max_h;
+}
+
+/* Read the DENSE leaf-value table out as a flat float[n_leaves*np*max_h] array
+ * in the exact [leaf, player, hand] layout `cache_val` already holds — the same
+ * layout the BR-gap best-responder (python/es_resolver/exploitability_c.py)
+ * indexes as table[leaf, player, hand]. Returns `need` (the element count) on
+ * success, or `need` (WITHOUT copying) when out==NULL so the caller can size
+ * its buffer first, or -1 if out is non-NULL but out_len < need.
+ *
+ * ⭐ FILL-ALL (the whole reason this exists): during the solve the cache is
+ * filled LAZILY — only leaves the sampled CFR walk VISITED are cache_state==2;
+ * unvisited leaves are still 0. But the BR-gap walk reads EVERY leaf, so a raw
+ * memcpy would hand back 0 for every unreached leaf and corrupt the gap. So we
+ * first fill any not-ready leaf here, exactly as esro_oracle's lazy path does
+ * (esro_fill_leaf is deterministic + strategy-independent — bias-averaged over
+ * the fixed {0..3} distribution — so a post-solve fill yields the identical
+ * value a visited leaf would hold). This runs ONLY at readout (expose-gated,
+ * post-solve, single-threaded — no Hogwild contention), NEVER in the hot path,
+ * so the shipped lazy-once-per-visit behavior is unchanged.
+ *
+ * Thread-safety: intended for a post-solve, single-threaded call. We still use
+ * the CAS/spin fill discipline so a stray concurrent reader can't double-fill;
+ * a leaf already ready (state 2) is left untouched. */
+ES_EXPORT int es_real_oracle_get_leaf_table(void *ctx, float *out,
+                                            int out_len) {
+    ESRealOracleCtx *c = (ESRealOracleCtx *)ctx;
+    if (!c || !c->cache_val) return -1;
+    /* size in elements; guard the int multiply against overflow on absurd trees */
+    long long need_ll = (long long)c->n_leaves * (long long)c->np
+                        * (long long)c->max_h;
+    if (need_ll <= 0 || need_ll > 0x7fffffffLL) return -1;
+    int need = (int)need_ll;
+    if (out == NULL) return need;          /* size query */
+    if (out_len < need) return -1;         /* caller buffer too small */
+
+    /* FILL-ALL: bring every not-ready leaf to state 2 before the copy. */
+    for (int leaf_idx = 0; leaf_idx < c->n_leaves; leaf_idx++) {
+        int st = atomic_load(&c->cache_state[leaf_idx]);
+        if (st != 2) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(
+                    &c->cache_state[leaf_idx], &expected, 1)) {
+                esro_fill_leaf(c, leaf_idx);
+                atomic_store(&c->cache_state[leaf_idx], 2);
+            } else {
+                /* someone else is filling (or already did) — wait for ready */
+                while (atomic_load(&c->cache_state[leaf_idx]) != 2) { /* spin */ }
+            }
+        }
+    }
+    memcpy(out, c->cache_val, (size_t)need * sizeof(float));
+    return need;
+}
