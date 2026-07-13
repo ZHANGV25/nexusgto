@@ -57,11 +57,14 @@ def test_formula_is_pseudoharmonic_not_harmonic():
 
 
 def test_pick_boundary_at_gs_threshold():
-    # Boundary x* = (A+B+2AB)/(A+B+2) = 2.5/3.5 = 0.714285... — tie -> lo;
-    # just above -> hi.
+    # Boundary x* = (A+B+2AB)/(A+B+2) = 2.5/3.5 = 0.714285... Probe BOTH
+    # sides with a margin — x* is 5/7, not float-representable, so an
+    # exact-tie assertion is an ULP coin-flip (the first tests box failed
+    # on exactly that: w_lo computed 0.49999999999999994). The tie->smaller
+    # rule still holds for exact w equality (strict '>' in the pick).
     b = 2.5 / 3.5
-    assert pseudoharmonic_pick(b, [0.5, 1.0]) == 0
-    assert pseudoharmonic_pick(b + 1e-6, [0.5, 1.0]) == 1
+    assert pseudoharmonic_pick(b - 1e-4, [0.5, 1.0]) == 0
+    assert pseudoharmonic_pick(b + 1e-4, [0.5, 1.0]) == 1
 
 
 def test_pick_differs_from_abs_distance_snap():
