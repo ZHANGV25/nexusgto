@@ -20,6 +20,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from app.engine.agent.pseudoharmonic import (
+    pseudoharmonic_pick,
+    use_pseudoharmonic_snap,
+)
 from app.services.card_codec import (
     _action_to_solver_label,
     _solver_label_to_action_index,
@@ -101,7 +105,14 @@ def translate_action(
     frac = _bet_frac(amount, pot)
     off_tree = _is_off_tree(frac, sizes)
 
-    label = _action_to_solver_label(action, amount, pot, sizes)
+    if off_tree and frac is not None and use_pseudoharmonic_snap():
+        # Gap 4(1): pseudo-harmonic boundary (Pluribus action translation)
+        # instead of the abs-distance snap inside _action_to_solver_label —
+        # the OFF_TREE_PSEUDOHARMONIC tag is now earned, not aspirational.
+        pick = pseudoharmonic_pick(frac, sizes)
+        label = f"Bet {int(round(sizes[pick] * 100))}%"
+    else:
+        label = _action_to_solver_label(action, amount, pot, sizes)
     idx = _solver_label_to_action_index(
         label, facing_bet, sizes, add_explicit_allin,
     )
