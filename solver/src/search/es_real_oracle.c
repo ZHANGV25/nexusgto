@@ -224,6 +224,18 @@ ES_EXPORT void *es_make_real_oracle(
     c->n_leaves = n_leaves;
     c->max_h = max_h;
 
+    /* max_h is the cache stride (hands per player). If it were < num_hands[p]
+     * for any player, the all-hands fill clamps to max_h (rollout.c) and the
+     * leaf-table readout's [.., :num_hands] slice would read past the stride
+     * into the next player's row → silently wrong BR-gap (review 2026-07-12 5b).
+     * The caller contract is max_h >= max_p num_hands[p]; enforce it. */
+    for (int _p = 0; _p < np; _p++) {
+        if (max_h < tree->num_hands[_p]) {
+            free(c);
+            return NULL;  /* caller: pass max_h >= max num_hands per player */
+        }
+    }
+
     c->pot = (int *)malloc((size_t)n_leaves * sizeof(int));
     c->bets = (int *)malloc((size_t)n_leaves * np * sizeof(int));
     c->active = (int *)malloc((size_t)n_leaves * np * sizeof(int));
@@ -284,4 +296,77 @@ ES_EXPORT void es_real_oracle_stats2(void *ctx, uint64_t *fills,
     if (cache_hits) *cache_hits = atomic_load(&c->cache_hits);
     if (sims) *sims = atomic_load(&c->rollout_sims);
     if (errors) *errors = atomic_load(&c->oracle_errors);
+}
+
+/* Cache dimensions, so a caller can size a [n_leaves, np, max_h] buffer before
+ * reading the leaf-value table out. Any out-param may be NULL. */
+ES_EXPORT void es_real_oracle_dims(void *ctx, int *n_leaves, int *np,
+                                   int *max_h) {
+    ESRealOracleCtx *c = (ESRealOracleCtx *)ctx;
+    if (!c) return;
+    if (n_leaves) *n_leaves = c->n_leaves;
+    if (np)       *np       = c->np;
+    if (max_h)    *max_h    = c->max_h;
+}
+
+/* Read the DENSE leaf-value table out as a flat float[n_leaves*np*max_h] array
+ * in the exact [leaf, player, hand] layout `cache_val` already holds — the same
+ * layout the BR-gap best-responder (python/es_resolver/exploitability_c.py)
+ * indexes as table[leaf, player, hand]. Returns `need` (the element count) on
+ * success, or `need` (WITHOUT copying) when out==NULL so the caller can size
+ * its buffer first, or -1 if out is non-NULL but out_len < need.
+ *
+ * ⭐ FILL-ALL (the whole reason this exists): during the solve the cache is
+ * filled LAZILY — only leaves the sampled CFR walk VISITED are cache_state==2;
+ * unvisited leaves are still 0. But the BR-gap walk reads EVERY leaf, so a raw
+ * memcpy would hand back 0 for every unreached leaf and corrupt the gap. So we
+ * first fill any not-ready leaf here, exactly as esro_oracle's lazy path does
+ * (esro_fill_leaf is deterministic + strategy-independent — bias-averaged over
+ * the fixed {0..3} distribution — so a post-solve fill yields the identical
+ * value a visited leaf would hold). This runs ONLY at readout (expose-gated,
+ * post-solve, single-threaded — no Hogwild contention), NEVER in the hot path,
+ * so the shipped lazy-once-per-visit behavior is unchanged.
+ *
+ * Thread-safety: intended for a post-solve, single-threaded call. We still use
+ * the CAS/spin fill discipline so a stray concurrent reader can't double-fill;
+ * a leaf already ready (state 2) is left untouched. */
+ES_EXPORT int es_real_oracle_get_leaf_table(void *ctx, float *out,
+                                            int out_len) {
+    ESRealOracleCtx *c = (ESRealOracleCtx *)ctx;
+    if (!c || !c->cache_val) return -1;
+    /* size in elements; guard the int multiply against overflow on absurd trees */
+    long long need_ll = (long long)c->n_leaves * (long long)c->np
+                        * (long long)c->max_h;
+    if (need_ll <= 0 || need_ll > 0x7fffffffLL) return -1;
+    int need = (int)need_ll;
+    if (out == NULL) return need;          /* size query */
+    if (out_len < need) return -1;         /* caller buffer too small */
+
+    /* FILL-ALL: bring every not-ready leaf to state 2 before the copy.
+     * ⭐ Unlike the hot-path lazy fill (which ignores the rc — a rare failed
+     * leaf there is a tolerable degraded serve), the READOUT must NOT hand the
+     * best-responder a leaf that failed to fill: esro_fill_leaf returns -1 on
+     * OOM or all-rollouts-errored, in which case dst[]==0.0 and a zeroed leaf is
+     * indistinguishable from a real zero value → silently biases the BR-gap
+     * toward 0. So track any fill failure and fail the WHOLE readout loud
+     * (return -2) rather than copy a partially-zeroed table (review 2026-07-12
+     * 5a). A leaf already ready (state 2) from the solve is trusted. */
+    int fill_failed = 0;
+    for (int leaf_idx = 0; leaf_idx < c->n_leaves; leaf_idx++) {
+        int st = atomic_load(&c->cache_state[leaf_idx]);
+        if (st != 2) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(
+                    &c->cache_state[leaf_idx], &expected, 1)) {
+                if (esro_fill_leaf(c, leaf_idx) != 0) fill_failed = 1;
+                atomic_store(&c->cache_state[leaf_idx], 2);
+            } else {
+                /* someone else is filling (or already did) — wait for ready */
+                while (atomic_load(&c->cache_state[leaf_idx]) != 2) { /* spin */ }
+            }
+        }
+    }
+    if (fill_failed) return -2;  /* a leaf failed to fill; do NOT return zeros */
+    memcpy(out, c->cache_val, (size_t)need * sizeof(float));
+    return need;
 }

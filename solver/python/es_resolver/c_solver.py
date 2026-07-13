@@ -147,6 +147,17 @@ if _HAS_REAL:
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64)]
+    # Leaf-table readout (BR-gap scoring of a rollout-mode solve). dims() sizes
+    # the buffer; get_leaf_table() fills-all then copies cache_val out.
+    if hasattr(_lib, "es_real_oracle_dims"):
+        _lib.es_real_oracle_dims.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        _lib.es_real_oracle_dims.restype = None
+    if hasattr(_lib, "es_real_oracle_get_leaf_table"):
+        _lib.es_real_oracle_get_leaf_table.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        _lib.es_real_oracle_get_leaf_table.restype = ctypes.c_int
     _lib.es_free_real_oracle.argtypes = [ctypes.c_void_p]
 
 
@@ -296,6 +307,51 @@ class CSolver:
         _lib.es_real_oracle_stats2(ctx, ctypes.byref(fills), ctypes.byref(hits),
                                    ctypes.byref(sims), ctypes.byref(errs))
         return (fills.value, hits.value, sims.value, errs.value)
+
+    def get_oracle_leaf_table(self):
+        """Dense leaf-value table [n_leaves, np, max_h] read from the lazy
+        rollout oracle's cache, for BR-gap scoring of a rollout-mode solve.
+
+        Returns a C-contiguous float32 ndarray of shape (n_leaves, np, max_h) —
+        the EXACT layout exploitability_c.py indexes as table[leaf, player, hand]
+        (leaf in [0,n_leaves), player in [0,np), hand in [0, num_hands[player])
+        with num_hands[player] <= max_h, so table[leaf, player, :nh_p] is valid).
+        Returns None if this solver was NOT built via from_real_oracle (no real-
+        oracle ctx) or if the DLL predates the accessor.
+
+        The C side FILLS ALL leaves before copying (the solve's cache is lazy —
+        only visited leaves are populated — but the BR-gap walk reads every
+        leaf). Post-solve, single-threaded; never touches the hot path.
+        """
+        ctx = getattr(self, "_real_oracle_ctx", None)
+        if ctx is None:
+            return None
+        if not (hasattr(_lib, "es_real_oracle_dims")
+                and hasattr(_lib, "es_real_oracle_get_leaf_table")):
+            return None
+        n_leaves = ctypes.c_int(0); npl = ctypes.c_int(0); max_h = ctypes.c_int(0)
+        _lib.es_real_oracle_dims(ctx, ctypes.byref(n_leaves),
+                                 ctypes.byref(npl), ctypes.byref(max_h))
+        need = int(n_leaves.value) * int(npl.value) * int(max_h.value)
+        if need <= 0:
+            return None
+        buf = np.empty(need, dtype=np.float32)
+        got = _lib.es_real_oracle_get_leaf_table(
+            ctx, buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), need)
+        if got == -2:
+            # A leaf failed to fill during the readout (OOM / all-rollouts-
+            # errored). The C side refused to return a partially-zeroed table
+            # (which would silently bias the BR-gap toward 0). Fail loud.
+            raise RuntimeError(
+                "es_real_oracle_get_leaf_table: a leaf failed to fill (rc=-2) — "
+                "the leaf table would be partially zeroed; refusing to score a "
+                "corrupted BR-gap")
+        if got != need:
+            raise RuntimeError(
+                f"es_real_oracle_get_leaf_table returned {got}, expected {need} "
+                f"(dims {n_leaves.value}x{npl.value}x{max_h.value})")
+        return buf.reshape(
+            (int(n_leaves.value), int(npl.value), int(max_h.value)))
 
     def set_cfr_mode(self, mode: int) -> None:
         """0 = vanilla (validated reference), 1 = Linear CFR (matches the GPU).
