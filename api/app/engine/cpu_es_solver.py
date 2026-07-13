@@ -469,6 +469,26 @@ class CpuEsSolver:
             )
         if readout not in ("avg", "final"):
             raise ValueError(f"readout must be 'avg' or 'final', got {readout!r}")
+        # NEXUS_LEAF_CACHE_K: measurement knob (fidelity-rider Arm 1) — raise
+        # the lazy oracle's per-leaf bias-sample count above the shipped
+        # default without a caller change. Read per solve (the oracle is
+        # constructed per solve). Absent env = byte-identical. Bounded to
+        # [1, 64]: a typo like "400" would multiply every leaf fill 400x and
+        # silently burn the box's wall clock.
+        _env_k = os.environ.get("NEXUS_LEAF_CACHE_K")
+        if _env_k:
+            _k = int(_env_k)
+            if not (1 <= _k <= 64):
+                raise ValueError(
+                    f"NEXUS_LEAF_CACHE_K={_k} outside [1, 64] (refusing a "
+                    "silent wall-clock blowup)"
+                )
+            if _k != cache_k:
+                logger.info(
+                    "leaf-rollout cache_k %d -> %d (NEXUS_LEAF_CACHE_K)",
+                    cache_k, _k,
+                )
+            cache_k = _k
         if not self._ready:
             raise RuntimeError("CpuEsSolver not initialized")
         rc = self._rollout_c
