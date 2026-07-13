@@ -837,11 +837,15 @@ class GameState:
                         "on-tree"
                     )
                 if use_pseudoharmonic_snap():
-                    # Gap 4(1): pseudo-harmonic boundary. Raw chip amounts
-                    # are fine — the weight formula is reciprocal-only, so
-                    # the pot denominator cancels (scale-invariant).
+                    # Gap 4(1): pseudo-harmonic boundary. The G&S mapping is
+                    # POT-RELATIVE (its "+1" terms are the pot), so chips
+                    # must be normalized by the pot the actor faces — raw
+                    # chip amounts would silently use the wrong boundary
+                    # (merge review 2026-07-13).
+                    _pot_ref = float(pot) if pot > 0 else 1.0
                     position = pseudoharmonic_pick(
-                        float(increment), [float(s) for s in survivors]
+                        float(increment) / _pot_ref,
+                        [float(s) / _pot_ref for s in survivors],
                     )
                 else:
                     position = min(

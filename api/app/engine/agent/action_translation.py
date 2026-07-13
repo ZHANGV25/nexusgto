@@ -105,10 +105,15 @@ def translate_action(
     frac = _bet_frac(amount, pot)
     off_tree = _is_off_tree(frac, sizes)
 
-    if off_tree and frac is not None and use_pseudoharmonic_snap():
+    if (off_tree and frac is not None and frac < 5.0
+            and use_pseudoharmonic_snap()):
         # Gap 4(1): pseudo-harmonic boundary (Pluribus action translation)
         # instead of the abs-distance snap inside _action_to_solver_label —
         # the OFF_TREE_PSEUDOHARMONIC tag is now earned, not aspirational.
+        # frac >= 5.0 stays on the legacy path: _snap_amount_to_tree maps
+        # those to "All-in" (the explicit-allin slot when the vocab has
+        # one), which the size-only pick here cannot produce (merge review
+        # 2026-07-13 — allin-adjacent index/provenance divergence).
         pick = pseudoharmonic_pick(frac, sizes)
         label = f"Bet {int(round(sizes[pick] * 100))}%"
     else:
