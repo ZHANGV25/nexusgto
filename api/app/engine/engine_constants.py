@@ -20,7 +20,7 @@ Sources (poker-solver repo, measured on EC2 2026-06-10):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
 QUALITY_SOURCE = "poker-solver/measured_logs/NR_LADDER_2026-06-10.md"
@@ -323,22 +323,66 @@ DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
 }
 
 
+# ── Gap 6 (Pluribus conformance): PLAY vs DISPLAY readout split ───────────
+# Pluribus PLAYS the FINAL-iteration strategy during search and reserves the
+# weighted average (sigma-bar) for belief updates and analysis
+# (PLURIBUS_EXACT_CONFORMANCE_SPEC_2026-06-26.md §Gap 6). DEFAULT_LIVE_CONFIG
+# above is the /v1 DISPLAY contract — 2p/3p serve sigma-bar frequencies (the
+# validated analysis surface) and MUST stay readout="avg" there. Any consumer
+# that ACTS on the mix (the agent match mode; an autonomous agent) must
+# take this table instead: readout="final" at every N. The 4-6p rows are the
+# same objects as DEFAULT (already final); only 2p/3p differ. Floors are
+# keyed on the FULL config, so the flipped 2p/3p play rows correctly cite no
+# measured floor (measured_floor_for returns None on a readout mismatch).
+PLAY_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
+    n: (
+        cfg
+        if cfg.readout == "final"
+        else replace(
+            cfg,
+            readout="final",
+            note=(
+                f"{n}p PLAY config (Gap 6): final-iterate readout for "
+                "acting consumers — Pluribus plays the final iterate; "
+                "sigma-bar display floor notes do not apply"
+            ),
+        )
+    )
+    for n, cfg in DEFAULT_LIVE_CONFIG_BY_N.items()
+}
+
+
 def live_config_for(
     n_players: int,
     iterations_override: Optional[int] = None,
     num_rollouts_override: Optional[int] = None,
+    *,
+    purpose: str = "display",
 ) -> LiveSolveConfig:
     """Resolve the live-solve config for a player count + client overrides.
 
+    purpose: "display" (the /v1 sigma-bar frequency contract — the default)
+        or "play" (Gap 6: final-iterate readout for consumers that ACT on
+        the returned mix).
+
     Raises:
-        ValueError: unsupported player count, or an override outside the
-            measured bounds (rejected, never clamped silently).
+        ValueError: unsupported player count, unknown purpose, or an
+            override outside the measured bounds (rejected, never clamped
+            silently).
     """
-    base = DEFAULT_LIVE_CONFIG_BY_N.get(n_players)
+    if purpose not in ("display", "play"):
+        raise ValueError(
+            f"purpose must be 'display' or 'play', got {purpose!r}"
+        )
+    table = (
+        PLAY_LIVE_CONFIG_BY_N if purpose == "play"
+        else DEFAULT_LIVE_CONFIG_BY_N
+    )
+    base = table.get(n_players)
     if base is None:
         raise ValueError(
             f"unsupported player count for live re-solve: {n_players} "
-            f"(supported: {sorted(DEFAULT_LIVE_CONFIG_BY_N)})"
+            f"(supported: {sorted(table)})"
         )
     iterations = base.iterations
     num_rollouts = base.num_rollouts

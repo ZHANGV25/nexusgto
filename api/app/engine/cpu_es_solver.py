@@ -1068,6 +1068,33 @@ class CpuEsSolver:
                 _street_code = 1 if street == "flop" else 2
                 (_ro_n_leaves, _ro_pot, _ro_bets, _ro_active,
                  _ro_hist, _ro_hist_len, _ro_seats) = _oracle_arrays
+                # NEXUS_LEAF_CACHE_K: measurement knob (fidelity-rider Arm 1)
+                # — raises THIS LAZY ORACLE's per-leaf bias-sample count only.
+                # Deliberately scoped here, NOT at solve() entry: the eager
+                # construct's num_samples_k must stay untouched so an env-set
+                # measurement box never silently multiplies the eager anchor
+                # (merge review 2026-07-13). Absent env = byte-identical.
+                # Bounded [1, 64] with a fail-loud parse (a userdata typo must
+                # reject once, clearly — not traceback on every spot).
+                _env_k = os.environ.get("NEXUS_LEAF_CACHE_K")
+                if _env_k:
+                    try:
+                        _k = int(_env_k)
+                    except ValueError:
+                        raise ValueError(
+                            f"NEXUS_LEAF_CACHE_K={_env_k!r} is not an integer"
+                        ) from None
+                    if not (1 <= _k <= 64):
+                        raise ValueError(
+                            f"NEXUS_LEAF_CACHE_K={_k} outside [1, 64] "
+                            "(refusing a silent wall-clock blowup)"
+                        )
+                    if _k != cache_k:
+                        logger.info(
+                            "lazy leaf-rollout cache_k %d -> %d "
+                            "(NEXUS_LEAF_CACHE_K)", cache_k, _k,
+                        )
+                    cache_k = _k
                 cs = self._CSolver.from_real_oracle(
                     gpu._tree,
                     self._bp_handle.value,  # BPSReader* address (int)

@@ -35,6 +35,10 @@ from app.engine.agent.action_vocab import (
     legal_categories_chips,
     raise_to_amount,
 )
+from app.engine.agent.pseudoharmonic import (
+    pseudoharmonic_pick,
+    use_pseudoharmonic_snap,
+)
 from app.engine.agent.preflop_play import (
     PreflopReplayError,
     PreflopRules,
@@ -832,10 +836,22 @@ class GameState:
                         "slot (stack-commitment prune) — cannot represent "
                         "on-tree"
                     )
-                position = min(
-                    range(len(survivors)),
-                    key=lambda i: abs(math.log(increment / survivors[i])),
-                )
+                if use_pseudoharmonic_snap():
+                    # Gap 4(1): pseudo-harmonic boundary. The G&S mapping is
+                    # POT-RELATIVE (its "+1" terms are the pot), so chips
+                    # must be normalized by the pot the actor faces — raw
+                    # chip amounts would silently use the wrong boundary
+                    # (merge review 2026-07-13).
+                    _pot_ref = float(pot) if pot > 0 else 1.0
+                    position = pseudoharmonic_pick(
+                        float(increment) / _pot_ref,
+                        [float(s) / _pot_ref for s in survivors],
+                    )
+                else:
+                    position = min(
+                        range(len(survivors)),
+                        key=lambda i: abs(math.log(increment / survivors[i])),
+                    )
                 off_tree = survivors[position] != increment
                 idx = n_nonraise + position
                 street_bets[slot] += increment
