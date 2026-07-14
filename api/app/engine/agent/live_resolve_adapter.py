@@ -1,8 +1,10 @@
 """GameState -> CpuEsSolver translation for LIVE_RESOLVE (plan §3.6).
 
-The agent's StrategySource.get_mix is STATELESS: (GameState, hero_cards) ->
-ActionMix. The live-solve engines are STATEFUL/imperative. This module is the
-thin adapter that bridges the two for the LIVE_RESOLVE ceiling, GPU-free.
+The agent's StrategySource.get_mix maps (GameState, hero_cards) -> ActionMix.
+The live-solve engines are STATEFUL/imperative. This module is the thin adapter
+that bridges the two for the LIVE_RESOLVE ceiling, GPU-free. Re-solves remain
+per-call; a default-off BeliefCarrySession held by LiveResolveSource can carry
+completed-street search beliefs onto later calls.
 
 ENGINE CHOICE (empirically validated — docs/BENCHMARK_RESULTS.md §3c):
   - flop / turn  → CpuEsSolver (poker-solver CPU external-sampling ES). Builds
@@ -21,12 +23,13 @@ flop/turn (infoset-cap NULL deref; verified exit 127). It works for river only.
 So LIVE_RESOLVE wraps CpuEsSolver for the flop/turn surface this session targets.
 
 SCOPE / SIMPLIFICATIONS (documented, honest):
-  - PER-CALL STATELESS re-solve: ranges are rebuilt fresh each call from the
+  - PER-CALL re-solve: ranges are rebuilt fresh each call from the
     board (169 grid, blocked by the board). Ranges are SEEDED IN-DISTRIBUTION
     from the blueprint preflop σ̄ when range_weight_dicts is supplied (see
     LiveResolveSource + live_resolve_ranges) — uniform ranges make the re-solve
-    over-bet (the 3b confound). There is NO cross-street Bayesian narrowing —
-    this is a per-street re-solve, not the full Pluribus narrowing ceiling.
+    over-bet (the 3b confound). With NEXUS_BELIEF_CARRY enabled, completed-
+    street search-sigma likelihoods are composed onto those seeded weights;
+    the default-off path remains the independent per-street behavior.
   - MID-STREET ENTRY (faced bet / post-raise) is served by solving from the
     STREET ROOT (chips/players reconstructed at street entry) and REPLAYING
     this street's recorded actions (GameState.street_history) inside the
@@ -171,7 +174,8 @@ def build_solve_inputs(
 
     # 169 grid per entry player, blocked by the board (mirrors solve_cpu_es).
     # Seeded in-distribution when range_weight_dicts is supplied (aligned to
-    # COMPACT SLOT order), else uniform-on-legal. No cross-street narrowing.
+    # COMPACT SLOT order), else uniform-on-legal. Flagged belief carry is
+    # composed into the weight dicts by LiveResolveSource before this call.
     blocked = set(board_ints)
     use_weights = (
         range_weight_dicts is not None
@@ -201,6 +205,9 @@ def build_solve_inputs(
         "board_ints": board_ints,
         "positions_sorted": positions_sorted,
         "player_seats": player_seats,
+        # Solver-player -> compact-slot map. This is inert translation metadata
+        # unless the default-off belief stash path requests it.
+        "entry_slots": entry_slots,
         "player_ranges": player_ranges,
         "hero_player_idx": hero_player_idx,
         "pot_bb": pot_bb,

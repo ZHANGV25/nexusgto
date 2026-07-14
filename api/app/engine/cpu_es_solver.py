@@ -432,6 +432,7 @@ class CpuEsSolver:
         vec_mode: int = 0,
         readout: str = "avg",
         hero_replay: Optional[Dict[str, object]] = None,
+        belief_stash_out: Optional[Dict[str, object]] = None,
     ) -> Dict[int, Dict[int, Dict[str, float]]]:
         """Run an N-player flop/turn/river CPU-ES solve. Returns all_by_player:
         {player_idx: {hand_idx: {action_label: freq}}} — the SAME structure the
@@ -461,6 +462,10 @@ class CpuEsSolver:
             the mid-street / faced-bet entry the live game loop needs — not
             at the first-BFS (no-bet) decision node. Fail-loud on any
             replay mismatch (off-tree action / vocab drift).
+        belief_stash_out: optional in/out dict for cross-street belief carry.
+            The caller seeds ``entry_slots`` and ``hist_start``. After CFR,
+            the dict is replaced with this street's PlainTree + sigma-bar
+            readout. ``None`` (the default) performs no stash work.
         """
         if vec_mode and readout != "final":
             raise ValueError(
@@ -471,6 +476,15 @@ class CpuEsSolver:
             raise ValueError(f"readout must be 'avg' or 'final', got {readout!r}")
         if not self._ready:
             raise RuntimeError("CpuEsSolver not initialized")
+        # Belief-narrowed root ranges and offline-filled catalog boundary EVs
+        # are different fidelity models. Check only on the opt-in stash path:
+        # default-OFF solves add no env read or other hot-path work.
+        if (belief_stash_out is not None
+                and os.environ.get("CONT_EV_CATALOG_MANIFEST")):
+            raise RuntimeError(
+                "belief carry is incompatible with CONT_EV_CATALOG_MANIFEST: "
+                "belief-narrowed root ranges cannot be combined with offline-"
+                "filled catalog boundary values; disable one feature")
         rc = self._rollout_c
         n_players = len(player_ranges)
         scale = 100.0
@@ -1176,6 +1190,43 @@ class CpuEsSolver:
             cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
+
+            # BELIEF CARRY STASH (NEXUS_BELIEF_CARRY, default OFF). The output
+            # dict is the entire gate: with the default None there is no import,
+            # tree copy, sigma-bar read, or metadata access. Extraction must
+            # happen here while `cs` (and its strategy sums) is alive. It always
+            # reads avg_strategy, independent of the strategy served above.
+            if belief_stash_out is not None:
+                _belief_meta = dict(belief_stash_out)
+                try:
+                    from app.engine.agent.belief_stash import pack_belief_stash
+                    pack_belief_stash(
+                        belief_stash_out,
+                        cs=cs,
+                        tree=tree,
+                        player_seats=player_seats,
+                        board=board_ints[:len(board_strs)],
+                        bet_sizes=bet_sizes,
+                        subsequent_bet_sizes=subsequent_bet_sizes,
+                        add_explicit_allin=add_explicit_allin,
+                    )
+                except Exception as _e:
+                    # Belief carry is an optional refinement. Never let a
+                    # packing failure corrupt or abort the solved strategy.
+                    belief_stash_out.clear()
+                    belief_stash_out.update(
+                        status="empty",
+                        reason=("belief-stash extraction failed: "
+                                f"{type(_e).__name__}: {_e}"),
+                        entry_slots=_belief_meta.get("entry_slots"),
+                        hist_start=_belief_meta.get("hist_start"),
+                        street=len(board_strs) - 2,
+                        board=tuple(board_ints[:len(board_strs)]),
+                    )
+                    logger.warning(
+                        "CpuEsSolver belief-stash extraction failed",
+                        exc_info=True,
+                    )
 
             # LAZY rollout oracle: snapshot the fill/cache stats AFTER the run
             # (the leaves were filled on-demand during the walk). None on the

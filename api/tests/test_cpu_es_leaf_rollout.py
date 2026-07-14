@@ -16,6 +16,7 @@ Coverage:
   * interaction guards fail loud: rollout + armed cont_ev / bias-action /
     miss-fallback / 2p range-conditioning.
   * stats recording from real_oracle_stats().
+  * solve-level belief-stash hook success + signature-drift fail-safe.
 """
 from __future__ import annotations
 
@@ -30,35 +31,90 @@ from app.engine.cpu_es_solver import CpuEsSolver
 
 # ── Fakes ────────────────────────────────────────────────────────────────
 class _FakeNode:
-    def __init__(self, ntype, leaf_idx=-1, active=None):
+    def __init__(
+        self, ntype, leaf_idx=-1, active=None, *, idx=-1, player=-1,
+        children=(), pot=0, bets=None, num_board=3, num_players=0,
+    ):
         self.type = ntype
         self.leaf_idx = leaf_idx
         self.active_players = active if active is not None else []
-        self.player = -1
-        self.num_children = 0
+        self.idx = idx
+        self.player = player
+        self.children = tuple(children)
+        self.num_children = len(self.children)
+        self.pot = pot
+        self.bets = tuple(bets if bets is not None else [0] * num_players)
+        self.active = tuple(bool(value) for value in self.active_players)
+        self.num_board = num_board
+        self.fold_player = -1
+        self.num_players = num_players
 
 
 class _FakeTree:
     """Minimal ss_tree stand-in. Empty decision_node_indices makes the
     strategy-extraction tail trivial (node_idx None -> raw={})."""
 
-    def __init__(self, n_players, n_leaves=2, n_nodes=50, has_chance=False):
+    def __init__(
+        self, n_players, n_leaves=2, n_nodes=50, has_chance=False,
+        with_decision_root=False,
+    ):
         self.num_leaf_nodes = n_leaves
         self.num_leaves = n_leaves
         self.num_nodes = n_nodes
         self.num_chance_nodes = 1 if has_chance else 0
-        self.num_decision_nodes = 4
+        self.num_decision_nodes = 1 if with_decision_root else 4
         self.max_depth = 3
-        self.decision_node_indices = []  # trivial extraction tail
-        # One LEAF node (type==4) per leaf_idx carrying an active vector, so
-        # _build_real_oracle_leaf_state's per-leaf active read finds them.
-        self.nodes = []
-        for li in range(n_leaves):
-            self.nodes.append(
-                _FakeNode(4, leaf_idx=li, active=[1] * n_players))
+        self.num_players = n_players
+        self.num_board = 3
+        self.board = (0, 1, 2)
+        self.starting_pot = 2000
+        self.effective_stack = 9500
+        self.player_hands = [
+            [(0, 1, 1.0), (2, 3, 1.0)] for _ in range(n_players)
+        ]
+        self.num_hands = [len(hands) for hands in self.player_hands]
+        self.max_hands = max(self.num_hands)
+        active = [1] * n_players
+        bets = [0] * n_players
+        if with_decision_root:
+            # The stash hook needs a PlainTree-shaped root decision and leaf
+            # boundaries. Disconnected padding below proves the packer prunes.
+            self.decision_node_indices = [0]
+            self.nodes = [
+                _FakeNode(
+                    0, active=active, idx=0, player=0, children=(1, 2),
+                    pot=2000, bets=bets, num_board=3,
+                    num_players=n_players,
+                ),
+                _FakeNode(
+                    4, leaf_idx=0, active=active, idx=1, pot=2000,
+                    bets=bets, num_board=3, num_players=n_players,
+                ),
+                _FakeNode(
+                    4, leaf_idx=1, active=active, idx=2, pot=2000,
+                    bets=bets, num_board=3, num_players=n_players,
+                ),
+            ]
+        else:
+            self.decision_node_indices = []  # trivial extraction tail
+            # One LEAF node (type==4) per leaf_idx carrying an active vector,
+            # so _build_real_oracle_leaf_state's per-leaf read finds them.
+            self.nodes = [
+                _FakeNode(
+                    4, leaf_idx=li, active=active, idx=li, pot=2000,
+                    bets=bets, num_board=3, num_players=n_players,
+                )
+                for li in range(n_leaves)
+            ]
         # pad with non-leaf nodes up to num_nodes
         while len(self.nodes) < n_nodes:
-            self.nodes.append(_FakeNode(0))
+            idx = len(self.nodes)
+            self.nodes.append(
+                _FakeNode(
+                    0, active=active, idx=idx, pot=2000, bets=bets,
+                    num_board=3, num_players=n_players,
+                )
+            )
 
 
 class _FakeGpu:
@@ -82,6 +138,10 @@ class _FakeSolver:
 
     last_from_table = None
     last_from_real_oracle = None
+    avg_calls = []
+    final_calls = []
+    avg_sigma = np.asarray([[0.8, 0.2], [0.35, 0.65]], dtype=np.float32)
+    final_sigma = np.asarray([[0.1, 0.9], [0.6, 0.4]], dtype=np.float32)
 
     def __init__(self):
         self._reach = False
@@ -103,8 +163,14 @@ class _FakeSolver:
     def set_cfr_mode(self, m): pass
     def set_vec_mode(self, m): pass
     def run(self, iterations, num_threads=0): pass
-    def avg_strategy(self, ni): return None
-    def final_strategy(self, ni): return None
+    def avg_strategy(self, ni):
+        type(self).avg_calls.append(ni)
+        return type(self).avg_sigma
+
+    def final_strategy(self, ni):
+        type(self).final_calls.append(ni)
+        return type(self).final_sigma
+
     def real_oracle_stats(self):
         return (7, 3, 21, 0)
 
@@ -186,6 +252,8 @@ def _solve_kwargs(n_players, street="flop"):
 def _reset_fake_solver():
     _FakeSolver.last_from_table = None
     _FakeSolver.last_from_real_oracle = None
+    _FakeSolver.avg_calls = []
+    _FakeSolver.final_calls = []
     # never leave NEXUS_LEAF_ROLLOUT set across tests
     yield
     os.environ.pop("NEXUS_LEAF_ROLLOUT", None)
@@ -308,7 +376,85 @@ def test_build_real_oracle_seat_count_mismatch_raises():
         s._build_real_oracle_leaf_state(_FakeTree(n), leaf_infos, n, [0, 1])
 
 
+# -- solve-level belief stash hook ------------------------------------------
+def test_solve_packs_belief_stash_from_avg_when_serving_final(monkeypatch):
+    monkeypatch.delenv("CONT_EV_CATALOG_MANIFEST", raising=False)
+    n = 3
+    tree = _FakeTree(n, with_decision_root=True)
+    s = _make_solver(n, tree, _FakeRollout())
+    stash = {"entry_slots": [2, 0, 1], "hist_start": 4}
+    kwargs = _solve_kwargs(n)
+    kwargs["readout"] = "final"
+
+    s.solve(**kwargs, belief_stash_out=stash)
+
+    assert set(stash) == {
+        "status", "tree", "sigma", "entry_slots", "player_seats",
+        "street", "board", "hist_start",
+    }
+    assert stash["status"] == "ok"
+    assert stash["entry_slots"] == [2, 0, 1]
+    assert stash["hist_start"] == 4
+    assert stash["player_seats"] == [0, 1, 2]
+    assert stash["street"] == 1
+    assert stash["board"] == (0, 1, 2)
+
+    pruned = stash["tree"]
+    assert pruned is not tree
+    assert len(tree.nodes) == 50
+    assert len(pruned.nodes) == 3
+    assert pruned.decision_node_indices == (0,)
+    assert pruned.nodes[0].children == (1, 2)
+    assert [node.type for node in pruned.nodes] == [0, 4, 4]
+    assert [node.num_children for node in pruned.nodes] == [2, 0, 0]
+    assert set(stash["sigma"]) == {0}
+    np.testing.assert_array_equal(stash["sigma"][0], _FakeSolver.avg_sigma)
+    assert not np.array_equal(stash["sigma"][0], _FakeSolver.final_sigma)
+    assert _FakeSolver.avg_calls == [0]
+    assert _FakeSolver.final_calls == [0]
+
+
+def test_solve_belief_stash_wrong_packer_signature_is_fail_safe(monkeypatch):
+    from app.engine.agent import belief_stash as belief_stash_module
+
+    def _wrong_signature(out):
+        raise AssertionError("wrong-signature stub must not be entered")
+
+    monkeypatch.delenv("CONT_EV_CATALOG_MANIFEST", raising=False)
+    monkeypatch.setattr(
+        belief_stash_module, "pack_belief_stash", _wrong_signature,
+    )
+    n = 3
+    tree = _FakeTree(n, with_decision_root=True)
+    s = _make_solver(n, tree, _FakeRollout())
+    stash = {"entry_slots": [2, 0, 1], "hist_start": 7}
+
+    s.solve(**_solve_kwargs(n), belief_stash_out=stash)
+
+    assert stash["status"] == "empty"
+    assert stash["reason"].startswith(
+        "belief-stash extraction failed: TypeError:"
+    )
+    assert "unexpected keyword argument" in stash["reason"]
+    assert stash["entry_slots"] == [2, 0, 1]
+    assert stash["hist_start"] == 7
+    assert stash["street"] == 1
+    assert stash["board"] == (0, 1, 2)
+    assert "tree" not in stash and "sigma" not in stash
+
+
 # ── interaction guards fail loud ───────────────────────────────────────────
+def test_guard_belief_stash_plus_catalog(monkeypatch):
+    monkeypatch.setenv("NEXUS_BELIEF_CARRY", "1")
+    monkeypatch.setenv("CONT_EV_CATALOG_MANIFEST", "/unused/catalog.json")
+    n = 3
+    s = _make_solver(n, _FakeTree(n), _FakeRollout())
+    stash = {"entry_slots": list(range(n)), "hist_start": 0}
+
+    with pytest.raises(RuntimeError, match="belief carry.*incompatible"):
+        s.solve(**_solve_kwargs(n), belief_stash_out=stash)
+
+
 def test_guard_rollout_plus_armed_cont_ev_flop(monkeypatch):
     monkeypatch.setenv("NEXUS_LEAF_ROLLOUT", "1")
     n = 3  # flop + n>=3 + cev_holder present -> a3 would arm
