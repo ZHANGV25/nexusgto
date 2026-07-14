@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -380,9 +381,11 @@ class LiveResolveSource(StrategySource):
     fallback crashes building flop/turn trees), so LIVE_RESOLVE wraps CpuEsSolver
     instead; that is the honest WIRE+VERIFY of the realtime pipeline GPU-free.
 
-    STATELESS per-call: each get_mix is an independent re-solve with ranges
-    rebuilt from the board (no cross-street narrowing — a documented v1
-    simplification). The 12GB blueprint load is one-time in the held engine.
+    Each get_mix remains a fresh re-solve. By default its ranges are rebuilt
+    independently; NEXUS_BELIEF_CARRY (or the constructor override) enables a
+    per-hand session that multiplies completed-street search-sigma likelihoods
+    into later sigma-seeded ranges. The 12GB blueprint load is one-time in the
+    held engine.
     """
 
     def __init__(
@@ -390,6 +393,7 @@ class LiveResolveSource(StrategySource):
         seed_ranges: bool = True, strategy_reader=None,
         vec_mode: bool = False, readout: str = "avg", num_threads: int = 0,
         num_rollouts: int = 3, cache_k: int = 1,
+        belief_carry: Optional[bool] = None,
     ) -> None:
         self._config = config
         self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
@@ -425,6 +429,13 @@ class LiveResolveSource(StrategySource):
         # back to uniform ranges (the over-bet caveat then applies — documented).
         self._seed_ranges = bool(seed_ranges)
         self._reader = strategy_reader  # reader.get_strategy(...) or None
+        # None follows the environment on every get_mix so in-process gate
+        # harnesses can switch it without rebuilding the held 12GB engine.
+        # The session itself stays lazy: flag OFF never constructs one.
+        # NEXUS_BELIEF_CARRY=1 is for held-source in-process drivers; a fresh
+        # per-job /v1 source pays stash extraction but dies before consuming it.
+        self._belief_carry_override = belief_carry
+        self._belief_session = None
         # RECORDED per call (call-local, like RecordingHybridSource): how the
         # last get_mix seeded its ranges — "blueprint_preflop_sigma" or
         # "uniform". The engine provider reads this to DISCLOSE uniform
@@ -432,6 +443,14 @@ class LiveResolveSource(StrategySource):
         # uniform seeding on unparsed preflop shapes was an unflagged
         # quality compromise).
         self.last_range_seeding: Optional[str] = None
+        # Structured per-call disclosure. None is the flag-OFF contract.
+        self.last_belief_carry: Optional[dict] = None
+
+    def _belief_carry_enabled(self) -> bool:
+        if self._belief_carry_override is not None:
+            return bool(self._belief_carry_override)
+        value = os.environ.get("NEXUS_BELIEF_CARRY", "")
+        return value[:1] in ("1", "t", "T", "y", "Y")
 
     def _ensure_engine(self):
         if self._engine is not None:
@@ -488,6 +507,41 @@ class LiveResolveSource(StrategySource):
             labels_to_index_freqs,
         )
 
+        belief_enabled = self._belief_carry_enabled()
+        belief_session = None
+        if belief_enabled:
+            from app.engine.agent.belief_carry import BeliefCarrySession
+
+            if self._belief_session is None:
+                self._belief_session = BeliefCarrySession()
+            belief_session = self._belief_session
+            try:
+                belief_session.observe(state)
+                self.last_belief_carry = belief_session.summary()
+            except Exception:
+                # Belief carry is an optional refinement. A malformed session
+                # must never prevent the underlying live solve.
+                logger.warning(
+                    "LiveResolveSource: belief session observe FAILED; "
+                    "solving this node without carry",
+                    exc_info=True,
+                )
+                self._belief_session = None
+                belief_session = None
+                self.last_belief_carry = {
+                    "continued": False, "reset": False, "reset_reason": None,
+                    "applied": False, "dropped": True,
+                    "drop_reason": "belief_carry: dropped (observe failed)",
+                    "invalidated_post_solve": False, "carry_dead": False,
+                    "folded_streets": [], "skipped_streets": [],
+                    "slot_factors": [], "stash_status": None,
+                }
+        else:
+            # Do not retain a stale hand across an OFF interval if a driver
+            # toggles the environment between calls.
+            self._belief_session = None
+            self.last_belief_carry = None
+
         engine = self._ensure_engine()
 
         # Seed in-distribution ranges (preflop σ̄) when possible — removes the
@@ -499,6 +553,35 @@ class LiveResolveSource(StrategySource):
             "blueprint_preflop_sigma" if range_dicts is not None else "uniform"
         )
 
+        if belief_session is not None:
+            try:
+                if range_dicts is None:
+                    belief_session.skip_uniform_preflop()
+                else:
+                    carried = belief_session.apply_ranges(
+                        range_dicts, state.n_slots
+                    )
+                    if carried is None:
+                        # Wrong-length sigma dicts would be silently ignored by
+                        # the adapter. Make that uniform fallback explicit.
+                        range_dicts = None
+                        self.last_range_seeding = "uniform"
+                    else:
+                        range_dicts = carried
+                        if belief_session.summary()["applied"]:
+                            self.last_range_seeding = (
+                                "blueprint_preflop_sigma+belief_carry"
+                            )
+                self.last_belief_carry = belief_session.summary()
+            except Exception:
+                logger.warning(
+                    "LiveResolveSource: belief range application FAILED; "
+                    "solving with unfactored preflop ranges",
+                    exc_info=True,
+                )
+                belief_session.record_failure("range application failed")
+                self.last_belief_carry = belief_session.summary()
+
         inputs = build_solve_inputs(state, range_weight_dicts=range_dicts)
         #   raises LiveResolveUnsupported on terminal / river / mid-street re-entry.
 
@@ -509,6 +592,17 @@ class LiveResolveSource(StrategySource):
         add_allin = bool(state.add_explicit_allin)
 
         hero_idx = inputs["hero_player_idx"]
+        belief_stash = None
+        belief_solve_kwargs = {}
+        if belief_session is not None:
+            belief_stash = {
+                "entry_slots": list(inputs["entry_slots"]),
+                "hist_start": (
+                    len(state.postflop_history) - len(state.street_history)
+                ),
+            }
+            # Empty when OFF, so the existing solve call receives no new kwarg.
+            belief_solve_kwargs["belief_stash_out"] = belief_stash
         # cont_ev CATALOG routing (multi-spot, 2026-07-08): when the engine has a
         # catalog router attached (engine.cont_ev_router — only when
         # CONT_EV_CATALOG_MANIFEST is configured), route this solve to the right
@@ -550,8 +644,41 @@ class LiveResolveSource(StrategySource):
                         "street_actions": inputs["street_actions"],
                         "expected_actions": inputs["n_legal"],
                     },
+                    **belief_solve_kwargs,
                 )
         except Exception as e:
+            if belief_session is not None and belief_stash is not None:
+                # Never leave an older same-street stash pending after the
+                # latest solve attempt failed. A later street must skip this
+                # factor source instead of silently using stale search sigma.
+                try:
+                    belief_session.receive_stash(
+                        {
+                            "status": "empty",
+                            "reason": (
+                                "latest live solve failed before belief "
+                                "stash intake"
+                            ),
+                            "entry_slots": list(inputs["entry_slots"]),
+                            "hist_start": (
+                                len(state.postflop_history)
+                                - len(state.street_history)
+                            ),
+                            "street": int(state.street),
+                        }
+                    )
+                    self.last_belief_carry = belief_session.summary()
+                except Exception:
+                    logger.warning(
+                        "LiveResolveSource: failed to discard stale belief "
+                        "stash after solve error",
+                        exc_info=True,
+                    )
+                    belief_session.record_failure(
+                        "solve failed and stale stash discard failed",
+                        clear=True,
+                    )
+                    self.last_belief_carry = belief_session.summary()
             # Known abstraction-surface limits (tree raise cap, real-chips
             # action-set divergence, unvalidated vocab shape) are surfaced
             # by the engine as ReplayUnsupported -> convert to the
@@ -564,6 +691,51 @@ class LiveResolveSource(StrategySource):
                     type(e).__name__ == "ReplayUnsupported":
                 raise LiveResolveUnsupported(str(e)) from e
             raise
+
+        if belief_session is not None and belief_stash is not None:
+            # The packer preserves these pre-seeded fields, but setdefault
+            # makes injected fake engines and an extraction failure equally
+            # safe and fully disclosed.
+            belief_stash.setdefault("entry_slots", list(inputs["entry_slots"]))
+            belief_stash.setdefault(
+                "hist_start",
+                len(state.postflop_history) - len(state.street_history),
+            )
+            belief_stash.setdefault("street", int(state.street))
+            belief_stash.setdefault("status", "empty")
+            if belief_stash.get("status") != "ok":
+                belief_stash.setdefault(
+                    "reason", "solver did not populate the belief stash"
+                )
+            try:
+                belief_session.receive_stash(belief_stash)
+            except Exception:
+                logger.warning(
+                    "LiveResolveSource: belief stash intake FAILED; "
+                    "discarding carry data from this solve",
+                    exc_info=True,
+                )
+                # A later same-street solve must replace the prior stash even
+                # when this latest extraction failed: beliefs use the LAST
+                # search solve, never a silently stale one.
+                try:
+                    belief_session.receive_stash(
+                        {
+                            "status": "empty",
+                            "reason": "belief stash intake failed",
+                            "entry_slots": list(inputs["entry_slots"]),
+                            "hist_start": (
+                                len(state.postflop_history)
+                                - len(state.street_history)
+                            ),
+                            "street": int(state.street),
+                        }
+                    )
+                except Exception:
+                    belief_session.record_failure(
+                        "stash intake failed", clear=True
+                    )
+            self.last_belief_carry = belief_session.summary()
 
         row = hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
         strat = all_by_player.get(hero_idx, {}).get(row)
