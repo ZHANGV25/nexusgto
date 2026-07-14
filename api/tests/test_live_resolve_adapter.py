@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 
 from app.engine.agent.game_state import new_postflop_state
@@ -413,3 +414,285 @@ def test_live_resolve_6p_faced_bet_vec_final(live_source_6p):
     assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
     assert mix.is_uniform_fallback is False
     print(f"\n6p faced-bet vec-final: dt={dt:.1f}s mix={mix.freqs}")
+
+
+# ── Gap 4(2): off-tree add-action + replay (real C tree, EC2-only) ────────
+
+
+def _gap4_base_state():
+    return new_postflop_state(
+        seats=["SB", "BB", "UTG", "MP"],
+        preflop_prefix=[1, 1, 0, 0, 1, 0],
+        board=[_ci("Ah"), _ci("8s"), _ci("3c")],
+    )
+
+
+def _gap4_hu_state():
+    return new_postflop_state(
+        seats=["BB", "UTG"],
+        preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Ah"), _ci("8s"), _ci("3c")],
+    )
+
+
+def _gap4_fraction_for_increment(state, increment):
+    slot = int(state.to_act_slot)
+    pot = int(state.pot)
+    to_call = max(0, int(state.current_bet) - int(state.street_bets[slot]))
+    if to_call == 0:
+        return (float(increment) + 0.5) / float(pot)
+    return (
+        float(increment - to_call) + 0.5
+    ) / float(pot + to_call)
+
+
+def _gap4_faithful_increment(state, target_fraction):
+    slot = int(state.to_act_slot)
+    pot = int(state.pot)
+    to_call = max(0, int(state.current_bet) - int(state.street_bets[slot]))
+    stack = int(state.stacks[slot])
+    denominator = pot if to_call == 0 else pot + to_call
+    base = int(float(target_fraction) * denominator) + to_call
+    canonical = state._surviving_raise_amounts(slot)
+    for offset in sorted(range(-32, 33), key=lambda value: (abs(value), value)):
+        amount = base + offset
+        if amount <= to_call or amount >= stack:
+            continue
+        fraction = _gap4_fraction_for_increment(state, amount)
+        rebuilt = (
+            int(fraction * pot)
+            if to_call == 0
+            else to_call + int(fraction * (pot + to_call))
+        )
+        if rebuilt != amount:
+            continue
+        if any(abs(amount - existing) <= 1 for existing in canonical):
+            continue
+        return amount
+    raise AssertionError("could not construct an exact-chip off-tree raise")
+
+
+def test_gap4_real_projection_discloses_unmergeable_added_mass():
+    from app.engine.cpu_es_solver import CpuEsSolver
+    from app.engine.offtree_replay import AddedChild, NodeProjection
+
+    # A commitment-pruned hero node has only fold/call base children, while
+    # the global extension still exposes one richer-tree raise column.
+    projection = NodeProjection(
+        base_child_indices=(0, 1),
+        base_raise_targets=(),
+        added_children=(AddedChild(child_index=2, fraction=1.4),),
+        base_action_labels=("Fold", "Call"),
+    )
+    sigma = np.asarray(
+        [[0.2, 0.3, 0.5], [0.0, 0.0, 0.0]], dtype=np.float64,
+    )
+
+    projected, merged, dropped, reasons = (
+        CpuEsSolver.__new__(CpuEsSolver)._project_offtree_strategy(
+            sigma, projection
+        )
+    )
+
+    assert projected[0].tolist() == pytest.approx([0.4, 0.6])
+    assert projected[1].tolist() == pytest.approx([0.0, 0.0])
+    assert merged == {0: 0.0, 1: 0.0}
+    assert dropped == {0: 0.5}
+    assert reasons == {0: "no_base_raise_child"}
+
+
+def test_gap4_flag_on_zero_event_uses_one_base_solve(monkeypatch):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    import app.engine.agent.live_resolve_adapter as adapter
+
+    class _CaptureEngine:
+        def __init__(self):
+            self.calls = []
+
+        def solve(self, **kwargs):
+            self.calls.append(kwargs)
+            return {0: {0: {"Check": 0.25, "Bet 75%": 0.75}}}
+
+    state = _gap4_base_state()
+    engine = _CaptureEngine()
+    inputs = {
+        "board_strs": ["Ah", "8s", "3c"],
+        "board_ints": list(state.board),
+        "player_ranges": [[(0, 1, 1.0)]] * state.n_slots,
+        "positions_sorted": list(state.seat_of_slot),
+        "player_seats": list(range(state.n_slots)),
+        "entry_slots": list(range(state.n_slots)),
+        "hero_player_idx": 0,
+        "pot_bb": float(state.pot) / 100.0,
+        "stack_bb": float(max(state.stacks)) / 100.0,
+        "game_action_indices": list(state.preflop_prefix),
+        "street_actions": [],
+        "n_legal": state.num_legal_actions(),
+        "has_to_call": False,
+    }
+    monkeypatch.setattr(
+        adapter, "build_solve_inputs", lambda *_args, **_kwargs: inputs,
+    )
+    monkeypatch.setattr(adapter, "hero_grid_row", lambda *_args: 0)
+    source = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"),
+        cpu_es_solver=engine,
+        seed_ranges=False,
+        belief_carry=False,
+        offtree_add=True,
+    )
+
+    mix = source.get_mix(state, (_ci("Ad"), _ci("Js")))
+
+    assert len(engine.calls) == 1
+    call = engine.calls[0]
+    assert call["bet_sizes"] == [0.75]
+    assert call["subsequent_bet_sizes"] == [1.0]
+    assert "offtree" not in call["hero_replay"]
+    assert mix.freqs == {0: 0.25, 1: 0.75}
+    assert source.last_offtree_add == {
+        "enabled": True,
+        "events": [],
+        "added_first": [],
+        "added_subsequent": [],
+        "skipped": [],
+        "replayed_through_added": False,
+        "hero_merged_mass": 0.0,
+        "dropped": False,
+        "drop_reason": None,
+    }
+
+
+def test_gap4_flag_on_zero_event_is_bit_identical(
+    cpu_es_engine, blueprint_path,
+):
+    from app.engine.agent.strategy_source import LiveResolveSource
+
+    config = ModeConfig(
+        mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0,
+    )
+    state = _gap4_base_state()
+    cards = (_ci("Ad"), _ci("Js"))
+    off = LiveResolveSource(
+        config, cpu_es_solver=cpu_es_engine, iterations=200,
+        num_threads=1, offtree_add=False,
+    )
+    on = LiveResolveSource(
+        config, cpu_es_solver=cpu_es_engine, iterations=200,
+        num_threads=1, offtree_add=True,
+    )
+
+    off_mix = off.get_mix(state, cards)
+    on_mix = on.get_mix(state, cards)
+
+    assert on_mix.freqs == off_mix.freqs
+    assert on_mix.is_uniform_fallback is off_mix.is_uniform_fallback
+    assert off.last_offtree_add is None
+    assert on.last_offtree_add == {
+        "enabled": True,
+        "events": [],
+        "added_first": [],
+        "added_subsequent": [],
+        "skipped": [],
+        "replayed_through_added": False,
+        "hero_merged_mass": 0.0,
+        "dropped": False,
+        "drop_reason": None,
+    }
+
+
+def test_gap4_extended_solve_replays_exact_chips_and_keeps_base_arity(
+    cpu_es_engine, blueprint_path,
+):
+    from app.engine.agent.strategy_source import LiveResolveSource
+
+    state = _gap4_base_state().advance(0).advance(0)
+    amount = _gap4_faithful_increment(state, 1.4)
+    expected_fraction = _gap4_fraction_for_increment(state, amount)
+    observed = state.advance_observed("raise", amount=amount)
+    state = observed.state
+    event_step = len(state.street_history) - 1
+    source = LiveResolveSource(
+        ModeConfig(
+            mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0,
+        ),
+        cpu_es_solver=cpu_es_engine,
+        iterations=200,
+        belief_carry=True,
+        offtree_add=True,
+    )
+
+    mix = source.get_mix(state, (_ci("Ad"), _ci("Js")))
+    disclosure = source.last_offtree_add
+    stats = cpu_es_engine._last_solve_stats
+
+    assert disclosure is not None
+    assert disclosure["added_first"] == pytest.approx(
+        [expected_fraction], rel=0.0, abs=1e-12,
+    )
+    assert disclosure["events"][0]["stack_before"] == (
+        state.street_offtree_raises[0][4]
+    )
+    assert disclosure["events"][0]["fraction"] == pytest.approx(
+        expected_fraction, rel=0.0, abs=1e-12,
+    )
+    assert disclosure["replayed_through_added"] is True
+    assert disclosure["dropped"] is False
+    assert stats["offtree_replayed_through"] is True
+    assert stats["offtree_added_child_chips"][event_step] == amount
+    assert set(mix.freqs) == set(range(state.num_legal_actions()))
+    assert len(mix.freqs) == state.num_legal_actions()
+    assert mix.is_uniform_fallback is False
+
+    stash = source.last_belief_carry["stash_status"]
+    assert stash["status"] == "empty"
+    assert "unsupported belief-stash vocab" in stash["reason"]
+
+
+def test_gap4_hu_subsequent_raise_replays_live_without_cap_fallback(
+    cpu_es_engine, blueprint_path,
+):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    from app.engine.engine_constants import live_config_for
+
+    state = _gap4_hu_state().advance(1)  # BB's canonical 0.75-pot bet.
+    amount = _gap4_faithful_increment(state, 1.6)
+    expected_fraction = _gap4_fraction_for_increment(state, amount)
+    state = state.advance_observed("raise", amount=amount).state
+    event_step = len(state.street_history) - 1
+    config = live_config_for(2)
+    source = LiveResolveSource(
+        ModeConfig(
+            mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0,
+        ),
+        cpu_es_solver=cpu_es_engine,
+        iterations=config.iterations,
+        num_rollouts=config.num_rollouts,
+        vec_mode=config.vec_mode,
+        readout=config.readout,
+        num_threads=1,
+        belief_carry=False,
+        offtree_add=True,
+    )
+
+    mix = source.get_mix(state, (_ci("Ad"), _ci("Js")))
+    disclosure = source.last_offtree_add
+    stats = cpu_es_engine._last_solve_stats
+
+    assert disclosure is not None
+    assert disclosure["added_first"] == []
+    assert disclosure["added_subsequent"] == pytest.approx(
+        [expected_fraction], rel=0.0, abs=1e-12,
+    )
+    assert disclosure["events"][0]["stack_before"] == (
+        state.street_offtree_raises[0][4]
+    )
+    assert disclosure["events"][0]["fraction"] == pytest.approx(
+        expected_fraction, rel=0.0, abs=1e-12,
+    )
+    assert disclosure["replayed_through_added"] is True
+    assert disclosure["dropped"] is False
+    assert stats["offtree_added_child_chips"][event_step] == amount
+    assert set(mix.freqs) == set(range(state.num_legal_actions()))
+    assert len(mix.freqs) == state.num_legal_actions() == 3
+    assert mix.is_uniform_fallback is False
