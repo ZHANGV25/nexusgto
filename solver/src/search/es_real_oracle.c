@@ -93,6 +93,9 @@ static int esro_fill_leaf(ESRealOracleCtx *c, int leaf_idx) {
     int np = c->np;
     int max_h = c->max_h;
 
+    /* RolloutHand is 12 bytes (two int32_t plus one float), so this is
+     * 6 * 1400 * 12 = 100,800 bytes (98.4 KiB), below the 256 KiB threshold;
+     * keep it on the stack for this probe. */
     RolloutHand hand_buf[SS_MAX_PLAYERS][SS_MAX_HANDS];
     RolloutHandList hand_lists[SS_MAX_PLAYERS];
     int32_t active32[SS_MAX_PLAYERS], bets32[SS_MAX_PLAYERS], stacks32[SS_MAX_PLAYERS];

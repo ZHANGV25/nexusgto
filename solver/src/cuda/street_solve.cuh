@@ -33,7 +33,7 @@
 /* ── Limits ──────────────────────────────────────────────────────────── */
 
 #define SS_MAX_PLAYERS    6       /* max players in a subgame (6-max) */
-#define SS_MAX_HANDS      200     /* max hands per player */
+#define SS_MAX_HANDS      1400    /* max hands per player */
 #define SS_MAX_ACTIONS    8       /* max actions per decision node */
 #define SS_MAX_TREE_NODES 4096    /* max nodes (larger for N-player trees) */
 #define SS_MAX_BOARD      5

@@ -10,6 +10,12 @@
  * the storage-layout idiom of subgame_preflop.c (per-node offset tables into a
  * flat dense array) but NOT its math (that is vector CFR with reach weighting;
  * this is single-path external sampling).
+ *
+ * 1a SS_MAX_HANDS audit (2026-07-15): no additional live src/ hand/range/
+ * weight array was hard-coded to 200, so A4 required no replacement beyond
+ * the canonical SS_MAX_HANDS definition. Other live literal 200s are card-
+ * abstraction/sample constants or stale complexity comments; the archived
+ * FS_MAX_HANDS cap is outside this CPU-ES probe.
  */
 
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
@@ -977,6 +983,18 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
     const SSNode *nd = &t->nodes[node_idx];
     int type = nd->type;
     int nh = t->num_hands[traverser];
+    double (*child_vals)[SS_MAX_HANDS] = NULL;
+    if (type == ES_T_DECISION && nd->player == traverser) {
+        child_vals = (double (*)[SS_MAX_HANDS])malloc(
+            (size_t)SS_MAX_ACTIONS * sizeof(*child_vals));
+        if (!child_vals) {
+            fprintf(stderr,
+                    "FATAL es_traverse_vec: OOM allocating child_vals "
+                    "(%d actions x %d hands)\n",
+                    SS_MAX_ACTIONS, SS_MAX_HANDS);
+            abort();
+        }
+    }
 
     if (type == ES_T_FOLD) {
         /* Hand-independent for the traverser: net = (pot - my_bet) if traverser
@@ -985,6 +1003,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         local->fold_terminals++;
         double v = es_fold_value(nd, traverser);
         for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : v;
+        free(child_vals);
         return;
     }
     if (type == ES_T_SHOWDOWN) {
@@ -999,6 +1018,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         double my_bet = (double)nd->bets[traverser];
         if (!nd->active_players[traverser]) {
             for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : -my_bet;
+            free(child_vals);
             return;
         }
         /* NODE board (the runout dealt through in-tree chance nodes), not the
@@ -1023,13 +1043,21 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         for (int p = 0; p < np; p++) {
             if (p == traverser || !nd->active_players[p]) continue;
             int hi = opp_sampled[p];
-            if (hi < 0) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
+            if (hi < 0) {
+                for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+                free(child_vals);
+                return;
+            }
             int c0 = t->hands[p][hi][0], c1 = t->hands[p][hi][1];
             int conflict = 0;
             if (!es_no_conflict_skip())
                 for (int b = 0; b < 5; b++)
                     if (c0 == board[b] || c1 == board[b]) { conflict = 1; break; }
-            if (conflict) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
+            if (conflict) {
+                for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+                free(child_vals);
+                return;
+            }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
             opp_strength[p] = eval7(cards);
             opp_live[n_opp_live++] = p;
@@ -1065,6 +1093,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
                               - my_bet;
             }
         }
+        free(child_vals);
         return;
     }
     if (type == ES_T_LEAF) {
@@ -1079,6 +1108,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             out_vals[h] = r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
                                     h, sampled, nd, rng);
         }
+        free(child_vals);
         return;
     }
     if (type == ES_T_CHANCE) {
@@ -1090,11 +1120,20 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         int nc = nd->num_children;
         if (nc <= 0) {
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+            free(child_vals);
             return;
         }
         if (es_chance_enumerate(r)) {
             /* ENUMERATE (default): per-hand average over all dealt cards. */
-            double tmp[SS_MAX_HANDS];
+            double *tmp = (double *)malloc(
+                (size_t)SS_MAX_HANDS * sizeof(*tmp));
+            if (!tmp) {
+                fprintf(stderr,
+                        "FATAL es_traverse_vec: OOM allocating chance tmp "
+                        "(%d hands)\n",
+                        SS_MAX_HANDS);
+                abort();
+            }
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
             for (int a = 0; a < nc; a++) {
                 int child = t->children[nd->first_child + a];
@@ -1104,6 +1143,8 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             }
             double inv = 1.0 / (double)nc;
             for (int h = 0; h < nh; h++) out_vals[h] *= inv;
+            free(tmp);
+            free(child_vals);
             return;
         }
         int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
@@ -1111,6 +1152,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
                         iter, out_vals);
+        free(child_vals);
         return;
     }
 
@@ -1128,6 +1170,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             int child = t->children[nd->first_child];
             es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
                             iter, out_vals);
+            free(child_vals);
             return;
         }
         int64_t off = r->node_off[node_idx];
@@ -1139,6 +1182,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
                         iter, out_vals);
+        free(child_vals);
         return;
     }
 
@@ -1147,8 +1191,8 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
      * then per-hand regret-match + combine + update. */
     if (r->visit_count) r->visit_count[node_idx]++;
     int64_t off = r->node_off[node_idx];
-    /* child_vals[a][h] — na*nh doubles, depth-bounded stack (na<=8, nh<=200). */
-    double child_vals[SS_MAX_ACTIONS][SS_MAX_HANDS];
+    /* child_vals[a][h] is heap-backed because 8 x 1400 doubles is 87.5 KiB
+     * in every recursive traverser-decision frame. */
     for (int a = 0; a < na; a++) {
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
@@ -1180,6 +1224,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         }
         out_vals[h] = node_val;
     }
+    free(child_vals);
 }
 
 /* Build the dead-hand mask for a vec walk: traverser hand h is dead if either
