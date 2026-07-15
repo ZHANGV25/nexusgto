@@ -38,6 +38,15 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from app.engine.offtree_replay import (
+    NodeProjection,
+    OffTreeExtensionUnsafe,
+    ReplayUnsupported,
+    build_node_projection,
+    replay_offtree_street_node,
+    validate_extended_tree,
+)
+
 logger = logging.getLogger(__name__)
 
 # Serializes the OPT-IN env-mutation window (NEXUS_ALLOW_CHANCE_SOLVE -> set
@@ -56,20 +65,6 @@ _ENV_MUTATION_LOCK = threading.Lock()
 # on the NEXUS_LEAF_ROLLOUT construct path.
 _ESRO_MAX_FLOP_HIST = 256
 
-
-class ReplayUnsupported(Exception):
-    """The solved tree cannot faithfully represent this mid-street entry.
-
-    Raised (instead of ValueError) for KNOWN abstraction-surface limits —
-    the multiway raise cap (the tree caps street raises at
-    SS_MULTIWAY_MAX_RAISES=2 while the agent/trainer vocab allows 3), an
-    action-count divergence between the reached node and the agent's legal
-    set (real-chips commitment prune vs canonical tree chips), or an
-    unvalidated vocab shape (multi-size / explicit-allin) on the replay
-    path. LiveResolveSource converts this to LiveResolveUnsupported so the
-    hybrid source falls back to blueprint LOOKUP for the decision (the
-    blueprint vocab covers these lines). Genuine drift/bugs stay ValueError
-    and fail loud."""
 
 # poker-solver locations (the provider side-loads python/ onto sys.path at init;
 # we resolve the DLL + python dir from the same env the provider uses).
@@ -206,6 +201,7 @@ class CpuEsSolver:
         # {selects, semantics} snapshot from the last bias-action solve.
         self._last_cont_ev_bias_action_stats = None
         self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
+        self._last_solve_stats = None  # per-solve observability, incl. Gap 4
         # NEXUS_LEAF_ROLLOUT: {leaf_fills, cache_hits, rollout_sims, oracle_errors}
         # from the last lazy-oracle solve (es_real_oracle_stats2). None on the
         # eager (default) path — _last_solve_stats.leaf_mode disambiguates.
@@ -485,6 +481,18 @@ class CpuEsSolver:
                 "belief carry is incompatible with CONT_EV_CATALOG_MANIFEST: "
                 "belief-narrowed root ranges cannot be combined with offline-"
                 "filled catalog boundary values; disable one feature")
+        _offtree_replay = None
+        if hero_replay is not None and "offtree" in hero_replay:
+            candidate = hero_replay["offtree"]
+            if not isinstance(candidate, dict):
+                raise ValueError("hero_replay.offtree must be a dict")
+            _offtree_replay = candidate
+            if os.environ.get("CONT_EV_CATALOG_MANIFEST"):
+                raise RuntimeError(
+                    "off-tree add is incompatible with "
+                    "CONT_EV_CATALOG_MANIFEST: extended search trees cannot "
+                    "be combined with offline-filled catalog boundary "
+                    "values; disable one feature")
         rc = self._rollout_c
         n_players = len(player_ranges)
         scale = 100.0
@@ -495,6 +503,34 @@ class CpuEsSolver:
                 f"{len(board_strs)}"
             )
         street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
+
+        _base_bet_sizes = list(bet_sizes)
+        _base_subsequent_sizes = list(subsequent_bet_sizes)
+        _event_fractions: Dict[int, float] = {}
+        if _offtree_replay is not None:
+            try:
+                _base_bet_sizes = [
+                    float(value) for value in
+                    _offtree_replay["base_bet_sizes"]  # type: ignore[index]
+                ]
+                _base_subsequent_sizes = [
+                    float(value) for value in
+                    _offtree_replay["base_subsequent_bet_sizes"]  # type: ignore[index]
+                ]
+                _event_fractions = {
+                    int(step): float(fraction)
+                    for step, fraction in dict(
+                        _offtree_replay["event_fractions"]  # type: ignore[index]
+                    ).items()
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid hero_replay.offtree descriptor: {exc}"
+                ) from exc
+            if not _event_fractions:
+                raise ValueError(
+                    "hero_replay.offtree requires at least one event fraction"
+                )
 
         # ── 2p-TURN: Pluribus-DEPTH-LIMITED by default (2026-06-18) ──
         # The 2p turn now terminates at a cont-strat LEAF at the RIVER boundary
@@ -557,6 +593,12 @@ class CpuEsSolver:
                 finally:
                     _ENV_MUTATION_LOCK.release()
         try:
+            if len(bet_sizes) > 1 or len(subsequent_bet_sizes) > 1:
+                # ss_build_tree2 permits more children than the fixed-width
+                # ES solver layout can hold. Validate the native tree before
+                # any CSolver is constructed; LiveResolveSource can then drop
+                # an unsafe optional extension and re-solve with base sizes.
+                validate_extended_tree(gpu._tree)
             tree = self._snapshot_tree(gpu._tree, player_ranges)
             max_h = gpu._max_hands
 
@@ -1342,57 +1384,117 @@ class CpuEsSolver:
             # The hero's replayed node (mid-street entry), if requested.
             hero_idx: Optional[int] = None
             hero_node: Optional[int] = None
+            hero_projection: Optional[NodeProjection] = None
+            _offtree_replayed_through = False
+            _offtree_added_child_chips: Dict[int, int] = {}
             if hero_replay is not None and hero_replay.get("street_actions"):
-                # The replay path is validated for the single-size,
-                # no-explicit-allin vocab only (the 8.05B shape). With
-                # multi-size / explicit-allin vocabs the agent's surviving-
-                # raise count can silently diverge from the tree's child
-                # count (different all-in baselines) and the structural
-                # check cannot distinguish raise children — route to the
-                # lookup fallback rather than risk a wrong-node read
-                # (review 2026-06-10).
-                if (add_explicit_allin or len(bet_sizes) > 1
-                        or len(subsequent_bet_sizes) > 1):
-                    raise ReplayUnsupported(
-                        "street replay is validated only for single-size, "
-                        "no-explicit-allin vocabs (got bet_sizes="
-                        f"{list(bet_sizes)}, subsequent="
-                        f"{list(subsequent_bet_sizes)}, allin="
-                        f"{add_explicit_allin})"
+                if _offtree_replay is not None:
+                    hero_idx = int(
+                        hero_replay["player_idx"]  # type: ignore[arg-type]
                     )
-                hero_idx = int(hero_replay["player_idx"])  # type: ignore[arg-type]
-                hero_node = self._replay_street_node(
-                    tree,
-                    list(hero_replay["street_actions"]),  # type: ignore[arg-type]
-                    n_players=n_players,
-                )
-                reached = tree.nodes[hero_node]
-                if reached.type != 0 or reached.player != hero_idx:
-                    raise ValueError(
-                        f"replayed street actions lead to node {hero_node} "
-                        f"(type={reached.type}, player={reached.player}) — not a "
-                        f"decision node owned by hero player {hero_idx}. The "
-                        "recorded street history does not match the solved tree."
+                    _walk = replay_offtree_street_node(
+                        tree,
+                        list(hero_replay["street_actions"]),  # type: ignore[arg-type]
+                        n_players=n_players,
+                        base_bet_sizes=_base_bet_sizes,
+                        base_subsequent_bet_sizes=_base_subsequent_sizes,
+                        bet_sizes=bet_sizes,
+                        subsequent_bet_sizes=subsequent_bet_sizes,
+                        add_explicit_allin=add_explicit_allin,
+                        event_fractions=_event_fractions,
                     )
-                expected = hero_replay.get("expected_actions")
-                if expected is not None and reached.num_children != int(expected):  # type: ignore[arg-type]
-                    # The tree's action set at the hero's node differs from
-                    # the agent's legal set: either the multiway raise cap
-                    # (tree capped at 2 raises, vocab allows a 3rd — the mix
-                    # would silently lack it) or a real-chips commitment
-                    # prune the canonical tree chips don't have. Both are
-                    # KNOWN abstraction limits -> lookup fallback.
-                    raise ReplayUnsupported(
-                        f"hero node has {reached.num_children} tree actions "
-                        f"but the agent's legal set has {expected} — the "
-                        "solved tree cannot represent this decision"
+                    hero_node = int(_walk.node_index)
+                    _offtree_replayed_through = bool(
+                        _walk.replayed_through_added
                     )
+                    _offtree_added_child_chips = dict(
+                        _walk.added_child_chips
+                    )
+                    reached = tree.nodes[hero_node]
+                    if reached.type != 0 or reached.player != hero_idx:
+                        raise ValueError(
+                            f"replayed street actions lead to node {hero_node} "
+                            f"(type={reached.type}, player={reached.player}) — "
+                            f"not a decision node owned by hero player "
+                            f"{hero_idx}. The recorded street history does "
+                            "not match the solved tree."
+                        )
+                    hero_projection = build_node_projection(
+                        tree,
+                        hero_node,
+                        n_players=n_players,
+                        base_bet_sizes=_base_bet_sizes,
+                        base_subsequent_bet_sizes=_base_subsequent_sizes,
+                        bet_sizes=bet_sizes,
+                        subsequent_bet_sizes=subsequent_bet_sizes,
+                        add_explicit_allin=add_explicit_allin,
+                    )
+                    expected = hero_replay.get("expected_actions")
+                    if (expected is not None
+                            and len(hero_projection.base_child_indices)
+                            != int(expected)):  # type: ignore[arg-type]
+                        raise ReplayUnsupported(
+                            "hero node has "
+                            f"{len(hero_projection.base_child_indices)} base-"
+                            "vocabulary tree actions but the agent's legal "
+                            f"set has {expected} — the solved tree cannot "
+                            "represent this decision"
+                        )
+                else:
+                    # The replay path is validated for the single-size,
+                    # no-explicit-allin vocab only (the 8.05B shape). With
+                    # multi-size / explicit-allin vocabs the agent's surviving-
+                    # raise count can silently diverge from the tree's child
+                    # count (different all-in baselines) and the structural
+                    # check cannot distinguish raise children — route to the
+                    # lookup fallback rather than risk a wrong-node read
+                    # (review 2026-06-10).
+                    if (add_explicit_allin or len(bet_sizes) > 1
+                            or len(subsequent_bet_sizes) > 1):
+                        raise ReplayUnsupported(
+                            "street replay is validated only for single-size, "
+                            "no-explicit-allin vocabs (got bet_sizes="
+                            f"{list(bet_sizes)}, subsequent="
+                            f"{list(subsequent_bet_sizes)}, allin="
+                            f"{add_explicit_allin})"
+                        )
+                    hero_idx = int(hero_replay["player_idx"])  # type: ignore[arg-type]
+                    hero_node = self._replay_street_node(
+                        tree,
+                        list(hero_replay["street_actions"]),  # type: ignore[arg-type]
+                        n_players=n_players,
+                    )
+                    reached = tree.nodes[hero_node]
+                    if reached.type != 0 or reached.player != hero_idx:
+                        raise ValueError(
+                            f"replayed street actions lead to node {hero_node} "
+                            f"(type={reached.type}, player={reached.player}) — not a "
+                            f"decision node owned by hero player {hero_idx}. The "
+                            "recorded street history does not match the solved tree."
+                        )
+                    expected = hero_replay.get("expected_actions")
+                    if expected is not None and reached.num_children != int(expected):  # type: ignore[arg-type]
+                        # The tree's action set at the hero's node differs from
+                        # the agent's legal set: either the multiway raise cap
+                        # (tree capped at 2 raises, vocab allows a 3rd — the mix
+                        # would silently lack it) or a real-chips commitment
+                        # prune the canonical tree chips don't have. Both are
+                        # KNOWN abstraction limits -> lookup fallback.
+                        raise ReplayUnsupported(
+                            f"hero node has {reached.num_children} tree actions "
+                            f"but the agent's legal set has {expected} — the "
+                            "solved tree cannot represent this decision"
+                        )
 
             # ── Extract strategies → all_by_player, with the weight-0 /
             #    never-visited filter the GPU's get_all_avg_strategies applies
             #    (freq>0.001; skip uniform-default rows so out-of-range hands
             #    stay fold-100% placeholders in _build_response_strategies). ──
             all_by_player: Dict[int, Dict[int, Dict[str, float]]] = {}
+            _hero_merged_mass_by_row: Dict[int, float] = {}
+            _hero_dropped_mass_by_row: Dict[int, float] = {}
+            _hero_drop_reason_by_row: Dict[int, str] = {}
+            _projection_skipped_players: List[Dict[str, object]] = []
             for p_idx in range(n_players):
                 if hero_idx is not None and p_idx == hero_idx:
                     node_idx = hero_node
@@ -1400,7 +1502,11 @@ class CpuEsSolver:
                     node_idx = self._first_decision_node_for(tree, p_idx)
                 raw: Dict[int, Dict[str, float]] = {}
                 if node_idx is not None:
-                    if hero_idx is not None and p_idx == hero_idx:
+                    if _offtree_replay is not None:
+                        # Extension labels are derived from the projected base
+                        # children below, never from the richer child universe.
+                        labels: List[str] = []
+                    elif hero_idx is not None and p_idx == hero_idx:
                         # Replayed (possibly faced-bet) node: synthesize
                         # labels from the tree's own chip deltas —
                         # _build_labels is wrong off the street root.
@@ -1408,6 +1514,65 @@ class CpuEsSolver:
                     else:
                         labels = self._build_labels(gpu._tree, node_idx)
                     sigma = read_strategy(node_idx)  # [nh, na] or None
+                    if _offtree_replay is not None and sigma is not None:
+                        try:
+                            projection = (
+                                hero_projection
+                                if hero_idx is not None and p_idx == hero_idx
+                                else build_node_projection(
+                                    tree,
+                                    node_idx,
+                                    n_players=n_players,
+                                    base_bet_sizes=_base_bet_sizes,
+                                    base_subsequent_bet_sizes=(
+                                        _base_subsequent_sizes
+                                    ),
+                                    bet_sizes=bet_sizes,
+                                    subsequent_bet_sizes=subsequent_bet_sizes,
+                                    add_explicit_allin=add_explicit_allin,
+                                )
+                            )
+                            if projection is None:
+                                raise ReplayUnsupported(
+                                    "missing base projection for player "
+                                    f"{p_idx} node {node_idx}"
+                                )
+                            if (len(projection.base_action_labels)
+                                    != len(projection.base_child_indices)):
+                                raise ReplayUnsupported(
+                                    f"node {node_idx} has "
+                                    f"{len(projection.base_child_indices)} "
+                                    "base children but "
+                                    f"{len(projection.base_action_labels)} "
+                                    "base labels"
+                                )
+                            labels = list(projection.base_action_labels)
+                            (sigma, _merged_by_row, _dropped_by_row,
+                             _drop_reason_by_row) = (
+                                self._project_offtree_strategy(
+                                    sigma, projection
+                                )
+                            )
+                        except ReplayUnsupported as projection_error:
+                            # Only the replayed hero node is load-bearing for
+                            # the served mix.  A richer-tree projection miss at
+                            # another player's first display node must not
+                            # discard an otherwise faithful hero solve.
+                            if hero_idx is not None and p_idx == hero_idx:
+                                raise
+                            _projection_skipped_players.append(
+                                {
+                                    "player_idx": int(p_idx),
+                                    "node_index": int(node_idx),
+                                    "reason": str(projection_error),
+                                }
+                            )
+                            all_by_player[p_idx] = raw
+                            continue
+                        if hero_idx is not None and p_idx == hero_idx:
+                            _hero_merged_mass_by_row = _merged_by_row
+                            _hero_dropped_mass_by_row = _dropped_by_row
+                            _hero_drop_reason_by_row = _drop_reason_by_row
                     na = sigma.shape[1] if sigma is not None else 0
                     nh = len(player_ranges[p_idx])
                     for h in range(min(nh, sigma.shape[0] if sigma is not None else 0)):
@@ -1417,6 +1582,11 @@ class CpuEsSolver:
                         strat = {}
                         for a in range(min(na, len(labels))):
                             freq = float(sigma[h, a])
+                            # Match the shipped readout convention after
+                            # projection too: discard numerical dust and omit
+                            # all-zero rows.  LiveResolveSource independently
+                            # dense-fills a retained hero row at the serving
+                            # seam, so its legal-action arity remains exact.
                             if freq > 0.001:
                                 strat[labels[a]] = freq
                         if strat:
@@ -1456,6 +1626,37 @@ class CpuEsSolver:
                 "num_decision_nodes": int(
                     getattr(gpu._tree, "num_decision_nodes", 0)),
                 "max_depth": int(getattr(gpu._tree, "max_depth", 0)),
+                "offtree_added": {
+                    "first": [
+                        float(value) for value in bet_sizes
+                        if float(value) not in _base_bet_sizes
+                    ] if _offtree_replay is not None else [],
+                    "subsequent": [
+                        float(value) for value in subsequent_bet_sizes
+                        if float(value) not in _base_subsequent_sizes
+                    ] if _offtree_replay is not None else [],
+                },
+                "offtree_replayed_through": bool(
+                    _offtree_replayed_through
+                ),
+                # CpuEsSolver returns every grid row. LiveResolveSource picks
+                # the served hero row and exposes its scalar mass.
+                "offtree_hero_merged_mass": 0.0,
+                "offtree_hero_merged_mass_by_row": dict(
+                    _hero_merged_mass_by_row
+                ),
+                "offtree_hero_dropped_mass_by_row": dict(
+                    _hero_dropped_mass_by_row
+                ),
+                "offtree_hero_drop_reason_by_row": dict(
+                    _hero_drop_reason_by_row
+                ),
+                "offtree_projection_skipped_players": list(
+                    _projection_skipped_players
+                ),
+                "offtree_added_child_chips": dict(
+                    _offtree_added_child_chips
+                ),
             }
 
             logger.info(
@@ -1544,6 +1745,82 @@ class CpuEsSolver:
             if nd.type == 0 and nd.player == player_idx and nd.num_children > 0:
                 return ni
         return None
+
+    def _project_offtree_strategy(
+        self,
+        sigma: np.ndarray,
+        projection: NodeProjection,
+    ) -> Tuple[np.ndarray, Dict[int, float], Dict[int, float], Dict[int, str]]:
+        """Project every strategy row from added children to base columns."""
+
+        from app.engine.agent.offtree_add import merge_added_action_mass
+
+        if sigma.ndim != 2:
+            raise ReplayUnsupported(
+                f"extended strategy readout has shape {sigma.shape}, expected "
+                "a [rows, actions] matrix"
+            )
+        referenced = list(projection.base_child_indices) + [
+            child.child_index for child in projection.added_children
+        ]
+        if referenced and max(referenced) >= sigma.shape[1]:
+            raise ReplayUnsupported(
+                f"extended strategy has {sigma.shape[1]} columns but node "
+                f"projection references column {max(referenced)}"
+            )
+
+        base_positions = [
+            int(position) for position, _fraction
+            in projection.base_raise_targets
+        ]
+        base_fractions = [
+            float(fraction) for _position, fraction
+            in projection.base_raise_targets
+        ]
+        rows: List[Tuple[float, ...]] = []
+        merged_by_row: Dict[int, float] = {}
+        dropped_by_row: Dict[int, float] = {}
+        drop_reason_by_row: Dict[int, str] = {}
+        for row_index in range(int(sigma.shape[0])):
+            base_masses = [
+                float(sigma[row_index, child_index])
+                for child_index in projection.base_child_indices
+            ]
+            added_actions = [
+                (
+                    float(child.fraction),
+                    float(sigma[row_index, child.child_index]),
+                )
+                for child in projection.added_children
+            ]
+            merged = merge_added_action_mass(
+                base_masses,
+                base_fractions,
+                base_positions,
+                added_actions,
+            )
+            rows.append(tuple(float(value) for value in merged.masses))
+            merged_by_row[int(row_index)] = float(merged.merged_mass)
+            if merged.dropped_mass > 0.0:
+                dropped_by_row[int(row_index)] = float(merged.dropped_mass)
+            if merged.drop_reason:
+                drop_reason_by_row[int(row_index)] = str(
+                    merged.drop_reason
+                )
+
+        projected = (
+            np.asarray(rows, dtype=sigma.dtype)
+            if rows
+            else np.empty(
+                (0, len(projection.base_child_indices)), dtype=sigma.dtype
+            )
+        )
+        return (
+            projected,
+            merged_by_row,
+            dropped_by_row,
+            drop_reason_by_row,
+        )
 
     def _replay_street_node(
         self,

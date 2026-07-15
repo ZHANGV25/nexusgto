@@ -394,6 +394,7 @@ class LiveResolveSource(StrategySource):
         vec_mode: bool = False, readout: str = "avg", num_threads: int = 0,
         num_rollouts: int = 3, cache_k: int = 1,
         belief_carry: Optional[bool] = None,
+        offtree_add: Optional[bool] = None,
     ) -> None:
         self._config = config
         self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
@@ -436,6 +437,9 @@ class LiveResolveSource(StrategySource):
         # per-job /v1 source pays stash extraction but dies before consuming it.
         self._belief_carry_override = belief_carry
         self._belief_session = None
+        # Same per-call override contract as belief carry. None follows the
+        # environment; explicit True/False is used by in-process A/B harnesses.
+        self._offtree_add_override = offtree_add
         # RECORDED per call (call-local, like RecordingHybridSource): how the
         # last get_mix seeded its ranges — "blueprint_preflop_sigma" or
         # "uniform". The engine provider reads this to DISCLOSE uniform
@@ -445,12 +449,19 @@ class LiveResolveSource(StrategySource):
         self.last_range_seeding: Optional[str] = None
         # Structured per-call disclosure. None is the flag-OFF contract.
         self.last_belief_carry: Optional[dict] = None
+        self.last_offtree_add: Optional[dict] = None
 
     def _belief_carry_enabled(self) -> bool:
         if self._belief_carry_override is not None:
             return bool(self._belief_carry_override)
         value = os.environ.get("NEXUS_BELIEF_CARRY", "")
         return value[:1] in ("1", "t", "T", "y", "Y")
+
+    def _offtree_add_enabled(self) -> bool:
+        if self._offtree_add_override is not None:
+            return bool(self._offtree_add_override)
+        from app.engine.agent.offtree_add import offtree_add_enabled
+        return offtree_add_enabled()
 
     def _ensure_engine(self):
         if self._engine is not None:
@@ -506,6 +517,33 @@ class LiveResolveSource(StrategySource):
             hero_grid_row,
             labels_to_index_freqs,
         )
+
+        offtree_enabled = self._offtree_add_enabled()
+        if offtree_enabled:
+            self.last_offtree_add = {
+                "enabled": True,
+                "events": [
+                    {
+                        "step": int(step),
+                        "increment": int(increment),
+                        "pot_before": int(pot_before),
+                        "to_call_before": int(to_call_before),
+                        "stack_before": int(stack_before),
+                    }
+                    for (step, increment, pot_before, to_call_before,
+                         stack_before)
+                    in state.street_offtree_raises
+                ],
+                "added_first": [],
+                "added_subsequent": [],
+                "skipped": [],
+                "replayed_through_added": False,
+                "hero_merged_mass": 0.0,
+                "dropped": False,
+                "drop_reason": None,
+            }
+        else:
+            self.last_offtree_add = None
 
         belief_enabled = self._belief_carry_enabled()
         belief_session = None
@@ -591,6 +629,49 @@ class LiveResolveSource(StrategySource):
         subsequent = list(state.subsequent_bet_sizes)
         add_allin = bool(state.add_explicit_allin)
 
+        offtree_analysis = None
+        offtree_plan = None
+        if offtree_enabled:
+            from app.engine.agent.offtree_add import build_offtree_extension
+
+            offtree_analysis = build_offtree_extension(
+                state, bet_sizes, subsequent
+            )
+            if offtree_analysis is not None:
+                offtree_plan = offtree_analysis.plan
+                if self.last_offtree_add is None:
+                    raise RuntimeError(
+                        "off-tree analysis exists without enabled disclosure"
+                    )
+                self.last_offtree_add["events"] = [
+                    {
+                        "step": int(event.step),
+                        "increment": int(event.increment),
+                        "pot_before": int(event.pot_before),
+                        "to_call_before": int(event.to_call_before),
+                        "stack_before": int(event.stack_before),
+                        "fraction": float(event.fraction),
+                        "raise_level": str(event.raise_level),
+                    }
+                    for event in offtree_analysis.events
+                ]
+                self.last_offtree_add["skipped"] = [
+                    {
+                        "step": int(skip.step),
+                        "fraction": float(skip.fraction),
+                        "raise_level": str(skip.raise_level),
+                        "reason": str(skip.reason),
+                    }
+                    for skip in offtree_analysis.skipped
+                ]
+                if offtree_plan is not None:
+                    self.last_offtree_add["added_first"] = list(
+                        offtree_plan.added_first
+                    )
+                    self.last_offtree_add["added_subsequent"] = list(
+                        offtree_plan.added_subsequent
+                    )
+
         hero_idx = inputs["hero_player_idx"]
         belief_stash = None
         belief_solve_kwargs = {}
@@ -619,33 +700,112 @@ class LiveResolveSource(StrategySource):
             )
         else:
             _arm_cm = contextlib.nullcontext()
+        _offtree_extension_served = False
         try:
             with _arm_cm:
-                all_by_player = engine.solve(
-                    board_strs=inputs["board_strs"],
-                    board_ints=inputs["board_ints"],
-                    player_ranges=inputs["player_ranges"],
-                    positions_sorted=inputs["positions_sorted"],
-                    player_seats=inputs["player_seats"],
-                    pot_bb=inputs["pot_bb"],
-                    stack_bb=inputs["stack_bb"],
-                    bet_sizes=bet_sizes,
-                    subsequent_bet_sizes=subsequent,
-                    add_explicit_allin=add_allin,
-                    game_action_indices=inputs["game_action_indices"],
-                    iterations=self._iterations,
-                    num_threads=self._num_threads,
-                    num_rollouts=self._num_rollouts,
-                    cache_k=self._cache_k,
-                    vec_mode=1 if self._vec_mode else 0,
-                    readout=self._readout,
-                    hero_replay={
-                        "player_idx": hero_idx,
-                        "street_actions": inputs["street_actions"],
-                        "expected_actions": inputs["n_legal"],
-                    },
-                    **belief_solve_kwargs,
-                )
+                if offtree_plan is not None:
+                    from app.engine.cpu_es_solver import (
+                        OffTreeExtensionUnsafe,
+                    )
+
+                    try:
+                        all_by_player = engine.solve(
+                            board_strs=inputs["board_strs"],
+                            board_ints=inputs["board_ints"],
+                            player_ranges=inputs["player_ranges"],
+                            positions_sorted=inputs["positions_sorted"],
+                            player_seats=inputs["player_seats"],
+                            pot_bb=inputs["pot_bb"],
+                            stack_bb=inputs["stack_bb"],
+                            bet_sizes=list(offtree_plan.bet_sizes),
+                            subsequent_bet_sizes=list(
+                                offtree_plan.subsequent_bet_sizes
+                            ),
+                            add_explicit_allin=add_allin,
+                            game_action_indices=inputs["game_action_indices"],
+                            iterations=self._iterations,
+                            num_threads=self._num_threads,
+                            num_rollouts=self._num_rollouts,
+                            cache_k=self._cache_k,
+                            vec_mode=1 if self._vec_mode else 0,
+                            readout=self._readout,
+                            hero_replay={
+                                "player_idx": hero_idx,
+                                "street_actions": inputs["street_actions"],
+                                "expected_actions": inputs["n_legal"],
+                                "offtree": {
+                                    "base_bet_sizes": list(bet_sizes),
+                                    "base_subsequent_bet_sizes": list(
+                                        subsequent
+                                    ),
+                                    "event_fractions": dict(
+                                        offtree_plan.event_fractions
+                                    ),
+                                },
+                            },
+                            **belief_solve_kwargs,
+                        )
+                        _offtree_extension_served = True
+                    except OffTreeExtensionUnsafe as unsafe:
+                        if self.last_offtree_add is None:
+                            raise RuntimeError(
+                                "unsafe off-tree extension without disclosure"
+                            ) from unsafe
+                        self.last_offtree_add["dropped"] = True
+                        self.last_offtree_add["drop_reason"] = str(unsafe)
+                        # Fail safe exactly once: rebuild/solve the unextended
+                        # base tree through the shipped replay path.
+                        all_by_player = engine.solve(
+                            board_strs=inputs["board_strs"],
+                            board_ints=inputs["board_ints"],
+                            player_ranges=inputs["player_ranges"],
+                            positions_sorted=inputs["positions_sorted"],
+                            player_seats=inputs["player_seats"],
+                            pot_bb=inputs["pot_bb"],
+                            stack_bb=inputs["stack_bb"],
+                            bet_sizes=bet_sizes,
+                            subsequent_bet_sizes=subsequent,
+                            add_explicit_allin=add_allin,
+                            game_action_indices=inputs["game_action_indices"],
+                            iterations=self._iterations,
+                            num_threads=self._num_threads,
+                            num_rollouts=self._num_rollouts,
+                            cache_k=self._cache_k,
+                            vec_mode=1 if self._vec_mode else 0,
+                            readout=self._readout,
+                            hero_replay={
+                                "player_idx": hero_idx,
+                                "street_actions": inputs["street_actions"],
+                                "expected_actions": inputs["n_legal"],
+                            },
+                            **belief_solve_kwargs,
+                        )
+                else:
+                    all_by_player = engine.solve(
+                        board_strs=inputs["board_strs"],
+                        board_ints=inputs["board_ints"],
+                        player_ranges=inputs["player_ranges"],
+                        positions_sorted=inputs["positions_sorted"],
+                        player_seats=inputs["player_seats"],
+                        pot_bb=inputs["pot_bb"],
+                        stack_bb=inputs["stack_bb"],
+                        bet_sizes=bet_sizes,
+                        subsequent_bet_sizes=subsequent,
+                        add_explicit_allin=add_allin,
+                        game_action_indices=inputs["game_action_indices"],
+                        iterations=self._iterations,
+                        num_threads=self._num_threads,
+                        num_rollouts=self._num_rollouts,
+                        cache_k=self._cache_k,
+                        vec_mode=1 if self._vec_mode else 0,
+                        readout=self._readout,
+                        hero_replay={
+                            "player_idx": hero_idx,
+                            "street_actions": inputs["street_actions"],
+                            "expected_actions": inputs["n_legal"],
+                        },
+                        **belief_solve_kwargs,
+                    )
         except Exception as e:
             if belief_session is not None and belief_stash is not None:
                 # Never leave an older same-street stash pending after the
@@ -689,6 +849,10 @@ class LiveResolveSource(StrategySource):
             from app.engine.cpu_es_solver import ReplayUnsupported
             if isinstance(e, ReplayUnsupported) or \
                     type(e).__name__ == "ReplayUnsupported":
+                if (self.last_offtree_add is not None
+                        and offtree_plan is not None):
+                    self.last_offtree_add["dropped"] = True
+                    self.last_offtree_add["drop_reason"] = str(e)
                 raise LiveResolveUnsupported(str(e)) from e
             raise
 
@@ -738,6 +902,35 @@ class LiveResolveSource(StrategySource):
             self.last_belief_carry = belief_session.summary()
 
         row = hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
+        if self.last_offtree_add is not None and offtree_plan is not None:
+            stats = getattr(engine, "_last_solve_stats", None) or {}
+            self.last_offtree_add["replayed_through_added"] = bool(
+                stats.get("offtree_replayed_through", False)
+            )
+            merged_by_row = stats.get(
+                "offtree_hero_merged_mass_by_row", {}
+            ) or {}
+            dropped_by_row = stats.get(
+                "offtree_hero_dropped_mass_by_row", {}
+            ) or {}
+            reason_by_row = stats.get(
+                "offtree_hero_drop_reason_by_row", {}
+            ) or {}
+            self.last_offtree_add["hero_merged_mass"] = float(
+                merged_by_row.get(row, merged_by_row.get(str(row), 0.0))
+            )
+            served_dropped_mass = float(
+                dropped_by_row.get(row, dropped_by_row.get(str(row), 0.0))
+            )
+            if (served_dropped_mass > 0.0
+                    and not self.last_offtree_add["dropped"]):
+                self.last_offtree_add["dropped"] = True
+                self.last_offtree_add["drop_reason"] = str(
+                    reason_by_row.get(
+                        row,
+                        reason_by_row.get(str(row), "no_base_raise_child"),
+                    )
+                )
         strat = all_by_player.get(hero_idx, {}).get(row)
         n_legal = int(inputs["n_legal"])
 
@@ -760,6 +953,14 @@ class LiveResolveSource(StrategySource):
         )
         if not freqs:
             return ActionMix.uniform(n_legal, is_fallback=True)
+        if _offtree_extension_served:
+            # CpuEsSolver projects all extended children into the base label
+            # universe. Preserve literal-zero base actions as keys so the
+            # served arity remains exactly the agent's legal arity.
+            freqs = {
+                action_idx: float(freqs.get(action_idx, 0.0))
+                for action_idx in range(n_legal)
+            }
         return ActionMix(freqs)
 
 

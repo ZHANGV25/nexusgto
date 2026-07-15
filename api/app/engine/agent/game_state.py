@@ -440,6 +440,10 @@ class GameState:
             (a suffix of postflop_history; reset when a betting round
             closes). Live-resolve node replay reads this — it is tracked
             here so callers never re-derive street segmentation by hand.
+        street_offtree_raises: off-tree genuine-raise observations on the
+            CURRENT street as (step, increment, pot_before, to_call_before,
+            stack_before). Reset with street_history when the betting round
+            closes.
         to_act_slot: compact slot whose turn it is, or None if the hand/street
             is terminal (one player left or river betting complete).
         current_bet: chips the current outstanding bet requires (street-local).
@@ -460,6 +464,7 @@ class GameState:
     preflop_prefix: Tuple[int, ...]
     postflop_history: Tuple[int, ...] = ()
     street_history: Tuple[int, ...] = ()
+    street_offtree_raises: Tuple[Tuple[int, int, int, int, int], ...] = ()
     to_act_slot: Optional[int] = 0
     current_bet: int = 0
     street_bets: Tuple[int, ...] = ()
@@ -650,6 +655,7 @@ class GameState:
             slot=slot, action_idx=action_idx, active=active, acted=acted,
             street_bets=street_bets, stacks=stacks, current_bet=current_bet,
             raises=raises, pot=pot,
+            street_offtree_raises=self.street_offtree_raises,
         )
 
     def _after_action(
@@ -664,6 +670,9 @@ class GameState:
         current_bet: int,
         raises: int,
         pot: int,
+        street_offtree_raises: Tuple[
+            Tuple[int, int, int, int, int], ...
+        ],
     ) -> "GameState":
         """Shared post-action tail for advance()/advance_observed():
         record the action index in both histories, find the next actor
@@ -690,6 +699,7 @@ class GameState:
                 pot=pot,
                 postflop_history=new_history,
                 street_history=new_street_history,
+                street_offtree_raises=street_offtree_raises,
                 to_act_slot=(None if self._one_left(active) else next_slot),
             )
 
@@ -745,9 +755,11 @@ class GameState:
         acted = list(self.acted)
         street_bets = list(self.street_bets)
         stacks = list(self.stacks)
+        stack_before = stacks[slot]
         current_bet = self.current_bet
         raises = self.raises_this_street
         pot = self.pot
+        street_offtree_raises = self.street_offtree_raises
         acted[slot] = True
 
         n_nonraise = (1 if facing else 0) + 1
@@ -860,6 +872,14 @@ class GameState:
                 current_bet = max(current_bet, street_bets[slot])
                 raises += 1
                 applied = increment
+                if off_tree:
+                    street_offtree_raises = street_offtree_raises + ((
+                        len(self.street_history),
+                        increment,
+                        pot,
+                        to_call,
+                        stack_before,
+                    ),)
 
         pot += pot_add[0]
 
@@ -867,6 +887,7 @@ class GameState:
             slot=slot, action_idx=idx, active=active, acted=acted,
             street_bets=street_bets, stacks=stacks, current_bet=current_bet,
             raises=raises, pot=pot,
+            street_offtree_raises=street_offtree_raises,
         )
         return ObservedAdvance(
             state=next_state, action_idx=idx, off_tree=off_tree,
@@ -942,6 +963,7 @@ class GameState:
                 pot=pot,
                 postflop_history=history,
                 street_history=(),
+                street_offtree_raises=(),
                 to_act_slot=None,
                 betting_round_closed_count=closed_count,
             )
@@ -956,6 +978,7 @@ class GameState:
             street=next_street,
             postflop_history=history,
             street_history=(),
+            street_offtree_raises=(),
             to_act_slot=first,
             current_bet=0,
             street_bets=tuple([0] * n_slots),
@@ -1059,6 +1082,7 @@ def new_postflop_state(
         preflop_prefix=tuple(preflop_prefix),
         postflop_history=(),
         street_history=(),
+        street_offtree_raises=(),
         to_act_slot=0,
         current_bet=0,
         street_bets=tuple([0] * n),
