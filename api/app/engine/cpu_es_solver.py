@@ -1379,7 +1379,14 @@ class CpuEsSolver:
             # threshold — deterministic AND correct. Large trees (873k flop ext,
             # 5-6p) keep multi-thread. Reach mode already runs single-thread.
             _nn = int(getattr(gpu._tree, "num_nodes", 0))
-            _eff_threads = 1 if (0 < _nn <= 2000 and not use_reach) else num_threads
+            # Sampled leaves are exempt from the small-tree single-thread
+            # force: their per-iteration work is rollout-dominated (~ms per
+            # leaf visit vs ~ns table reads), so Hogwild race windows are
+            # negligible relative to work and wall-clock scales with threads
+            # (measured 2026-07-17: 3p sampled 50k iters = 836s single-thread).
+            _eff_threads = (1 if (0 < _nn <= 2000 and not use_reach
+                                  and not _leaf_sampled)
+                            else num_threads)
             if _leaf_sampled:
                 cs.set_deadline_ms(_sampled_deadline)
             t1 = time.time()
