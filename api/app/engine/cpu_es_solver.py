@@ -62,7 +62,7 @@ _ENV_MUTATION_LOCK = threading.Lock()
 # Per-leaf flop-history buffer width the C real-oracle (es_real_oracle.c)
 # copies — MUST equal ESRO_MAX_FLOP_HIST in poker-solver
 # (python/es_resolver/run_real_spot_c.py:35, the validated caller). Only used
-# on the NEXUS_LEAF_ROLLOUT construct path.
+# on the lazy and sampled C leaf-oracle construct paths.
 _ESRO_MAX_FLOP_HIST = 256
 
 
@@ -171,6 +171,51 @@ def _leaf_rollout_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _leaf_sampled_enabled() -> bool:
+    """Fresh per-visit sampled leaf oracle -- DEFAULT OFF.
+
+    Unlike ``NEXUS_LEAF_ROLLOUT`` this mode does not cache an all-hands leaf
+    table. Each scalar traversal samples the continuation hands and policy in
+    C. The eager serving path is untouched while the flag is absent/off.
+    """
+    v = os.environ.get("NEXUS_LEAF_SAMPLED", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
+def _leaf_sampled_policy() -> int:
+    """Parse the sampled-oracle continuation policy (0 or 1)."""
+    raw = os.environ.get("NEXUS_LEAF_SAMPLED_POLICY") or "1"
+    try:
+        policy = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_LEAF_SAMPLED_POLICY={raw!r} is not an integer"
+        ) from None
+    if policy not in (0, 1):
+        raise ValueError(
+            "NEXUS_LEAF_SAMPLED_POLICY must be 0 (uniform-fresh) or "
+            f"1 (regret-matched), got {policy}"
+        )
+    return policy
+
+
+def _sampled_deadline_ms() -> int:
+    """Parse the optional relative sampled-solve deadline in milliseconds."""
+    raw = os.environ.get("NEXUS_SAMPLED_DEADLINE_MS") or "0"
+    try:
+        deadline_ms = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_SAMPLED_DEADLINE_MS={raw!r} is not an integer"
+        ) from None
+    if not (0 <= deadline_ms <= 0x7FFFFFFFFFFFFFFF):
+        raise ValueError(
+            "NEXUS_SAMPLED_DEADLINE_MS must fit a nonnegative int64, "
+            f"got {deadline_ms}"
+        )
+    return deadline_ms
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -206,6 +251,9 @@ class CpuEsSolver:
         # from the last lazy-oracle solve (es_real_oracle_stats2). None on the
         # eager (default) path — _last_solve_stats.leaf_mode disambiguates.
         self._last_leaf_rollout_stats = None
+        # NEXUS_LEAF_SAMPLED: fresh per-visit oracle counters from the last
+        # sampled solve. None on every other leaf-value path.
+        self._last_sampled_stats = None
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -463,6 +511,19 @@ class CpuEsSolver:
             the dict is replaced with this street's PlainTree + sigma-bar
             readout. ``None`` (the default) performs no stash work.
         """
+        # Sampled leaves are scalar-only. Apply their precedence before the
+        # normal vec/readout validation so a caller requesting vec + avg is
+        # accepted and run as scalar without changing the requested readout.
+        _sampled_requested = _leaf_sampled_enabled()
+        _rollout_requested = _leaf_rollout_enabled()
+        _sampled_policy = None
+        _sampled_deadline = 0
+        _sampled_iterations_run = None
+        self._last_sampled_stats = None
+        if _sampled_requested:
+            vec_mode = 0
+            _sampled_policy = _leaf_sampled_policy()
+            _sampled_deadline = _sampled_deadline_ms()
         if vec_mode and readout != "final":
             raise ValueError(
                 "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
@@ -503,6 +564,54 @@ class CpuEsSolver:
                 f"{len(board_strs)}"
             )
         street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
+
+        # Sampled mode is a distinct leaf-value strategy even on a native
+        # zero-leaf river/chance tree, where no sampled context is constructed.
+        # Reject incompatible operator intent before the tree shape can bypass
+        # these guards.
+        if _sampled_requested:
+            if _rollout_requested:
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_ROLLOUT=1; enable exactly one leaf oracle")
+            if _a3_cont_ev_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_A3_CONT_EV=1")
+            if _a3_cont_ev_turn_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_A3_CONT_EV_TURN=1")
+            if _cont_ev_bias_action_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_CONT_EV_BIAS_ACTION=1")
+            if _cont_ev_miss_fallback_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_CONT_EV_MISS_FALLBACK=1")
+            if os.environ.get("CONT_EV_CATALOG_MANIFEST"):
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "CONT_EV_CATALOG_MANIFEST")
+            _sampled_cev_would_arm = (
+                self._cev_holder is not None
+                and ((street == "flop" and n_players >= 3)
+                     or (street == "turn" and n_players >= 3
+                         and _a3_cont_ev_turn_enabled()))
+            )
+            if _sampled_cev_would_arm:
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with the "
+                    "loaded/armed cont_ev boundary")
+            _sampled_cond_on = os.environ.get(
+                "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
+                    "0", "f", "F", "n", "N")
+            if _sampled_cond_on:
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 requires "
+                    "NEXUS_LEAF_RANGE_CONDITIONING=0: sampled leaves "
+                    "bypass the eager per-leaf range-conditioning construct")
 
         _base_bet_sizes = list(bet_sizes)
         _base_subsequent_sizes = list(subsequent_bet_sizes)
@@ -699,7 +808,9 @@ class CpuEsSolver:
                 # the construct site and stats below stay well-defined.
                 leaf_mode = "table_eager"
                 _leaf_rollout = False
+                _leaf_sampled = False
                 _oracle_arrays = None
+                self._last_leaf_rollout_stats = None
             else:
                 # Encode the per-leaf flop history under the TRAINED manifest
                 # vocab (bet-vocab desync fix) — NOT the subgame/tree-build
@@ -723,8 +834,15 @@ class CpuEsSolver:
                 # leaves the CFR walk visits (the ~27min 6p exhaustive-fill
                 # bypass; the fill is >=99.7% of solve time). See
                 # _leaf_rollout_enabled() for the full contract.
-                _leaf_rollout = _leaf_rollout_enabled()
-                leaf_mode = "rollout_lazy" if _leaf_rollout else "table_eager"
+                _leaf_rollout = _rollout_requested
+                _leaf_sampled = _sampled_requested
+                if _leaf_sampled:
+                    leaf_mode = "sampled_per_visit"
+                elif _leaf_rollout:
+                    leaf_mode = "rollout_lazy"
+                else:
+                    leaf_mode = "table_eager"
+                self._last_leaf_rollout_stats = None
 
                 if _leaf_rollout:
                     # ── INTERACTION GUARDS: rollout mode BYPASSES the eager
@@ -820,6 +938,11 @@ class CpuEsSolver:
                 # THIS construct iff the flag is on, the table is loaded, and
                 # this is a flop multiway spot (the consumer's own predicate).
                 # When off, none of these globals are touched. ──
+                if _leaf_sampled:
+                    _oracle_arrays = self._build_real_oracle_leaf_state(
+                        gpu._tree, leaf_infos, n_players, player_seats)
+                    table = None
+
                 a3_armed = (
                     self._cev_holder is not None
                     and street == "flop"
@@ -960,8 +1083,8 @@ class CpuEsSolver:
                 # construct_s stays 0.0 and we go straight to construction.
                 t0 = time.time()
                 try:
-                    if _leaf_rollout:
-                        pass  # no eager fill; from_real_oracle at construct site
+                    if _leaf_rollout or _leaf_sampled:
+                        pass  # leaf oracle is constructed at the solver site
                     elif per_leaf_ranges is not None:
                         table = rc.compute_subgame_leaf_values_sampled_perleaf_c(
                             leaf_infos=leaf_infos, board=board_ints, street=street,
@@ -1099,7 +1222,29 @@ class CpuEsSolver:
                     print(f"CpuEsSolver DIAG: table dump failed: {_e}", file=sys.stderr, flush=True)
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
-            if _leaf_rollout:
+            if _leaf_sampled:
+                # Fresh per-visit blueprint rollout. The resolver seed is the
+                # sole RNG source for traversal hands, actions, continuation
+                # biases, and rollouts, so map the public master_seed here.
+                # There is deliberately no cache_k or oracle master_seed.
+                _street_code = 1 if street == "flop" else 2
+                (_so_n_leaves, _so_pot, _so_bets, _so_active,
+                 _so_hist, _so_hist_len, _so_seats) = _oracle_arrays
+                cs = self._CSolver.from_sampled_oracle(
+                    gpu._tree,
+                    self._bp_handle.value,
+                    street=_street_code,
+                    stack_chips=stack_chips,
+                    n_leaves=_so_n_leaves,
+                    max_h=max_h,
+                    pot=_so_pot, bets=_so_bets, active=_so_active,
+                    hist_flat=_so_hist, hist_len=_so_hist_len,
+                    player_seats=_so_seats,
+                    num_rollouts=num_rollouts,
+                    bias_policy=_sampled_policy,
+                    seed=master_seed,
+                )
+            elif _leaf_rollout:
                 # LAZY real-blueprint-rollout oracle (NEXUS_LEAF_ROLLOUT=1).
                 # Construct the solver over the SAME tree but with the C
                 # es_real_oracle instead of the eager table: leaf values are
@@ -1170,6 +1315,11 @@ class CpuEsSolver:
                 cs = self._CSolver.from_table(
                     gpu._tree, table, n_players, max_h, seed=1)
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
+            if _sampled_requested:
+                # The C default inherits ES_OPP_ENUMERATE when opp_mode is -1.
+                # Pin sampling explicitly so a box-level research env cannot
+                # defeat sampled mode's no-opponent-enumeration precedence.
+                cs.set_opp_mode(0)
 
             # In-tree CHANCE handling. A 2p flop/turn tree extends through a chance
             # node (OP3 turn-extension). Single-card-per-iter sampling is high-
@@ -1197,7 +1347,8 @@ class CpuEsSolver:
             _reach = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
                 "1", "t", "T", "y", "Y")
             use_reach = (
-                tree_has_chance and n_players == 2 and _reach
+                not _sampled_requested
+                and tree_has_chance and n_players == 2 and _reach
                 and hasattr(cs, "set_reach_mode")
             )
             if use_reach:
@@ -1211,11 +1362,12 @@ class CpuEsSolver:
                 vec_mode = 0
             elif tree_has_chance and hasattr(cs, "set_chance_mode"):
                 cs.set_chance_mode(1)   # enumerate card outcomes (correct)
-                if n_players <= 3 and hasattr(cs, "set_opp_mode"):
+                if (not _sampled_requested and n_players <= 3
+                        and hasattr(cs, "set_opp_mode")):
                     cs.set_opp_mode(1)  # full CFR over opponent actions (2-3p)
                     cs.set_vec_mode(1)  # all traverser hands per walk
                     vec_mode = 1        # force vec for the readout below
-            if vec_mode:
+            if vec_mode and not _sampled_requested:
                 cs.set_vec_mode(1)
             # SMALL-TREE -> SINGLE-THREAD (2026-06-16). Multi-thread Hogwild on a
             # tiny tree is dominated by race noise: the Pluribus-faithful 2p flop
@@ -1228,9 +1380,13 @@ class CpuEsSolver:
             # 5-6p) keep multi-thread. Reach mode already runs single-thread.
             _nn = int(getattr(gpu._tree, "num_nodes", 0))
             _eff_threads = 1 if (0 < _nn <= 2000 and not use_reach) else num_threads
+            if _leaf_sampled:
+                cs.set_deadline_ms(_sampled_deadline)
             t1 = time.time()
             cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
+            if _leaf_sampled:
+                _sampled_iterations_run = cs.iterations_run()
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
 
             # BELIEF CARRY STASH (NEXUS_BELIEF_CARRY, default OFF). The output
@@ -1298,6 +1454,37 @@ class CpuEsSolver:
                     logger.warning("leaf-rollout stats read failed: %s", _e)
                     self._last_leaf_rollout_stats = None
 
+            if _leaf_sampled:
+                try:
+                    (_visits, _rollouts, _errs, _uniform_visits,
+                     _uniform_rollouts, _regret_visits,
+                     _regret_rollouts) = cs.sampled_oracle_stats()
+                    self._last_sampled_stats = {
+                        "leaf_visits": int(_visits),
+                        "rollouts": int(_rollouts),
+                        "oracle_errors": int(_errs),
+                        "uniform_visits": int(_uniform_visits),
+                        "uniform_rollouts": int(_uniform_rollouts),
+                        "regret_visits": int(_regret_visits),
+                        "regret_rollouts": int(_regret_rollouts),
+                    }
+                    logger.info(
+                        "CpuEsSolver sampled-leaf: %dp %s policy=%d "
+                        "visits=%d rollouts=%d errors=%d uniform=%d/%d "
+                        "regret=%d/%d iterations=%d/%d deadline_ms=%d",
+                        n_players, street, _sampled_policy, _visits,
+                        _rollouts, _errs, _uniform_visits, _uniform_rollouts,
+                        _regret_visits, _regret_rollouts,
+                        _sampled_iterations_run, iterations,
+                        _sampled_deadline,
+                    )
+                    if _errs:
+                        logger.warning(
+                            "CpuEsSolver sampled-leaf: %d oracle errors", _errs)
+                except Exception as _e:  # observability must not break a solve
+                    logger.warning("sampled-leaf stats read failed: %s", _e)
+                    self._last_sampled_stats = None
+
             # BR-GAP EXPOSE (NEXUS_BR_GAP_EXPOSE=1, default OFF). Stash the GENUINE
             # production solve objects (tree snapshot + leaf table + served sigma)
             # so an offline per-spot correctness harness can compute the in-tree
@@ -1342,6 +1529,11 @@ class CpuEsSolver:
                             _br_table = None
                         if _br_table is None:
                             _br_table_source = "rollout_oracle_unavailable"
+                    elif _leaf_sampled:
+                        # A fresh per-visit oracle has no coherent dense table
+                        # to expose for the optional offline BR-gap harness.
+                        _br_table = None
+                        _br_table_source = "sampled_oracle_unavailable"
                     self._last_br_gap_objs = {
                         "tree": _tree_snap, "table": _br_table, "sigma": _sigma,
                         "table_source": _br_table_source,
@@ -1604,15 +1796,26 @@ class CpuEsSolver:
                 "n_players": n_players,
                 "street": street,
                 # leaf-value strategy for THIS solve: "table_eager" (shipped
-                # default: exhaustive fill + from_table) vs "rollout_lazy"
-                # (NEXUS_LEAF_ROLLOUT=1: lazy per-visited-leaf real oracle).
+                # default: exhaustive fill + from_table), "rollout_lazy"
+                # (cached all-hands oracle), or "sampled_per_visit".
                 "leaf_mode": leaf_mode,
                 "leaf_rollout_stats": self._last_leaf_rollout_stats,
+                "sampled_stats": self._last_sampled_stats,
                 "construct_s": float(construct_s),
                 "solve_s": float(solve_s),
                 "iterations": int(iterations),
+                "iterations_run": int(
+                    _sampled_iterations_run
+                    if _sampled_iterations_run is not None else iterations
+                ),
                 "num_rollouts": int(num_rollouts),
                 "master_seed": int(master_seed),
+                "sampled_policy": (
+                    int(_sampled_policy) if _leaf_sampled else None
+                ),
+                "sampled_deadline_ms": (
+                    int(_sampled_deadline) if _leaf_sampled else None
+                ),
                 "vec_mode": int(vec_mode),
                 "readout": readout,
                 "num_threads": int(num_threads),
@@ -1662,7 +1865,9 @@ class CpuEsSolver:
             logger.info(
                 "CpuEsSolver solve: %dp %s construct=%.1fs solve=%.1fs "
                 "(%d iters, %s threads, off-lock)",
-                n_players, street, construct_s, solve_s, iterations,
+                n_players, street, construct_s, solve_s,
+                (_sampled_iterations_run
+                 if _sampled_iterations_run is not None else iterations),
                 num_threads or "all",
             )
             return all_by_player
@@ -1673,8 +1878,8 @@ class CpuEsSolver:
         self, ss_tree, leaf_infos, n_players: int, player_seats,
     ) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                np.ndarray, np.ndarray]:
-        """Per-leaf flat int32 state arrays for CSolver.from_real_oracle
-        (NEXUS_LEAF_ROLLOUT). Returns
+        """Per-leaf flat int32 state arrays for ``from_real_oracle`` or
+        ``from_sampled_oracle``. Returns
         (n_leaves, pot, bets, active, hist_flat, hist_len, player_seats).
 
         Mirrors poker-solver python/es_resolver/run_real_spot_c.py
@@ -1689,8 +1894,8 @@ class CpuEsSolver:
         seat-relative blueprint lookup matches the served spot.
 
         The C ctx COPIES all arrays, so the numpy buffers here need only outlive
-        the from_real_oracle call. Contiguity/dtype coercion happens in
-        c_solver.from_real_oracle (it re-casts each to C-contiguous int32).
+        the factory call. Both c_solver factories coerce them to C-contiguous
+        int32.
 
         FIDELITY NOTE: the per-leaf active read here is the oracle's contract
         and is the more correct quantity than the eager fill's global

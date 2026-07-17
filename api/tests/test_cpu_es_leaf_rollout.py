@@ -1,4 +1,4 @@
-"""Unit tests for the LAZY leaf-rollout serving mode (NEXUS_LEAF_ROLLOUT).
+"""Unit tests for the lazy and sampled leaf-oracle serving modes.
 
 Mocked at the seam — NO blueprint, NO C libraries. app.engine.cpu_es_solver
 imports only stdlib + numpy at module scope (the C/blueprint loading is inside
@@ -16,11 +16,10 @@ Coverage:
   * interaction guards fail loud: rollout + armed cont_ev / bias-action /
     miss-fallback / 2p range-conditioning.
   * stats recording from real_oracle_stats().
+  * sampled-mode identity, routing, scalar precedence, deadline/stats/guards.
   * solve-level belief-stash hook success + signature-drift fail-safe.
 """
 from __future__ import annotations
-
-import os
 
 import numpy as np
 import pytest
@@ -138,8 +137,18 @@ class _FakeSolver:
 
     last_from_table = None
     last_from_real_oracle = None
+    last_from_sampled_oracle = None
     avg_calls = []
     final_calls = []
+    vec_calls = []
+    chance_calls = []
+    opp_calls = []
+    reach_calls = []
+    deadline_calls = []
+    iterations_run_calls = 0
+    sampled_stats_calls = 0
+    events = []
+    iterations_completed = 1
     avg_sigma = np.asarray([[0.8, 0.2], [0.35, 0.65]], dtype=np.float32)
     final_sigma = np.asarray([[0.1, 0.9], [0.6, 0.4]], dtype=np.float32)
 
@@ -159,10 +168,38 @@ class _FakeSolver:
         cls.last_from_real_oracle = {"tree": tree, "bp_handle": bp_handle, **kw}
         return cls()
 
+    @classmethod
+    def from_sampled_oracle(cls, tree, bp_handle, **kw):
+        cls.last_from_sampled_oracle = {
+            "tree": tree, "bp_handle": bp_handle, **kw}
+        return cls()
+
     # ── solve surface ──
     def set_cfr_mode(self, m): pass
-    def set_vec_mode(self, m): pass
-    def run(self, iterations, num_threads=0): pass
+    def set_vec_mode(self, m):
+        type(self).vec_calls.append(m)
+
+    def set_chance_mode(self, m):
+        type(self).chance_calls.append(m)
+
+    def set_opp_mode(self, m):
+        type(self).opp_calls.append(m)
+
+    def set_reach_mode(self, m):
+        type(self).reach_calls.append(m)
+
+    def set_deadline_ms(self, ms):
+        type(self).deadline_calls.append(ms)
+        type(self).events.append(("deadline", ms))
+
+    def run(self, iterations, num_threads=0):
+        type(self).events.append(("run", iterations, num_threads))
+
+    def iterations_run(self):
+        type(self).iterations_run_calls += 1
+        type(self).events.append(("iterations_run",))
+        return type(self).iterations_completed
+
     def avg_strategy(self, ni):
         type(self).avg_calls.append(ni)
         return type(self).avg_sigma
@@ -173,6 +210,10 @@ class _FakeSolver:
 
     def real_oracle_stats(self):
         return (7, 3, 21, 0)
+
+    def sampled_oracle_stats(self):
+        type(self).sampled_stats_calls += 1
+        return (11, 33, 2, 4, 12, 7, 21)
 
 
 class _FakeRollout:
@@ -215,6 +256,7 @@ def _make_solver(n_players, tree, rc, cev_holder=None):
     s._last_cont_ev_bias_action_stats = None
     s._last_br_gap_objs = None
     s._last_leaf_rollout_stats = None
+    s._last_sampled_stats = None
     s._last_solve_stats = None
 
     tree_for_snapshot = tree
@@ -248,15 +290,45 @@ def _solve_kwargs(n_players, street="flop"):
     )
 
 
+_ISOLATED_ENV_KEYS = (
+    "NEXUS_LEAF_ROLLOUT",
+    "NEXUS_LEAF_CACHE_K",
+    "NEXUS_LEAF_SAMPLED",
+    "NEXUS_LEAF_SAMPLED_POLICY",
+    "NEXUS_SAMPLED_DEADLINE_MS",
+    "NEXUS_A3_CONT_EV",
+    "NEXUS_A3_CONT_EV_TURN",
+    "NEXUS_CONT_EV_BIAS_ACTION",
+    "NEXUS_CONT_EV_MISS_FALLBACK",
+    "CONT_EV_CATALOG_MANIFEST",
+    "NEXUS_LEAF_RANGE_CONDITIONING",
+    "NEXUS_ALLOW_CHANCE_SOLVE",
+    "NEXUS_ES_REACH",
+)
+
+
 @pytest.fixture(autouse=True)
-def _reset_fake_solver():
+def _reset_fake_solver(monkeypatch):
     _FakeSolver.last_from_table = None
     _FakeSolver.last_from_real_oracle = None
+    _FakeSolver.last_from_sampled_oracle = None
     _FakeSolver.avg_calls = []
     _FakeSolver.final_calls = []
-    # never leave NEXUS_LEAF_ROLLOUT set across tests
-    yield
-    os.environ.pop("NEXUS_LEAF_ROLLOUT", None)
+    _FakeSolver.vec_calls = []
+    _FakeSolver.chance_calls = []
+    _FakeSolver.opp_calls = []
+    _FakeSolver.reach_calls = []
+    _FakeSolver.deadline_calls = []
+    _FakeSolver.iterations_run_calls = 0
+    _FakeSolver.sampled_stats_calls = 0
+    _FakeSolver.events = []
+    _FakeSolver.iterations_completed = 1
+    # Measurement/serving env from the invoking box must not select a mode or
+    # trip a guard in these pure fake-backed tests. monkeypatch restores every
+    # original value after the test, including values set by the test itself.
+    for key in _ISOLATED_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("NEXUS_LEAF_RANGE_CONDITIONING", "0")
 
 
 # ── flag parsing ──────────────────────────────────────────────────────────
@@ -344,6 +416,209 @@ def test_flag_on_records_oracle_stats(monkeypatch):
     assert st == {"leaf_fills": 7, "cache_hits": 3,
                   "rollout_sims": 21, "oracle_errors": 0}
     assert s._last_solve_stats["leaf_rollout_stats"] == st
+
+
+# ── fresh per-visit sampled leaf oracle ─────────────────────────────────────
+def test_sampled_off_is_eager_noop_even_with_sampled_knobs(monkeypatch):
+    """Sampled-only sub-knobs are inert until the mode flag is enabled."""
+    n = 3
+    baseline_rc = _FakeRollout()
+    baseline = _make_solver(n, _FakeTree(n), baseline_rc)
+    baseline_result = baseline.solve(**_solve_kwargs(n))
+
+    # Deliberately invalid values prove neither parser nor sampled CSolver API
+    # is touched while the default-off mode flag is absent.
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED_POLICY", "not-an-int")
+    monkeypatch.setenv("NEXUS_SAMPLED_DEADLINE_MS", "also-not-an-int")
+    probed_rc = _FakeRollout()
+    probed = _make_solver(n, _FakeTree(n), probed_rc)
+    probed_result = probed.solve(**_solve_kwargs(n))
+
+    assert probed_result == baseline_result
+    assert baseline_rc.eager_fill_calls == 1
+    assert probed_rc.eager_fill_calls == 1
+    assert _FakeSolver.last_from_table is not None
+    assert _FakeSolver.last_from_real_oracle is None
+    assert _FakeSolver.last_from_sampled_oracle is None
+    assert _FakeSolver.deadline_calls == []
+    assert _FakeSolver.iterations_run_calls == 0
+    assert _FakeSolver.sampled_stats_calls == 0
+    assert probed._last_sampled_stats is None
+    assert probed._last_solve_stats["leaf_mode"] == "table_eager"
+    assert probed._last_solve_stats["sampled_stats"] is None
+    assert probed._last_solve_stats["sampled_policy"] is None
+    assert probed._last_solve_stats["sampled_deadline_ms"] is None
+
+
+@pytest.mark.parametrize(
+    ("policy_value", "expected_policy"),
+    [(None, 1), ("0", 0)],
+)
+def test_sampled_routes_with_policy_seed_and_leaf_arrays(
+    monkeypatch, policy_value, expected_policy,
+):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    if policy_value is not None:
+        monkeypatch.setenv("NEXUS_LEAF_SAMPLED_POLICY", policy_value)
+    n = 3
+    tree = _FakeTree(n)
+    rc = _FakeRollout()
+    s = _make_solver(n, tree, rc)
+    kwargs = _solve_kwargs(n)
+
+    s.solve(**kwargs)
+
+    assert rc.eager_fill_calls == 0
+    assert _FakeSolver.last_from_table is None
+    assert _FakeSolver.last_from_real_oracle is None
+    call = _FakeSolver.last_from_sampled_oracle
+    assert call is not None
+    assert call["tree"] is tree
+    assert call["bp_handle"] == 0xDEADBEEF
+    assert call["street"] == 1
+    assert call["stack_chips"] == int(round(95.0 * 100))
+    assert call["n_leaves"] == 2
+    assert call["max_h"] == 6
+    assert call["num_rollouts"] == 3
+    assert call["bias_policy"] == expected_policy
+    # The sampled oracle has one RNG: the resolver seed. The public solve seed
+    # maps to it; cached-oracle-only arguments must never leak into this call.
+    assert call["seed"] == kwargs["master_seed"]
+    assert "cache_k" not in call
+    assert "master_seed" not in call
+    assert call["pot"].tolist() == [200, 400]
+    assert call["bets"].tolist() == [100, 100, 100, 200, 200, 200]
+    assert call["active"].tolist() == [1, 1, 1, 1, 1, 1]
+    assert call["hist_len"].tolist() == [2, 1]
+    assert call["player_seats"].tolist() == [0, 1, 2]
+    assert s._last_solve_stats["leaf_mode"] == "sampled_per_visit"
+    assert s._last_solve_stats["sampled_policy"] == expected_policy
+    assert s._last_solve_stats["sampled_deadline_ms"] == 0
+
+
+def test_sampled_records_all_oracle_stats(monkeypatch):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    n = 3
+    s = _make_solver(n, _FakeTree(n), _FakeRollout())
+
+    s.solve(**_solve_kwargs(n))
+
+    expected = {
+        "leaf_visits": 11,
+        "rollouts": 33,
+        "oracle_errors": 2,
+        "uniform_visits": 4,
+        "uniform_rollouts": 12,
+        "regret_visits": 7,
+        "regret_rollouts": 21,
+    }
+    assert _FakeSolver.sampled_stats_calls == 1
+    assert s._last_sampled_stats == expected
+    assert s._last_solve_stats["sampled_stats"] == expected
+
+
+def test_sampled_deadline_wraps_run_and_records_actual_iterations(monkeypatch):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    monkeypatch.setenv("NEXUS_SAMPLED_DEADLINE_MS", "250")
+    _FakeSolver.iterations_completed = 23
+    n = 3
+    s = _make_solver(n, _FakeTree(n), _FakeRollout())
+    kwargs = _solve_kwargs(n)
+    kwargs["iterations"] = 50
+
+    s.solve(**kwargs)
+
+    assert _FakeSolver.events == [
+        ("deadline", 250),
+        ("run", 50, 1),
+        ("iterations_run",),
+    ]
+    assert _FakeSolver.deadline_calls == [250]
+    assert _FakeSolver.iterations_run_calls == 1
+    assert s._last_solve_stats["iterations"] == 50
+    assert s._last_solve_stats["iterations_run"] == 23
+    assert s._last_solve_stats["sampled_deadline_ms"] == 250
+
+
+def test_sampled_vec_avg_request_runs_scalar_without_forcing_readout(monkeypatch):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    n = 3
+    s = _make_solver(n, _FakeTree(n), _FakeRollout())
+    kwargs = _solve_kwargs(n)
+    kwargs.update(vec_mode=1, readout="avg")
+
+    s.solve(**kwargs)
+
+    assert _FakeSolver.vec_calls == []
+    assert _FakeSolver.opp_calls == [0]
+    assert _FakeSolver.reach_calls == []
+    assert s._last_solve_stats["vec_mode"] == 0
+    assert s._last_solve_stats["readout"] == "avg"
+    assert s._last_solve_stats["use_reach"] is False
+
+
+@pytest.mark.parametrize("n_players", [2, 3])
+def test_sampled_chance_tree_suppresses_vec_opp_and_reach(
+    monkeypatch, n_players,
+):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    monkeypatch.setenv("NEXUS_ALLOW_CHANCE_SOLVE", "1")
+    if n_players == 2:
+        monkeypatch.setenv("NEXUS_LEAF_RANGE_CONDITIONING", "0")
+    tree = _FakeTree(n_players, has_chance=True)
+    s = _make_solver(n_players, tree, _FakeRollout())
+    kwargs = _solve_kwargs(n_players)
+    kwargs.update(vec_mode=1, readout="final")
+
+    s.solve(**kwargs)
+
+    assert _FakeSolver.chance_calls == [1]
+    assert _FakeSolver.vec_calls == []
+    assert _FakeSolver.opp_calls == [0]
+    assert _FakeSolver.reach_calls == []
+    assert s._last_solve_stats["vec_mode"] == 0
+    assert s._last_solve_stats["use_reach"] is False
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "n_players"),
+    [
+        ("NEXUS_LEAF_ROLLOUT", "1", 3),
+        ("NEXUS_A3_CONT_EV", "1", 3),
+        ("NEXUS_A3_CONT_EV_TURN", "1", 3),
+        ("NEXUS_CONT_EV_BIAS_ACTION", "1", 3),
+        ("NEXUS_CONT_EV_MISS_FALLBACK", "1", 3),
+        ("CONT_EV_CATALOG_MANIFEST", "/unused/catalog.json", 3),
+        ("NEXUS_LEAF_RANGE_CONDITIONING", "1", 3),
+    ],
+)
+def test_sampled_rejects_every_forbidden_combination(
+    monkeypatch, env_name, env_value, n_players,
+):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    monkeypatch.setenv(env_name, env_value)
+    rc = _FakeRollout()
+    s = _make_solver(n_players, _FakeTree(n_players), rc)
+
+    with pytest.raises(RuntimeError, match=env_name):
+        s.solve(**_solve_kwargs(n_players))
+
+    assert rc.eager_fill_calls == 0
+    assert _FakeSolver.last_from_table is None
+    assert _FakeSolver.last_from_real_oracle is None
+    assert _FakeSolver.last_from_sampled_oracle is None
+
+
+def test_sampled_conflict_rejected_before_zero_leaf_bypass(monkeypatch):
+    monkeypatch.setenv("NEXUS_LEAF_SAMPLED", "1")
+    monkeypatch.setenv("NEXUS_LEAF_ROLLOUT", "1")
+    monkeypatch.setenv("NEXUS_ALLOW_CHANCE_SOLVE", "1")
+    n = 3
+    tree = _FakeTree(n, n_leaves=0, has_chance=True)
+    s = _make_solver(n, tree, _FakeRollout())
+
+    with pytest.raises(RuntimeError, match="NEXUS_LEAF_ROLLOUT"):
+        s.solve(**_solve_kwargs(n, street="turn"))
 
 
 # ── per-leaf state builder ─────────────────────────────────────────────────
