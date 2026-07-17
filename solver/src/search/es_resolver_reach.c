@@ -622,6 +622,8 @@ void es_reach_profile_read(double *t1, double *t2, double *t3, double *t4) {
  * <= 0 -> all cores. 2p-first: rejects np>2 (5-6p MUST sample; 3p reach is a later
  * extension needing odometer terminal integration). */
 int es_run_reach(ESResolver *r, int64_t iterations, int num_threads) {
+    uint64_t deadline_start_ms = (r->deadline_ms > 0)
+                                 ? es_monotonic_ms() : 0;
     if (r->np != 2) {
         es_set_error("reach mode supports np==2 only (got np=%d); 5-6p must sample",
                      r->np);
@@ -637,13 +639,19 @@ int es_run_reach(ESResolver *r, int64_t iterations, int num_threads) {
 
     uint64_t rng = r->master_seed ^ 0xD1B54A32D192ED03ULL;  /* leaf-oracle stream */
     ESStats local; memset(&local, 0, sizeof(local));
+    int64_t completed = 0;
     for (int64_t it = 0; it < iterations; it++) {
+        if ((it & 4095LL) == 0
+            && es_deadline_expired(r, deadline_start_ms))
+            break;
         for (int trav = 0; trav < r->np; trav++) {
             local.traversals++;
             es_reach_pass(r, trav, it + 1, &rng);
         }
+        completed++;
     }
     es_merge_stats(&r->stats, &local);
+    r->iterations_run = completed;
     return 0;
 }
 

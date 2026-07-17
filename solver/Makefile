@@ -119,16 +119,33 @@ endif
 es_resolver: $(BUILD_DIR)/es_resolver$(SHLIB_EXT)
 es_resolver_real: $(BUILD_DIR)/es_resolver_real$(SHLIB_EXT)
 
-$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/rollout.h | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
-	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
 	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
+
+# Per-visit sampled leaf oracle contracts. rollout_simulate_one is supplied by
+# a deterministic stub, so no blueprint artifact or live rollout is required.
+$(BUILD_DIR)/test_es_sampled_oracle: tests/test_es_sampled_oracle.c \
+        $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h \
+        $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+        $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/es_oracles.c \
+        $(SEARCH_DIR)/rollout_internal.h $(SEARCH_DIR)/rollout.h \
+        $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_sampled_oracle.c \
+	    $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_resolver.c \
+	    $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_sampled_oracle
+test_es_sampled_oracle: $(BUILD_DIR)/test_es_sampled_oracle
+	./$(BUILD_DIR)/test_es_sampled_oracle
 
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
 # Builds with nvcc; requires CUDA toolkit on PATH. Targets sm_75 (T4 on
@@ -642,6 +659,7 @@ test_phase_r_all: test_phase_r_dispatch test_cont_ev_table \
                   test_b3_bucket_alignment test_phase_r_boundary_bucket \
                   test_rollout_cont_ev_boundary \
                   test_rollout_cont_ev_bias_action \
+                  test_es_sampled_oracle \
                   test_cont_ev_standalone_roundtrip \
                   test_turn_all \
                   test_meanfield_all

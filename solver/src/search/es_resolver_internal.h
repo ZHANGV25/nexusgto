@@ -37,6 +37,18 @@ struct ESResolver {
     void *oracle_ctx;
     uint64_t master_seed;
 
+    /* Tagged automatically by es_create from the resolver-local sampled
+     * trampoline callback. Sampled leaves require scalar traversal: vec mode
+     * evaluates hands with incoherent fresh bias draws, while reach mode
+     * enumerates hands and shares an RNG through its parallel terminal pass. */
+    int oracle_is_sampled;
+
+    /* Per-run deadline configuration + last-run completion count. These stay
+     * private rather than extending public ESStats (whose layout is ABI).
+     * deadline_ms <= 0 means disabled; iterations_run resets at es_run entry. */
+    int64_t deadline_ms;
+    int64_t iterations_run;
+
     /* CFR variant. 0 = VANILLA (the validated reference fixed point — plain
      * per-visit strat-sum, no regret discount). 1 = LINEAR CFR matching the GPU
      * (street_solve.cu:1933-1943): strat-sum += t·σ, regrets ·= t/(t+1) per
@@ -145,6 +157,12 @@ extern "C" {
 /* Set the thread-local last-error string (printf-style). Definition (and the
  * g_es_error thread-local buffer it writes) stay in es_resolver.c. */
 NEXUS_INTERNAL void es_set_error(const char *fmt, ...);
+
+/* Cross-platform monotonic clock + deadline predicate shared by the sampling
+ * and reach run loops. The start value is captured once at path entry. */
+NEXUS_INTERNAL uint64_t es_monotonic_ms(void);
+NEXUS_INTERNAL int es_deadline_expired(const ESResolver *r,
+                                       uint64_t start_ms);
 
 /* Regret-matching: positive-regret normalize into a strategy (uniform if all
  * non-positive). Definition in es_resolver.c. */

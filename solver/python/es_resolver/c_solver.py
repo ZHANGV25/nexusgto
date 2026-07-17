@@ -8,10 +8,11 @@ Design (advisor 2026-06-01):
     ctypes.byref(gpu_solver._tree) straight in. No PlainTree snapshot (that was
     only the Python reference's ctypes-lifetime workaround).
   - The leaf oracle is a C function pointer + ctx (es_oracles.c). NEVER a Python
-    callback in the hot path. We expose two oracle factories:
+    callback in the hot path. Deterministic validation factories include:
       from_table(table, np, max_h)  — deterministic table lookup
       joint_zero_sum(strength0, strength1) — 2p zero-sum strength showdown
-    For the real-blueprint rollout oracle see real_oracle_c (separate module).
+    For the real-blueprint rollout oracles use from_real_oracle (cached all-
+    hands) or from_sampled_oracle (fresh per-visit sampled hands/biases).
   - avg_strategy(node_idx) returns an [nh, na] float64 numpy array (matches
     ESSolver.avg_strategy). The C side fills a flat [nh*na] buffer.
 
@@ -34,8 +35,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
 # ES_DLL selects which build to load:
 #   "es_resolver.dll"      — lightweight, table/joint oracles only (validation)
-#   "es_resolver_real.dll" — links rollout + bps_reader; adds the real oracle +
-#                            the BPS loader symbols (real-blueprint path / bench)
+#   "es_resolver_real.dll" — links rollout + bps_reader; adds cached + sampled
+#                            real oracles and BPS loader symbols
 # Platform-aware shared-library extension. Windows builds .dll; Linux (the prod
 # EC2 target) builds .so. ES_DLL may be given with or without an extension; if
 # bare ("es_resolver_real"), the platform extension is appended. NOTE: the Linux
@@ -66,6 +67,7 @@ def _load_dll() -> ctypes.CDLL:
 
 _lib = _load_dll()
 _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
+_HAS_SAMPLED = hasattr(_lib, "es_make_sampled_oracle")
 
 # void* es_create(const SSTreeData*, ESLeafOracle, void* ctx, uint64_t seed)
 _lib.es_create.restype = ctypes.c_void_p
@@ -81,6 +83,12 @@ if hasattr(_lib, "es_set_opp_mode"):
     _lib.es_set_opp_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_reach_mode"):
     _lib.es_set_reach_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_set_deadline_ms"):
+    _lib.es_set_deadline_ms.restype = None
+    _lib.es_set_deadline_ms.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+if hasattr(_lib, "es_iterations_run"):
+    _lib.es_iterations_run.restype = ctypes.c_int64
+    _lib.es_iterations_run.argtypes = [ctypes.c_void_p]
 if hasattr(_lib, "es_exploitability_2p"):
     _lib.es_exploitability_2p.restype = ctypes.c_double
     _lib.es_exploitability_2p.argtypes = [
@@ -160,6 +168,38 @@ if _HAS_REAL:
         _lib.es_real_oracle_get_leaf_table.restype = ctypes.c_int
     _lib.es_free_real_oracle.argtypes = [ctypes.c_void_p]
 
+# Per-visit sampled blueprint-rollout oracle (only in es_resolver_real.dll).
+# Unlike the cached real oracle, this consumes only the resolver's passed RNG;
+# there is deliberately no separate oracle master-seed parameter.
+if _HAS_SAMPLED:
+    _lib.es_make_sampled_oracle.restype = ctypes.c_void_p
+    _lib.es_make_sampled_oracle.argtypes = [
+        ctypes.c_void_p,   # bp (BPSReader*)
+        ctypes.c_void_p,   # tree (SSTreeData*)
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        # street, stack_chips, num_rollouts, bias_policy
+        ctypes.c_int,      # n_leaves
+        ctypes.c_int,      # max_h
+        ctypes.POINTER(ctypes.c_int),  # pot
+        ctypes.POINTER(ctypes.c_int),  # bets
+        ctypes.POINTER(ctypes.c_int),  # active
+        ctypes.POINTER(ctypes.c_int),  # hist_flat
+        ctypes.POINTER(ctypes.c_int),  # hist_len
+        ctypes.POINTER(ctypes.c_int),  # player_seats
+    ]
+    _lib.es_sampled_oracle_fn.restype = ctypes.c_void_p
+    _lib.es_sampled_oracle_stats.restype = None
+    _lib.es_sampled_oracle_stats.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+    _lib.es_sampled_oracle_stats2.restype = None
+    _lib.es_sampled_oracle_stats2.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64)]
+    _lib.es_free_sampled_oracle.restype = None
+    _lib.es_free_sampled_oracle.argtypes = [ctypes.c_void_p]
+
 
 class ESStats(ctypes.Structure):
     _fields_ = [
@@ -213,10 +253,14 @@ class CSolver:
     """
 
     def __init__(self, tree, oracle_fn_ptr, oracle_ctx, seed: int = 0,
-                 _keepalive=None):
+                 _keepalive=None, _sampled_oracle: bool = False):
         self._tree = tree
         self._oracle_ctx = oracle_ctx
         self._real_oracle_ctx = None  # set by from_real_oracle (different free)
+        # Tag sampled ownership before es_create so a constructor failure is
+        # still cleaned up by the type-specific destructor (the generic oracle
+        # free only releases the outer allocation).
+        self._sampled_oracle_ctx = oracle_ctx if _sampled_oracle else None
         self._keepalive = _keepalive  # numpy buffers the oracle borrows
         self._handle = _lib.es_create(
             ctypes.byref(tree), oracle_fn_ptr, oracle_ctx, ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF))
@@ -297,6 +341,52 @@ class CSolver:
         s._real_oracle_ctx = ctx  # for stats + free
         return s
 
+    @classmethod
+    def from_sampled_oracle(cls, tree, bp_handle, street: int, stack_chips: int,
+                            n_leaves: int, max_h: int, pot, bets, active,
+                            hist_flat, hist_len, player_seats,
+                            num_rollouts: int = 3, bias_policy: int = 1,
+                            seed: int = 0) -> "CSolver":
+        """Per-visit sampled blueprint-rollout oracle.
+
+        Policy 0 draws every active player's continuation bias uniformly and
+        freshly on each leaf visit. Policy 1 regret-matches opponent biases and
+        enumerates all four traverser biases before updating the traverser's
+        dense bias-regret row. Opponent hands are the traversal's given sampled
+        hands; there is no cache, all-hands fill, or leaf-value table.
+
+        Requires es_resolver_real. Per-leaf arrays have the same int32,
+        C-contiguous layouts as from_real_oracle; the C context copies them.
+        ``seed`` is the resolver's sole master seed and therefore controls all
+        hand, action, continuation-bias, and rollout randomness. Sampled leaf
+        mode is scalar-only; set_vec_mode(1) and set_reach_mode(1) are rejected.
+        """
+        if not _HAS_SAMPLED:
+            raise RuntimeError(
+                "es_make_sampled_oracle not in this DLL; "
+                "set ES_DLL=es_resolver_real.dll")
+        if bias_policy not in (0, 1):
+            raise ValueError("bias_policy must be 0 (uniform-fresh) or 1 (regret-matched)")
+
+        # Keep arrays alive through the constructor call; C takes owned copies.
+        ka = [np.ascontiguousarray(a, dtype=np.int32)
+              for a in (pot, bets, active, hist_flat, hist_len, player_seats)]
+        ctx = _lib.es_make_sampled_oracle(
+            ctypes.c_void_p(bp_handle), ctypes.byref(tree),
+            street, stack_chips, num_rollouts, bias_policy,
+            n_leaves, max_h,
+            ka[0].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[1].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[2].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[3].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[4].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[5].ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+        if not ctx:
+            raise RuntimeError("es_make_sampled_oracle returned NULL (invalid arguments or OOM)")
+        fn = _lib.es_sampled_oracle_fn()
+        return cls(tree, fn, ctx, seed=seed, _keepalive=None,
+                   _sampled_oracle=True)
+
     def real_oracle_stats(self):
         """(leaf_fills, cache_hits, rollout_sims, oracle_errors)."""
         ctx = getattr(self, "_real_oracle_ctx", None)
@@ -307,6 +397,30 @@ class CSolver:
         _lib.es_real_oracle_stats2(ctx, ctypes.byref(fills), ctypes.byref(hits),
                                    ctypes.byref(sims), ctypes.byref(errs))
         return (fills.value, hits.value, sims.value, errs.value)
+
+    def sampled_oracle_stats(self):
+        """Sampled-oracle counters.
+
+        Returns ``(leaf_visits, rollouts, oracle_errors, uniform_visits,
+        uniform_rollouts, regret_visits, regret_rollouts)``. The policy split is
+        redundant for one immutable-policy context, but makes mixed-run
+        instrumentation and accidental policy drift visible.
+        """
+        ctx = getattr(self, "_sampled_oracle_ctx", None)
+        if ctx is None:
+            return (0, 0, 0, 0, 0, 0, 0)
+        visits = ctypes.c_uint64(0); rollouts = ctypes.c_uint64(0)
+        errs = ctypes.c_uint64(0)
+        uniform_visits = ctypes.c_uint64(0); uniform_rollouts = ctypes.c_uint64(0)
+        regret_visits = ctypes.c_uint64(0); regret_rollouts = ctypes.c_uint64(0)
+        _lib.es_sampled_oracle_stats(
+            ctx, ctypes.byref(visits), ctypes.byref(rollouts), ctypes.byref(errs))
+        _lib.es_sampled_oracle_stats2(
+            ctx, ctypes.byref(uniform_visits), ctypes.byref(uniform_rollouts),
+            ctypes.byref(regret_visits), ctypes.byref(regret_rollouts))
+        return (visits.value, rollouts.value, errs.value,
+                uniform_visits.value, uniform_rollouts.value,
+                regret_visits.value, regret_rollouts.value)
 
     def get_oracle_leaf_table(self):
         """Dense leaf-value table [n_leaves, np, max_h] read from the lazy
@@ -365,6 +479,10 @@ class CSolver:
         """0 = scalar (validated reference), 1 = vectorized traverser (all
         traverser hands per walk; same fixed point, lower variance). Set before
         run(). Raises if the DLL predates the feature and mode==1."""
+        if mode == 1 and getattr(self, "_sampled_oracle_ctx", None) is not None:
+            raise ValueError(
+                "sampled leaf mode is scalar-only: fresh per-visit biases are "
+                "incoherent across the vectorized per-hand leaf loop")
         if hasattr(_lib, "es_set_vec_mode"):
             _lib.es_set_vec_mode(self._handle, int(mode))
         elif mode == 1:
@@ -397,6 +515,9 @@ class CSolver:
         deterministic; np==2 only), 0 = OFF (default; sampling traversers). When
         ON it supersedes cfr/vec/chance/opp modes. Set before run(). Raises if the
         DLL predates the feature and mode==1."""
+        if mode == 1 and getattr(self, "_sampled_oracle_ctx", None) is not None:
+            raise ValueError(
+                "sampled leaf mode is scalar-only and cannot use full-hand reach mode")
         if hasattr(_lib, "es_set_reach_mode"):
             _lib.es_set_reach_mode(self._handle, int(mode))
         elif mode == 1:
@@ -423,6 +544,27 @@ class CSolver:
 
     def visit_count(self, node_idx: int) -> int:
         return int(_lib.es_get_visit_count(self._handle, int(node_idx)))
+
+    def set_deadline_ms(self, ms: int) -> None:
+        """Set a relative solve deadline in milliseconds; 0 disables it.
+
+        The deadline is applied by the next run() and checked periodically by
+        the C iteration loop. Use iterations_run() to read how many complete
+        iterations the most recent run actually finished.
+        """
+        if ms < 0 or ms > 0x7FFFFFFFFFFFFFFF:
+            raise ValueError("deadline must fit a nonnegative int64 millisecond value")
+        if not hasattr(_lib, "es_set_deadline_ms"):
+            if ms != 0:
+                raise RuntimeError("es_set_deadline_ms not in this DLL (rebuild)")
+            return
+        _lib.es_set_deadline_ms(self._handle, ctypes.c_int64(int(ms)))
+
+    def iterations_run(self) -> int:
+        """Complete iterations finished by the most recent run()."""
+        if not hasattr(_lib, "es_iterations_run"):
+            raise RuntimeError("es_iterations_run not in this DLL (rebuild)")
+        return int(_lib.es_iterations_run(self._handle))
 
     # ── run ───────────────────────────────────────────────────────────────
     def run(self, iterations: int, num_threads: int = 1) -> None:
@@ -488,6 +630,10 @@ class CSolver:
             if getattr(self, "_real_oracle_ctx", None):
                 _lib.es_free_real_oracle(self._real_oracle_ctx)
                 self._real_oracle_ctx = None
+                self._oracle_ctx = None  # same ptr; don't double-free
+            elif getattr(self, "_sampled_oracle_ctx", None):
+                _lib.es_free_sampled_oracle(self._sampled_oracle_ctx)
+                self._sampled_oracle_ctx = None
                 self._oracle_ctx = None  # same ptr; don't double-free
             elif getattr(self, "_oracle_ctx", None):
                 _lib.es_free_oracle_ctx(self._oracle_ctx)

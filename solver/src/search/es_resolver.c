@@ -12,6 +12,10 @@
  * this is single-path external sampling).
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "es_resolver.h"
 #include "es_resolver_internal.h"
 
@@ -21,6 +25,15 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdatomic.h>
+#include <time.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "hand_eval.h"   /* eval7 (static inline) */
 
@@ -42,6 +55,59 @@ void es_set_error(const char *fmt, ...) {
 }
 const char *es_get_last_error(void) {
     return g_es_error[0] ? g_es_error : NULL;
+}
+
+/* The sampled oracle implementation lives only in es_resolver_real, while this
+ * resolver core is also compiled into the lightweight validation DLL. Keep the
+ * public callback identity here and dispatch through the sampled ctx's first
+ * member (`ESLeafOracle invoke`). A pointer to a struct, suitably converted,
+ * points to its initial member, so this typed load is alias-safe. The sampled
+ * TU pins the layout with a compile-time offsetof check. */
+static double es_sampled_oracle_adapter(
+    void *ctx, int leaf_idx, int traverser, int traverser_hand,
+    const int *sampled_hands, const SSNode *leaf_node, uint64_t *rng)
+{
+    if (!ctx) {
+        es_set_error("sampled oracle ctx is NULL");
+        return 0.0;
+    }
+    ESLeafOracle invoke = *(ESLeafOracle *)ctx;
+    if (!invoke) {
+        es_set_error("sampled oracle dispatch is NULL");
+        return 0.0;
+    }
+    return invoke(ctx, leaf_idx, traverser, traverser_hand, sampled_hands,
+                  leaf_node, rng);
+}
+
+ES_EXPORT ESLeafOracle es_sampled_oracle_fn(void) {
+    return es_sampled_oracle_adapter;
+}
+
+/* Monotonic milliseconds for deadline checks. QueryPerformanceCounter and
+ * CLOCK_MONOTONIC are unaffected by wall-clock adjustments. */
+uint64_t es_monotonic_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, now;
+    if (!QueryPerformanceFrequency(&freq) || !QueryPerformanceCounter(&now)
+        || freq.QuadPart <= 0)
+        return UINT64_MAX;
+    return (uint64_t)((double)now.QuadPart * 1000.0
+                      / (double)freq.QuadPart);
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return UINT64_MAX;
+    return (uint64_t)ts.tv_sec * 1000ULL
+           + (uint64_t)ts.tv_nsec / 1000000ULL;
+#endif
+}
+
+int es_deadline_expired(const ESResolver *r, uint64_t start_ms) {
+    if (!r || r->deadline_ms <= 0) return 0;
+    uint64_t now_ms = es_monotonic_ms();
+    if (start_ms == UINT64_MAX || now_ms == UINT64_MAX) return 0;
+    if (now_ms < start_ms) return 0;  /* backward jump: do not fire */
+    return now_ms - start_ms >= (uint64_t)r->deadline_ms;
 }
 
 /* ── RNG: xorshift64, identical to mccfr_blueprint.c:62 ──────────────────── */
@@ -253,6 +319,7 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->tree = tree;
     r->oracle = leaf_oracle;
     r->oracle_ctx = oracle_ctx;
+    r->oracle_is_sampled = (leaf_oracle == es_sampled_oracle_adapter);
     r->master_seed = seed ? seed : 0x9E3779B97F4A7C15ULL;
     r->chance_mode = -1;   /* inherit process/env default until set */
     r->opp_mode = -1;
@@ -290,6 +357,14 @@ void es_set_opp_mode(ESResolver *r, int mode) {
  * opponent reach, deterministic — no RNG). Set BEFORE es_run. */
 void es_set_reach_mode(ESResolver *r, int mode) {
     if (r) r->reach_mode = (mode == 1) ? 1 : 0;
+}
+
+void es_set_deadline_ms(ESResolver *r, int64_t ms) {
+    if (r) r->deadline_ms = (ms > 0) ? ms : 0;
+}
+
+int64_t es_iterations_run(const ESResolver *r) {
+    return r ? r->iterations_run : 0;
 }
 
 /* DEBUG visit counter (single-thread localization only). */
@@ -1096,6 +1171,13 @@ static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
 
 int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     if (!r) { es_set_error("resolver is NULL"); return -1; }
+    r->iterations_run = 0;
+    if (r->oracle_is_sampled && (r->vec_traverser || r->reach_mode)) {
+        es_set_error("sampled leaf oracle is scalar-only "
+                     "(vec_mode=%d reach_mode=%d)",
+                     r->vec_traverser, r->reach_mode);
+        return -1;
+    }
     if (iterations <= 0) return 0;
 
     /* Full-per-hand-reach vector CFR: dedicated deterministic path (no sampling,
@@ -1114,13 +1196,19 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
 #endif
 
     int np = r->np;
+    uint64_t deadline_start_ms = (r->deadline_ms > 0)
+                                 ? es_monotonic_ms() : 0;
 
     if (nthreads == 1) {
         /* Deterministic single-thread path (the validated reference). */
         uint64_t rng = r->master_seed ^ 0xD1B54A32D192ED03ULL;
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
+        int64_t completed = 0;
         for (int64_t it = 0; it < iterations; it++) {
+            if ((it & 4095LL) == 0
+                && es_deadline_expired(r, deadline_start_ms))
+                break;
             for (int trav = 0; trav < np; trav++) {
                 if (r->vec_traverser) {
                     /* vec mode walks ALL traverser hands; es_vec_pass samples
@@ -1134,8 +1222,10 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                     es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
                 }
             }
+            completed++;
         }
         es_merge_stats(&r->stats, &local);
+        r->iterations_run = completed;
         return 0;
     }
 
@@ -1143,6 +1233,16 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     /* Hogwild: partition iterations across threads. Shared regret/strat-sum
      * tables, per-thread RNG seeded distinctly. Racy accumulation (Pluribus
      * Hogwild) — validated to still converge. */
+    /* Explicit dynamic chunk dispatch is equivalent to schedule(dynamic, 2048)
+     * for global Linear-CFR iteration weights, but can stop claiming work when
+     * a deadline expires. An OpenMP worksharing loop cannot portably break and
+     * would otherwise churn through all remaining requested indices. */
+    _Atomic(int64_t) next_it;
+    _Atomic(int) deadline_stop;
+    atomic_init(&next_it, 0);
+    atomic_init(&deadline_stop, 0);
+    int64_t completed = 0;
+    int use_deadline = (r->deadline_ms > 0);
     #pragma omp parallel num_threads(nthreads)
     {
         int tid = omp_get_thread_num();
@@ -1153,33 +1253,47 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         (void)es_rng_next(&rng); (void)es_rng_next(&rng);
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
+        int64_t local_completed = 0;
 
-        /* schedule(dynamic) so OpenMP hands out `it` from a SHARED counter —
-         * concurrently-processed `it` values cluster near current global
-         * progress. This is load-bearing for LINEAR CFR: the Linear t-weight
-         * (it+1) must track global wall-progress, not a per-thread chunk index.
-         * Under schedule(static) thread 23 would stamp weight ≈ 23·T/24 onto the
-         * shared strat-sum from wall-time zero (while regrets are immature),
-         * incoherent across threads and silently killing Linear's acceleration.
-         * Coarse chunk amortizes the shared-counter atomic. (Vanilla mode 0
-         * ignores `it`, so it is unaffected either way.) */
-        #pragma omp for schedule(dynamic, 2048)
-        for (int64_t it = 0; it < iterations; it++) {
-            for (int trav = 0; trav < np; trav++) {
-                if (r->vec_traverser) {
-                    local.traversals++;
-                    es_vec_pass(r, trav, &rng, &local, it + 1);
-                } else {
-                    es_sample_hands(r, &rng, sampled);
-                    if (sampled[trav] < 0) continue;
-                    local.traversals++;
-                    es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+        /* The shared cursor keeps concurrently processed `it` values near
+         * current global progress. This is load-bearing for LINEAR CFR: the
+         * t-weight must be the global iteration, not a per-thread chunk index.
+         * A coarse chunk amortizes the shared-cursor atomic. */
+        for (;;) {
+            if (use_deadline && atomic_load(&deadline_stop)) break;
+            int64_t begin = atomic_fetch_add(&next_it, 2048);
+            if (begin >= iterations) break;
+            int64_t remain = iterations - begin;
+            int64_t end = begin + (remain < 2048 ? remain : 2048);
+
+            for (int64_t it = begin; it < end; it++) {
+                if (use_deadline && atomic_load(&deadline_stop)) break;
+                if ((it & 4095LL) == 0
+                    && es_deadline_expired(r, deadline_start_ms)) {
+                    atomic_store(&deadline_stop, 1);
+                    break;
                 }
+                for (int trav = 0; trav < np; trav++) {
+                    if (r->vec_traverser) {
+                        local.traversals++;
+                        es_vec_pass(r, trav, &rng, &local, it + 1);
+                    } else {
+                        es_sample_hands(r, &rng, sampled);
+                        if (sampled[trav] < 0) continue;
+                        local.traversals++;
+                        es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+                    }
+                }
+                local_completed++;
             }
         }
         #pragma omp critical
-        es_merge_stats(&r->stats, &local);
+        {
+            es_merge_stats(&r->stats, &local);
+            completed += local_completed;
+        }
     }
+    r->iterations_run = completed;
 #endif
     return 0;
 }

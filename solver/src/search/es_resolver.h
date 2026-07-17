@@ -83,6 +83,15 @@ typedef double (*ESLeafOracle)(
     uint64_t *rng
 );
 
+/* Resolver-owned trampoline for the sampled-rollout oracle. The sampled
+ * oracle factory returns a ctx whose first member is its immutable dispatch
+ * callback; this trampoline forwards each visit to that callback. Keeping the
+ * trampoline in the resolver core lets es_create identify sampled mode without
+ * a link-time dependency on es_sampled_oracle.c (the lightweight resolver does
+ * not link rollout code). Callers normally obtain this through the sampled
+ * oracle factory rather than invoking it directly. */
+ES_EXPORT ESLeafOracle es_sampled_oracle_fn(void);
+
 /* ── Solver handle (opaque) ──────────────────────────────────────────────
  * Allocated by es_create, freed by es_free. Holds the dense regret/strat-sum
  * tables and per-node offset metadata derived once from the tree. */
@@ -113,7 +122,9 @@ ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
  * iters for the same exploitability; IDENTICAL fixed point). Card-conflicting
  * traverser hands are skipped per walk (the unbiased card-removal estimator).
  * Set BEFORE es_run. Gate 1 (VECTOR_TRAVERSER_DESIGN.md): vec must reach the
- * SAME exploitability as scalar on a 2p/3p spot with OVERLAPPING ranges. */
+ * SAME exploitability as scalar on a 2p/3p spot with OVERLAPPING ranges.
+ * Sampled leaf mode is scalar-only: es_run fails if vec mode is enabled on a
+ * resolver using es_sampled_oracle_fn(). */
 ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
 
 /* Chance-node handling: 1 = ENUMERATE (correct, zero chance-variance: average
@@ -142,7 +153,9 @@ ES_EXPORT void es_set_opp_mode(ESResolver *r, int mode);
  * needs to average out opponent-hand variance. It is always Linear-CFR + chance-
  * ENUMERATE + full reach by construction (ignores cfr/vec/chance/opp modes) and
  * is DETERMINISTIC (no RNG). For SMALL player counts only — 5-6p MUST keep
- * SAMPLING (set reach_mode=0). Set BEFORE es_run. */
+ * SAMPLING (set reach_mode=0). Sampled leaf mode is also incompatible with
+ * reach mode because its fresh per-visit oracle requires one sampled hand
+ * profile and one per-thread RNG stream. Set BEFORE es_run. */
 ES_EXPORT void es_set_reach_mode(ESResolver *r, int mode);
 
 /* 2p exploitability (best-response gap) of the CURRENT σ̄, in pot-chip units per
@@ -165,13 +178,30 @@ ES_EXPORT void es_reach_profile_read(double *t1, double *t2, double *t3, double 
 ES_EXPORT void es_enable_visit_counter(ESResolver *r);
 ES_EXPORT int64_t es_get_visit_count(const ESResolver *r, int node_idx);
 
+/* Optional per-es_run monotonic wall-clock budget in milliseconds. `ms` > 0
+ * applies a fresh duration budget to each subsequent es_run call; `ms` <= 0
+ * disables the deadline (the default). The loops check at most once per 4096
+ * outer CFR iterations and always finish an in-flight outer iteration cleanly.
+ * Set before es_run; changing it during a run is unsupported. */
+ES_EXPORT void es_set_deadline_ms(ESResolver *r, int64_t ms);
+
+/* Number of complete outer CFR iterations performed by the most recent
+ * es_run call. This is a last-run count, not cumulative. It is reset to zero at
+ * run entry, including no-op and failed runs, and may be less than the requested
+ * count when a deadline expires. */
+ES_EXPORT int64_t es_iterations_run(const ESResolver *r);
+
 /* Run `iterations` ES iterations. Each iteration walks once per player as
  * traverser (matching es_solver.py iterate()). num_threads > 1 enables
  * Hogwild (iterations partitioned across threads; shared tables, racy adds).
  * num_threads <= 0 → use all available cores. num_threads == 1 → deterministic
  * single-thread (the validated reference path).
  *
- * Returns 0 on success, -1 on error. */
+ * A resolver using es_sampled_oracle_fn() must keep both vec and reach modes
+ * disabled; incompatible modes fail loud before any traversal begins.
+ *
+ * Returns 0 on success (including a clean deadline stop), -1 on error. Read
+ * es_iterations_run() afterward for the completed outer-iteration count. */
 ES_EXPORT int es_run(ESResolver *r, int64_t iterations, int num_threads);
 
 /* Forward-only EV estimate for `player` under the UNIFORM profile (no regret
