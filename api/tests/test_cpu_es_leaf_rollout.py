@@ -528,9 +528,13 @@ def test_sampled_deadline_wraps_run_and_records_actual_iterations(monkeypatch):
 
     s.solve(**kwargs)
 
+    # num_threads=0 (all cores): sampled mode is EXEMPT from the small-tree
+    # single-thread force — per-iteration work is rollout-dominated, so
+    # wall-clock scales with threads (2026-07-17 fix; 3p sampled 50k iters
+    # measured 836s when forced single-thread).
     assert _FakeSolver.events == [
         ("deadline", 250),
-        ("run", 50, 1),
+        ("run", 50, 0),
         ("iterations_run",),
     ]
     assert _FakeSolver.deadline_calls == [250]
