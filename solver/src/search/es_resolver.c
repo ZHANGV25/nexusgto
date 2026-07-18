@@ -477,6 +477,70 @@ static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
  * base opponent draw is board+inter-opponent (NOT traverser-conditioned). This
  * compounds with opponent count (≈0 at 2p one-opponent, large at 3p+) — the
  * exact 2p-pass / 3p-fail signature. chosen[skip] is left = -1. */
+/* Diagnostic-only replay of scalar ES joint sampling.  Draw normally first,
+ * then retain the requested hero hand so randomized assignment order remains
+ * exactly production-identical. */
+ES_EXPORT int32_t es_debug_sample_hands_conditioned_c(
+    const SSTreeData *tree,
+    uint64_t stream_seed,
+    int32_t conditioned_player,
+    int32_t conditioned_hand,
+    int32_t num_samples,
+    int32_t max_attempts,
+    int32_t *out_hands,
+    uint64_t *out_rng_states,
+    int32_t *out_attempts,
+    int32_t *out_incomplete
+) {
+    if (out_attempts) *out_attempts = 0;
+    if (out_incomplete) *out_incomplete = 0;
+    if (!tree || !out_hands || num_samples <= 0
+        || max_attempts < num_samples
+        || tree->num_players < 2 || tree->num_players > SS_MAX_PLAYERS
+        || conditioned_player < 0
+        || conditioned_player >= tree->num_players
+        || conditioned_hand < 0
+        || conditioned_hand >= tree->num_hands[conditioned_player])
+        return -1;
+    for (int p = 0; p < tree->num_players; p++) {
+        if (tree->num_hands[p] < 0 || tree->num_hands[p] > SS_MAX_HANDS)
+            return -1;
+    }
+    if (tree->num_board < 0 || tree->num_board > SS_MAX_BOARD) return -1;
+    for (int b = 0; b < tree->num_board; b++) {
+        if (tree->board[b] < 0 || tree->board[b] >= 52) return -1;
+    }
+
+    ESResolver view;
+    memset(&view, 0, sizeof(view));
+    view.tree = tree;
+    view.np = tree->num_players;
+
+    uint64_t rng = stream_seed ? stream_seed : 0xD1B54A32D192ED03ULL;
+    int32_t kept = 0;
+    int32_t attempts = 0;
+    int32_t incomplete = 0;
+    int chosen[SS_MAX_PLAYERS];
+    while (kept < num_samples && attempts < max_attempts) {
+        es_sample_hands(&view, &rng, chosen);
+        attempts++;
+        if (chosen[conditioned_player] != conditioned_hand) continue;
+
+        int missing = 0;
+        for (int p = 0; p < view.np; p++) {
+            out_hands[(size_t)kept * (size_t)view.np + (size_t)p] = chosen[p];
+            if (chosen[p] < 0) missing = 1;
+        }
+        if (out_rng_states) out_rng_states[kept] = rng;
+        incomplete += missing;
+        kept++;
+    }
+    if (out_attempts) *out_attempts = attempts;
+    if (out_incomplete) *out_incomplete = incomplete;
+    return kept;
+}
+
+/* The opponent-only VEC implementation documented above begins here. */
 static void es_sample_opponents(ESResolver *r, uint64_t *rng, int skip,
                                 int *chosen) {
     const SSTreeData *t = r->tree;

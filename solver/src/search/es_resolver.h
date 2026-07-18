@@ -303,6 +303,27 @@ ES_EXPORT void es_real_oracle_stats2(void *ctx, uint64_t *fills,
                                      uint64_t *errors);
 ES_EXPORT void es_free_real_oracle(void *ctx);
 
+/* Diagnostic-only exact sampler surface.  Replays es_sample_hands with its
+ * native randomized assignment order and weighted reservoir, retaining only
+ * joint draws whose conditioned player received conditioned_hand.  The
+ * production resolver never calls this entry point.
+ *
+ * out_hands is sample-major [num_samples * tree->num_players]; out_rng_states
+ * receives the sampler stream immediately after each retained joint draw.
+ * Returns the number retained (possibly less than num_samples when
+ * max_attempts is exhausted), or -1 for invalid arguments. */
+ES_EXPORT int32_t es_debug_sample_hands_conditioned_c(
+    const SSTreeData *tree,
+    uint64_t stream_seed,
+    int32_t conditioned_player,
+    int32_t conditioned_hand,
+    int32_t num_samples,
+    int32_t max_attempts,
+    int32_t *out_hands,
+    uint64_t *out_rng_states,
+    int32_t *out_attempts,
+    int32_t *out_incomplete);
+
 #ifdef __cplusplus
 }
 #endif

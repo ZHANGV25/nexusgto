@@ -651,6 +651,40 @@ BPS_EXPORT int rollout_hand_index_for_turn_test(const int32_t *board,
 BPS_EXPORT void rollout_set_tolerate_bucket_miss(int enabled);
 BPS_EXPORT int  rollout_get_tolerate_bucket_miss(void);
 
+/* Per-hand leaf-EV discriminator hooks.  These exports are diagnostic-only
+ * and are never called by the production rollout path. */
+BPS_EXPORT int32_t rollout_debug_sample_eager_hands_c(
+    const int *board, int32_t n_board_cards,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    int32_t hero_player, int32_t hero_hand_idx,
+    int32_t num_samples, uint64_t master_seed,
+    int32_t leaf_idx_for_seed, int32_t combo_for_seed,
+    int32_t *out_hands, uint64_t *out_rng_states,
+    int32_t *out_attempts);
+
+BPS_EXPORT int32_t rollout_debug_simulate_fixed_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street, int32_t pot_chips,
+    const int32_t *active, int32_t num_players,
+    const int32_t *stacks, const int32_t *bets,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    const int32_t *bias_profile, int32_t hero_player,
+    const int32_t *sampled_hands_c0,
+    const int32_t *sampled_hands_c1,
+    const int32_t *has_sample,
+    int32_t skip_first_betting,
+    uint64_t rng_seed,
+    float *out_payoff, uint64_t *out_rng_state);
+
+/* Current-flop five-card made-hand strength (category in bits 20+), using the
+ * same eval5 implementation as rollout showdowns.  Higher is stronger. */
+BPS_EXPORT uint32_t rollout_debug_flop_strength_c(
+    const int *board3, int32_t c0, int32_t c1);
+
 #ifdef __cplusplus
 }
 #endif

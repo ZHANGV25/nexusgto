@@ -156,6 +156,45 @@ static int esso_rollout_batch(
     return 0;
 }
 
+ES_EXPORT int32_t es_sampled_debug_simulate_fixed_c(
+    const void *bp_void,
+    const int *board, int32_t n_board_cards,
+    int32_t street, int32_t pot_chips,
+    const int32_t *active, int32_t num_players,
+    const int32_t *stacks, const int32_t *bets,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    const int32_t *bias_profile, int32_t hero_player,
+    const int32_t *sampled_hands_c0,
+    const int32_t *sampled_hands_c1,
+    const int32_t *has_sample,
+    int32_t skip_first_betting,
+    uint64_t rng_seed,
+    float *out_payoff, uint64_t *out_rng_state
+) {
+    if (!bp_void || !board || !active || !stacks || !bets || !acting_order
+        || !player_seats || !game_action_history || !bias_profile
+        || !sampled_hands_c0 || !sampled_hands_c1 || !has_sample
+        || !out_payoff || n_board_cards < 0 || n_board_cards > 5
+        || num_players < 2 || num_players > SS_MAX_PLAYERS
+        || acting_order_len < 0 || acting_order_len > num_players
+        || gah_len < 0 || gah_len > 256
+        || hero_player < 0 || hero_player >= num_players)
+        return -1;
+    uint64_t rng = rng_seed ? rng_seed : 0xdeadbeefcafebabeULL;
+    int32_t rc = rollout_simulate_one(
+        (const BPSReader *)bp_void,
+        board, n_board_cards, street, pot_chips,
+        active, stacks, bets, num_players,
+        acting_order, acting_order_len, player_seats,
+        game_action_history, gah_len, bias_profile, hero_player,
+        sampled_hands_c0, sampled_hands_c1, has_sample,
+        skip_first_betting, &rng, out_payoff);
+    if (out_rng_state) *out_rng_state = rng;
+    return rc;
+}
+
 static double esso_oracle(void *vctx, int leaf_idx, int traverser,
                           int traverser_hand, const int *sampled_hands,
                           const SSNode *leaf_node, uint64_t *rng) {
