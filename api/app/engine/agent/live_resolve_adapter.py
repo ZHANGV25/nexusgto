@@ -24,7 +24,8 @@ So LIVE_RESOLVE wraps CpuEsSolver for the flop/turn surface this session targets
 
 SCOPE / SIMPLIFICATIONS (documented, honest):
   - PER-CALL re-solve: ranges are rebuilt fresh each call from the
-    board (169 grid, blocked by the board). Ranges are SEEDED IN-DISTRIBUTION
+    board (169-class grid, K=1 by default, blocked by the board). Ranges are
+    SEEDED IN-DISTRIBUTION
     from the blueprint preflop σ̄ when range_weight_dicts is supplied (see
     LiveResolveSource + live_resolve_ranges) — uniform ranges make the re-solve
     over-bet (the 3b confound). With NEXUS_BELIEF_CARRY enabled, completed-
@@ -43,6 +44,7 @@ SCOPE / SIMPLIFICATIONS (documented, honest):
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.engine.agent.game_state import BIG_BLIND, SEAT_NAME, GameState
@@ -50,7 +52,12 @@ from app.engine.agent.key_builder import build_key
 
 # Reuse the production card encoder (rank<<2 | suit, A=12) — identical to the
 # agent's card ints, so a round-trip int->str->int is the identity.
-from app.services.postflop_provider import _build_hand_grid_range, _int_to_card
+from app.services.postflop_provider import (
+    GridK,
+    HandGridMetadata,
+    _build_hand_grid_range_with_metadata,
+    _int_to_card,
+)
 
 # Reuse the production label↔index translation (metadata-driven, bet_sizes-aware).
 from app.services.card_codec import _solver_label_to_action_index
@@ -76,6 +83,24 @@ def _has_to_call(state: GameState) -> bool:
     """Whether the to-act player faces an outstanding bet (drives fold/call vs
     check in _solver_label_to_action_index)."""
     return state.facing_bet
+
+
+def _grid_k_from_env() -> GridK:
+    """Read the research grid dose without changing the shipped K=1 default."""
+    raw = os.environ.get("NEXUS_GRID_K", "1").strip()
+    if raw.upper() == "ALL":
+        return "ALL"
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_GRID_K must be a positive integer or ALL, got {raw!r}"
+        ) from None
+    if value <= 0:
+        raise ValueError(
+            f"NEXUS_GRID_K must be a positive integer or ALL, got {raw!r}"
+        )
+    return value
 
 
 def build_solve_inputs(
@@ -172,7 +197,8 @@ def build_solve_inputs(
     player_seats = [state.seat_of_slot[s] for s in entry_slots]
     hero_player_idx = entry_slots.index(hero_slot)
 
-    # 169 grid per entry player, blocked by the board (mirrors solve_cpu_es).
+    # K-combo grid per entry player, blocked by the board. NEXUS_GRID_K is a
+    # measurement-only dose flag; its default 1 preserves the shipped grid.
     # Seeded in-distribution when range_weight_dicts is supplied (aligned to
     # COMPACT SLOT order), else uniform-on-legal. Flagged belief carry is
     # composed into the weight dicts by LiveResolveSource before this call.
@@ -181,11 +207,16 @@ def build_solve_inputs(
         range_weight_dicts is not None
         and len(range_weight_dicts) == state.n_slots
     )
+    grid_k = _grid_k_from_env()
     player_ranges: List[List[Tuple[int, int, float]]] = []
+    player_range_metadata: List[List[HandGridMetadata]] = []
     for slot in entry_slots:
         weights = range_weight_dicts[slot] if use_weights else None
-        grid = _build_hand_grid_range(blocked, weights=weights)
+        grid, metadata = _build_hand_grid_range_with_metadata(
+            blocked, weights=weights, k=grid_k,
+        )
         player_ranges.append([(r[0], r[1], r[2]) for r in grid])
+        player_range_metadata.append(metadata)
 
     # Chips -> big blinds (CpuEsSolver scales bb by 100 internally).
     pot_bb = float(pot_entry) / BIG_BLIND
@@ -209,6 +240,8 @@ def build_solve_inputs(
         # unless the default-off belief stash path requests it.
         "entry_slots": entry_slots,
         "player_ranges": player_ranges,
+        "player_range_metadata": player_range_metadata,
+        "grid_k": grid_k,
         "hero_player_idx": hero_player_idx,
         "pot_bb": pot_bb,
         "stack_bb": stack_bb,
@@ -221,7 +254,7 @@ def build_solve_inputs(
 
 def hero_grid_row(player_ranges: Sequence, hero_player_idx: int,
                   hero_cards: Tuple[int, int]) -> int:
-    """Index of the hero's hand-CLASS row in its 169 grid.
+    """Index of the hero's hand-CLASS row in its legacy K=1 grid.
 
     CpuEsSolver returns σ̄ per grid row (one representative combo per 169 class);
     the hero's exact cards belong to one class, whose row carries that class's
@@ -239,6 +272,70 @@ def hero_grid_row(player_ranges: Sequence, hero_player_idx: int,
     raise ValueError(
         f"hero hand ({c0},{c1}) maps to no grid class — corrupted range grid"
     )
+
+
+def hero_grid_rows(
+    player_ranges: Sequence,
+    hero_player_idx: int,
+    hero_cards: Tuple[int, int],
+    range_metadata: Optional[Sequence] = None,
+) -> List[Tuple[int, float]]:
+    """Return every ``(row_index, weight)`` for the hero's hand class.
+
+    Metadata is optional for compatibility with hand-built grids. When given,
+    fully blocked placeholders are skipped so their legacy ``(0, 1)`` cards
+    cannot masquerade as pocket deuces during class matching.
+    """
+    target = _class_key(*hero_cards)
+    grid = player_ranges[hero_player_idx]
+    metadata = (
+        range_metadata[hero_player_idx]
+        if range_metadata is not None else None
+    )
+    rows: List[Tuple[int, float]] = []
+    for i, (g0, g1, weight) in enumerate(grid):
+        if metadata is not None and int(metadata[i][2]) == 0:
+            continue
+        if _class_key(g0, g1) == target:
+            rows.append((i, float(weight)))
+    if rows:
+        return rows
+    c0, c1 = hero_cards
+    raise ValueError(
+        f"hero hand ({c0},{c1}) maps to no grid class - corrupted range grid"
+    )
+
+
+def aggregate_grid_row_strategies(
+    per_hand: Dict[int, Dict[str, float]],
+    rows: Sequence[Tuple[int, float]],
+) -> Optional[Dict[str, float]]:
+    """Weight-average every positive-weight strategy row in one class.
+
+    The one-row case returns the original mapping unchanged, preserving the
+    shipped K=1 float path. A missing positive-weight row returns ``None``
+    instead of silently renormalizing over an incomplete class sample.
+    """
+    if len(rows) == 1:
+        row, weight = rows[0]
+        return per_hand.get(row) if weight > 0.0 else None
+    total_weight = sum(weight for _row, weight in rows if weight > 0.0)
+    if total_weight <= 0.0:
+        return None
+    weighted: Dict[str, float] = {}
+    for row, weight in rows:
+        if weight <= 0.0:
+            continue
+        strategy = per_hand.get(row)
+        if not strategy:
+            return None
+        for label, frequency in strategy.items():
+            weighted[label] = (
+                weighted.get(label, 0.0) + weight * float(frequency)
+            )
+    return {
+        label: value / total_weight for label, value in weighted.items()
+    }
 
 
 def _class_key(c0: int, c1: int) -> Tuple[int, int, bool]:

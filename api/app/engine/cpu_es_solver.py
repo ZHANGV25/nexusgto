@@ -34,7 +34,7 @@ import os
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -64,6 +64,10 @@ _ENV_MUTATION_LOCK = threading.Lock()
 # (python/es_resolver/run_real_spot_c.py:35, the validated caller). Only used
 # on the lazy and sampled C leaf-oracle construct paths.
 _ESRO_MAX_FLOP_HIST = 256
+
+
+class ProjectedFillMemoryExceeded(MemoryError):
+    """An eager-fill arm exceeded its pre-allocation measurement guard."""
 
 
 # poker-solver locations (the provider side-loads python/ onto sys.path at init;
@@ -247,6 +251,7 @@ class CpuEsSolver:
         self._last_cont_ev_bias_action_stats = None
         self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
         self._last_solve_stats = None  # per-solve observability, incl. Gap 4
+        self._last_preflight_stats = None  # measurement guard, set before fill
         # NEXUS_LEAF_ROLLOUT: {leaf_fills, cache_hits, rollout_sims, oracle_errors}
         # from the last lazy-oracle solve (es_real_oracle_stats2). None on the
         # eager (default) path — _last_solve_stats.leaf_mode disambiguates.
@@ -477,6 +482,11 @@ class CpuEsSolver:
         readout: str = "avg",
         hero_replay: Optional[Dict[str, object]] = None,
         belief_stash_out: Optional[Dict[str, object]] = None,
+        deadline_ms: Optional[int] = None,
+        max_projected_fill_bytes: Optional[int] = None,
+        progress_callback: Optional[
+            Callable[[str, Dict[str, object]], None]
+        ] = None,
     ) -> Dict[int, Dict[int, Dict[str, float]]]:
         """Run an N-player flop/turn/river CPU-ES solve. Returns all_by_player:
         {player_idx: {hand_idx: {action_label: freq}}} — the SAME structure the
@@ -511,6 +521,15 @@ class CpuEsSolver:
             the dict is replaced with this street's PlainTree + sigma-bar
             readout. ``None`` (the default) performs no stash work.
         """
+        if deadline_ms is not None and int(deadline_ms) < 0:
+            raise ValueError(f"deadline_ms must be >= 0, got {deadline_ms}")
+        if (max_projected_fill_bytes is not None
+                and int(max_projected_fill_bytes) < 0):
+            raise ValueError(
+                "max_projected_fill_bytes must be >= 0, got "
+                f"{max_projected_fill_bytes}"
+            )
+
         # Sampled leaves are scalar-only. Apply their precedence before the
         # normal vec/readout validation so a caller requesting vec + avg is
         # accepted and run as scalar without changing the requested readout.
@@ -773,6 +792,34 @@ class CpuEsSolver:
 
             n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
             n_leaves = int(gpu._tree.num_leaves)
+            # The eager sampled fill materializes a float32 output table with
+            # shape [n_leaves, n_players, max_h] and a float64 accumulator of
+            # the same shape: 12 bytes per cell at peak.  num_samples_k changes
+            # how many samples are accumulated, not either allocation's shape.
+            # Expose the tree-derived projection before the first allocation so
+            # measurement drivers can abort one unsafe arm without killing the
+            # box. The callback/guard are default-off production no-ops.
+            projected_fill_bytes = (
+                int(n_leaves) * int(n_players) * int(max_h) * 12
+            )
+            self._last_preflight_stats = {
+                "n_leaves": int(n_leaves),
+                "n_players": int(n_players),
+                "max_hands": int(max_h),
+                "bytes_per_leaf_player_hand": 12,
+                "projected_fill_bytes": int(projected_fill_bytes),
+            }
+            if progress_callback is not None:
+                progress_callback("pre_fill", dict(self._last_preflight_stats))
+            if (max_projected_fill_bytes is not None
+                    and projected_fill_bytes > int(max_projected_fill_bytes)):
+                raise ProjectedFillMemoryExceeded(
+                    "projected eager-fill buffer "
+                    f"{projected_fill_bytes} bytes exceeds guard "
+                    f"{int(max_projected_fill_bytes)} bytes "
+                    f"(n_leaves={n_leaves}, n_players={n_players}, "
+                    f"max_hands={max_h}, bytes_per_cell=12)"
+                )
             # ZERO-LEAF trees terminate in SHOWDOWN/FOLD only and need NO leaf
             # table — the C ES settles those natively. Two cases:
             #   (a) RIVER: the builder disables cont-strat leaves at is_river.
@@ -1188,6 +1235,15 @@ class CpuEsSolver:
                                  "was NOT walked mean_field)")
                 construct_s = time.time() - t0
 
+            if progress_callback is not None:
+                progress_callback(
+                    "post_fill",
+                    {
+                        "construct_s": float(construct_s),
+                        "projected_fill_bytes": int(projected_fill_bytes),
+                    },
+                )
+
             # DIAG (NEXUS_ES_DIAG=1): dump leaf-table stats — isolate the 2p-flop
             # uniform-0.5 mystery (is the construct producing action-blind/zero
             # leaf values?). Cheap; off by default.
@@ -1387,13 +1443,40 @@ class CpuEsSolver:
             _eff_threads = (1 if (0 < _nn <= 2000 and not use_reach
                                   and not _leaf_sampled)
                             else num_threads)
-            if _leaf_sampled:
-                cs.set_deadline_ms(_sampled_deadline)
+            effective_deadline_ms = (
+                int(_sampled_deadline) if _leaf_sampled
+                else (int(deadline_ms) if deadline_ms is not None else None)
+            )
+            if effective_deadline_ms is not None:
+                cs.set_deadline_ms(effective_deadline_ms)
+            if progress_callback is not None:
+                progress_callback(
+                    "pre_es_run",
+                    {"requested_iterations": int(iterations)},
+                )
             t1 = time.time()
             cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
-            if _leaf_sampled:
+            # Preserve the default production path: query the native counter
+            # only for sampled mode (historical behavior) or when a measurement
+            # caller explicitly supplies deadline_ms (including zero).
+            iterations_run_observed = (
+                (_leaf_sampled or deadline_ms is not None)
+                and hasattr(cs, "iterations_run")
+            )
+            if iterations_run_observed:
                 _sampled_iterations_run = cs.iterations_run()
+            else:
+                _sampled_iterations_run = int(iterations)
+            if progress_callback is not None:
+                progress_callback(
+                    "post_es_run",
+                    {
+                        "solve_s": float(solve_s),
+                        "iterations_run": int(_sampled_iterations_run),
+                    },
+                )
+            readout_t0 = time.time()
             read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
 
             # BELIEF CARRY STASH (NEXUS_BELIEF_CARRY, default OFF). The output
@@ -1792,6 +1875,12 @@ class CpuEsSolver:
                             raw[h] = strat
                 all_by_player[p_idx] = raw
 
+            readout_s = time.time() - readout_t0
+            if progress_callback is not None:
+                progress_callback(
+                    "post_readout", {"readout_s": float(readout_s)}
+                )
+
             # OBSERVABILITY STASH (2026-07-05, latency ladder): construct/solve
             # walls + tree shape for the LAST solve, as instance attributes —
             # the same read-only convention as _last_cont_ev_stats. Offline
@@ -1810,11 +1899,12 @@ class CpuEsSolver:
                 "sampled_stats": self._last_sampled_stats,
                 "construct_s": float(construct_s),
                 "solve_s": float(solve_s),
+                "readout_s": float(readout_s),
+                "projected_fill_bytes": int(projected_fill_bytes),
                 "iterations": int(iterations),
-                "iterations_run": int(
-                    _sampled_iterations_run
-                    if _sampled_iterations_run is not None else iterations
-                ),
+                "iterations_run": int(_sampled_iterations_run),
+                "iterations_run_observed": bool(iterations_run_observed),
+                "deadline_ms": effective_deadline_ms,
                 "num_rollouts": int(num_rollouts),
                 "master_seed": int(master_seed),
                 "sampled_policy": (

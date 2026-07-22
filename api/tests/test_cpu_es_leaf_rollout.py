@@ -448,6 +448,47 @@ def test_sampled_off_is_eager_noop_even_with_sampled_knobs(monkeypatch):
     assert probed._last_solve_stats["sampled_stats"] is None
     assert probed._last_solve_stats["sampled_policy"] is None
     assert probed._last_solve_stats["sampled_deadline_ms"] is None
+    assert probed._last_solve_stats["iterations_run_observed"] is False
+
+
+def test_eager_measurement_observes_deadline_iterations_and_phases():
+    n = 3
+    rc = _FakeRollout()
+    solver = _make_solver(n, _FakeTree(n), rc)
+    kwargs = _solve_kwargs(n)
+    _FakeSolver.iterations_completed = kwargs["iterations"]
+    phases = []
+
+    solver.solve(
+        **kwargs, deadline_ms=0,
+        progress_callback=lambda phase, payload: phases.append((phase, payload)),
+    )
+
+    assert _FakeSolver.deadline_calls == [0]
+    assert _FakeSolver.iterations_run_calls == 1
+    assert solver._last_solve_stats["iterations_run"] == kwargs["iterations"]
+    assert solver._last_solve_stats["iterations_run_observed"] is True
+    assert solver._last_solve_stats["deadline_ms"] == 0
+    assert [phase for phase, _payload in phases] == [
+        "pre_fill", "post_fill", "pre_es_run", "post_es_run", "post_readout",
+    ]
+
+
+def test_eager_measurement_memory_guard_fails_before_fill():
+    n = 3
+    rc = _FakeRollout()
+    solver = _make_solver(n, _FakeTree(n), rc)
+    phases = []
+
+    with pytest.raises(ces.ProjectedFillMemoryExceeded):
+        solver.solve(
+            **_solve_kwargs(n), max_projected_fill_bytes=1,
+            progress_callback=lambda phase, payload: phases.append((phase, payload)),
+        )
+
+    assert rc.eager_fill_calls == 0
+    assert [phase for phase, _payload in phases] == ["pre_fill"]
+    assert solver._last_preflight_stats["projected_fill_bytes"] > 1
 
 
 @pytest.mark.parametrize(
