@@ -954,6 +954,48 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     }
 }
 
+typedef double (*ESVecScratch)[SS_MAX_ACTIONS][SS_MAX_HANDS];
+
+/* Exact number of simultaneously-live traverser-decision frames on the
+ * deepest root-to-terminal path. The tree is acyclic by construction (the
+ * recursive traversals below rely on the same property), so this structural
+ * prepass gives a tight scratch bound without using SS_MAX_TREE_NODES slots. */
+static int es_vec_scratch_slots_node(const SSTreeData *t, int node_idx,
+                                     int traverser) {
+    const SSNode *nd = &t->nodes[node_idx];
+    int max_below = 0;
+    for (int a = 0; a < nd->num_children; a++) {
+        int child = t->children[nd->first_child + a];
+        int below = es_vec_scratch_slots_node(t, child, traverser);
+        if (below > max_below) max_below = below;
+    }
+    return max_below
+           + (nd->type == ES_T_DECISION && nd->player == traverser ? 1 : 0);
+}
+
+static int es_vec_scratch_slots(const ESResolver *r) {
+    int max_slots = 0;
+    for (int trav = 0; trav < r->np; trav++) {
+        int slots = es_vec_scratch_slots_node(r->tree, 0, trav);
+        if (slots > max_slots) max_slots = slots;
+    }
+    return max_slots;
+}
+
+static ESVecScratch es_alloc_vec_scratch(int slots) {
+    if (slots <= 0) return NULL;
+    ESVecScratch scratch = (ESVecScratch)malloc(
+        (size_t)slots * sizeof(*scratch));
+    if (!scratch) {
+        fprintf(stderr,
+                "FATAL es_run: OOM allocating vec scratch "
+                "(%d slots x %d actions x %d hands)\n",
+                slots, SS_MAX_ACTIONS, SS_MAX_HANDS);
+        abort();
+    }
+    return scratch;
+}
+
 /* ── Vectorized traverser ────────────────────────────────────────────────────
  *
  * One walk down a SINGLE opponent-sampled path updates ALL traverser hands at
@@ -978,23 +1020,12 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
 static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
                             const int *opp_sampled, const int *dead,
                             uint64_t *rng, ESStats *local, int64_t iter,
+                            ESVecScratch scratch, int scratch_depth,
                             double *out_vals) {
     const SSTreeData *t = r->tree;
     const SSNode *nd = &t->nodes[node_idx];
     int type = nd->type;
     int nh = t->num_hands[traverser];
-    double (*child_vals)[SS_MAX_HANDS] = NULL;
-    if (type == ES_T_DECISION && nd->player == traverser) {
-        child_vals = (double (*)[SS_MAX_HANDS])malloc(
-            (size_t)SS_MAX_ACTIONS * sizeof(*child_vals));
-        if (!child_vals) {
-            fprintf(stderr,
-                    "FATAL es_traverse_vec: OOM allocating child_vals "
-                    "(%d actions x %d hands)\n",
-                    SS_MAX_ACTIONS, SS_MAX_HANDS);
-            abort();
-        }
-    }
 
     if (type == ES_T_FOLD) {
         /* Hand-independent for the traverser: net = (pot - my_bet) if traverser
@@ -1003,7 +1034,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         local->fold_terminals++;
         double v = es_fold_value(nd, traverser);
         for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : v;
-        free(child_vals);
         return;
     }
     if (type == ES_T_SHOWDOWN) {
@@ -1018,7 +1048,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         double my_bet = (double)nd->bets[traverser];
         if (!nd->active_players[traverser]) {
             for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : -my_bet;
-            free(child_vals);
             return;
         }
         /* NODE board (the runout dealt through in-tree chance nodes), not the
@@ -1045,7 +1074,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             int hi = opp_sampled[p];
             if (hi < 0) {
                 for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
-                free(child_vals);
                 return;
             }
             int c0 = t->hands[p][hi][0], c1 = t->hands[p][hi][1];
@@ -1055,7 +1083,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
                     if (c0 == board[b] || c1 == board[b]) { conflict = 1; break; }
             if (conflict) {
                 for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
-                free(child_vals);
                 return;
             }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
@@ -1093,7 +1120,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
                               - my_bet;
             }
         }
-        free(child_vals);
         return;
     }
     if (type == ES_T_LEAF) {
@@ -1108,7 +1134,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             out_vals[h] = r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
                                     h, sampled, nd, rng);
         }
-        free(child_vals);
         return;
     }
     if (type == ES_T_CHANCE) {
@@ -1120,7 +1145,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         int nc = nd->num_children;
         if (nc <= 0) {
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
-            free(child_vals);
             return;
         }
         if (es_chance_enumerate(r)) {
@@ -1138,21 +1162,19 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             for (int a = 0; a < nc; a++) {
                 int child = t->children[nd->first_child + a];
                 es_traverse_vec(r, child, traverser, opp_sampled, dead, rng,
-                                local, iter, tmp);
+                                local, iter, scratch, scratch_depth, tmp);
                 for (int h = 0; h < nh; h++) out_vals[h] += tmp[h];
             }
             double inv = 1.0 / (double)nc;
             for (int h = 0; h < nh; h++) out_vals[h] *= inv;
             free(tmp);
-            free(child_vals);
             return;
         }
         int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
                                               nd->num_board, nc, iter);
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                        iter, out_vals);
-        free(child_vals);
+                        iter, scratch, scratch_depth, out_vals);
         return;
     }
 
@@ -1169,8 +1191,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         if (ohand < 0) {
             int child = t->children[nd->first_child];
             es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                            iter, out_vals);
-            free(child_vals);
+                            iter, scratch, scratch_depth, out_vals);
             return;
         }
         int64_t off = r->node_off[node_idx];
@@ -1181,8 +1202,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         for (int k = 0; k < na; k++) { cum += sigma[k]; if (rd <= cum) { a = k; break; } }
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                        iter, out_vals);
-        free(child_vals);
+                        iter, scratch, scratch_depth, out_vals);
         return;
     }
 
@@ -1191,12 +1211,11 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
      * then per-hand regret-match + combine + update. */
     if (r->visit_count) r->visit_count[node_idx]++;
     int64_t off = r->node_off[node_idx];
-    /* child_vals[a][h] is heap-backed because 8 x 1400 doubles is 87.5 KiB
-     * in every recursive traverser-decision frame. */
+    double (*child_vals)[SS_MAX_HANDS] = scratch[scratch_depth];
     for (int a = 0; a < na; a++) {
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                        iter, child_vals[a]);
+                        iter, scratch, scratch_depth + 1, child_vals[a]);
     }
     double d = (double)iter / ((double)iter + 1.0);
     for (int h = 0; h < nh; h++) {
@@ -1224,7 +1243,6 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         }
         out_vals[h] = node_val;
     }
-    free(child_vals);
 }
 
 /* Build the dead-hand mask for a vec walk: traverser hand h is dead if either
@@ -1263,7 +1281,8 @@ void es_merge_stats(ESStats *dst, const ESStats *src) {
  * NOT be reserved — see es_sample_opponents), build the per-hand dead mask, then
  * walk once covering ALL of `trav`'s hands. */
 static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
-                               ESStats *local, int64_t iter) {
+                               ESStats *local, int64_t iter,
+                               ESVecScratch scratch) {
     int sampled[SS_MAX_PLAYERS];
     int dead[SS_MAX_HANDS];
     double out_vals[SS_MAX_HANDS];
@@ -1273,7 +1292,8 @@ static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
     es_sample_hands(r, rng, sampled);             /* VALIDATED sampler (default) */
 #endif
     es_build_dead_mask(r, trav, sampled, dead);
-    es_traverse_vec(r, 0, trav, sampled, dead, rng, local, iter, out_vals);
+    es_traverse_vec(r, 0, trav, sampled, dead, rng, local, iter,
+                    scratch, 0, out_vals);
 }
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
@@ -1305,6 +1325,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
 #endif
 
     int np = r->np;
+    int vec_scratch_count = r->vec_traverser ? es_vec_scratch_slots(r) : 0;
     uint64_t deadline_start_ms = (r->deadline_ms > 0)
                                  ? es_monotonic_ms() : 0;
 
@@ -1314,6 +1335,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
         int64_t completed = 0;
+        ESVecScratch vec_scratch = es_alloc_vec_scratch(vec_scratch_count);
         for (int64_t it = 0; it < iterations; it++) {
             if ((it & 4095LL) == 0
                 && es_deadline_expired(r, deadline_start_ms))
@@ -1323,7 +1345,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                     /* vec mode walks ALL traverser hands; es_vec_pass samples
                      * OPPONENTS ONLY (traverser cards not reserved). */
                     local.traversals++;
-                    es_vec_pass(r, trav, &rng, &local, it + 1);
+                    es_vec_pass(r, trav, &rng, &local, it + 1, vec_scratch);
                 } else {
                     es_sample_hands(r, &rng, sampled);
                     if (sampled[trav] < 0) continue;   /* traverser unassignable */
@@ -1333,6 +1355,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
             }
             completed++;
         }
+        free(vec_scratch);
         es_merge_stats(&r->stats, &local);
         r->iterations_run = completed;
         return 0;
@@ -1363,6 +1386,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
         int64_t local_completed = 0;
+        ESVecScratch vec_scratch = es_alloc_vec_scratch(vec_scratch_count);
 
         /* The shared cursor keeps concurrently processed `it` values near
          * current global progress. This is load-bearing for LINEAR CFR: the
@@ -1385,7 +1409,8 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                 for (int trav = 0; trav < np; trav++) {
                     if (r->vec_traverser) {
                         local.traversals++;
-                        es_vec_pass(r, trav, &rng, &local, it + 1);
+                        es_vec_pass(r, trav, &rng, &local, it + 1,
+                                    vec_scratch);
                     } else {
                         es_sample_hands(r, &rng, sampled);
                         if (sampled[trav] < 0) continue;
@@ -1396,6 +1421,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                 local_completed++;
             }
         }
+        free(vec_scratch);
         #pragma omp critical
         {
             es_merge_stats(&r->stats, &local);
@@ -1589,6 +1615,6 @@ ES_EXPORT double es_test_showdown_value_vec(
     uint64_t rng = 0x9E3779B97F4A7C15ULL;
     ESStats local; memset(&local, 0, sizeof(local));
     es_traverse_vec(&tmp, 0, traverser, opp_sampled, dead, &rng, &local,
-                    1, out_vals);
+                    1, NULL, 0, out_vals);
     return out_vals[0];
 }
