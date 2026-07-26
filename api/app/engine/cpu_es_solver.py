@@ -203,6 +203,55 @@ def _leaf_sampled_policy() -> int:
     return policy
 
 
+def _leaf_bias_cfr_mode() -> str:
+    """Parse the table-backed continuation-bias CFR mode."""
+    raw = os.environ.get("NEXUS_LEAF_BIAS_CFR") or "off"
+    if raw in ("off", "0"):
+        return "off"
+    if raw in ("marginal", "joint"):
+        return raw
+    raise ValueError(
+        "NEXUS_LEAF_BIAS_CFR must be off/0, marginal, or joint, "
+        f"got {raw!r}"
+    )
+
+
+def _bias_cfr_rounds() -> int:
+    """Parse B4 fill rounds; rounds=1 with nr=1/bin is the recommended start.
+
+    The design estimates that starting point at about 1.33x today's eager-fill
+    wall clock.
+    """
+    raw = os.environ.get("NEXUS_BIAS_CFR_ROUNDS") or "1"
+    try:
+        rounds = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_ROUNDS={raw!r} is not an integer"
+        ) from None
+    if not (1 <= rounds <= 64):
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_ROUNDS={rounds} outside [1, 64]"
+        )
+    return rounds
+
+
+def _bias_cfr_nr() -> int:
+    """Parse the number of rollouts per bias bin/profile."""
+    raw = os.environ.get("NEXUS_BIAS_CFR_NR") or "1"
+    try:
+        nr = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_NR={raw!r} is not an integer"
+        ) from None
+    if not (1 <= nr <= 100):
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_NR={nr} outside [1, 100]"
+        )
+    return nr
+
+
 def _sampled_deadline_ms() -> int:
     """Parse the optional relative sampled-solve deadline in milliseconds."""
     raw = os.environ.get("NEXUS_SAMPLED_DEADLINE_MS") or "0"
@@ -259,6 +308,9 @@ class CpuEsSolver:
         # NEXUS_LEAF_SAMPLED: fresh per-visit oracle counters from the last
         # sampled solve. None on every other leaf-value path.
         self._last_sampled_stats = None
+        # NEXUS_LEAF_BIAS_CFR: table-backed continuation-bias oracle counters
+        # from the last marginal/joint solve. None on every other path.
+        self._last_bias_oracle_stats = None
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -535,14 +587,23 @@ class CpuEsSolver:
         # accepted and run as scalar without changing the requested readout.
         _sampled_requested = _leaf_sampled_enabled()
         _rollout_requested = _leaf_rollout_enabled()
+        _bias_mode_requested = _leaf_bias_cfr_mode()
+        _leaf_bias_mode = _bias_mode_requested
+        _bias_rounds = None
+        _bias_nr = None
         _sampled_policy = None
         _sampled_deadline = 0
         _sampled_iterations_run = None
         self._last_sampled_stats = None
+        self._last_bias_oracle_stats = None
         if _sampled_requested:
             vec_mode = 0
             _sampled_policy = _leaf_sampled_policy()
             _sampled_deadline = _sampled_deadline_ms()
+        if _bias_mode_requested == "marginal":
+            _bias_rounds = _bias_cfr_rounds()
+        if _bias_mode_requested != "off":
+            _bias_nr = _bias_cfr_nr()
         if vec_mode and readout != "final":
             raise ValueError(
                 "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
@@ -589,6 +650,11 @@ class CpuEsSolver:
         # Reject incompatible operator intent before the tree shape can bypass
         # these guards.
         if _sampled_requested:
+            if _bias_mode_requested != "off":
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_BIAS_CFR: these are two distinct leaf-value "
+                    "strategies; enable exactly one.")
             if _rollout_requested:
                 raise RuntimeError(
                     "NEXUS_LEAF_SAMPLED=1 is incompatible with "
@@ -631,6 +697,52 @@ class CpuEsSolver:
                     "NEXUS_LEAF_SAMPLED=1 requires "
                     "NEXUS_LEAF_RANGE_CONDITIONING=0: sampled leaves "
                     "bypass the eager per-leaf range-conditioning construct")
+
+        if _bias_mode_requested != "off":
+            # ── INTERACTION GUARDS: bias-table CFR is its own eager leaf-value
+            # strategy. Combining it with another leaf oracle or an armed
+            # cont_ev boundary would silently discard one requested strategy.
+            # PRECEDENCE: neither wins — the operator must enable exactly one.
+            if _rollout_requested:
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with "
+                    "NEXUS_LEAF_ROLLOUT=1: these are two distinct leaf-value "
+                    "strategies; enable exactly one.")
+            _bias_cev_would_arm = (
+                self._cev_holder is not None
+                and ((street == "flop" and n_players >= 3)
+                     or (_a3_cont_ev_turn_enabled()
+                         and street == "turn" and n_players >= 3))
+            )
+            if _bias_cev_would_arm:
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with the armed "
+                    "cont_ev boundary (NEXUS_A3_CONT_EV / "
+                    "NEXUS_A3_CONT_EV_TURN): these are two distinct "
+                    "leaf-value strategies; enable exactly one.")
+            if _cont_ev_bias_action_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with "
+                    "NEXUS_CONT_EV_BIAS_ACTION: these are two distinct "
+                    "leaf-value strategies; enable exactly one.")
+            if _cont_ev_miss_fallback_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with "
+                    "NEXUS_CONT_EV_MISS_FALLBACK: these are two distinct "
+                    "leaf-value strategies; enable exactly one.")
+            if _bias_mode_requested == "joint" and n_players != 2:
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR=joint requires n_players == 2")
+            _bias_cond_on = os.environ.get(
+                "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
+                    "0", "f", "F", "n", "N")
+            if (_bias_mode_requested == "joint" and _bias_cond_on
+                    and n_players == 2 and street in ("flop", "turn")):
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR=joint at 2p flop/turn requires "
+                    "NEXUS_LEAF_RANGE_CONDITIONING=0: the joint16 enumerator "
+                    "has no per-leaf range variant, and v1 will not silently "
+                    "drop conditioning.")
 
         _base_bet_sizes = list(bet_sizes)
         _base_subsequent_sizes = list(subsequent_bet_sizes)
@@ -856,6 +968,7 @@ class CpuEsSolver:
                 leaf_mode = "table_eager"
                 _leaf_rollout = False
                 _leaf_sampled = False
+                _leaf_bias_mode = "off"
                 _oracle_arrays = None
                 self._last_leaf_rollout_stats = None
             else:
@@ -887,6 +1000,10 @@ class CpuEsSolver:
                     leaf_mode = "sampled_per_visit"
                 elif _leaf_rollout:
                     leaf_mode = "rollout_lazy"
+                elif _leaf_bias_mode == "marginal":
+                    leaf_mode = "table_eager_bias4"
+                elif _leaf_bias_mode == "joint":
+                    leaf_mode = "table_eager_joint16"
                 else:
                     leaf_mode = "table_eager"
                 self._last_leaf_rollout_stats = None
@@ -1132,6 +1249,57 @@ class CpuEsSolver:
                 try:
                     if _leaf_rollout or _leaf_sampled:
                         pass  # leaf oracle is constructed at the solver site
+                    elif _leaf_bias_mode == "marginal":
+                        if per_leaf_ranges is not None:
+                            table = rc.compute_subgame_leaf_values_bias4_perleaf(
+                                leaf_infos=leaf_infos, board=board_ints,
+                                street=street, player_hands=player_ranges,
+                                per_leaf_player_hands=per_leaf_ranges,
+                                active=[True] * n_players,
+                                acting_order=list(range(n_players)),
+                                player_seats=list(player_seats),
+                                game_action_history=list(
+                                    game_action_indices or []),
+                                blueprint=self._blueprint,
+                                starting_pot_chips=int(
+                                    round(pot_bb * scale)),
+                                stack_chips=stack_chips, max_hands=max_h,
+                                num_rollouts=_bias_nr,
+                                num_rounds=_bias_rounds,
+                                master_seed=master_seed,
+                            )
+                        else:
+                            table = rc.compute_subgame_leaf_values_bias4(
+                                leaf_infos=leaf_infos, board=board_ints,
+                                street=street, player_hands=player_ranges,
+                                active=[True] * n_players,
+                                acting_order=list(range(n_players)),
+                                player_seats=list(player_seats),
+                                game_action_history=list(
+                                    game_action_indices or []),
+                                blueprint=self._blueprint,
+                                starting_pot_chips=int(
+                                    round(pot_bb * scale)),
+                                stack_chips=stack_chips, max_hands=max_h,
+                                num_rollouts=_bias_nr,
+                                num_rounds=_bias_rounds,
+                                master_seed=master_seed,
+                            )
+                    elif _leaf_bias_mode == "joint":
+                        table = rc.compute_subgame_leaf_values_c(
+                            leaf_infos=leaf_infos, board=board_ints,
+                            street=street, player_hands=player_ranges,
+                            active=[True] * n_players,
+                            acting_order=list(range(n_players)),
+                            player_seats=list(player_seats),
+                            game_action_history=list(
+                                game_action_indices or []),
+                            blueprint=self._blueprint,
+                            starting_pot_chips=int(round(pot_bb * scale)),
+                            stack_chips=stack_chips, max_hands=max_h,
+                            num_rollouts=_bias_nr,
+                            master_seed=master_seed,
+                        )
                     elif per_leaf_ranges is not None:
                         table = rc.compute_subgame_leaf_values_sampled_perleaf_c(
                             leaf_infos=leaf_infos, board=board_ints, street=street,
@@ -1367,6 +1535,20 @@ class CpuEsSolver:
                     master_seed=master_seed,
                     seed=1,
                 )
+            elif _leaf_bias_mode != "off":
+                _bias_oracle_mode = (
+                    0 if _leaf_bias_mode == "marginal" else 1
+                )
+                _bias_n_leaves = (
+                    int(table.shape[0])
+                    if _bias_oracle_mode == 0
+                    else int(table.shape[0]) // 16
+                )
+                cs = self._CSolver.from_bias_table(
+                    gpu._tree, table, mode=_bias_oracle_mode,
+                    np_=n_players, max_h=max_h, n_leaves=_bias_n_leaves,
+                    seed=1,
+                )
             else:
                 cs = self._CSolver.from_table(
                     gpu._tree, table, n_players, max_h, seed=1)
@@ -1575,6 +1757,24 @@ class CpuEsSolver:
                     logger.warning("sampled-leaf stats read failed: %s", _e)
                     self._last_sampled_stats = None
 
+            if _leaf_bias_mode != "off":
+                try:
+                    _visits, _errs = cs.bias_oracle_stats()
+                    self._last_bias_oracle_stats = {
+                        "visits": int(_visits),
+                        "errors": int(_errs),
+                    }
+                    logger.info(
+                        "CpuEsSolver bias-table: %dp %s mode=%s visits=%d "
+                        "errors=%d", n_players, street, _leaf_bias_mode,
+                        _visits, _errs)
+                    if _errs:
+                        logger.warning(
+                            "CpuEsSolver bias-table: %d oracle errors", _errs)
+                except Exception as _e:  # observability must not break a solve
+                    logger.warning("bias-table stats read failed: %s", _e)
+                    self._last_bias_oracle_stats = None
+
             # BR-GAP EXPOSE (NEXUS_BR_GAP_EXPOSE=1, default OFF). Stash the GENUINE
             # production solve objects (tree snapshot + leaf table + served sigma)
             # so an offline per-spot correctness harness can compute the in-tree
@@ -1619,6 +1819,18 @@ class CpuEsSolver:
                             _br_table = None
                         if _br_table is None:
                             _br_table_source = "rollout_oracle_unavailable"
+                    elif _leaf_bias_mode != "off":
+                        _br_table = None
+                        _br_table_source = "bias_oracle_effective"
+                        try:
+                            _br_table = cs.get_bias_effective_table()
+                        except Exception as _te:  # never break a real solve
+                            logger.warning(
+                                "BR-gap bias leaf-table readout failed: %s",
+                                _te)
+                        if _br_table is None:
+                            _br_table_source = (
+                                "bias_oracle_effective_unavailable")
                     elif _leaf_sampled:
                         # A fresh per-visit oracle has no coherent dense table
                         # to expose for the optional offline BR-gap harness.
@@ -1893,9 +2105,11 @@ class CpuEsSolver:
                 "street": street,
                 # leaf-value strategy for THIS solve: "table_eager" (shipped
                 # default: exhaustive fill + from_table), "rollout_lazy"
-                # (cached all-hands oracle), or "sampled_per_visit".
+                # (cached all-hands oracle), "sampled_per_visit", or one of
+                # the table-backed bias-CFR modes.
                 "leaf_mode": leaf_mode,
                 "leaf_rollout_stats": self._last_leaf_rollout_stats,
+                "bias_oracle_stats": self._last_bias_oracle_stats,
                 "sampled_stats": self._last_sampled_stats,
                 "construct_s": float(construct_s),
                 "solve_s": float(solve_s),

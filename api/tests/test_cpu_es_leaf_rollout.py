@@ -136,10 +136,12 @@ class _FakeSolver:
     """Records construction + exposes the run/read surface solve() calls."""
 
     last_from_table = None
+    last_from_bias_table = None
     last_from_real_oracle = None
     last_from_sampled_oracle = None
     avg_calls = []
     final_calls = []
+    cfr_calls = []
     vec_calls = []
     chance_calls = []
     opp_calls = []
@@ -147,6 +149,8 @@ class _FakeSolver:
     deadline_calls = []
     iterations_run_calls = 0
     sampled_stats_calls = 0
+    bias_stats_calls = 0
+    bias_stats = (13, 0)
     events = []
     iterations_completed = 1
     avg_sigma = np.asarray([[0.8, 0.2], [0.35, 0.65]], dtype=np.float32)
@@ -164,6 +168,11 @@ class _FakeSolver:
         return cls()
 
     @classmethod
+    def from_bias_table(cls, tree, values, **kw):
+        cls.last_from_bias_table = {"tree": tree, "values": values, **kw}
+        return cls()
+
+    @classmethod
     def from_real_oracle(cls, tree, bp_handle, **kw):
         cls.last_from_real_oracle = {"tree": tree, "bp_handle": bp_handle, **kw}
         return cls()
@@ -175,7 +184,9 @@ class _FakeSolver:
         return cls()
 
     # ── solve surface ──
-    def set_cfr_mode(self, m): pass
+    def set_cfr_mode(self, m):
+        type(self).cfr_calls.append(m)
+
     def set_vec_mode(self, m):
         type(self).vec_calls.append(m)
 
@@ -215,6 +226,10 @@ class _FakeSolver:
         type(self).sampled_stats_calls += 1
         return (11, 33, 2, 4, 12, 7, 21)
 
+    def bias_oracle_stats(self):
+        type(self).bias_stats_calls += 1
+        return type(self).bias_stats
+
 
 class _FakeRollout:
     """Fake isolated rollout_c. Records the eager-fill call; provides the
@@ -222,16 +237,44 @@ class _FakeRollout:
 
     def __init__(self):
         self.eager_fill_calls = 0
+        self.sampled_fill_calls = 0
+        self.sampled_perleaf_fill_calls = 0
+        self.bias4_fill_calls = 0
+        self.bias4_perleaf_fill_calls = 0
+        self.joint_fill_calls = 0
+        self.last_fill_kwargs = None
 
     def compute_subgame_leaf_values_sampled_c(self, **kw):
         self.eager_fill_calls += 1
+        self.sampled_fill_calls += 1
+        self.last_fill_kwargs = kw
         n_players = len(kw["player_hands"])
         return np.zeros((2, n_players, 6), dtype=np.float32)
 
     def compute_subgame_leaf_values_sampled_perleaf_c(self, **kw):
         self.eager_fill_calls += 1
+        self.sampled_perleaf_fill_calls += 1
+        self.last_fill_kwargs = kw
         n_players = len(kw["player_hands"])
         return np.zeros((2, n_players, 6), dtype=np.float32)
+
+    def compute_subgame_leaf_values_bias4(self, **kw):
+        self.bias4_fill_calls += 1
+        self.last_fill_kwargs = kw
+        n_players = len(kw["player_hands"])
+        return np.zeros((2, 4, n_players, 6), dtype=np.float32)
+
+    def compute_subgame_leaf_values_bias4_perleaf(self, **kw):
+        self.bias4_perleaf_fill_calls += 1
+        self.last_fill_kwargs = kw
+        n_players = len(kw["player_hands"])
+        return np.zeros((2, 4, n_players, 6), dtype=np.float32)
+
+    def compute_subgame_leaf_values_c(self, **kw):
+        self.joint_fill_calls += 1
+        self.last_fill_kwargs = kw
+        n_players = len(kw["player_hands"])
+        return np.zeros((2 * 16, n_players, 6), dtype=np.float32)
 
 
 class _FakeBpHandle:
@@ -257,6 +300,7 @@ def _make_solver(n_players, tree, rc, cev_holder=None):
     s._last_br_gap_objs = None
     s._last_leaf_rollout_stats = None
     s._last_sampled_stats = None
+    s._last_bias_oracle_stats = None
     s._last_solve_stats = None
 
     tree_for_snapshot = tree
@@ -296,6 +340,9 @@ _ISOLATED_ENV_KEYS = (
     "NEXUS_LEAF_SAMPLED",
     "NEXUS_LEAF_SAMPLED_POLICY",
     "NEXUS_SAMPLED_DEADLINE_MS",
+    "NEXUS_LEAF_BIAS_CFR",
+    "NEXUS_BIAS_CFR_ROUNDS",
+    "NEXUS_BIAS_CFR_NR",
     "NEXUS_A3_CONT_EV",
     "NEXUS_A3_CONT_EV_TURN",
     "NEXUS_CONT_EV_BIAS_ACTION",
@@ -310,10 +357,12 @@ _ISOLATED_ENV_KEYS = (
 @pytest.fixture(autouse=True)
 def _reset_fake_solver(monkeypatch):
     _FakeSolver.last_from_table = None
+    _FakeSolver.last_from_bias_table = None
     _FakeSolver.last_from_real_oracle = None
     _FakeSolver.last_from_sampled_oracle = None
     _FakeSolver.avg_calls = []
     _FakeSolver.final_calls = []
+    _FakeSolver.cfr_calls = []
     _FakeSolver.vec_calls = []
     _FakeSolver.chance_calls = []
     _FakeSolver.opp_calls = []
@@ -321,6 +370,8 @@ def _reset_fake_solver(monkeypatch):
     _FakeSolver.deadline_calls = []
     _FakeSolver.iterations_run_calls = 0
     _FakeSolver.sampled_stats_calls = 0
+    _FakeSolver.bias_stats_calls = 0
+    _FakeSolver.bias_stats = (13, 0)
     _FakeSolver.events = []
     _FakeSolver.iterations_completed = 1
     # Measurement/serving env from the invoking box must not select a mode or
