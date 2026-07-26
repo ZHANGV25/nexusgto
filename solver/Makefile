@@ -119,13 +119,13 @@ endif
 es_resolver: $(BUILD_DIR)/es_resolver$(SHLIB_EXT)
 es_resolver_real: $(BUILD_DIR)/es_resolver_real$(SHLIB_EXT)
 
-$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
-	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c -o $@ $(LDFLAGS)
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
-	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
 	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
@@ -134,18 +134,46 @@ $(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_
 # a deterministic stub, so no blueprint artifact or live rollout is required.
 $(BUILD_DIR)/test_es_sampled_oracle: tests/test_es_sampled_oracle.c \
         $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h \
+        $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h \
         $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
         $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/es_oracles.c \
         $(SEARCH_DIR)/rollout_internal.h $(SEARCH_DIR)/rollout.h \
         $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_sampled_oracle.c \
-	    $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_resolver.c \
+	    $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_resolver.c \
 	    $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c \
 	    -o $@ $(LDFLAGS)
 
 .PHONY: test_es_sampled_oracle
 test_es_sampled_oracle: $(BUILD_DIR)/test_es_sampled_oracle
 	./$(BUILD_DIR)/test_es_sampled_oracle
+
+# Stratified B4 fill contracts. rollout_compute_leaf_values_all_hands_c and
+# the error surface are supplied by in-test stubs, so ONLY rollout_sampled.c
+# may be linked (linking rollout.c would duplicate the stubbed symbols).
+$(BUILD_DIR)/test_rollout_bias4: tests/test_rollout_bias4.c \
+        $(SEARCH_DIR)/rollout_sampled.c \
+        $(SEARCH_DIR)/rollout_internal.h $(SEARCH_DIR)/rollout.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_rollout_bias4.c \
+	    $(SEARCH_DIR)/rollout_sampled.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_rollout_bias4
+test_rollout_bias4: $(BUILD_DIR)/test_rollout_bias4
+	./$(BUILD_DIR)/test_rollout_bias4
+
+# Table-backed bias-oracle fixed points. The oracle is exercised directly
+# through its function pointer; no resolver or rollout objects are needed.
+$(BUILD_DIR)/test_es_bias_oracle: tests/test_es_bias_oracle.c \
+        $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h \
+        $(SEARCH_DIR)/es_resolver.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_bias_oracle.c \
+	    $(SEARCH_DIR)/es_bias_oracle.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_bias_oracle
+test_es_bias_oracle: $(BUILD_DIR)/test_es_bias_oracle
+	./$(BUILD_DIR)/test_es_bias_oracle
 
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
 # Builds with nvcc; requires CUDA toolkit on PATH. Targets sm_75 (T4 on

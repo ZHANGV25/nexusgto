@@ -68,6 +68,14 @@ def _load_dll() -> ctypes.CDLL:
 _lib = _load_dll()
 _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 _HAS_SAMPLED = hasattr(_lib, "es_make_sampled_oracle")
+_BIAS_SYMBOLS = (
+    "es_make_bias_oracle",
+    "es_bias_oracle_fn",
+    "es_free_bias_oracle",
+    "es_bias_oracle_stats",
+    "es_bias_oracle_get_effective_table",
+)
+_HAS_BIAS = all(hasattr(_lib, name) for name in _BIAS_SYMBOLS)
 
 # void* es_create(const SSTreeData*, ESLeafOracle, void* ctx, uint64_t seed)
 _lib.es_create.restype = ctypes.c_void_p
@@ -128,6 +136,27 @@ _lib.es_make_joint_oracle.restype = ctypes.c_void_p
 _lib.es_make_joint_oracle.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _lib.es_joint_oracle_fn.restype = ctypes.c_void_p
 _lib.es_free_oracle_ctx.argtypes = [ctypes.c_void_p]
+
+# Table-backed continuation-bias oracle (lightweight and real DLLs).
+if _HAS_BIAS:
+    _lib.es_make_bias_oracle.restype = ctypes.c_void_p
+    _lib.es_make_bias_oracle.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _lib.es_bias_oracle_fn.restype = ctypes.c_void_p
+    _lib.es_free_bias_oracle.restype = None
+    _lib.es_free_bias_oracle.argtypes = [ctypes.c_void_p]
+    _lib.es_bias_oracle_stats.restype = None
+    _lib.es_bias_oracle_stats.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    _lib.es_bias_oracle_get_effective_table.restype = ctypes.c_int32
+    _lib.es_bias_oracle_get_effective_table.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+    ]
 
 # real-blueprint rollout oracle (only in es_resolver_real.dll)
 ESRO_MAX_FLOP_HIST = 256  # = ROLLOUT_MAX_ACTION_HISTORY
@@ -257,6 +286,9 @@ class CSolver:
         self._tree = tree
         self._oracle_ctx = oracle_ctx
         self._real_oracle_ctx = None  # set by from_real_oracle (different free)
+        self._bias_oracle_ctx = None
+        self._bias_values_keepalive = None
+        self._bias_dims = None
         # Tag sampled ownership before es_create so a constructor failure is
         # still cleaned up by the type-specific destructor (the generic oracle
         # free only releases the outer allocation).
@@ -286,6 +318,77 @@ class CSolver:
             t.ctypes.data_as(ctypes.c_void_p), np_players, max_h)
         fn = _lib.es_table_oracle_fn()
         return cls(tree, fn, ctx, seed=seed, _keepalive=t)
+
+    @classmethod
+    def from_bias_table(cls, tree, values: np.ndarray, mode: int, np_: int,
+                        max_h: int, n_leaves: int,
+                        seed: int = 1) -> "CSolver":
+        """Table-backed continuation-bias oracle.
+
+        mode=0 consumes [n_leaves,4,np,max_h] marginal values. mode=1 is
+        JOINT2P and consumes [n_leaves*16,np,max_h]. The C context borrows the
+        float32 values buffer, so this instance retains it for the full solver
+        lifetime.
+        """
+        missing = [name for name in _BIAS_SYMBOLS if not hasattr(_lib, name)]
+        if missing:
+            raise RuntimeError(
+                "bias oracle symbols are missing from this DLL "
+                f"({', '.join(missing)}); rebuild es_resolver / "
+                "es_resolver_real with es_bias_oracle.c"
+            )
+        if mode not in (0, 1):
+            raise ValueError("mode must be 0 (MARGINAL) or 1 (JOINT2P)")
+        if np_ != int(tree.num_players_field):
+            raise ValueError(
+                f"np_={np_} does not match tree players="
+                f"{tree.num_players_field}"
+            )
+        if mode == 1 and np_ != 2:
+            raise ValueError("JOINT2P mode requires np_=2")
+        if n_leaves <= 0 or max_h <= 0:
+            raise ValueError("n_leaves and max_h must be positive")
+        if n_leaves < int(tree.num_leaves):
+            raise ValueError(
+                f"n_leaves={n_leaves} is smaller than tree.num_leaves="
+                f"{tree.num_leaves}"
+            )
+        for player in range(np_):
+            if max_h < int(tree.num_hands[player]):
+                raise ValueError(
+                    f"max_h={max_h} does not cover player {player}'s "
+                    f"{tree.num_hands[player]} hands"
+                )
+
+        t = np.ascontiguousarray(values, dtype=np.float32)
+        bias_slots = 4 if mode == 0 else 16
+        expected = n_leaves * bias_slots * np_ * max_h
+        if t.size != expected:
+            layout = (
+                f"({n_leaves}, 4, {np_}, {max_h})"
+                if mode == 0
+                else f"({n_leaves * 16}, {np_}, {max_h})"
+            )
+            raise ValueError(
+                f"bias values contain {t.size} floats, expected {expected} "
+                f"for layout {layout}"
+            )
+
+        ctx = _lib.es_make_bias_oracle(
+            t.ctypes.data_as(ctypes.c_void_p),
+            int(mode), int(np_), int(max_h), int(n_leaves),
+        )
+        if not ctx:
+            raise RuntimeError(
+                "es_make_bias_oracle returned NULL "
+                "(invalid arguments, size overflow, or OOM)"
+            )
+        fn = _lib.es_bias_oracle_fn()
+        solver = cls(tree, fn, ctx, seed=seed, _keepalive=t)
+        solver._bias_oracle_ctx = ctx
+        solver._bias_values_keepalive = t
+        solver._bias_dims = (int(n_leaves), int(np_), int(max_h))
+        return solver
 
     @classmethod
     def joint_zero_sum(cls, tree, strength0: np.ndarray, strength1: np.ndarray,
@@ -421,6 +524,62 @@ class CSolver:
         return (visits.value, rollouts.value, errs.value,
                 uniform_visits.value, uniform_rollouts.value,
                 regret_visits.value, regret_rollouts.value)
+
+    def bias_oracle_stats(self):
+        """Return ``(leaf_visits, oracle_errors)`` for a bias-table solve."""
+        ctx = getattr(self, "_bias_oracle_ctx", None)
+        if ctx is None:
+            return (0, 0)
+        if not hasattr(_lib, "es_bias_oracle_stats"):
+            raise RuntimeError(
+                "es_bias_oracle_stats not in this DLL; rebuild "
+                "es_resolver / es_resolver_real"
+            )
+        visits = ctypes.c_uint64(0)
+        errors = ctypes.c_uint64(0)
+        _lib.es_bias_oracle_stats(
+            ctx, ctypes.byref(visits), ctypes.byref(errors))
+        return (visits.value, errors.value)
+
+    def get_bias_effective_table(self):
+        """Post-solve [n_leaves,np,max_h] float32 reporting table.
+
+        JOINT2P folds opponent biases uniformly for this reporting-only
+        projection; live solve calls use the sampled opponent hand's
+        regret-matched bias row.
+        """
+        ctx = getattr(self, "_bias_oracle_ctx", None)
+        if ctx is None:
+            return None
+        if not hasattr(_lib, "es_bias_oracle_get_effective_table"):
+            raise RuntimeError(
+                "es_bias_oracle_get_effective_table not in this DLL; "
+                "rebuild es_resolver / es_resolver_real"
+            )
+        dims = getattr(self, "_bias_dims", None)
+        values = getattr(self, "_bias_values_keepalive", None)
+        if dims is None or values is None:
+            raise RuntimeError(
+                "bias oracle dimensions/values keepalive are missing"
+            )
+        n_leaves, np_players, max_h = dims
+        need = n_leaves * np_players * max_h
+        if need <= 0:
+            raise RuntimeError(
+                "bias oracle reported a non-positive effective-table size"
+            )
+        buf = np.empty(need, dtype=np.float32)
+        got = _lib.es_bias_oracle_get_effective_table(
+            ctx, values.ctypes.data_as(ctypes.c_void_p),
+            buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), need,
+        )
+        if got != need:
+            raise RuntimeError(
+                "es_bias_oracle_get_effective_table returned "
+                f"{got}, expected {need} "
+                f"(dims {n_leaves}x{np_players}x{max_h})"
+            )
+        return buf.reshape((n_leaves, np_players, max_h))
 
     def get_oracle_leaf_table(self):
         """Dense leaf-value table [n_leaves, np, max_h] read from the lazy
@@ -630,6 +789,11 @@ class CSolver:
             if getattr(self, "_real_oracle_ctx", None):
                 _lib.es_free_real_oracle(self._real_oracle_ctx)
                 self._real_oracle_ctx = None
+                self._oracle_ctx = None  # same ptr; don't double-free
+            elif getattr(self, "_bias_oracle_ctx", None):
+                _lib.es_free_bias_oracle(self._bias_oracle_ctx)
+                self._bias_oracle_ctx = None
+                self._bias_values_keepalive = None
                 self._oracle_ctx = None  # same ptr; don't double-free
             elif getattr(self, "_sampled_oracle_ctx", None):
                 _lib.es_free_sampled_oracle(self._sampled_oracle_ctx)

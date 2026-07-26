@@ -384,6 +384,57 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_perleaf_c(
 
 /* ── Error surface ───────────────────────────────────────────────────── */
 
+/* Stratified four-bias marginal construct. For each (leaf, round), draws one
+ * independent permutation of {0,1,2,3} per player and runs four joint-profile
+ * batches. Each player's batch value is accumulated into that player's
+ * selected bias bin, so every [leaf][bias][player][hand] slot receives exactly
+ * one sample per round while opponent biases remain uniform in expectation.
+ *
+ * Output shape is float32[max_leaf_idx + 1][4][num_players][max_hands].
+ * Flat index:
+ *   out[(((leaf_idx * 4 + bias) * num_players) + player) * max_hands
+ *       + hand].
+ */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_bias4_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_rounds,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+);
+
+/* Per-leaf conditioned-range variant of the stratified B4 construct. The
+ * per_leaf_player_hands array is [n_leaves][num_players], indexed by the
+ * leaf_infos loop position exactly like the sampled per-leaf entry. */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_bias4_perleaf_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const RolloutHandList *per_leaf_player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_rounds,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+);
+
 BPS_EXPORT void rollout_get_last_error(
     const char **reason, int32_t *street, int32_t *num_players
 );

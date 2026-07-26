@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 import time
@@ -33,6 +34,8 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
+
+_LOG = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -239,6 +242,63 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
             ctypes.c_int32,                     # out_size
         ]
         lib.rollout_compute_subgame_leaf_values_sampled_perleaf_c.restype = \
+            ctypes.c_int32
+
+    # Stratified four-bias marginal construct. Optional at module load so a
+    # stale rollout library produces a focused rebuild error at call time.
+    if hasattr(lib, "rollout_compute_subgame_leaf_values_bias4_c"):
+        lib.rollout_compute_subgame_leaf_values_bias4_c.argtypes = [
+            ctypes.c_void_p,                    # BPSReader *
+            ctypes.POINTER(ctypes.c_int),       # board
+            ctypes.c_int32,                     # n_board_cards
+            ctypes.c_int32,                     # street
+            ctypes.POINTER(_RolloutLeafInfo),   # leaf_infos
+            ctypes.c_int32,                     # n_leaves
+            ctypes.POINTER(ctypes.c_int32),     # active
+            ctypes.c_int32,                     # num_players
+            ctypes.POINTER(_RolloutHandList),   # player_hands
+            ctypes.POINTER(ctypes.c_int32),     # acting_order
+            ctypes.c_int32,                     # acting_order_len
+            ctypes.POINTER(ctypes.c_int32),     # player_seats
+            ctypes.POINTER(ctypes.c_int32),     # game_action_history
+            ctypes.c_int32,                     # gah_len
+            ctypes.c_int32,                     # stack_chips
+            ctypes.c_int32,                     # max_hands
+            ctypes.c_int32,                     # num_rollouts
+            ctypes.c_int32,                     # num_rounds
+            ctypes.c_uint64,                    # master_seed
+            ctypes.POINTER(ctypes.c_float),     # out
+            ctypes.c_int32,                     # out_size
+        ]
+        lib.rollout_compute_subgame_leaf_values_bias4_c.restype = \
+            ctypes.c_int32
+
+    if hasattr(lib, "rollout_compute_subgame_leaf_values_bias4_perleaf_c"):
+        lib.rollout_compute_subgame_leaf_values_bias4_perleaf_c.argtypes = [
+            ctypes.c_void_p,                    # BPSReader *
+            ctypes.POINTER(ctypes.c_int),       # board
+            ctypes.c_int32,                     # n_board_cards
+            ctypes.c_int32,                     # street
+            ctypes.POINTER(_RolloutLeafInfo),   # leaf_infos
+            ctypes.c_int32,                     # n_leaves
+            ctypes.POINTER(ctypes.c_int32),     # active
+            ctypes.c_int32,                     # num_players
+            ctypes.POINTER(_RolloutHandList),   # player_hands
+            ctypes.POINTER(_RolloutHandList),   # per_leaf_player_hands
+            ctypes.POINTER(ctypes.c_int32),     # acting_order
+            ctypes.c_int32,                     # acting_order_len
+            ctypes.POINTER(ctypes.c_int32),     # player_seats
+            ctypes.POINTER(ctypes.c_int32),     # game_action_history
+            ctypes.c_int32,                     # gah_len
+            ctypes.c_int32,                     # stack_chips
+            ctypes.c_int32,                     # max_hands
+            ctypes.c_int32,                     # num_rollouts
+            ctypes.c_int32,                     # num_rounds
+            ctypes.c_uint64,                    # master_seed
+            ctypes.POINTER(ctypes.c_float),     # out
+            ctypes.c_int32,                     # out_size
+        ]
+        lib.rollout_compute_subgame_leaf_values_bias4_perleaf_c.restype = \
             ctypes.c_int32
 
     lib.rollout_compute_leaf_value_c.argtypes = [
@@ -1178,6 +1238,237 @@ def compute_subgame_leaf_values_sampled_perleaf_c(
 
 
 # ─── Phase F Step 14: cont_ev_table consumer ──────────────────────────
+
+
+def _compute_subgame_leaf_values_bias4_impl(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    per_leaf_player_hands: Optional[
+        List[List[List[Tuple[int, int, float]]]]
+    ],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int,
+    num_rounds: int,
+    rng,
+    master_seed: int,
+) -> np.ndarray:
+    """Shared ctypes marshalling for the plain and per-leaf B4 entries."""
+    if street not in _STREET_NUM:
+        raise ValueError(f"bad street {street!r}")
+    if num_rounds < 1:
+        raise ValueError(f"num_rounds must be >= 1, got {num_rounds}")
+
+    lib = _lib()
+    perleaf = per_leaf_player_hands is not None
+    symbol = (
+        "rollout_compute_subgame_leaf_values_bias4_perleaf_c"
+        if perleaf else "rollout_compute_subgame_leaf_values_bias4_c"
+    )
+    if not hasattr(lib, symbol):
+        raise RuntimeError(
+            f"rollout lib lacks {symbol} -- rebuild rollout / "
+            "es_resolver_real with the Gap 2B bias4 fill"
+        )
+
+    if rng is not None:
+        try:
+            master_seed = int(
+                rng.integers(0, 2**64 - 1, dtype=np.uint64))
+        except Exception:
+            pass
+
+    if not hasattr(blueprint, "_reader"):
+        raise TypeError(
+            "C rollout requires a BPSReaderC blueprint (has ._reader handle); "
+            f"got {type(blueprint).__name__}."
+        )
+    bp_ptr = blueprint._reader
+
+    num_players = len(player_hands)
+    if num_players <= 0 or num_players > _ROLLOUT_MAX_PLAYERS:
+        raise ValueError(f"num_players {num_players} out of range [1, 6]")
+
+    n_leaves = len(leaf_infos)
+    if perleaf:
+        if per_leaf_player_hands is None:
+            raise RuntimeError("internal bias4 per-leaf range dispatch error")
+        if len(per_leaf_player_hands) != n_leaves:
+            raise ValueError(
+                "per_leaf_player_hands has "
+                f"{len(per_leaf_player_hands)} entries, expected one per "
+                f"leaf ({n_leaves})"
+            )
+        for leaf_local_idx, ranges in enumerate(per_leaf_player_hands):
+            if len(ranges) != num_players:
+                raise ValueError(
+                    f"per_leaf_player_hands[{leaf_local_idx}] has "
+                    f"{len(ranges)} player ranges, expected {num_players}"
+                )
+
+    max_leaf_idx = max((li.leaf_idx for li in leaf_infos), default=-1)
+    n_slots = max_leaf_idx + 1
+    floats_needed = n_slots * 4 * num_players * max_hands
+    projected_bytes = floats_needed * np.dtype(np.float32).itemsize
+    _LOG.info(
+        "bias4 leaf fill dims: n_leaves=%d n_slots=%d np=%d max_h=%d "
+        "projected_bytes=%d",
+        n_leaves, n_slots, num_players, max_hands, projected_bytes,
+    )
+    out = np.zeros(
+        (n_slots, 4, num_players, max_hands), dtype=np.float32)
+    if n_leaves == 0:
+        return out
+
+    board_arr = (ctypes.c_int * len(board))(*board) if board else None
+    board_ptr = (
+        board_arr if board_arr is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+
+    li_arr = (_RolloutLeafInfo * n_leaves)()
+    for i, li in enumerate(leaf_infos):
+        li_arr[i].leaf_idx = int(li.leaf_idx)
+        li_arr[i].pot_chips = int(li.pot)
+        bets_src = (
+            list(li.bets) if hasattr(li, "bets") else [0] * num_players
+        )
+        for player in range(_ROLLOUT_MAX_PLAYERS):
+            li_arr[i].bets[player] = (
+                int(bets_src[player]) if player < num_players else 0
+            )
+        _pack_leaf_flop_history(li_arr[i], li, i)
+
+    active_arr = (ctypes.c_int32 * num_players)(
+        *[1 if is_active else 0 for is_active in active]
+    )
+
+    stash: list = []
+    hl_arr = (_RolloutHandList * num_players)()
+    for player in range(num_players):
+        hl_arr[player] = _hand_list_struct(player_hands[player], stash)
+
+    pl_arr = None
+    if perleaf:
+        if per_leaf_player_hands is None:
+            raise RuntimeError("internal bias4 per-leaf range dispatch error")
+        pl_arr = (_RolloutHandList * (n_leaves * num_players))()
+        for leaf_local_idx in range(n_leaves):
+            for player in range(num_players):
+                pl_arr[leaf_local_idx * num_players + player] = \
+                    _hand_list_struct(
+                        per_leaf_player_hands[leaf_local_idx][player],
+                        stash,
+                    )
+
+    acting_order_arr = (
+        ctypes.c_int32 * len(acting_order))(*acting_order)
+    player_seats_arr = (
+        ctypes.c_int32 * len(player_seats))(*player_seats)
+    gah_arr = (
+        (ctypes.c_int32 * len(game_action_history))(*game_action_history)
+        if game_action_history else (ctypes.c_int32 * 0)()
+    )
+    out_ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+    common_args = (
+        bp_ptr,
+        board_ptr, ctypes.c_int32(len(board)),
+        ctypes.c_int32(_STREET_NUM[street]),
+        li_arr, ctypes.c_int32(n_leaves),
+        active_arr, ctypes.c_int32(num_players),
+        hl_arr,
+    )
+    tail_args = (
+        acting_order_arr, ctypes.c_int32(len(acting_order)),
+        player_seats_arr,
+        gah_arr, ctypes.c_int32(len(game_action_history)),
+        ctypes.c_int32(int(stack_chips)),
+        ctypes.c_int32(int(max_hands)),
+        ctypes.c_int32(int(num_rollouts)),
+        ctypes.c_int32(int(num_rounds)),
+        ctypes.c_uint64(int(master_seed) & 0xFFFFFFFFFFFFFFFF),
+        out_ptr, ctypes.c_int32(int(floats_needed)),
+    )
+    if perleaf:
+        rc = lib.rollout_compute_subgame_leaf_values_bias4_perleaf_c(
+            *common_args, pl_arr, *tail_args)
+    else:
+        rc = lib.rollout_compute_subgame_leaf_values_bias4_c(
+            *common_args, *tail_args)
+
+    if rc != 0:
+        msg, street_n, np_n = _last_error()
+        label = "bias4 perleaf" if perleaf else "bias4"
+        raise LeafValueUnavailable(
+            street=street, num_players=num_players,
+            reason=f"[rollout.c {label}] {msg}",
+        )
+    return out
+
+
+def compute_subgame_leaf_values_bias4(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    starting_pot_chips: int,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int = 1,
+    num_rounds: int = 1,
+    rng=None,
+    master_seed: int = 0x5a17_e8c0_feed_beef,
+) -> np.ndarray:
+    """Return stratified marginal values as [n_slots, 4, np, max_h]."""
+    del starting_pot_chips
+    return _compute_subgame_leaf_values_bias4_impl(
+        leaf_infos, board, street, player_hands, None, active,
+        acting_order, player_seats, game_action_history, blueprint,
+        stack_chips, max_hands, num_rollouts, num_rounds, rng, master_seed,
+    )
+
+
+def compute_subgame_leaf_values_bias4_perleaf(
+    leaf_infos: List,
+    board: List[int],
+    street: str,
+    player_hands: List[List[Tuple[int, int, float]]],
+    per_leaf_player_hands: List[
+        List[List[Tuple[int, int, float]]]
+    ],
+    active: List[bool],
+    acting_order: List[int],
+    player_seats: List[int],
+    game_action_history: List[int],
+    blueprint,
+    starting_pot_chips: int,
+    stack_chips: int,
+    max_hands: int,
+    num_rollouts: int = 1,
+    num_rounds: int = 1,
+    rng=None,
+    master_seed: int = 0x5a17_e8c0_feed_beef,
+) -> np.ndarray:
+    """Per-leaf-range stratified marginal values, same B4 output layout."""
+    del starting_pot_chips
+    return _compute_subgame_leaf_values_bias4_impl(
+        leaf_infos, board, street, player_hands, per_leaf_player_hands,
+        active, acting_order, player_seats, game_action_history, blueprint,
+        stack_chips, max_hands, num_rollouts, num_rounds, rng, master_seed,
+    )
 
 
 def set_rollout_cont_ev_table(table_ptr: Optional[int]) -> None:
