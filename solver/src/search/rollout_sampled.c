@@ -345,7 +345,7 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_perleaf_c(
         num_rollouts, num_samples_k, master_seed, out, out_size);
 }
 
-/* -- Stratified four-bias marginal variant ------------------------------ */
+/* ── Stratified four-bias marginal variant ────────────────────────────── */
 
 /* Draw a uniform permutation of {0,1,2,3} from a stream keyed by
  * (master_seed, leaf_idx, round, player). The seed derivation follows

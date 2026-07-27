@@ -382,8 +382,6 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_perleaf_c(
     float *out, int32_t out_size
 );
 
-/* ── Error surface ───────────────────────────────────────────────────── */
-
 /* Stratified four-bias marginal construct. For each (leaf, round), draws one
  * independent permutation of {0,1,2,3} per player and runs four joint-profile
  * batches. Each player's batch value is accumulated into that player's
@@ -434,6 +432,8 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_bias4_perleaf_c(
     uint64_t master_seed,
     float *out, int32_t out_size
 );
+
+/* ── Error surface ───────────────────────────────────────────────────── */
 
 BPS_EXPORT void rollout_get_last_error(
     const char **reason, int32_t *street, int32_t *num_players

@@ -18,18 +18,27 @@ sys.path.insert(0, str(ROOT / "python"))
 
 # The sampled-oracle regression needs the real target. A harness can override
 # this test specifically with GAP2B_ES_DLL.
+_PREVIOUS_ES_DLL = os.environ.get("ES_DLL")
 os.environ["ES_DLL"] = os.environ.get("GAP2B_ES_DLL", "es_resolver_real")
 
 try:
-    from engine.street_solver_gpu import (  # type: ignore[import-untyped]
-        SSNode,
-        SSTreeData,
-        SS_MAX_PLAYERS,
-    )
-    from es_resolver.c_solver import CSolver  # type: ignore[import-untyped]
-except (FileNotFoundError, OSError) as exc:
-    pytest.skip(
-        f"Gap 2B resolver DLL unavailable: {exc}", allow_module_level=True)
+    try:
+        from engine.street_solver_gpu import (  # type: ignore[import-untyped]
+            SSNode,
+            SSTreeData,
+            SS_MAX_PLAYERS,
+        )
+        from es_resolver.c_solver import CSolver  # type: ignore[import-untyped]
+    except (FileNotFoundError, OSError) as exc:
+        pytest.skip(
+            f"Gap 2B resolver DLL unavailable: {exc}",
+            allow_module_level=True,
+        )
+finally:
+    if _PREVIOUS_ES_DLL is None:
+        os.environ.pop("ES_DLL", None)
+    else:
+        os.environ["ES_DLL"] = _PREVIOUS_ES_DLL
 
 
 def _node(type_: int, player: int, leaf_idx: int = -1) -> SSNode:
@@ -88,10 +97,14 @@ def _tiny_bias_tree() -> SSTreeData:
 
 def _dominant_leaf_values() -> np.ndarray:
     values = np.zeros((2, 4, 2, 2), dtype=np.float32)
-    # Root player 0 strictly prefers leaf 1 for both hands under every bias.
-    values[1, :, 0, :] = 5.0
-    # Player 1 has the opposite zero-sum sign (it has no decision in this tree).
-    values[1, :, 1, :] = -5.0
+    for bias in range(4):
+        # Player 0 learns dominant bias 3 at both leaves while leaf 1 remains
+        # exactly five chips better than leaf 0 for the root action.
+        values[0, bias, 0, :] = float(bias)
+        values[1, bias, 0, :] = float(5 + bias)
+        # Player 1 has the opposite zero-sum sign (and no tree decision).
+        values[0, bias, 1, :] = float(-bias)
+        values[1, bias, 1, :] = float(-(5 + bias))
     return values
 
 
@@ -112,6 +125,7 @@ def test_from_bias_table_keepalive_stats_and_effective_table() -> None:
         assert effective is not None
         assert effective.shape == (2, 2, 2)
         assert effective.dtype == np.float32
+        assert np.all(effective[1, 0, :] > 7.9)
     finally:
         solver.__del__()
 

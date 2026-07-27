@@ -69,14 +69,10 @@ _lib = _load_dll()
 _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 _HAS_SAMPLED = hasattr(_lib, "es_make_sampled_oracle")
 _BIAS_SYMBOLS = (
-    "es_make_bias_oracle",
-    "es_bias_oracle_fn",
-    "es_free_bias_oracle",
-    "es_bias_oracle_stats",
-    "es_bias_oracle_get_effective_table",
+    "es_make_bias_oracle", "es_bias_oracle_fn", "es_free_bias_oracle",
+    "es_bias_oracle_stats", "es_bias_oracle_get_effective_table",
 )
 _HAS_BIAS = all(hasattr(_lib, name) for name in _BIAS_SYMBOLS)
-
 # void* es_create(const SSTreeData*, ESLeafOracle, void* ctx, uint64_t seed)
 _lib.es_create.restype = ctypes.c_void_p
 _lib.es_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
@@ -323,9 +319,8 @@ class CSolver:
     def from_bias_table(cls, tree, values: np.ndarray, mode: int, np_: int,
                         max_h: int, n_leaves: int,
                         seed: int = 1) -> "CSolver":
-        """Table-backed continuation-bias oracle.
-
-        mode=0 consumes [n_leaves,4,np,max_h] marginal values. mode=1 is
+        """Table-backed continuation-bias oracle. mode=0 consumes
+        [n_leaves,4,np,max_h] marginal values. mode=1 is
         JOINT2P and consumes [n_leaves*16,np,max_h]. The C context borrows the
         float32 values buffer, so this instance retains it for the full solver
         lifetime.
@@ -542,9 +537,8 @@ class CSolver:
         return (visits.value, errors.value)
 
     def get_bias_effective_table(self):
-        """Post-solve [n_leaves,np,max_h] float32 reporting table.
-
-        JOINT2P folds opponent biases uniformly for this reporting-only
+        """Post-solve [n_leaves,np,max_h] float32 reporting table. JOINT2P
+        folds opponent biases uniformly for this reporting-only
         projection; live solve calls use the sampled opponent hand's
         regret-matched bias row.
         """

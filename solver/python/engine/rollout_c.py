@@ -1237,7 +1237,7 @@ def compute_subgame_leaf_values_sampled_perleaf_c(
     return out
 
 
-# ─── Phase F Step 14: cont_ev_table consumer ──────────────────────────
+# ─── Stratified four-bias marginal construct ─────────────────────────────
 
 
 def _compute_subgame_leaf_values_bias4_impl(
@@ -1469,6 +1469,9 @@ def compute_subgame_leaf_values_bias4_perleaf(
         active, acting_order, player_seats, game_action_history, blueprint,
         stack_chips, max_hands, num_rollouts, num_rounds, rng, master_seed,
     )
+
+
+# ─── Phase F Step 14: cont_ev_table consumer ──────────────────────────
 
 
 def set_rollout_cont_ev_table(table_ptr: Optional[int]) -> None:

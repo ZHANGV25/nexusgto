@@ -115,7 +115,9 @@ static double es_oracle_bias(void *vctx, int leaf_idx, int traverser,
         return 0.0;
     }
 
-    float opponent_strategy[ES_BIAS_NUM_ACTIONS];
+    float opponent_strategy[ES_BIAS_NUM_ACTIONS] = {
+        0.25f, 0.25f, 0.25f, 0.25f
+    };
     if (c->mode == ES_BIAS_JOINT2P) {
         int opponent = 1 - traverser;
         int opponent_hand = sampled_hands[opponent];
@@ -128,10 +130,6 @@ static double es_oracle_bias(void *vctx, int leaf_idx, int traverser,
             esbo_regret_match(
                 esbo_regret_row(c, leaf_idx, opponent, opponent_hand),
                 opponent_strategy);
-        } else {
-            for (int b = 0; b < ES_BIAS_NUM_ACTIONS; b++)
-                opponent_strategy[b] =
-                    1.0f / (float)ES_BIAS_NUM_ACTIONS;
         }
     }
 
@@ -217,7 +215,8 @@ ES_EXPORT int32_t es_bias_oracle_get_effective_table(
     void *ctx, const float *values, float *out, int32_t out_size
 ) {
     ESBiasOracleCtx *c = (ESBiasOracleCtx *)ctx;
-    if (!c || !values || !out || out_size < 0) return -1;
+    if (!c || !values || values != c->values || !out || out_size < 0)
+        return -1;
 
     size_t needed = (size_t)c->n_leaves;
     if (needed > SIZE_MAX / (size_t)c->np) return -1;

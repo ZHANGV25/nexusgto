@@ -175,11 +175,15 @@ $(BUILD_DIR)/test_es_bias_oracle: tests/test_es_bias_oracle.c \
 test_es_bias_oracle: $(BUILD_DIR)/test_es_bias_oracle
 	./$(BUILD_DIR)/test_es_bias_oracle
 
+.PHONY: test_gap2b_bias_c
+test_gap2b_bias_c: test_rollout_bias4 test_es_bias_oracle
+
 # ── Street solve (CUDA — N-player single-street GPU solver) ──
 # Builds with nvcc; requires CUDA toolkit on PATH. Targets sm_75 (T4 on
 # g4dn) by default; override SS_GPU_ARCH=sm_86 for A10, sm_70 for V100.
 # Skip on Mac dev machines (nvcc not present); the .so is consumed by
 # python/street_solver_gpu.py at runtime via ctypes on Linux.
+
 NVCC ?= nvcc
 SS_GPU_ARCH ?= sm_75
 street_solve: $(BUILD_DIR)/street_solve$(SHLIB_EXT)
