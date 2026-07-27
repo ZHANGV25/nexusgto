@@ -298,7 +298,9 @@ class CpuEsSolver:
         self._cev_bias_semantics = "uniform"
         # {selects, semantics} snapshot from the last bias-action solve.
         self._last_cont_ev_bias_action_stats = None
-        self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
+        # NEXUS_BR_GAP_EXPOSE: {tree, table, sigma}; readout="both" adds
+        # sigmas={avg, final} while keeping legacy sigma=avg.
+        self._last_br_gap_objs = None
         self._last_solve_stats = None  # per-solve observability, incl. Gap 4
         self._last_preflight_stats = None  # measurement guard, set before fill
         # NEXUS_LEAF_ROLLOUT: {leaf_fills, cache_hits, rollout_sims, oracle_errors}
@@ -539,7 +541,10 @@ class CpuEsSolver:
         progress_callback: Optional[
             Callable[[str, Dict[str, object]], None]
         ] = None,
-    ) -> Dict[int, Dict[int, Dict[str, float]]]:
+    ) -> (
+        Dict[int, Dict[int, Dict[str, float]]]
+        | Dict[str, Dict[int, Dict[int, Dict[str, float]]]]
+    ):
         """Run an N-player flop/turn/river CPU-ES solve. Returns all_by_player:
         {player_idx: {hand_idx: {action_label: freq}}} — the SAME structure the
         GPU provider's get_all_avg_strategies produces, so the provider's
@@ -559,9 +564,11 @@ class CpuEsSolver:
             1 = vectorized traverser. vec-Linear is Gate-1-validated for the
             FINAL-iterate readout ONLY (vec-Linear-AVERAGE is seed-unstable at
             3+ players — VECTOR_TRAVERSER_DESIGN.md). Enforced below.
-        readout: "avg" = σ̄ (the frequency-display contract) or "final" =
+        readout: "avg" = σ̄ (the frequency-display contract), "final" =
             final iterate (the playing-agent contract; what the EC2 wall-clock
-            gate measured: 6p ~0.15%/pot floor in ~22s solve at 96 cores).
+            gate measured: 6p ~0.15%/pot floor in ~22s solve at 96 cores), or
+            "both" = one scalar solve with both mappings returned under their
+            readout names.
         hero_replay: optional {"player_idx": int, "street_actions": [int,...]}.
             When given, that player's strategy is read at the node reached by
             REPLAYING this street's action indices from the street root —
@@ -580,6 +587,11 @@ class CpuEsSolver:
             raise ValueError(
                 "max_projected_fill_bytes must be >= 0, got "
                 f"{max_projected_fill_bytes}"
+            )
+        if vec_mode and readout == "both":
+            raise ValueError(
+                "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
+                "seed-unstable at 3+ players (Gate-1, VECTOR_TRAVERSER_DESIGN.md)"
             )
 
         # Sampled leaves are scalar-only. Apply their precedence before the
@@ -609,8 +621,11 @@ class CpuEsSolver:
                 "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
                 "seed-unstable at 3+ players (Gate-1, VECTOR_TRAVERSER_DESIGN.md)"
             )
-        if readout not in ("avg", "final"):
-            raise ValueError(f"readout must be 'avg' or 'final', got {readout!r}")
+        if readout not in ("avg", "final", "both"):
+            raise ValueError(
+                "readout must be 'avg', 'final', or 'both', "
+                f"got {readout!r}"
+            )
         if not self._ready:
             raise RuntimeError("CpuEsSolver not initialized")
         # Belief-narrowed root ranges and offline-filled catalog boundary EVs
@@ -1596,12 +1611,22 @@ class CpuEsSolver:
                 # iter-hungry; the default 2p turn never reaches here (gated to
                 # lookup above). Research / future higher-iter path.
                 cs.set_reach_mode(1)    # full reach; ignores cfr/chance/opp/vec
-                readout = "avg"         # σ̄ readout (the frequency-display contract)
+                if readout != "both":
+                    # Preserve the established reach-mode σ̄ contract for the
+                    # historical single-readout callers.  The new scalar
+                    # measurement readout explicitly requests both.
+                    readout = "avg"
                 vec_mode = 0
             elif tree_has_chance and hasattr(cs, "set_chance_mode"):
                 cs.set_chance_mode(1)   # enumerate card outcomes (correct)
                 if (not _sampled_requested and n_players <= 3
                         and hasattr(cs, "set_opp_mode")):
+                    if readout == "both":
+                        raise ValueError(
+                            "readout='both' is unsupported on chance-node trees "
+                            "(internal vec forcing would make the avg readout "
+                            "vec-Linear-AVERAGE)"
+                        )
                     cs.set_opp_mode(1)  # full CFR over opponent actions (2-3p)
                     cs.set_vec_mode(1)  # all traverser hands per walk
                     vec_mode = 1        # force vec for the readout below
@@ -1659,7 +1684,22 @@ class CpuEsSolver:
                     },
                 )
             readout_t0 = time.time()
-            read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
+            if readout == "both":
+                read_strategies = {
+                    "avg": cs.avg_strategy,
+                    "final": cs.final_strategy,
+                }
+                # Legacy optional diagnostics and the legacy BR-gap ``sigma``
+                # field still need one reader.  Keep σ̄ as their reference;
+                # the BR-gap stash adds both readers separately below.
+                read_strategy = read_strategies["avg"]
+            else:
+                read_strategy = (
+                    cs.final_strategy
+                    if readout == "final"
+                    else cs.avg_strategy
+                )
+                read_strategies = {readout: read_strategy}
 
             # BELIEF CARRY STASH (NEXUS_BELIEF_CARRY, default OFF). The output
             # dict is the entire gate: with the default None there is no import,
@@ -1790,11 +1830,20 @@ class CpuEsSolver:
                     _ranges = [[(c0, c1, w) for (c0, c1, w) in rng]
                                for rng in player_ranges]
                     _tree_snap = _snap(gpu._tree, _ranges)
-                    _sigma = {}
-                    for _ni in _tree_snap.decision_node_indices:
-                        _a = read_strategy(_ni)
-                        if _a is not None:
-                            _sigma[_ni] = _a
+                    _sigmas = {}
+                    for _readout_name, _strategy_reader in (
+                            read_strategies.items()):
+                        _readout_sigma = {}
+                        for _ni in _tree_snap.decision_node_indices:
+                            _a = _strategy_reader(_ni)
+                            if _a is not None:
+                                _readout_sigma[_ni] = _a
+                        _sigmas[_readout_name] = _readout_sigma
+                    _sigma = (
+                        _sigmas["avg"]
+                        if readout == "both"
+                        else _sigmas[readout]
+                    )
                     # LEAF TABLE for the BR-gap best-responder. The EAGER path has
                     # a materialized `table`; the ROLLOUT path (NEXUS_LEAF_ROLLOUT)
                     # sets table=None (no eager fill — leaf values live in the C
@@ -1836,12 +1885,18 @@ class CpuEsSolver:
                         # to expose for the optional offline BR-gap harness.
                         _br_table = None
                         _br_table_source = "sampled_oracle_unavailable"
-                    self._last_br_gap_objs = {
+                    _br_gap_objs = {
                         "tree": _tree_snap, "table": _br_table, "sigma": _sigma,
                         "table_source": _br_table_source,
                         "n_players": n_players, "street": street,
                         "pot_chips": int(round(pot_bb * scale)),
                     }
+                    if readout == "both":
+                        # Additive research-only surface.  Keep the legacy
+                        # ``sigma`` key as σ̄ so every existing scorer retains
+                        # its exact input shape.
+                        _br_gap_objs["sigmas"] = _sigmas
+                    self._last_br_gap_objs = _br_gap_objs
                 except Exception as _e:  # never break a real solve for the stash
                     logger.warning("BR-gap expose stash failed: %s", _e)
                     self._last_br_gap_objs = None
@@ -1983,109 +2038,137 @@ class CpuEsSolver:
             # ── Extract strategies → all_by_player, with the weight-0 /
             #    never-visited filter the GPU's get_all_avg_strategies applies
             #    (freq>0.001; skip uniform-default rows so out-of-range hands
-            #    stay fold-100% placeholders in _build_response_strategies). ──
-            all_by_player: Dict[int, Dict[int, Dict[str, float]]] = {}
-            _hero_merged_mass_by_row: Dict[int, float] = {}
-            _hero_dropped_mass_by_row: Dict[int, float] = {}
-            _hero_drop_reason_by_row: Dict[int, str] = {}
-            _projection_skipped_players: List[Dict[str, object]] = []
-            for p_idx in range(n_players):
-                if hero_idx is not None and p_idx == hero_idx:
-                    node_idx = hero_node
-                else:
-                    node_idx = self._first_decision_node_for(tree, p_idx)
-                raw: Dict[int, Dict[str, float]] = {}
-                if node_idx is not None:
-                    if _offtree_replay is not None:
-                        # Extension labels are derived from the projected base
-                        # children below, never from the richer child universe.
-                        labels: List[str] = []
-                    elif hero_idx is not None and p_idx == hero_idx:
-                        # Replayed (possibly faced-bet) node: synthesize
-                        # labels from the tree's own chip deltas —
-                        # _build_labels is wrong off the street root.
-                        labels = self._node_action_labels(tree, node_idx, n_players)
+            #    stay fold-100% placeholders in _build_response_strategies).
+            #    The historical paths iterate exactly once; ``both`` reuses the
+            #    solved object and runs the same read-only extraction twice. ──
+            all_by_readout: Dict[
+                str, Dict[int, Dict[int, Dict[str, float]]]
+            ] = {}
+            for _readout_name, read_strategy in read_strategies.items():
+                all_by_player: Dict[int, Dict[int, Dict[str, float]]] = {}
+                _hero_merged_mass_by_row: Dict[int, float] = {}
+                _hero_dropped_mass_by_row: Dict[int, float] = {}
+                _hero_drop_reason_by_row: Dict[int, str] = {}
+                _projection_skipped_players: List[Dict[str, object]] = []
+                for p_idx in range(n_players):
+                    if hero_idx is not None and p_idx == hero_idx:
+                        node_idx = hero_node
                     else:
-                        labels = self._build_labels(gpu._tree, node_idx)
-                    sigma = read_strategy(node_idx)  # [nh, na] or None
-                    if _offtree_replay is not None and sigma is not None:
-                        try:
-                            projection = (
-                                hero_projection
-                                if hero_idx is not None and p_idx == hero_idx
-                                else build_node_projection(
-                                    tree,
-                                    node_idx,
-                                    n_players=n_players,
-                                    base_bet_sizes=_base_bet_sizes,
-                                    base_subsequent_bet_sizes=(
-                                        _base_subsequent_sizes
-                                    ),
-                                    bet_sizes=bet_sizes,
-                                    subsequent_bet_sizes=subsequent_bet_sizes,
-                                    add_explicit_allin=add_explicit_allin,
-                                )
+                        node_idx = self._first_decision_node_for(tree, p_idx)
+                    raw: Dict[int, Dict[str, float]] = {}
+                    if node_idx is not None:
+                        if _offtree_replay is not None:
+                            # Extension labels come from projected base
+                            # children, never the richer child universe.
+                            labels: List[str] = []
+                        elif hero_idx is not None and p_idx == hero_idx:
+                            # Replayed (possibly faced-bet) node: synthesize
+                            # labels from the tree's own chip deltas —
+                            # _build_labels is wrong off the street root.
+                            labels = self._node_action_labels(
+                                tree, node_idx, n_players
                             )
-                            if projection is None:
-                                raise ReplayUnsupported(
-                                    "missing base projection for player "
-                                    f"{p_idx} node {node_idx}"
+                        else:
+                            labels = self._build_labels(gpu._tree, node_idx)
+                        sigma = read_strategy(node_idx)  # [nh, na] or None
+                        if _offtree_replay is not None and sigma is not None:
+                            try:
+                                projection = (
+                                    hero_projection
+                                    if (hero_idx is not None
+                                        and p_idx == hero_idx)
+                                    else build_node_projection(
+                                        tree,
+                                        node_idx,
+                                        n_players=n_players,
+                                        base_bet_sizes=_base_bet_sizes,
+                                        base_subsequent_bet_sizes=(
+                                            _base_subsequent_sizes
+                                        ),
+                                        bet_sizes=bet_sizes,
+                                        subsequent_bet_sizes=(
+                                            subsequent_bet_sizes
+                                        ),
+                                        add_explicit_allin=(
+                                            add_explicit_allin
+                                        ),
+                                    )
                                 )
-                            if (len(projection.base_action_labels)
-                                    != len(projection.base_child_indices)):
-                                raise ReplayUnsupported(
-                                    f"node {node_idx} has "
-                                    f"{len(projection.base_child_indices)} "
-                                    "base children but "
-                                    f"{len(projection.base_action_labels)} "
-                                    "base labels"
+                                if projection is None:
+                                    raise ReplayUnsupported(
+                                        "missing base projection for player "
+                                        f"{p_idx} node {node_idx}"
+                                    )
+                                if (len(projection.base_action_labels)
+                                        != len(
+                                            projection.base_child_indices
+                                        )):
+                                    raise ReplayUnsupported(
+                                        f"node {node_idx} has "
+                                        f"{len(projection.base_child_indices)} "
+                                        "base children but "
+                                        f"{len(projection.base_action_labels)} "
+                                        "base labels"
+                                    )
+                                labels = list(
+                                    projection.base_action_labels
                                 )
-                            labels = list(projection.base_action_labels)
-                            (sigma, _merged_by_row, _dropped_by_row,
-                             _drop_reason_by_row) = (
-                                self._project_offtree_strategy(
-                                    sigma, projection
+                                (sigma, _merged_by_row, _dropped_by_row,
+                                 _drop_reason_by_row) = (
+                                    self._project_offtree_strategy(
+                                        sigma, projection
+                                    )
                                 )
-                            )
-                        except ReplayUnsupported as projection_error:
-                            # Only the replayed hero node is load-bearing for
-                            # the served mix.  A richer-tree projection miss at
-                            # another player's first display node must not
-                            # discard an otherwise faithful hero solve.
-                            if hero_idx is not None and p_idx == hero_idx:
-                                raise
-                            _projection_skipped_players.append(
-                                {
-                                    "player_idx": int(p_idx),
-                                    "node_index": int(node_idx),
-                                    "reason": str(projection_error),
-                                }
-                            )
-                            all_by_player[p_idx] = raw
-                            continue
-                        if hero_idx is not None and p_idx == hero_idx:
-                            _hero_merged_mass_by_row = _merged_by_row
-                            _hero_dropped_mass_by_row = _dropped_by_row
-                            _hero_drop_reason_by_row = _drop_reason_by_row
-                    na = sigma.shape[1] if sigma is not None else 0
-                    nh = len(player_ranges[p_idx])
-                    for h in range(min(nh, sigma.shape[0] if sigma is not None else 0)):
-                        # weight-0 hand → never visited → skip (fold-100% placeholder)
-                        if player_ranges[p_idx][h][2] <= 0.0:
-                            continue
-                        strat = {}
-                        for a in range(min(na, len(labels))):
-                            freq = float(sigma[h, a])
-                            # Match the shipped readout convention after
-                            # projection too: discard numerical dust and omit
-                            # all-zero rows.  LiveResolveSource independently
-                            # dense-fills a retained hero row at the serving
-                            # seam, so its legal-action arity remains exact.
-                            if freq > 0.001:
-                                strat[labels[a]] = freq
-                        if strat:
-                            raw[h] = strat
-                all_by_player[p_idx] = raw
+                            except ReplayUnsupported as projection_error:
+                                # Only the replayed hero node is load-bearing
+                                # for the served mix.  A projection miss at
+                                # another player's display node must not
+                                # discard an otherwise faithful hero solve.
+                                if (hero_idx is not None
+                                        and p_idx == hero_idx):
+                                    raise
+                                _projection_skipped_players.append(
+                                    {
+                                        "player_idx": int(p_idx),
+                                        "node_index": int(node_idx),
+                                        "reason": str(projection_error),
+                                    }
+                                )
+                                all_by_player[p_idx] = raw
+                                continue
+                            if (hero_idx is not None
+                                    and p_idx == hero_idx):
+                                _hero_merged_mass_by_row = _merged_by_row
+                                _hero_dropped_mass_by_row = _dropped_by_row
+                                _hero_drop_reason_by_row = _drop_reason_by_row
+                        na = sigma.shape[1] if sigma is not None else 0
+                        nh = len(player_ranges[p_idx])
+                        n_sigma_rows = (
+                            sigma.shape[0] if sigma is not None else 0
+                        )
+                        for h in range(min(nh, n_sigma_rows)):
+                            # weight-0 hand → never visited → skip
+                            # (fold-100% placeholder)
+                            if player_ranges[p_idx][h][2] <= 0.0:
+                                continue
+                            strat = {}
+                            for a in range(min(na, len(labels))):
+                                freq = float(sigma[h, a])
+                                # Match the shipped readout convention after
+                                # projection too: discard numerical dust and
+                                # omit all-zero rows.
+                                if freq > 0.001:
+                                    strat[labels[a]] = freq
+                            if strat:
+                                raw[h] = strat
+                    all_by_player[p_idx] = raw
+                all_by_readout[_readout_name] = all_by_player
+
+            solve_result = (
+                all_by_readout
+                if readout == "both"
+                else all_by_readout[readout]
+            )
 
             readout_s = time.time() - readout_t0
             if progress_callback is not None:
@@ -2181,7 +2264,7 @@ class CpuEsSolver:
                  if _sampled_iterations_run is not None else iterations),
                 num_threads or "all",
             )
-            return all_by_player
+            return solve_result
         finally:
             gpu._freed = True  # native ss_free_tree hangs on this box; skip it
 

@@ -40,13 +40,13 @@ Run from nexusgto-api/::
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 _API_ROOT = Path(__file__).resolve().parent.parent
 if str(_API_ROOT) not in sys.path:
@@ -77,6 +77,20 @@ class ActingPolicy(Protocol):
 
 
 PolicyFactory = Callable[[int], ActingPolicy]
+
+
+class SolveWallTracker(Protocol):
+    """Per-group timing seam supplied by the live-source CLI factory."""
+
+    @property
+    def sources(self) -> Mapping[str, str]:
+        ...
+
+    def begin_group(self) -> None:
+        ...
+
+    def finish_group(self) -> Dict[str, Tuple[float, ...]]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -190,6 +204,8 @@ class DealGroupResult:
         RotationResult,
     ]
     paired_numerator: int
+    solve_wall_samples: Dict[str, Tuple[float, ...]] = field(default_factory=dict)
+    solve_wall_sources: Dict[str, str] = field(default_factory=dict)
 
     @property
     def paired_differential_chips(self) -> float:
@@ -218,7 +234,7 @@ class DealGroupResult:
     def as_dict(
         self, *, mode: str, master_seed: int, epsilon: Optional[float] = None
     ) -> Dict[str, object]:
-        return {
+        record = {
             "schema": SCHEMA,
             "record_type": "deal_group",
             "mode": mode,
@@ -243,6 +259,11 @@ class DealGroupResult:
                 self.fallback_count / self.action_count if self.action_count else 0.0
             ),
         }
+        if self.solve_wall_sources:
+            record["solve_wall_s_by_source"] = _solve_wall_summaries(
+                self.solve_wall_samples, self.solve_wall_sources
+            )
+        return record
 
 
 @dataclass(frozen=True)
@@ -372,11 +393,11 @@ def _policies_for_rotation(
     policies: List[ActingPolicy] = []
     for seat in range(N_SEATS):
         policy_seed = _derived_seed(master_seed, group_index, seat, stream=1)
-        if mode == "ab" and seat != hero_seat:
-            if b_factory is None:
-                raise ValueError("mode='ab' requires b_factory")
+        if seat != hero_seat and b_factory is not None:
             policy = b_factory(policy_seed)
         else:
+            if mode == "ab" and seat != hero_seat:
+                raise ValueError("mode='ab' requires b_factory")
             policy = a_factory(policy_seed)
         if mode == "epsilon" and seat == hero_seat:
             perturb_seed = _derived_seed(master_seed, group_index, seat, stream=2)
@@ -395,12 +416,15 @@ def play_deal_group(
     b_factory: Optional[PolicyFactory] = None,
     epsilon: float = 0.05,
     hand_player: HandPlayer,
+    solve_wall_tracker: Optional[SolveWallTracker] = None,
 ) -> DealGroupResult:
     """Replay one exact deal with the designated hero in every position."""
 
     if mode not in VALID_MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {VALID_MODES}")
     epsilon = _validate_epsilon(epsilon)
+    if solve_wall_tracker is not None:
+        solve_wall_tracker.begin_group()
 
     rotations: List[RotationResult] = []
     total_numerator = 0
@@ -451,11 +475,21 @@ def play_deal_group(
         deal=deal,
         rotations=tuple(rotations),  # type: ignore[arg-type]
         paired_numerator=total_numerator,
+        solve_wall_samples=(
+            solve_wall_tracker.finish_group()
+            if solve_wall_tracker is not None else {}
+        ),
+        solve_wall_sources=(
+            dict(solve_wall_tracker.sources)
+            if solve_wall_tracker is not None else {}
+        ),
     )
 
 
 def summarize_groups(
-    groups: Sequence[DealGroupResult], *, mode: str, master_seed: int, epsilon: float
+    groups: Sequence[DealGroupResult], *, mode: str, master_seed: int, epsilon: float,
+    truncated_by_wall_budget: bool = False,
+    wall_budget_active: bool = False,
 ) -> Dict[str, object]:
     """Summarize independent deal groups, mirroring measure_bot_strength."""
 
@@ -489,7 +523,13 @@ def summarize_groups(
         ci_note = "n < 2 deal groups: no variance estimate; run more deals"
     decisions = sum(group.action_count for group in groups)
     fallbacks = sum(group.fallback_count for group in groups)
-    return {
+    source_names: Dict[str, str] = {}
+    wall_samples: Dict[str, List[float]] = {}
+    for group in groups:
+        source_names.update(group.solve_wall_sources)
+        for role, role_samples in group.solve_wall_samples.items():
+            wall_samples.setdefault(role, []).extend(role_samples)
+    summary = {
         "schema": SCHEMA,
         "record_type": "summary",
         "mode": mode,
@@ -529,6 +569,15 @@ def summarize_groups(
             else None
         ),
     }
+    if source_names:
+        summary["solve_wall_s_by_source"] = _solve_wall_summaries(
+            wall_samples, source_names
+        )
+    if wall_budget_active or truncated_by_wall_budget:
+        summary["truncated_by_wall_budget"] = bool(
+            truncated_by_wall_budget
+        )
+    return summary
 
 
 def run_match(
@@ -541,6 +590,9 @@ def run_match(
     epsilon: float = 0.05,
     hand_player: Optional[HandPlayer] = None,
     on_group: Optional[Callable[[DealGroupResult], None]] = None,
+    solve_wall_tracker: Optional[SolveWallTracker] = None,
+    max_wall_s: Optional[float] = None,
+    clock: Optional[Callable[[], float]] = None,
 ) -> MatchRun:
     """Run ``deals`` independent groups (six full duplicate arms per group).
 
@@ -554,9 +606,16 @@ def run_match(
         raise ValueError("master_seed must be non-negative")
     if mode not in VALID_MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {VALID_MODES}")
+    if max_wall_s is not None and (
+        not math.isfinite(float(max_wall_s)) or float(max_wall_s) <= 0.0
+    ):
+        raise ValueError("max_wall_s must be finite and positive when provided")
     epsilon = _validate_epsilon(epsilon)
     player = hand_player or play_full_hand
     deal_rng = np.random.default_rng(master_seed)
+    monotonic = clock or time.monotonic
+    started = monotonic() if max_wall_s is not None else None
+    truncated_by_wall_budget = False
     collected: List[DealGroupResult] = []
     for group_index in range(deals):
         deal = deal_from_rng(deal_rng)
@@ -570,6 +629,7 @@ def run_match(
                 b_factory=b_factory,
                 epsilon=epsilon,
                 hand_player=player,
+                solve_wall_tracker=solve_wall_tracker,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -580,9 +640,18 @@ def run_match(
         if on_group is not None:
             on_group(group)
         collected.append(group)
+        if (
+            max_wall_s is not None
+            and started is not None
+            and monotonic() - started > float(max_wall_s)
+        ):
+            truncated_by_wall_budget = True
+            break
     groups = tuple(collected)
     summary = summarize_groups(
-        groups, mode=mode, master_seed=master_seed, epsilon=epsilon
+        groups, mode=mode, master_seed=master_seed, epsilon=epsilon,
+        truncated_by_wall_budget=truncated_by_wall_budget,
+        wall_budget_active=max_wall_s is not None,
     )
     return MatchRun(groups=groups, summary=summary)
 
@@ -692,182 +761,31 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
     )
 
 
-def write_match(run: MatchRun, out_dir: Union[str, Path]) -> Tuple[Path, Path]:
-    """Write deterministic JSONL group records plus one summary JSON."""
+from scripts import run_match_cli as _cli  # noqa: E402
 
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    groups_path = out / "deal_groups.jsonl"
-    groups_tmp = out / "deal_groups.jsonl.tmp"
-    mode = str(run.summary["mode"])
-    master_seed = int(run.summary["master_seed"])
-    epsilon_value = run.summary.get("epsilon")
-    record_epsilon = float(epsilon_value) if epsilon_value is not None else None
-    with groups_tmp.open("w", encoding="utf-8", newline="\n") as fh:
-        for group in run.groups:
-            json.dump(
-                group.as_dict(
-                    mode=mode, master_seed=master_seed, epsilon=record_epsilon
-                ),
-                fh,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            fh.write("\n")
-    os.replace(str(groups_tmp), str(groups_path))
-
-    summary_path = out / "summary.json"
-    summary_tmp = out / "summary.json.tmp"
-    with summary_tmp.open("w", encoding="utf-8", newline="\n") as fh:
-        json.dump(run.summary, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.replace(str(summary_tmp), str(summary_path))
-    return groups_path, summary_path
+write_match = _cli.write_match
+_scoped_leaf_mode = _cli.scoped_leaf_mode
+_resolved_leaf_mode_env = _cli.resolved_leaf_mode_env
+_percentile = _cli.percentile
+_solve_wall_summaries = _cli.solve_wall_summaries
 
 
 def _lookup_factories(
     args: argparse.Namespace,
-) -> Tuple[PolicyFactory, Optional[PolicyFactory], Dict[str, Optional[str]]]:
-    """Construct shared LOOKUP sources and cheap per-hand seeded PokerAgents.
-
-    Returns the two factories plus the resolved absolute blueprint paths so
-    the run summary records exactly which artifacts played.
-
-    Path validation runs BEFORE the app imports so misconfiguration fails
-    fast without touching blueprint machinery.
-    """
-
-    a_path = args.blueprint_a or os.environ.get("AGENT_BLUEPRINT_PATH")
-    if not a_path or not Path(a_path).is_file():
-        raise ValueError("set --blueprint-a or AGENT_BLUEPRINT_PATH to the 8.05B .bps")
-    if args.mode == "ab":
-        b_path = args.blueprint_b or os.environ.get("AGENT_BLUEPRINT_B_PATH")
-        if not b_path:
-            raise ValueError(
-                "mode 'ab' requires --blueprint-b or AGENT_BLUEPRINT_B_PATH; "
-                "refusing to silently fall back to blueprint A (that would run "
-                "A-vs-A labeled as A-vs-B)"
-            )
-        if not Path(b_path).is_file():
-            raise ValueError("--blueprint-b / AGENT_BLUEPRINT_B_PATH is not a file")
-    else:
-        b_path = a_path
-
-    from app.engine.agent.agent import PokerAgent
-    from app.engine.agent.modes import ModeConfig
-    from app.engine.agent.strategy_source import LookupSource
-
-    a_source = LookupSource(
-        ModeConfig(mode="LOOKUP", blueprint_path=str(a_path), uniform_on_miss=True)
-    )
-    b_source = a_source
-    if args.mode == "ab" and os.path.abspath(str(b_path)) != os.path.abspath(str(a_path)):
-        b_source = LookupSource(
-            ModeConfig(mode="LOOKUP", blueprint_path=str(b_path), uniform_on_miss=True)
-        )
-
-    def a_factory(seed: int) -> ActingPolicy:
-        cfg = ModeConfig(
-            mode="LOOKUP", seed=seed, blueprint_path=str(a_path), uniform_on_miss=True
-        )
-        return PokerAgent(source=a_source, config=cfg)
-
-    def b_factory(seed: int) -> ActingPolicy:
-        cfg = ModeConfig(
-            mode="LOOKUP", seed=seed, blueprint_path=str(b_path), uniform_on_miss=True
-        )
-        return PokerAgent(source=b_source, config=cfg)
-
-    blueprint_paths: Dict[str, Optional[str]] = {
-        "blueprint_a": os.path.abspath(str(a_path)),
-        "blueprint_b": os.path.abspath(str(b_path)) if args.mode == "ab" else None,
-    }
-    return a_factory, b_factory if args.mode == "ab" else None, blueprint_paths
+) -> Tuple[PolicyFactory, Optional[PolicyFactory], Dict[str, object]]:
+    return _cli.build_factories(sys.modules[__name__], args)
 
 
-def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--mode", choices=VALID_MODES, required=True)
-    ap.add_argument(
-        "--deals",
-        type=int,
-        default=1000,
-        help="independent deal groups (six full duplicate hands per group)",
-    )
-    ap.add_argument("--epsilon", type=float, default=0.05)
-    ap.add_argument("--master-seed", type=int, default=0)
-    ap.add_argument("--out", required=True, help="output directory")
-    ap.add_argument("--blueprint-a", default=None)
-    ap.add_argument("--blueprint-b", default=None)
-    return ap.parse_args(argv)
+def _parse_args(
+    argv: Optional[Sequence[str]] = None,
+) -> argparse.Namespace:
+    return _cli.parse_args(sys.modules[__name__], argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _parse_args(argv)
-    try:
-        a_factory, b_factory, blueprint_paths = _lookup_factories(args)
-        out = Path(args.out)
-        out.mkdir(parents=True, exist_ok=True)
-        # Crash-safe partials: every completed group is appended and flushed
-        # immediately, so a crash or spot-death at group N-1 of N keeps the
-        # first N-1 groups on disk instead of discarding the whole run.
-        partial_path = out / "deal_groups.jsonl.partial"
-        record_epsilon = args.epsilon if args.mode == "epsilon" else None
-        progress: Dict[str, object] = {"n": 0, "fh": None}
+    """Dispatch the CLI while keeping pure match machinery importable."""
 
-        def on_group(group: DealGroupResult) -> None:
-            # Lazy open: a run that fails before its FIRST completed group
-            # never touches the partial file, so a bad re-run into the same
-            # --out cannot truncate a previous crash's salvageable groups.
-            if progress["fh"] is None:
-                progress["fh"] = partial_path.open(
-                    "w", encoding="utf-8", newline="\n"
-                )
-            fh = progress["fh"]
-            json.dump(
-                group.as_dict(
-                    mode=args.mode,
-                    master_seed=args.master_seed,
-                    epsilon=record_epsilon,
-                ),
-                fh,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            fh.write("\n")
-            fh.flush()
-            progress["n"] = int(progress["n"]) + 1
-            print(
-                f"[match] group {progress['n']}/{args.deals} complete",
-                file=sys.stderr,
-                flush=True,
-            )
-
-        try:
-            run = run_match(
-                deals=args.deals,
-                mode=args.mode,
-                master_seed=args.master_seed,
-                epsilon=args.epsilon,
-                a_factory=a_factory,
-                b_factory=b_factory,
-                on_group=on_group,
-            )
-        finally:
-            if progress["fh"] is not None:
-                progress["fh"].close()
-        run = MatchRun(groups=run.groups, summary={**run.summary, **blueprint_paths})
-        groups_path, summary_path = write_match(run, args.out)
-        partial_path.unlink(missing_ok=True)
-    except (ValueError, OSError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-
-    print(f"[match] wrote {groups_path} and {summary_path}")
-    print("MATCH_SUMMARY " + json.dumps(run.summary, sort_keys=True, separators=(",", ":")))
-    return 0
+    return _cli.main(sys.modules[__name__], argv)
 
 
 if __name__ == "__main__":
