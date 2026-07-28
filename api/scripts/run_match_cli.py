@@ -468,17 +468,30 @@ def build_factories(
         )
         live_by_count: Dict[int, object] = {}
         for n_players in range(2, 7):
-            live_config = live_config_for_fn(
-                n_players,
-                iterations_override=int(args.live_iterations),
-                num_rollouts_override=args.live_num_rollouts,
-                purpose="play",
-            )
+            config_kwargs = {
+                "iterations_override": int(args.live_iterations),
+                "purpose": "play",
+            }
+            if source_name != "live_sampled":
+                config_kwargs["num_rollouts_override"] = (
+                    args.live_num_rollouts
+                )
+            live_config = live_config_for_fn(n_players, **config_kwargs)
             if live_config.readout != "final":
                 raise RuntimeError(
                     "live_config_for(purpose='play') must return final "
                     f"readout at {n_players} players"
                 )
+            # The wall verdict measures per-visit sampled leaves down to nr=1;
+            # eager config bounds do not apply (docs/PLURIBUS_WALL_VERDICT_2026-07-28.md).
+            num_rollouts = (
+                args.live_num_rollouts
+                if (
+                    source_name == "live_sampled"
+                    and args.live_num_rollouts is not None
+                )
+                else live_config.num_rollouts
+            )
             live = LiveResolveSource(
                 ModeConfig(
                     mode="LIVE_RESOLVE",
@@ -491,7 +504,7 @@ def build_factories(
                 vec_mode=bool(live_config.vec_mode),
                 readout=str(live_config.readout),
                 num_threads=0,
-                num_rollouts=int(live_config.num_rollouts),
+                num_rollouts=int(num_rollouts),
                 cache_k=1,
                 belief_carry=False,
                 offtree_add=False,
@@ -535,6 +548,17 @@ def build_factories(
             "leaf_mode_envs": {
                 role: {
                     "source": role_sources[role],
+                    **(
+                        {
+                            "live_num_rollouts_bounds": (
+                                "sampled_direct"
+                                if role_sources[role] == "live_sampled"
+                                else "eager_config"
+                            )
+                        }
+                        if role_sources[role] != "lookup"
+                        else {}
+                    ),
                     "env_overrides": resolved_leaf_mode_env(
                         role_sources[role]
                     ),

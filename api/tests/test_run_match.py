@@ -604,13 +604,8 @@ def test_live_router_uses_lookup_preflop_and_street_entry_player_count():
     assert router.get_mix(three_way, (0, 1)) == "three"
 
 
-def test_live_num_rollouts_override_reaches_configs_and_metadata(
-    monkeypatch, tmp_path,
-):
-    blueprint_a = tmp_path / "a.bps"
-    blueprint_b = tmp_path / "b.bps"
-    blueprint_a.write_bytes(b"stub")
-    blueprint_b.write_bytes(b"stub")
+@pytest.fixture
+def stub_live_factory_modules(monkeypatch):
     config_calls = []
     live_sources = []
 
@@ -627,9 +622,15 @@ def test_live_num_rollouts_override_reaches_configs_and_metadata(
 
     def live_config_for(n_players, **kwargs):
         config_calls.append((n_players, kwargs))
+        num_rollouts = kwargs.get("num_rollouts_override")
+        if num_rollouts is not None and not 3 <= num_rollouts <= 30:
+            raise ValueError(
+                f"num_rollouts override {num_rollouts} outside the measured "
+                "bounds [3, 30]"
+            )
         return types.SimpleNamespace(
             iterations=kwargs["iterations_override"],
-            num_rollouts=kwargs["num_rollouts_override"],
+            num_rollouts=3 if num_rollouts is None else num_rollouts,
             vec_mode=False,
             readout="final",
         )
@@ -655,6 +656,17 @@ def test_live_num_rollouts_override_reaches_configs_and_metadata(
     }
     for name, module in fake_modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+    return config_calls, live_sources
+
+
+def test_live_num_rollouts_override_reaches_configs_and_metadata(
+    stub_live_factory_modules, tmp_path,
+):
+    blueprint_a = tmp_path / "a.bps"
+    blueprint_b = tmp_path / "b.bps"
+    blueprint_a.write_bytes(b"stub")
+    blueprint_b.write_bytes(b"stub")
+    config_calls, live_sources = stub_live_factory_modules
 
     args = runner._parse_args(
         [
@@ -669,11 +681,55 @@ def test_live_num_rollouts_override_reaches_configs_and_metadata(
 
     assert [call[0] for call in config_calls] == [2, 3, 4, 5, 6]
     assert all(
-        call[1]["num_rollouts_override"] == 2
+        "num_rollouts_override" not in call[1]
         for call in config_calls
     )
     assert all(source.num_rollouts == 2 for source in live_sources)
     assert metadata["live_num_rollouts"] == 2
+    assert (
+        metadata["leaf_mode_envs"]["hero"]["live_num_rollouts_bounds"]
+        == "sampled_direct"
+    )
+
+
+def test_live_sampled_nr_one_bypasses_eager_config_bounds(
+    stub_live_factory_modules, tmp_path,
+):
+    blueprint = tmp_path / "blueprint.bps"
+    blueprint.write_bytes(b"stub")
+    config_calls, live_sources = stub_live_factory_modules
+
+    sampled_args = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "sampled"),
+            "--blueprint-a", str(blueprint),
+            "--hero-source", "live_sampled",
+            "--live-num-rollouts", "1",
+        ]
+    )
+    _, _, metadata = runner._lookup_factories(sampled_args)
+
+    assert all(
+        "num_rollouts_override" not in kwargs
+        for _, kwargs in config_calls
+    )
+    assert all(source.num_rollouts == 1 for source in live_sources)
+    assert (
+        metadata["leaf_mode_envs"]["hero"]["live_num_rollouts_bounds"]
+        == "sampled_direct"
+    )
+
+    eager_args = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "eager"),
+            "--blueprint-a", str(blueprint),
+            "--hero-source", "live_eager",
+            "--live-num-rollouts", "1",
+        ]
+    )
+    with pytest.raises(ValueError, match=r"bounds \[3, 30\]"):
+        runner._lookup_factories(eager_args)
+    assert config_calls[-1][1]["num_rollouts_override"] == 1
 
 
 def test_group_and_summary_aggregate_tracked_solve_walls():
