@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -427,6 +428,7 @@ def test_cli_source_defaults_and_validation(capsys, tmp_path):
     assert args.hero_source == "lookup"
     assert args.field_source == "lookup"
     assert args.live_iterations == 250_000
+    assert args.live_num_rollouts is None
     assert args.max_wall_s is None
 
     with pytest.raises(SystemExit):
@@ -485,6 +487,20 @@ def test_cli_source_defaults_and_validation(capsys, tmp_path):
         runner._parse_args(
             ["--mode", "ab", "--out", str(tmp_path / "bad-wall"),
              "--max-wall-s", "0"]
+        )
+    live_override = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "live-override"),
+            "--live-num-rollouts", "2",
+        ]
+    )
+    assert live_override.live_num_rollouts == 2
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            [
+                "--mode", "ab", "--out", str(tmp_path / "bad-rollouts"),
+                "--live-num-rollouts", "0",
+            ]
         )
 
 
@@ -586,6 +602,78 @@ def test_live_router_uses_lookup_preflop_and_street_entry_player_count():
 
     assert router.get_mix(preflop, (0, 1)) == "lookup"
     assert router.get_mix(three_way, (0, 1)) == "three"
+
+
+def test_live_num_rollouts_override_reaches_configs_and_metadata(
+    monkeypatch, tmp_path,
+):
+    blueprint_a = tmp_path / "a.bps"
+    blueprint_b = tmp_path / "b.bps"
+    blueprint_a.write_bytes(b"stub")
+    blueprint_b.write_bytes(b"stub")
+    config_calls = []
+    live_sources = []
+
+    class Stub:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.__dict__.update(kwargs)
+
+    class LiveResolveSource:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.__dict__.update(kwargs)
+            live_sources.append(self)
+
+    def live_config_for(n_players, **kwargs):
+        config_calls.append((n_players, kwargs))
+        return types.SimpleNamespace(
+            iterations=kwargs["iterations_override"],
+            num_rollouts=kwargs["num_rollouts_override"],
+            vec_mode=False,
+            readout="final",
+        )
+
+    fake_modules = {
+        "app.engine.agent.agent": types.SimpleNamespace(
+            PokerAgent=Stub
+        ),
+        "app.engine.agent.modes": types.SimpleNamespace(
+            ModeConfig=Stub
+        ),
+        "app.engine.agent.strategy_source": types.SimpleNamespace(
+            HybridSource=Stub,
+            LiveResolveSource=LiveResolveSource,
+            LookupSource=Stub,
+        ),
+        "app.engine.cpu_es_solver": types.SimpleNamespace(
+            CpuEsSolver=Stub
+        ),
+        "app.engine.engine_constants": types.SimpleNamespace(
+            live_config_for=live_config_for
+        ),
+    }
+    for name, module in fake_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    args = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "out"),
+            "--blueprint-a", str(blueprint_a),
+            "--blueprint-b", str(blueprint_b),
+            "--hero-source", "live_sampled",
+            "--live-num-rollouts", "2",
+        ]
+    )
+    _, _, metadata = runner._lookup_factories(args)
+
+    assert [call[0] for call in config_calls] == [2, 3, 4, 5, 6]
+    assert all(
+        call[1]["num_rollouts_override"] == 2
+        for call in config_calls
+    )
+    assert all(source.num_rollouts == 2 for source in live_sources)
+    assert metadata["live_num_rollouts"] == 2
 
 
 def test_group_and_summary_aggregate_tracked_solve_walls():

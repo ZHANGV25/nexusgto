@@ -304,6 +304,9 @@ def parse_args(
         "--live-iterations", type=_positive_int, default=250_000
     )
     ap.add_argument(
+        "--live-num-rollouts", type=_positive_int, default=None
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -468,6 +471,7 @@ def build_factories(
             live_config = live_config_for_fn(
                 n_players,
                 iterations_override=int(args.live_iterations),
+                num_rollouts_override=args.live_num_rollouts,
                 purpose="play",
             )
             if live_config.readout != "final":
@@ -527,6 +531,7 @@ def build_factories(
             "hero_source": args.hero_source,
             "field_source": args.field_source,
             "live_iterations": int(args.live_iterations),
+            "live_num_rollouts": args.live_num_rollouts,
             "leaf_mode_envs": {
                 role: {
                     "source": role_sources[role],
