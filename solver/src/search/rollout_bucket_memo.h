@@ -14,6 +14,11 @@
  * deterministic), so races are idempotent/benign - the same discipline as
  * the bias_regret table in es_sampled_oracle.c.
  *
+ * Warm reuse: reset() with an UNCHANGED (reader, flop) fingerprint keeps
+ * the tables instead of wiping - entries are pure functions of the cards,
+ * so consecutive same-flop solves in one process start pre-warmed and
+ * stay exact.
+ *
  * Compile out with -DPOKER_ROLLOUT_BUCKET_MEMO_DISABLE: lookups then return
  * the bypass code and rollout.c falls through to plain computation.
  */

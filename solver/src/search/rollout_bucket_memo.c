@@ -42,12 +42,22 @@ static inline size_t rbm_pair_index(int c0, int c1) {
 
 /* Single-threaded setup only (oracle constructors, pre-Hogwild): memset the
  * tables FIRST, then publish the fingerprint, so a stale fingerprint can
- * never validate entries from a previous flop. */
+ * never validate entries from a previous flop.
+ *
+ * WARM PATH: when the fingerprint is unchanged (same reader, same flop) the
+ * tables are kept as-is. Cached entries are pure functions of the cards for
+ * this reader, so they stay exact across solves; consecutive decisions in
+ * the same hand share the flop and start pre-warmed. This makes reader
+ * POINTER identity load-bearing across solves: a freed reader reallocated
+ * at the same address would falsely validate - acceptable because every
+ * process loads its blueprint reader once and keeps it for its lifetime. */
 void rollout_bucket_memo_reset(const void *reader, const int flop[3]) {
     if (!reader || !flop) return;
     if (flop[0] < 0 || flop[0] > 51 || flop[1] < 0 || flop[1] > 51
         || flop[2] < 0 || flop[2] > 51)
         return;
+    uint64_t fp = rbm_fingerprint(reader, flop);
+    if (fp == g_fp && g_turn && g_river) return;  /* warm: keep the cache */
     if (!g_turn) g_turn = (int16_t *)malloc(RBM_TURN_SLOTS * sizeof(int16_t));
     if (!g_river) g_river = (int16_t *)malloc(RBM_RIVER_SLOTS * sizeof(int16_t));
     if (!g_turn || !g_river) {
@@ -60,7 +70,7 @@ void rollout_bucket_memo_reset(const void *reader, const int flop[3]) {
     g_fp = 0;
     memset(g_turn, 0xFF, RBM_TURN_SLOTS * sizeof(int16_t));
     memset(g_river, 0xFF, RBM_RIVER_SLOTS * sizeof(int16_t));
-    g_fp = rbm_fingerprint(reader, flop);
+    g_fp = fp;
 }
 
 static inline int rbm_ready(const void *reader, const int *board) {
