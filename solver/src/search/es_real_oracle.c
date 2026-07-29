@@ -23,6 +23,7 @@
 
 #include "es_resolver.h"
 #include "rollout.h"
+#include "rollout_bucket_memo.h"
 #include "bps_reader.h"
 
 #include <stdlib.h>
@@ -265,6 +266,12 @@ ES_EXPORT void *es_make_real_oracle(
     atomic_store(&c->cache_hits, 0);
     atomic_store(&c->rollout_sims, 0);
     atomic_store(&c->oracle_errors, 0);
+    /* Single-threaded setup point: arm the per-solve turn/river bucket memo
+     * for this solve's fixed flop before any Hogwild worker runs. */
+    if (tree->num_board >= 3) {
+        int flop3[3] = { tree->board[0], tree->board[1], tree->board[2] };
+        rollout_bucket_memo_reset(bp_void, flop3);
+    }
     return c;
 }
 

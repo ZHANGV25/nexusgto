@@ -10,6 +10,7 @@
 
 #include "es_sampled_oracle.h"
 #include "rollout_internal.h"
+#include "rollout_bucket_memo.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -398,6 +399,12 @@ ES_EXPORT void *es_make_sampled_oracle(
     memcpy(c->hist_len, hist_len, leaf_elems * sizeof(int));
     memcpy(c->player_seats, player_seats, (size_t)np * sizeof(int));
     for (int p = 0; p < np; p++) c->acting_order[p] = p;
+    /* Single-threaded setup point: arm the per-solve turn/river bucket memo
+     * for this solve's fixed flop before any Hogwild worker runs. */
+    if (tree->num_board >= 3) {
+        int flop3[3] = { tree->board[0], tree->board[1], tree->board[2] };
+        rollout_bucket_memo_reset(bp_void, flop3);
+    }
     return c;
 }
 

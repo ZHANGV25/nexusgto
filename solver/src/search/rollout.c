@@ -19,6 +19,7 @@
 
 #include "hand_eval.h"
 #include "mccfr_cont_ev_table.h"  /* Phase F: cont_ev_table consumer */
+#include "rollout_bucket_memo.h"  /* per-solve turn/river bucket memo */
 
 /* External declarations for the trainer-side action_hash function. We
  * avoid including mccfr_blueprint.h because that pulls in the entire
@@ -1396,9 +1397,27 @@ int rollout_simulate_one(
             if (n_board == 3) {
                 bucket = bps_hand_to_bucket(r, board, c0, c1);
             } else if (n_board == 4) {
-                bucket = bps_hand_to_bucket_turn(r, board, c0, c1);
+                /* Memo hit avoids the ca_compute_features/eval5 storm
+                 * (~64% of all solve cycles, ROLLOUT_PROFILE_2026-07-28).
+                 * MISS: compute + store. BYPASS: compute only. Cached ids
+                 * are bit-identical to recomputation by construction. */
+                bucket = rollout_bucket_memo_lookup_turn(r, board, c0, c1);
+                if (bucket < 0) {
+                    int cached = bucket;
+                    bucket = bps_hand_to_bucket_turn(r, board, c0, c1);
+                    if (cached == ROLLOUT_BUCKET_MEMO_MISS)
+                        rollout_bucket_memo_store_turn(r, board, c0, c1,
+                                                       bucket);
+                }
             } else if (n_board == 5) {
-                bucket = bps_hand_to_bucket_river(r, board, c0, c1);
+                bucket = rollout_bucket_memo_lookup_river(r, board, c0, c1);
+                if (bucket < 0) {
+                    int cached = bucket;
+                    bucket = bps_hand_to_bucket_river(r, board, c0, c1);
+                    if (cached == ROLLOUT_BUCKET_MEMO_MISS)
+                        rollout_bucket_memo_store_river(r, board, c0, c1,
+                                                        bucket);
+                }
             } else {
                 bucket = -1;
             }

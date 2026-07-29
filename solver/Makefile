@@ -98,8 +98,8 @@ $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_read
 # Links bps_reader.c (blueprint queries); eval7 is header-only.
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
-$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
 
 # ── CPU external-sampling ES re-solver (HYBRID 5p flop/turn path) ──
 # es_resolver: lightweight (table/joint oracles only) — validation harnesses.
@@ -123,10 +123,10 @@ $(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c \
-	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c \
 	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
 
@@ -137,11 +137,13 @@ $(BUILD_DIR)/test_es_sampled_oracle: tests/test_es_sampled_oracle.c \
         $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h \
         $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
         $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/es_oracles.c \
+        $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h \
         $(SEARCH_DIR)/rollout_internal.h $(SEARCH_DIR)/rollout.h \
         $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_sampled_oracle.c \
 	    $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_resolver.c \
 	    $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c \
+	    $(SEARCH_DIR)/rollout_bucket_memo.c \
 	    -o $@ $(LDFLAGS)
 
 .PHONY: test_es_sampled_oracle
