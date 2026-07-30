@@ -382,9 +382,12 @@ class _FlopRaiseWarPolicy:
             return runner.ActionChoice(1 if state.facing_bet else 0)
         if self.seat in (0, 2):
             n = state.num_legal_actions()
-            if n > 2:
-                return runner.ActionChoice(n - 1)  # biggest raise (stack-capped)
-            return runner.ActionChoice(1 if state.facing_bet else 0)
+            if not state.facing_bet:
+                # Unraised node: last action is the (single) sized bet.
+                return runner.ActionChoice(n - 1)
+            # Facing a bet: re-raise while a raise action exists (indices
+            # beyond fold/call), else call the all-in.
+            return runner.ActionChoice(n - 1 if n > 2 else 1)
         return runner.ActionChoice(0)
 
 
