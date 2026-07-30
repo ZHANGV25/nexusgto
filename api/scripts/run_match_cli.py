@@ -321,6 +321,12 @@ def parse_args(
             "board completions"
         ),
     )
+    ap.add_argument(
+        "--hand-log",
+        action="store_true",
+        default=False,
+        help="write chronological nexusgto_handlog_v1 events",
+    )
     args = ap.parse_args(argv)
     if args.seats == 2:
         ap.error(
@@ -636,11 +642,25 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
         ) or getattr(field_factory, "_solve_wall_tracker", None)
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
+        hand_log_emitter = None
+        if args.hand_log:
+            from scripts.hand_log_emitter import HandLogEmitter
+
+            hand_log_emitter = HandLogEmitter(
+                out,
+                hand_player=runner.play_full_hand,
+                mode=args.mode,
+                master_seed=args.master_seed,
+                epsilon=args.epsilon,
+                hero_source=args.hero_source,
+                field_source=args.field_source,
+                allin_equity_adjust=args.allin_equity_adjust,
+            )
         partial_path = out / "deal_groups.jsonl.partial"
         record_epsilon = args.epsilon if args.mode == "epsilon" else None
         progress: Dict[str, object] = {"n": 0, "fh": None}
 
-        def on_group(group: object) -> None:
+        def progress_on_group(group: object) -> None:
             if progress["fh"] is None:
                 progress["fh"] = partial_path.open(
                     "w", encoding="utf-8", newline="\n"
@@ -665,19 +685,32 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 flush=True,
             )
 
+        group_callback = progress_on_group
+        if hand_log_emitter is not None:
+            active_emitter = hand_log_emitter
+
+            def logged_on_group(group: object) -> None:
+                active_emitter.on_group(group)
+                progress_on_group(group)
+
+            group_callback = logged_on_group
+
         try:
-            run = runner.run_match(
-                deals=args.deals,
-                mode=args.mode,
-                master_seed=args.master_seed,
-                epsilon=args.epsilon,
-                a_factory=hero_factory,
-                b_factory=field_factory,
-                on_group=on_group,
-                solve_wall_tracker=tracker,
-                max_wall_s=args.max_wall_s,
-                allin_equity_adjust=args.allin_equity_adjust,
-            )
+            match_kwargs = {
+                "deals": args.deals,
+                "mode": args.mode,
+                "master_seed": args.master_seed,
+                "epsilon": args.epsilon,
+                "a_factory": hero_factory,
+                "b_factory": field_factory,
+                "on_group": group_callback,
+                "solve_wall_tracker": tracker,
+                "max_wall_s": args.max_wall_s,
+                "allin_equity_adjust": args.allin_equity_adjust,
+            }
+            if hand_log_emitter is not None:
+                match_kwargs["hand_player"] = hand_log_emitter.hand_player
+            run = runner.run_match(**match_kwargs)
         finally:
             if progress["fh"] is not None:
                 progress["fh"].close()
@@ -685,6 +718,8 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
             groups=run.groups, summary={**run.summary, **metadata}
         )
         groups_path, summary_path = runner.write_match(run, args.out)
+        if hand_log_emitter is not None:
+            hand_log_emitter.finalize()
         partial_path.unlink(missing_ok=True)
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
