@@ -18,6 +18,10 @@ The three modes are: ``aa`` (A against identical A, an exact plumbing null),
 fixed card-to-position assignment, and seat-keyed common policy seeds reduce
 card, position and action-sampling variance.
 
+With ``--allin-equity-adjust``, all-in showdowns are scored by their conditional
+mean over the true remaining-deck runout distribution.  This Rao-Blackwellized
+score is unbiased for the same mean while removing realized runout variance.
+
 FULL_SEAT names are button-relative positions, not permanent player chairs.
 Each deal group is one nominal session hand: group ``g`` advances its nominal
 hero/button-relative position to ``g mod 6``.  Its other five rotations are
@@ -45,6 +49,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
@@ -65,8 +70,11 @@ N_SEATS = len(SEAT_NAMES)
 BUTTON_SEAT = 5
 VALID_MODES = ("aa", "epsilon", "ab")
 SCHEMA = "nexusgto_match_v1"
+_ADJUSTED_ZERO_SUM_EPSILON = 1e-9
+_STREET_BOARD_CARD_COUNT = {1: 3, 2: 4, 3: 5}
 
 HoleCards = Tuple[int, int]
+AdjustedDeltas = Tuple[float, float, float, float, float, float]
 
 
 class ActingPolicy(Protocol):
@@ -121,12 +129,30 @@ class PlayedHand:
     fallback_count: int = 0
     contributions: Tuple[int, ...] = ()
     folded: Tuple[bool, ...] = ()
+    adjusted_deltas: Optional[AdjustedDeltas] = None
 
     def __post_init__(self) -> None:
         if len(self.deltas) != N_SEATS:
             raise ValueError(f"need {N_SEATS} deltas, got {len(self.deltas)}")
         if sum(self.deltas) != 0:
             raise AssertionError(f"hand does not conserve chips: deltas={self.deltas}")
+        if self.adjusted_deltas is not None:
+            if len(self.adjusted_deltas) != N_SEATS:
+                raise ValueError(
+                    f"need {N_SEATS} adjusted deltas, "
+                    f"got {len(self.adjusted_deltas)}"
+                )
+            # Averaging exact integer settlements can leave only floating-point
+            # summation residue; anything larger is a real conservation bug.
+            adjusted_sum = sum(self.adjusted_deltas)
+            if (
+                not all(math.isfinite(float(delta)) for delta in self.adjusted_deltas)
+                or abs(adjusted_sum) > _ADJUSTED_ZERO_SUM_EPSILON
+            ):
+                raise AssertionError(
+                    "adjusted hand does not conserve chips: "
+                    f"deltas={self.adjusted_deltas} sum={adjusted_sum}"
+                )
         if not 0 <= self.fallback_count <= self.action_count:
             raise ValueError("fallback_count must be between zero and action_count")
         if self.contributions and len(self.contributions) != N_SEATS:
@@ -163,8 +189,33 @@ class RotationResult:
     def seat_differential_chips(self) -> float:
         return self.seat_differential_numerator / float(N_SEATS - 1)
 
-    def as_dict(self) -> Dict[str, object]:
-        return {
+    @property
+    def hero_delta_adjusted(self) -> Optional[float]:
+        if self.hand.adjusted_deltas is None:
+            return None
+        return self.hand.adjusted_deltas[self.hero_seat]
+
+    @property
+    def field_delta_mean_adjusted(self) -> Optional[float]:
+        if self.hand.adjusted_deltas is None:
+            return None
+        field_sum = sum(
+            delta
+            for seat, delta in enumerate(self.hand.adjusted_deltas)
+            if seat != self.hero_seat
+        )
+        return field_sum / float(N_SEATS - 1)
+
+    @property
+    def seat_differential_chips_adjusted(self) -> Optional[float]:
+        hero = self.hero_delta_adjusted
+        field_mean = self.field_delta_mean_adjusted
+        if hero is None or field_mean is None:
+            return None
+        return hero - field_mean
+
+    def as_dict(self, *, allin_equity_adjust: bool = False) -> Dict[str, object]:
+        record = {
             "rotation_index": self.rotation_index,
             "session_hand_index": self.session_hand_index,
             "hero_seat": self.hero_seat,
@@ -187,6 +238,22 @@ class RotationResult:
             "went_to_showdown": self.hand.went_to_showdown,
             "preflop_prefix": list(self.hand.preflop_prefix),
         }
+        if allin_equity_adjust:
+            if self.hand.adjusted_deltas is None:
+                raise AssertionError(
+                    "adjusted group contains a hand without adjusted deltas"
+                )
+            record.update({
+                "adjusted_deltas": list(self.hand.adjusted_deltas),
+                "hero_delta_chips_adjusted": self.hero_delta_adjusted,
+                "field_mean_delta_chips_adjusted": (
+                    self.field_delta_mean_adjusted
+                ),
+                "seat_differential_chips_adjusted": (
+                    self.seat_differential_chips_adjusted
+                ),
+            })
+        return record
 
 
 @dataclass(frozen=True)
@@ -204,6 +271,8 @@ class DealGroupResult:
         RotationResult,
     ]
     paired_numerator: int
+    allin_equity_adjust: bool = False
+    adjusted_paired_numerator: Optional[float] = None
     solve_wall_samples: Dict[str, Tuple[float, ...]] = field(default_factory=dict)
     solve_wall_sources: Dict[str, str] = field(default_factory=dict)
 
@@ -222,6 +291,20 @@ class DealGroupResult:
         # number; reporting the differential as bb/100 would overstate a true
         # edge by 20%.
         return self.paired_numerator / float(N_SEATS * N_SEATS)
+
+    @property
+    def paired_differential_chips_adjusted(self) -> Optional[float]:
+        if self.adjusted_paired_numerator is None:
+            return None
+        return self.adjusted_paired_numerator / float(
+            (N_SEATS - 1) * N_SEATS
+        )
+
+    @property
+    def hero_net_chips_per_hand_adjusted(self) -> Optional[float]:
+        if self.adjusted_paired_numerator is None:
+            return None
+        return self.adjusted_paired_numerator / float(N_SEATS * N_SEATS)
 
     @property
     def action_count(self) -> int:
@@ -250,7 +333,12 @@ class DealGroupResult:
                 "are counterfactual arms of one session hand"
             ),
             "deal": self.deal.as_dict(),
-            "rotations": [rotation.as_dict() for rotation in self.rotations],
+            "rotations": [
+                rotation.as_dict(
+                    allin_equity_adjust=self.allin_equity_adjust
+                )
+                for rotation in self.rotations
+            ],
             "paired_differential_chips": self.paired_differential_chips,
             "hero_net_chips_per_hand": self.hero_net_chips_per_hand,
             "decisions": self.action_count,
@@ -259,6 +347,19 @@ class DealGroupResult:
                 self.fallback_count / self.action_count if self.action_count else 0.0
             ),
         }
+        if self.allin_equity_adjust:
+            if self.adjusted_paired_numerator is None:
+                raise AssertionError(
+                    "adjusted group has no adjusted paired numerator"
+                )
+            record.update({
+                "paired_differential_chips_adjusted": (
+                    self.paired_differential_chips_adjusted
+                ),
+                "hero_net_chips_per_hand_adjusted": (
+                    self.hero_net_chips_per_hand_adjusted
+                ),
+            })
         if self.solve_wall_sources:
             record["solve_wall_s_by_source"] = _solve_wall_summaries(
                 self.solve_wall_samples, self.solve_wall_sources
@@ -377,7 +478,7 @@ def deal_from_rng(rng: np.random.Generator) -> Deal:
     return Deal(board=board, hole_cards=holes)  # type: ignore[arg-type]
 
 
-HandPlayer = Callable[[Deal, Sequence[ActingPolicy]], PlayedHand]
+HandPlayer = Callable[..., PlayedHand]
 
 
 def _policies_for_rotation(
@@ -417,6 +518,7 @@ def play_deal_group(
     epsilon: float = 0.05,
     hand_player: HandPlayer,
     solve_wall_tracker: Optional[SolveWallTracker] = None,
+    allin_equity_adjust: bool = False,
 ) -> DealGroupResult:
     """Replay one exact deal with the designated hero in every position."""
 
@@ -428,6 +530,9 @@ def play_deal_group(
 
     rotations: List[RotationResult] = []
     total_numerator = 0
+    adjusted_total_numerator: Optional[float] = (
+        0.0 if allin_equity_adjust else None
+    )
     for rotation_index in range(N_SEATS):
         # group_index advances the nominal button-relative assignment.  These
         # six rotations are counterfactual duplicate arms of that one hand.
@@ -441,7 +546,14 @@ def play_deal_group(
             a_factory=a_factory,
             b_factory=b_factory,
         )
-        hand = hand_player(deal, policies)
+        if allin_equity_adjust:
+            hand = hand_player(
+                deal, policies, allin_equity_adjust=True
+            )
+        else:
+            # Keep the default call byte-for-byte compatible with injected
+            # two-argument hand players used by existing match tooling.
+            hand = hand_player(deal, policies)
         field_sum = sum(
             delta for seat, delta in enumerate(hand.deltas) if seat != hero_seat
         )
@@ -449,6 +561,23 @@ def play_deal_group(
         # numerator integral makes the AA conservation identity exactly zero,
         # rather than a tiny floating cancellation residue.
         numerator = (N_SEATS - 1) * hand.deltas[hero_seat] - field_sum
+        if allin_equity_adjust:
+            if hand.adjusted_deltas is None:
+                raise AssertionError(
+                    "allin_equity_adjust hand player returned no adjusted deltas"
+                )
+            adjusted_field_sum = sum(
+                delta
+                for seat, delta in enumerate(hand.adjusted_deltas)
+                if seat != hero_seat
+            )
+            adjusted_numerator = (
+                (N_SEATS - 1) * hand.adjusted_deltas[hero_seat]
+                - adjusted_field_sum
+            )
+            if adjusted_total_numerator is None:
+                raise AssertionError("adjusted numerator accumulator is missing")
+            adjusted_total_numerator += adjusted_numerator
         rotations.append(
             RotationResult(
                 rotation_index=rotation_index,
@@ -469,12 +598,37 @@ def play_deal_group(
             )
         if total_numerator != 0:
             raise AssertionError(f"AA paired differential is not exactly zero: {total_numerator}")
+        if allin_equity_adjust:
+            first_adjusted = rotations[0].hand.adjusted_deltas
+            if any(
+                rotation.hand.adjusted_deltas != first_adjusted
+                for rotation in rotations[1:]
+            ):
+                raise AssertionError(
+                    "AA adjusted duplicate arms diverged: policy factories "
+                    "must reset from the supplied seat-keyed seeds and must "
+                    "not leak mutable hand state"
+                )
+            if (
+                adjusted_total_numerator is None
+                or abs(adjusted_total_numerator)
+                > _ADJUSTED_ZERO_SUM_EPSILON
+            ):
+                raise AssertionError(
+                    "AA adjusted paired differential is not zero: "
+                    f"{adjusted_total_numerator}"
+                )
+            # Preserve the exact-null reporting contract despite harmless
+            # floating summation residue across the six rotated hero seats.
+            adjusted_total_numerator = 0.0
 
     return DealGroupResult(
         group_index=group_index,
         deal=deal,
         rotations=tuple(rotations),  # type: ignore[arg-type]
         paired_numerator=total_numerator,
+        allin_equity_adjust=allin_equity_adjust,
+        adjusted_paired_numerator=adjusted_total_numerator,
         solve_wall_samples=(
             solve_wall_tracker.finish_group()
             if solve_wall_tracker is not None else {}
@@ -577,6 +731,44 @@ def summarize_groups(
         summary["truncated_by_wall_budget"] = bool(
             truncated_by_wall_budget
         )
+    adjusted_values = [
+        group.hero_net_chips_per_hand_adjusted for group in groups
+    ]
+    if any(value is not None for value in adjusted_values):
+        if any(value is None for value in adjusted_values):
+            raise ValueError(
+                "cannot summarize a mixture of adjusted and raw-only groups"
+            )
+        adjusted_array = np.asarray(adjusted_values, dtype=np.float64)
+        adjusted_mean = float(adjusted_array.mean())
+        if n > 1:
+            adjusted_std = float(adjusted_array.std(ddof=1))
+            adjusted_stderr: Optional[float] = (
+                adjusted_std / math.sqrt(n)
+            )
+            adjusted_stderr_bb: Optional[float] = round(
+                adjusted_stderr * to_bb100, 4
+            )
+            adjusted_ci_bb: Optional[List[float]] = [
+                round(
+                    (adjusted_mean - 1.96 * adjusted_stderr) * to_bb100,
+                    4,
+                ),
+                round(
+                    (adjusted_mean + 1.96 * adjusted_stderr) * to_bb100,
+                    4,
+                ),
+            ]
+        else:
+            adjusted_stderr_bb = None
+            adjusted_ci_bb = None
+        summary.update({
+            "mean_bb_per_100_adjusted": round(
+                adjusted_mean * to_bb100, 4
+            ),
+            "stderr_bb_per_100_adjusted": adjusted_stderr_bb,
+            "ci95_bb_per_100_adjusted": adjusted_ci_bb,
+        })
     return summary
 
 
@@ -593,6 +785,7 @@ def run_match(
     solve_wall_tracker: Optional[SolveWallTracker] = None,
     max_wall_s: Optional[float] = None,
     clock: Optional[Callable[[], float]] = None,
+    allin_equity_adjust: bool = False,
 ) -> MatchRun:
     """Run ``deals`` independent groups (six full duplicate arms per group).
 
@@ -630,6 +823,7 @@ def run_match(
                 epsilon=epsilon,
                 hand_player=player,
                 solve_wall_tracker=solve_wall_tracker,
+                allin_equity_adjust=allin_equity_adjust,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -656,7 +850,91 @@ def run_match(
     return MatchRun(groups=groups, summary=summary)
 
 
-def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
+def _raw_adjusted_deltas(deltas: Sequence[int]) -> AdjustedDeltas:
+    return tuple(float(delta) for delta in deltas)  # type: ignore[return-value]
+
+
+def _allin_equity_adjusted_deltas(
+    *,
+    full_board: Sequence[int],
+    hole_cards: Sequence[HoleCards],
+    contributions: Sequence[int],
+    folded: Sequence[bool],
+    live_board_card_count: int,
+) -> AdjustedDeltas:
+    """Mean settlement deltas over every unseen board completion."""
+
+    from app.engine.agent.settlement import settle_hand
+
+    if live_board_card_count not in (3, 4, 5):
+        raise ValueError(
+            "postflop live board count must be 3, 4, or 5, got "
+            f"{live_board_card_count}"
+        )
+    live_seats = sum(1 for did_fold in folded if not did_fold)
+    realized = settle_hand(
+        list(full_board), hole_cards, contributions, folded,
+        button=BUTTON_SEAT,
+    )
+    if live_seats < 2 or live_board_card_count == 5:
+        return _raw_adjusted_deltas(realized.deltas)
+
+    live_board = tuple(int(card) for card in full_board[:live_board_card_count])
+    excluded = set(live_board)
+    for hand in hole_cards:
+        excluded.update(int(card) for card in hand)
+    remaining_deck = tuple(card for card in range(52) if card not in excluded)
+    cards_to_come = 5 - live_board_card_count
+    totals = [0] * N_SEATS
+    completion_count = 0
+    # For a flop all-in, each unordered turn/river pair represents two equally
+    # likely orders and settle_hand is order-insensitive, so combinations give
+    # the same exact mean without evaluating both permutations.
+    for runout in combinations(remaining_deck, cards_to_come):
+        settled = settle_hand(
+            list(live_board + runout),
+            hole_cards,
+            contributions,
+            folded,
+            button=BUTTON_SEAT,
+        )
+        for seat, delta in enumerate(settled.deltas):
+            totals[seat] += int(delta)
+        completion_count += 1
+    if completion_count == 0:
+        raise AssertionError("all-in board completion enumeration was empty")
+    adjusted = tuple(
+        total / float(completion_count) for total in totals
+    )
+    # Every enumerated settle_hand result is exact zero-sum. Division can
+    # introduce only a tiny floating summation residue.
+    adjusted_sum = sum(adjusted)
+    if abs(adjusted_sum) > _ADJUSTED_ZERO_SUM_EPSILON:
+        raise AssertionError(
+            "all-in equity-adjusted deltas do not conserve chips: "
+            f"deltas={adjusted} sum={adjusted_sum}"
+        )
+    return adjusted  # type: ignore[return-value]
+
+
+def _betting_closed_by_allin(state: object) -> bool:
+    active = tuple(bool(value) for value in getattr(state, "active"))
+    stacks = tuple(int(value) for value in getattr(state, "stacks"))
+    if len(active) != len(stacks):
+        raise AssertionError("GameState active/stacks length mismatch")
+    live_slots = [slot for slot, is_active in enumerate(active) if is_active]
+    return (
+        len(live_slots) >= 2
+        and sum(1 for slot in live_slots if stacks[slot] > 0) <= 1
+    )
+
+
+def play_full_hand(
+    deal: Deal,
+    policies: Sequence[ActingPolicy],
+    *,
+    allin_equity_adjust: bool = False,
+) -> PlayedHand:
     """Play preflop -> postflop -> multiway settlement through real states.
 
     Imports are deliberately local: importing this script or running injected
@@ -696,6 +974,10 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
             fallback_count=sum(int(getattr(p, "fallback_count", 0)) for p in policies),
             contributions=tuple(contributions),
             folded=tuple(folded),
+            adjusted_deltas=(
+                _raw_adjusted_deltas(settled.deltas)
+                if allin_equity_adjust else None
+            ),
         )
 
     live_names = list(pre.live_seat_names)
@@ -716,6 +998,15 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
         pot=int(validated_pot),
         stacks=list(validated_stacks),
     )
+    # GameState advances all-in players through forced zero-chip actions on
+    # later streets. A terminal state's street therefore cannot distinguish a
+    # true preflop all-in from a postflop all-in. Per the conservative contract,
+    # preflop all-ins fall back to raw scoring instead of guessing a 0-card
+    # live prefix.
+    preflop_allin = (
+        _betting_closed_by_allin(state) if allin_equity_adjust else False
+    )
+    allin_closed_street: Optional[int] = None
     postflop_actions = 0
     max_actions = 512
     while not state.terminal:
@@ -725,7 +1016,20 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
         if seat is None:
             raise AssertionError("non-terminal GameState has no acting seat")
         action_idx = _action_index(policies[seat].act(state, deal.hole_cards[seat]))
-        state = state.advance(action_idx)
+        acting_street = int(state.street)
+        next_state = state.advance(action_idx)
+        if (
+            allin_equity_adjust
+            and not preflop_allin
+            and allin_closed_street is None
+            and acting_street < 3
+            and _betting_closed_by_allin(next_state)
+        ):
+            # advance() may already expose the next street after the closing
+            # call, so the live prefix comes from GameState.street immediately
+            # before that action, never from action-count reconstruction.
+            allin_closed_street = acting_street
+        state = next_state
         postflop_actions += 1
 
     # PreflopState retains all six seats.  GameState compacts only the live
@@ -747,6 +1051,20 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
     settled = settle_hand(
         list(deal.board), deal.hole_cards, contributions, folded, button=BUTTON_SEAT
     )
+    adjusted_deltas: Optional[AdjustedDeltas] = None
+    if allin_equity_adjust:
+        if allin_closed_street is None:
+            adjusted_deltas = _raw_adjusted_deltas(settled.deltas)
+        else:
+            adjusted_deltas = _allin_equity_adjusted_deltas(
+                full_board=deal.board,
+                hole_cards=deal.hole_cards,
+                contributions=contributions,
+                folded=folded,
+                live_board_card_count=(
+                    _STREET_BOARD_CARD_COUNT[allin_closed_street]
+                ),
+            )
     terminal = "showdown" if settled.went_to_showdown else "postflop_fold"
     fallback_count = sum(int(getattr(policy, "fallback_count", 0)) for policy in policies)
     return PlayedHand(
@@ -758,6 +1076,7 @@ def play_full_hand(deal: Deal, policies: Sequence[ActingPolicy]) -> PlayedHand:
         fallback_count=fallback_count,
         contributions=tuple(contributions),
         folded=tuple(folded),
+        adjusted_deltas=adjusted_deltas,
     )
 
 
