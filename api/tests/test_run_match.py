@@ -371,6 +371,60 @@ def test_fold_and_river_closed_hands_copy_raw_deltas_when_adjusted():
     )
 
 
+class _FlopRaiseWarPolicy:
+    """Seats 0 and 2 max-raise each other on the flop until all-in; rest fold."""
+
+    def __init__(self, seat: int) -> None:
+        self.seat = seat
+
+    def act(self, state, _hero_cards):
+        if state.street == 0:
+            return runner.ActionChoice(1 if state.facing_bet else 0)
+        if self.seat in (0, 2):
+            n = state.num_legal_actions
+            if n > 2:
+                return runner.ActionChoice(n - 1)  # biggest raise (stack-capped)
+            return runner.ActionChoice(1 if state.facing_bet else 0)
+        return runner.ActionChoice(0)
+
+
+def test_flop_allin_through_real_states_fires_detection_and_differs_from_raw():
+    # AK vs QQ on 2c 7d Jh: both live seats win some completions, and the
+    # pre-dealt 3d/4h runout gives QQ the realized pot -- so the enumerated
+    # conditional mean provably differs from the realized settlement.
+    deal = runner.Deal(
+        board=(0, 21, 38, 5, 10),
+        hole_cards=((51, 47), (1, 2), (42, 43), (3, 4), (6, 7), (8, 9)),
+    )
+    policies = tuple(_FlopRaiseWarPolicy(seat) for seat in range(6))
+    raw_hand = runner.play_full_hand(deal, policies)
+    adj_hand = runner.play_full_hand(
+        deal,
+        tuple(_FlopRaiseWarPolicy(seat) for seat in range(6)),
+        allin_equity_adjust=True,
+    )
+
+    assert adj_hand.terminal == "showdown"
+    assert adj_hand.deltas == raw_hand.deltas
+    # Both warring seats are all-in on the flop with two streets to come.
+    assert adj_hand.folded == (False, True, False, True, True, True)
+    assert adj_hand.adjusted_deltas is not None
+    # THE detection-path gate: the adjusted score must be the enumerated
+    # flop-closure mean, not a copy of the realized runout settlement.
+    assert adj_hand.adjusted_deltas != tuple(
+        float(delta) for delta in adj_hand.deltas
+    )
+    expected = runner._allin_equity_adjusted_deltas(
+        full_board=deal.board,
+        hole_cards=deal.hole_cards,
+        contributions=adj_hand.contributions,
+        folded=adj_hand.folded,
+        live_board_card_count=3,
+    )
+    assert adj_hand.adjusted_deltas == pytest.approx(expected)
+    assert sum(adj_hand.adjusted_deltas) == pytest.approx(0.0, abs=1e-9)
+
+
 def test_flop_allin_adjustment_equals_independent_completion_mean():
     from app.engine.agent.settlement import settle_hand
 
