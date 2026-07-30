@@ -915,6 +915,7 @@ def test_live_sampled_nr_one_bypasses_eager_config_bounds(
         [
             "--mode", "ab", "--out", str(tmp_path / "eager"),
             "--blueprint-a", str(blueprint),
+            "--blueprint-b", str(blueprint),
             "--hero-source", "live_eager",
             "--live-num-rollouts", "1",
         ]
