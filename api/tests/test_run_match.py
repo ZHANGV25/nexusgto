@@ -393,8 +393,14 @@ class _FlopRaiseWarPolicy:
 
 def test_flop_allin_through_real_states_fires_detection_and_differs_from_raw():
     # AK vs QQ on 2c 7d Jh: both live seats win some completions, and the
-    # pre-dealt 3d/4h runout gives QQ the realized pot -- so the enumerated
+    # pre-dealt 4h river gives QQ the realized pot -- so the enumerated
     # conditional mean provably differs from the realized settlement.
+    # POSTFLOP_MAX_RAISES caps the flop raise war (the capped node offers
+    # [fold, call] only, and both warring seats still have chips), so the
+    # war resumes on the TURN and the stacks go in there: the closure the
+    # detection must capture is street 2 with FOUR live board cards, and
+    # the adjusted score is the mean over the 36 unseen rivers (AK wins
+    # exactly its 6 outs => p = 6/36, pinned by the reference below).
     deal = runner.Deal(
         board=(0, 21, 38, 5, 10),
         hole_cards=((51, 47), (1, 2), (42, 43), (3, 4), (6, 7), (8, 9)),
@@ -409,7 +415,7 @@ def test_flop_allin_through_real_states_fires_detection_and_differs_from_raw():
 
     assert adj_hand.terminal == "showdown"
     assert adj_hand.deltas == raw_hand.deltas
-    # Both warring seats are all-in on the flop with two streets to come.
+    # The four non-warring seats folded to the flop bet.
     assert adj_hand.folded == (False, True, False, True, True, True)
     assert adj_hand.adjusted_deltas is not None
     # THE detection-path gate: the adjusted score must be the enumerated
@@ -422,7 +428,7 @@ def test_flop_allin_through_real_states_fires_detection_and_differs_from_raw():
         hole_cards=deal.hole_cards,
         contributions=adj_hand.contributions,
         folded=adj_hand.folded,
-        live_board_card_count=3,
+        live_board_card_count=4,
     )
     assert adj_hand.adjusted_deltas == pytest.approx(expected)
     assert sum(adj_hand.adjusted_deltas) == pytest.approx(0.0, abs=1e-9)
