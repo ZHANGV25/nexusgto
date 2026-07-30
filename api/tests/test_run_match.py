@@ -381,7 +381,7 @@ class _FlopRaiseWarPolicy:
         if state.street == 0:
             return runner.ActionChoice(1 if state.facing_bet else 0)
         if self.seat in (0, 2):
-            n = state.num_legal_actions
+            n = state.num_legal_actions()
             if n > 2:
                 return runner.ActionChoice(n - 1)  # biggest raise (stack-capped)
             return runner.ActionChoice(1 if state.facing_bet else 0)
