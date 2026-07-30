@@ -891,6 +891,10 @@ def test_live_sampled_nr_one_bypasses_eager_config_bounds(
         [
             "--mode", "ab", "--out", str(tmp_path / "sampled"),
             "--blueprint-a", str(blueprint),
+            # mode 'ab' refuses to fall back to blueprint A silently; the real
+            # match invocation always passes both paths (identical here, as in
+            # the hero-vs-own-blueprint benches).
+            "--blueprint-b", str(blueprint),
             "--hero-source", "live_sampled",
             "--live-num-rollouts", "1",
         ]
