@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import types
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,11 @@ class _CheckCallPolicy:
 
     def act(self, state, _hero_cards):
         return runner.ActionChoice(1 if state.facing_bet else 0)
+
+
+class _AlwaysFoldPolicy:
+    def act(self, _state, _hero_cards):
+        return runner.ActionChoice(0)
 
 
 class _SeededPassivePolicy:
@@ -129,6 +135,42 @@ def test_ab_group_is_hero_minus_mean_field_and_rotates_all_seats():
     assert all(rotation.seat_differential_chips == 60.0 for rotation in group.rotations)
     # Headline metric: hero's own net chips, exactly the differential / 1.2.
     assert group.hero_net_chips_per_hand == 50.0
+
+
+def test_flag_off_omits_all_adjusted_serialization_fields():
+    def play(_deal, _policies):
+        return runner.PlayedHand(
+            deltas=(5, -1, -1, -1, -1, -1),
+            adjusted_deltas=(2.5, -0.5, -0.5, -0.5, -0.5, -0.5),
+            action_count=1,
+            terminal="synthetic",
+            went_to_showdown=False,
+        )
+
+    group = runner.play_deal_group(
+        _fixed_deal(),
+        group_index=0,
+        mode="aa",
+        master_seed=0,
+        a_factory=lambda _seed: _LabelPolicy("A"),
+        hand_player=play,
+    )
+    record = group.as_dict(mode="aa", master_seed=0)
+    summary = runner.summarize_groups(
+        [group], mode="aa", master_seed=0, epsilon=0.05
+    )
+
+    assert group.allin_equity_adjust is False
+    assert all(
+        "adjusted" not in key
+        for key in record
+    )
+    assert all(
+        "adjusted" not in key
+        for rotation in record["rotations"]
+        for key in rotation
+    )
+    assert all("adjusted" not in key for key in summary)
 
 
 def test_session_rotation_order_advances_with_group_index():
@@ -307,6 +349,140 @@ def test_aggressive_real_hand_merges_contributions_and_folded_statuses():
     assert sum(hand.deltas) == 0
 
 
+def test_fold_and_river_closed_hands_copy_raw_deltas_when_adjusted():
+    fold_hand = runner.play_full_hand(
+        _fixed_deal(),
+        tuple(_AlwaysFoldPolicy() for _ in range(6)),
+        allin_equity_adjust=True,
+    )
+    river_hand = runner.play_full_hand(
+        _fixed_deal(),
+        tuple(_CheckCallPolicy() for _ in range(6)),
+        allin_equity_adjust=True,
+    )
+
+    assert fold_hand.terminal == "preflop_fold"
+    assert fold_hand.adjusted_deltas == tuple(
+        float(delta) for delta in fold_hand.deltas
+    )
+    assert river_hand.terminal == "showdown"
+    assert river_hand.adjusted_deltas == tuple(
+        float(delta) for delta in river_hand.deltas
+    )
+
+
+def test_flop_allin_adjustment_equals_independent_completion_mean():
+    from app.engine.agent.settlement import settle_hand
+
+    board = (0, 5, 10, 44, 45)
+    hole_cards = (
+        (48, 49),
+        (46, 47),
+        (1, 2),
+        (3, 4),
+        (6, 7),
+        (8, 9),
+    )
+    contributions = (1000, 1000, 0, 0, 0, 0)
+    folded = (False, False, True, True, True, True)
+
+    production = runner._allin_equity_adjusted_deltas(
+        full_board=board,
+        hole_cards=hole_cards,
+        contributions=contributions,
+        folded=folded,
+        live_board_card_count=3,
+    )
+
+    # Independent enumeration: exclude every dealt hole card, including all
+    # four folded hands, plus only the three board cards live at the all-in.
+    excluded = set(board[:3])
+    for hand in hole_cards:
+        excluded.update(hand)
+    remaining = tuple(card for card in range(52) if card not in excluded)
+    assert len(remaining) == 37
+    totals = [0] * 6
+    completion_count = 0
+    for turn, river in combinations(remaining, 2):
+        settled = settle_hand(
+            [*board[:3], turn, river],
+            hole_cards,
+            contributions,
+            folded,
+            button=runner.BUTTON_SEAT,
+        )
+        for seat, delta in enumerate(settled.deltas):
+            totals[seat] += delta
+        completion_count += 1
+    expected = tuple(
+        total / float(completion_count) for total in totals
+    )
+    realized = settle_hand(
+        board,
+        hole_cards,
+        contributions,
+        folded,
+        button=runner.BUTTON_SEAT,
+    ).deltas
+
+    assert production == pytest.approx(expected)
+    assert sum(production) == pytest.approx(0.0, abs=1e-9)
+    assert any(
+        abs(adjusted - float(delta)) > 1e-9
+        for adjusted, delta in zip(production, realized)
+    )
+
+
+def test_aa_adjusted_telescoping_is_exact_zero_across_rotations():
+    def play(
+        _deal, _policies, *, allin_equity_adjust=False
+    ):
+        assert allin_equity_adjust is True
+        return runner.PlayedHand(
+            deltas=(5, -1, -1, -1, -1, -1),
+            adjusted_deltas=(2.5, -0.5, -0.5, -0.5, -0.5, -0.5),
+            action_count=1,
+            terminal="synthetic_adjusted",
+            went_to_showdown=True,
+        )
+
+    run = runner.run_match(
+        deals=2,
+        mode="aa",
+        master_seed=17,
+        a_factory=lambda _seed: _LabelPolicy("A"),
+        hand_player=play,
+        allin_equity_adjust=True,
+    )
+
+    assert all(
+        group.hero_net_chips_per_hand_adjusted == 0.0
+        for group in run.groups
+    )
+    assert all(
+        group.as_dict(
+            mode="aa", master_seed=17
+        )["hero_net_chips_per_hand_adjusted"] == 0.0
+        for group in run.groups
+    )
+    adjusted_record = run.groups[0].as_dict(
+        mode="aa", master_seed=17
+    )
+    assert (
+        adjusted_record["paired_differential_chips_adjusted"] == 0.0
+    )
+    assert all(
+        "adjusted_deltas" in rotation
+        and "hero_delta_chips_adjusted" in rotation
+        and "field_mean_delta_chips_adjusted" in rotation
+        and "seat_differential_chips_adjusted" in rotation
+        for rotation in adjusted_record["rotations"]
+    )
+    assert run.summary["mean_bb_per_100_adjusted"] == 0.0
+    assert run.summary["stderr_bb_per_100_adjusted"] == 0.0
+    assert run.summary["ci95_bb_per_100_adjusted"] == [0.0, 0.0]
+
+
 def test_stub_agents_play_at_least_100_full_showdown_hands_through_real_states():
     # 17 independent groups x 6 duplicate rotations = 102 complete 6-max hands.
     # Snapshot-compare sys.modules: earlier blueprint-gated tests legitimately
@@ -383,7 +559,7 @@ def test_cli_boundary_writes_artifacts_and_final_summary(monkeypatch, tmp_path, 
     exit_code = runner.main(
         [
             "--mode", "aa", "--deals", "1", "--master-seed", "19",
-            "--out", str(out),
+            "--out", str(out), "--allin-equity-adjust",
         ]
     )
 
@@ -401,6 +577,9 @@ def test_cli_boundary_writes_artifacts_and_final_summary(monkeypatch, tmp_path, 
     assert printed["blueprint_b"] is None
     assert printed["stderr_bb_per_100"] is None
     assert printed["ci95_bb_per_100"] is None
+    assert printed["mean_bb_per_100_adjusted"] == 0.0
+    assert printed["stderr_bb_per_100_adjusted"] is None
+    assert printed["ci95_bb_per_100_adjusted"] is None
     assert "no variance estimate" in printed["ci_note"]
 
 
@@ -430,6 +609,15 @@ def test_cli_source_defaults_and_validation(capsys, tmp_path):
     assert args.live_iterations == 250_000
     assert args.live_num_rollouts is None
     assert args.max_wall_s is None
+    assert args.allin_equity_adjust is False
+
+    adjusted = runner._parse_args(
+        [
+            "--mode", "aa", "--out", str(tmp_path / "adjusted"),
+            "--allin-equity-adjust",
+        ]
+    )
+    assert adjusted.allin_equity_adjust is True
 
     with pytest.raises(SystemExit):
         runner._parse_args(

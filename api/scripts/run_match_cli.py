@@ -312,6 +312,15 @@ def parse_args(
         default=None,
         help="stop cleanly after the first completed group beyond this wall",
     )
+    ap.add_argument(
+        "--allin-equity-adjust",
+        action="store_true",
+        default=False,
+        help=(
+            "score postflop all-ins by exact mean settlement over remaining "
+            "board completions"
+        ),
+    )
     args = ap.parse_args(argv)
     if args.seats == 2:
         ap.error(
@@ -667,6 +676,7 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 on_group=on_group,
                 solve_wall_tracker=tracker,
                 max_wall_s=args.max_wall_s,
+                allin_equity_adjust=args.allin_equity_adjust,
             )
         finally:
             if progress["fh"] is not None:
