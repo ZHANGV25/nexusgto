@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -357,6 +359,10 @@ def test_jsonl_group_records_and_summary_are_deterministic(tmp_path):
     assert summary["n_deal_groups"] == 2
     assert summary["n_full_hands"] == 12
     assert summary["fallback_count"] == 0
+    assert "solve_wall_s_by_source" not in records[0]
+    assert "solve_wall_s_by_source" not in summary
+    assert "truncated_by_wall_budget" not in summary
+    assert "seats" not in summary
 
     runner.write_match(run, tmp_path)
     assert groups_path.read_bytes() == first_groups
@@ -412,6 +418,411 @@ def test_ab_mode_refuses_to_default_blueprint_b_to_a(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="refusing to silently fall back"):
         runner._lookup_factories(args)
+
+
+def test_cli_source_defaults_and_validation(capsys, tmp_path):
+    args = runner._parse_args(
+        ["--mode", "aa", "--out", str(tmp_path / "default")]
+    )
+    assert args.seats == 6
+    assert args.hero_source == "lookup"
+    assert args.field_source == "lookup"
+    assert args.live_iterations == 250_000
+    assert args.live_num_rollouts is None
+    assert args.max_wall_s is None
+
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            [
+                "--mode", "aa", "--out", str(tmp_path / "hu"),
+                "--seats", "2",
+            ]
+        )
+    assert "full-hand preflop transition" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            [
+                "--mode", "aa", "--out", str(tmp_path / "bad-source"),
+                "--hero-source", "live_eager",
+                "--field-source", "live_sampled",
+            ]
+        )
+    assert "requires identical hero/field sources" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            [
+                "--mode", "aa", "--out", str(tmp_path / "aa-live"),
+                "--hero-source", "live_sampled",
+                "--field-source", "live_sampled",
+            ]
+        )
+    assert "exact deterministic lookup plumbing null" in capsys.readouterr().err
+
+    mixed = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "mixed"),
+            "--hero-source", "live_eager",
+            "--field-source", "live_sampled",
+        ]
+    )
+    assert (mixed.hero_source, mixed.field_source) == (
+        "live_eager", "live_sampled",
+    )
+
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            [
+                "--mode", "ab", "--out", str(tmp_path / "unknown"),
+                "--hero-source", "not-a-source",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            ["--mode", "ab", "--out", str(tmp_path / "bad-seats"),
+             "--seats", "3"]
+        )
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            ["--mode", "ab", "--out", str(tmp_path / "bad-wall"),
+             "--max-wall-s", "0"]
+        )
+    live_override = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "live-override"),
+            "--live-num-rollouts", "2",
+        ]
+    )
+    assert live_override.live_num_rollouts == 2
+    with pytest.raises(SystemExit):
+        runner._parse_args(
+            [
+                "--mode", "ab", "--out", str(tmp_path / "bad-rollouts"),
+                "--live-num-rollouts", "0",
+            ]
+        )
+
+
+def test_leaf_mode_scope_sets_exact_values_and_restores_on_exception(
+    monkeypatch,
+):
+    assert runner._cli.effective_leaf_mode_env("live_sampled") == {
+        "NEXUS_LEAF_SAMPLED": "1",
+        "NEXUS_LEAF_SAMPLED_POLICY": "1",
+        "NEXUS_LEAF_RANGE_CONDITIONING": "0",
+    }
+    assert runner._cli.effective_leaf_mode_env("live_eager") == {
+        "NEXUS_LEAF_SAMPLED": "0 (unset)",
+        "NEXUS_LEAF_SAMPLED_POLICY": "1 (inert default)",
+        "NEXUS_LEAF_RANGE_CONDITIONING": "1 (implicit default)",
+    }
+    controlled = tuple(runner._cli._CONTROLLED_LEAF_ENVS)
+    for index, name in enumerate(controlled):
+        if index % 2:
+            monkeypatch.setenv(name, f"prior-{index}")
+        else:
+            monkeypatch.delenv(name, raising=False)
+    before = {name: os.environ.get(name) for name in controlled}
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        with runner._scoped_leaf_mode("live_sampled"):
+            assert os.environ["NEXUS_LEAF_SAMPLED"] == "1"
+            assert os.environ["NEXUS_LEAF_SAMPLED_POLICY"] == "1"
+            assert os.environ["NEXUS_LEAF_RANGE_CONDITIONING"] == "0"
+            for name in controlled:
+                if name not in {
+                    "NEXUS_LEAF_SAMPLED",
+                    "NEXUS_LEAF_SAMPLED_POLICY",
+                    "NEXUS_LEAF_RANGE_CONDITIONING",
+                }:
+                    assert name not in os.environ
+            raise RuntimeError("synthetic failure")
+
+    assert {name: os.environ.get(name) for name in controlled} == before
+
+    with runner._scoped_leaf_mode("live_eager"):
+        assert all(name not in os.environ for name in controlled)
+    assert {name: os.environ.get(name) for name in controlled} == before
+
+
+def test_timed_solver_restores_environment_and_records_failed_solve(
+    monkeypatch,
+):
+    controlled = tuple(runner._cli._CONTROLLED_LEAF_ENVS)
+    for index, name in enumerate(controlled):
+        monkeypatch.setenv(name, f"prior-{index}")
+    before = {name: os.environ.get(name) for name in controlled}
+    tracker = runner._cli.SolveWallTracker({"hero": "live_sampled"})
+    tracker.begin_group()
+    clock_values = iter((10.0, 10.25))
+
+    class FailingSolver:
+        def solve(self):
+            assert os.environ["NEXUS_LEAF_SAMPLED"] == "1"
+            assert os.environ["NEXUS_LEAF_SAMPLED_POLICY"] == "1"
+            assert os.environ["NEXUS_LEAF_RANGE_CONDITIONING"] == "0"
+            raise RuntimeError("synthetic solve failure")
+
+    timed = runner._cli._ScopedTimedSolver(
+        FailingSolver(),
+        role="hero",
+        source="live_sampled",
+        tracker=tracker,
+        clock=lambda: next(clock_values),
+    )
+    with pytest.raises(RuntimeError, match="synthetic solve failure"):
+        timed.solve()
+
+    assert tracker.finish_group() == {"hero": (0.25,)}
+    assert {name: os.environ.get(name) for name in controlled} == before
+
+
+def test_live_router_uses_lookup_preflop_and_street_entry_player_count():
+    class Source:
+        def __init__(self, value):
+            self.value = value
+
+        def get_mix(self, _state, _hero_cards):
+            return self.value
+
+    router = runner._cli._LiveByPlayerCountSource(
+        Source("lookup"),
+        {2: Source("two"), 3: Source("three")},
+    )
+    preflop = type("State", (), {"street": 0})()
+    three_way = type(
+        "State", (),
+        {
+            "street": 1,
+            "active": (True, False, True, False),
+            "acted": (False, True, False, False),
+        },
+    )()
+
+    assert router.get_mix(preflop, (0, 1)) == "lookup"
+    assert router.get_mix(three_way, (0, 1)) == "three"
+
+
+@pytest.fixture
+def stub_live_factory_modules(monkeypatch):
+    config_calls = []
+    live_sources = []
+
+    class Stub:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.__dict__.update(kwargs)
+
+    class LiveResolveSource:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.__dict__.update(kwargs)
+            live_sources.append(self)
+
+    def live_config_for(n_players, **kwargs):
+        config_calls.append((n_players, kwargs))
+        num_rollouts = kwargs.get("num_rollouts_override")
+        if num_rollouts is not None and not 3 <= num_rollouts <= 30:
+            raise ValueError(
+                f"num_rollouts override {num_rollouts} outside the measured "
+                "bounds [3, 30]"
+            )
+        return types.SimpleNamespace(
+            iterations=kwargs["iterations_override"],
+            num_rollouts=3 if num_rollouts is None else num_rollouts,
+            vec_mode=False,
+            readout="final",
+        )
+
+    fake_modules = {
+        "app.engine.agent.agent": types.SimpleNamespace(
+            PokerAgent=Stub
+        ),
+        "app.engine.agent.modes": types.SimpleNamespace(
+            ModeConfig=Stub
+        ),
+        "app.engine.agent.strategy_source": types.SimpleNamespace(
+            HybridSource=Stub,
+            LiveResolveSource=LiveResolveSource,
+            LookupSource=Stub,
+        ),
+        "app.engine.cpu_es_solver": types.SimpleNamespace(
+            CpuEsSolver=Stub
+        ),
+        "app.engine.engine_constants": types.SimpleNamespace(
+            live_config_for=live_config_for
+        ),
+    }
+    for name, module in fake_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return config_calls, live_sources
+
+
+def test_live_num_rollouts_override_reaches_configs_and_metadata(
+    stub_live_factory_modules, tmp_path,
+):
+    blueprint_a = tmp_path / "a.bps"
+    blueprint_b = tmp_path / "b.bps"
+    blueprint_a.write_bytes(b"stub")
+    blueprint_b.write_bytes(b"stub")
+    config_calls, live_sources = stub_live_factory_modules
+
+    args = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "out"),
+            "--blueprint-a", str(blueprint_a),
+            "--blueprint-b", str(blueprint_b),
+            "--hero-source", "live_sampled",
+            "--live-num-rollouts", "2",
+        ]
+    )
+    _, _, metadata = runner._lookup_factories(args)
+
+    assert [call[0] for call in config_calls] == [2, 3, 4, 5, 6]
+    assert all(
+        "num_rollouts_override" not in call[1]
+        for call in config_calls
+    )
+    assert all(source.num_rollouts == 2 for source in live_sources)
+    assert metadata["live_num_rollouts"] == 2
+    assert (
+        metadata["leaf_mode_envs"]["hero"]["live_num_rollouts_bounds"]
+        == "sampled_direct"
+    )
+
+
+def test_live_sampled_nr_one_bypasses_eager_config_bounds(
+    stub_live_factory_modules, tmp_path,
+):
+    blueprint = tmp_path / "blueprint.bps"
+    blueprint.write_bytes(b"stub")
+    config_calls, live_sources = stub_live_factory_modules
+
+    sampled_args = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "sampled"),
+            "--blueprint-a", str(blueprint),
+            "--hero-source", "live_sampled",
+            "--live-num-rollouts", "1",
+        ]
+    )
+    _, _, metadata = runner._lookup_factories(sampled_args)
+
+    assert all(
+        "num_rollouts_override" not in kwargs
+        for _, kwargs in config_calls
+    )
+    assert all(source.num_rollouts == 1 for source in live_sources)
+    assert (
+        metadata["leaf_mode_envs"]["hero"]["live_num_rollouts_bounds"]
+        == "sampled_direct"
+    )
+
+    eager_args = runner._parse_args(
+        [
+            "--mode", "ab", "--out", str(tmp_path / "eager"),
+            "--blueprint-a", str(blueprint),
+            "--hero-source", "live_eager",
+            "--live-num-rollouts", "1",
+        ]
+    )
+    with pytest.raises(ValueError, match=r"bounds \[3, 30\]"):
+        runner._lookup_factories(eager_args)
+    assert config_calls[-1][1]["num_rollouts_override"] == 1
+
+
+def test_group_and_summary_aggregate_tracked_solve_walls():
+    tracker = runner._cli.SolveWallTracker({
+        "hero": "live_eager", "field": "live_sampled",
+    })
+    calls = {"n": 0}
+
+    def play(_deal, _policies):
+        calls["n"] += 1
+        tracker.record("hero", float(calls["n"]))
+        tracker.record("field", 0.5)
+        return runner.PlayedHand(
+            deltas=(0, 0, 0, 0, 0, 0),
+            action_count=0,
+            terminal="synthetic",
+            went_to_showdown=False,
+        )
+
+    group = runner.play_deal_group(
+        _fixed_deal(),
+        group_index=0,
+        mode="ab",
+        master_seed=0,
+        a_factory=lambda _seed: _LabelPolicy("A"),
+        b_factory=lambda _seed: _LabelPolicy("B"),
+        hand_player=play,
+        solve_wall_tracker=tracker,
+    )
+    group_walls = group.as_dict(
+        mode="ab", master_seed=0,
+    )["solve_wall_s_by_source"]
+    assert group_walls["hero"]["count"] == 6
+    assert group_walls["hero"]["p50"] == 3.5
+    assert group_walls["field"]["count"] == 6
+    assert group_walls["field"]["mean"] == 0.5
+
+    summary = runner.summarize_groups(
+        [group], mode="ab", master_seed=0, epsilon=0.05,
+    )
+    assert summary["solve_wall_s_by_source"] == group_walls
+
+
+def test_wall_budget_stops_after_a_completed_group_and_flags_summary():
+    clock_values = iter((10.0, 12.0))
+
+    def clock():
+        return next(clock_values)
+
+    def play(_deal, _policies):
+        return runner.PlayedHand(
+            deltas=(0, 0, 0, 0, 0, 0),
+            action_count=0,
+            terminal="synthetic",
+            went_to_showdown=False,
+        )
+
+    run = runner.run_match(
+        deals=3,
+        mode="aa",
+        master_seed=0,
+        a_factory=lambda _seed: _LabelPolicy("A"),
+        hand_player=play,
+        max_wall_s=1.0,
+        clock=clock,
+    )
+
+    assert len(run.groups) == 1
+    assert run.summary["n_deal_groups"] == 1
+    assert run.summary["truncated_by_wall_budget"] is True
+
+
+def test_solve_wall_summaries_pin_linear_percentiles():
+    summary = runner._solve_wall_summaries(
+        {"hero": (1.0, 2.0, 4.0, 8.0)},
+        {"hero": "live_sampled", "field": "lookup"},
+    )
+
+    hero = summary["hero"]
+    assert hero["source"] == "live_sampled"
+    assert hero["count"] == 4
+    assert hero["mean"] == 3.75
+    assert hero["p50"] == 3.0
+    assert hero["p95"] == pytest.approx(7.4)
+    assert hero["max"] == 8.0
+    assert summary["field"] == {
+        "source": "lookup",
+        "count": 0,
+        "mean": None,
+        "p50": None,
+        "p95": None,
+        "max": None,
+    }
 
 
 def test_summary_statistics_pin_nonzero_variance_and_bb_conversion(monkeypatch):

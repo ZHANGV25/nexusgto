@@ -513,8 +513,10 @@ class LiveResolveSource(StrategySource):
 
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
         from app.engine.agent.live_resolve_adapter import (
+            aggregate_grid_row_strategies,
             build_solve_inputs,
             hero_grid_row,
+            hero_grid_rows,
             labels_to_index_freqs,
         )
 
@@ -901,7 +903,18 @@ class LiveResolveSource(StrategySource):
                     )
             self.last_belief_carry = belief_session.summary()
 
-        row = hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
+        hero_rows = hero_grid_rows(
+            inputs["player_ranges"], hero_idx, hero_cards,
+            inputs.get("player_range_metadata"),
+        )
+        # Preserve the exact K=1 lookup path, including hero_grid_row's
+        # fail-loud contract. K>1 uses the first row only as an observability
+        # anchor; the served strategy below aggregates every class row.
+        legacy_k1 = inputs.get("grid_k", 1) == 1
+        row = (
+            hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
+            if legacy_k1 else hero_rows[0][0]
+        )
         if self.last_offtree_add is not None and offtree_plan is not None:
             stats = getattr(engine, "_last_solve_stats", None) or {}
             self.last_offtree_add["replayed_through_added"] = bool(
@@ -916,22 +929,51 @@ class LiveResolveSource(StrategySource):
             reason_by_row = stats.get(
                 "offtree_hero_drop_reason_by_row", {}
             ) or {}
-            self.last_offtree_add["hero_merged_mass"] = float(
-                merged_by_row.get(row, merged_by_row.get(str(row), 0.0))
-            )
-            served_dropped_mass = float(
-                dropped_by_row.get(row, dropped_by_row.get(str(row), 0.0))
-            )
+            positive_rows = [(r, w) for r, w in hero_rows if w > 0.0]
+            if legacy_k1:
+                self.last_offtree_add["hero_merged_mass"] = float(
+                    merged_by_row.get(row, merged_by_row.get(str(row), 0.0))
+                )
+                served_dropped_mass = float(
+                    dropped_by_row.get(row, dropped_by_row.get(str(row), 0.0))
+                )
+            else:
+                stat_weight = sum(w for _r, w in positive_rows)
+                self.last_offtree_add["hero_merged_mass"] = (
+                    sum(
+                        w * float(merged_by_row.get(r, merged_by_row.get(str(r), 0.0)))
+                        for r, w in positive_rows
+                    ) / stat_weight if stat_weight > 0.0 else 0.0
+                )
+                served_dropped_mass = (
+                    sum(
+                        w * float(dropped_by_row.get(r, dropped_by_row.get(str(r), 0.0)))
+                        for r, w in positive_rows
+                    ) / stat_weight if stat_weight > 0.0 else 0.0
+                )
             if (served_dropped_mass > 0.0
                     and not self.last_offtree_add["dropped"]):
                 self.last_offtree_add["dropped"] = True
-                self.last_offtree_add["drop_reason"] = str(
-                    reason_by_row.get(
-                        row,
-                        reason_by_row.get(str(row), "no_base_raise_child"),
+                if legacy_k1:
+                    self.last_offtree_add["drop_reason"] = str(
+                        reason_by_row.get(
+                            row,
+                            reason_by_row.get(str(row), "no_base_raise_child"),
+                        )
                     )
-                )
-        strat = all_by_player.get(hero_idx, {}).get(row)
+                else:
+                    reasons = {
+                        str(reason_by_row.get(r, reason_by_row.get(str(r))))
+                        for r, _w in positive_rows
+                        if reason_by_row.get(r, reason_by_row.get(str(r))) is not None
+                    }
+                    self.last_offtree_add["drop_reason"] = (
+                        ",".join(sorted(reasons)) if reasons
+                        else "no_base_raise_child"
+                    )
+
+        per_hand = all_by_player.get(hero_idx, {})
+        strat = aggregate_grid_row_strategies(per_hand, hero_rows)
         n_legal = int(inputs["n_legal"])
 
         if not strat:

@@ -34,7 +34,7 @@ import os
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -62,8 +62,12 @@ _ENV_MUTATION_LOCK = threading.Lock()
 # Per-leaf flop-history buffer width the C real-oracle (es_real_oracle.c)
 # copies — MUST equal ESRO_MAX_FLOP_HIST in poker-solver
 # (python/es_resolver/run_real_spot_c.py:35, the validated caller). Only used
-# on the NEXUS_LEAF_ROLLOUT construct path.
+# on the lazy and sampled C leaf-oracle construct paths.
 _ESRO_MAX_FLOP_HIST = 256
+
+
+class ProjectedFillMemoryExceeded(MemoryError):
+    """An eager-fill arm exceeded its pre-allocation measurement guard."""
 
 
 # poker-solver locations (the provider side-loads python/ onto sys.path at init;
@@ -171,6 +175,100 @@ def _leaf_rollout_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _leaf_sampled_enabled() -> bool:
+    """Fresh per-visit sampled leaf oracle -- DEFAULT OFF.
+
+    Unlike ``NEXUS_LEAF_ROLLOUT`` this mode does not cache an all-hands leaf
+    table. Each scalar traversal samples the continuation hands and policy in
+    C. The eager serving path is untouched while the flag is absent/off.
+    """
+    v = os.environ.get("NEXUS_LEAF_SAMPLED", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
+def _leaf_sampled_policy() -> int:
+    """Parse the sampled-oracle continuation policy (0 or 1)."""
+    raw = os.environ.get("NEXUS_LEAF_SAMPLED_POLICY") or "1"
+    try:
+        policy = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_LEAF_SAMPLED_POLICY={raw!r} is not an integer"
+        ) from None
+    if policy not in (0, 1):
+        raise ValueError(
+            "NEXUS_LEAF_SAMPLED_POLICY must be 0 (uniform-fresh) or "
+            f"1 (regret-matched), got {policy}"
+        )
+    return policy
+
+
+def _leaf_bias_cfr_mode() -> str:
+    """Parse the table-backed continuation-bias CFR mode."""
+    raw = os.environ.get("NEXUS_LEAF_BIAS_CFR") or "off"
+    if raw in ("off", "0"):
+        return "off"
+    if raw in ("marginal", "joint"):
+        return raw
+    raise ValueError(
+        "NEXUS_LEAF_BIAS_CFR must be off/0, marginal, or joint, "
+        f"got {raw!r}"
+    )
+
+
+def _bias_cfr_rounds() -> int:
+    """Parse B4 fill rounds; rounds=1 with nr=1/bin is the recommended start.
+
+    The design estimates that starting point at about 1.33x today's eager-fill
+    wall clock.
+    """
+    raw = os.environ.get("NEXUS_BIAS_CFR_ROUNDS") or "1"
+    try:
+        rounds = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_ROUNDS={raw!r} is not an integer"
+        ) from None
+    if not (1 <= rounds <= 64):
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_ROUNDS={rounds} outside [1, 64]"
+        )
+    return rounds
+
+
+def _bias_cfr_nr() -> int:
+    """Parse the number of rollouts per bias bin/profile."""
+    raw = os.environ.get("NEXUS_BIAS_CFR_NR") or "1"
+    try:
+        nr = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_NR={raw!r} is not an integer"
+        ) from None
+    if not (1 <= nr <= 100):
+        raise ValueError(
+            f"NEXUS_BIAS_CFR_NR={nr} outside [1, 100]"
+        )
+    return nr
+
+
+def _sampled_deadline_ms() -> int:
+    """Parse the optional relative sampled-solve deadline in milliseconds."""
+    raw = os.environ.get("NEXUS_SAMPLED_DEADLINE_MS") or "0"
+    try:
+        deadline_ms = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_SAMPLED_DEADLINE_MS={raw!r} is not an integer"
+        ) from None
+    if not (0 <= deadline_ms <= 0x7FFFFFFFFFFFFFFF):
+        raise ValueError(
+            "NEXUS_SAMPLED_DEADLINE_MS must fit a nonnegative int64, "
+            f"got {deadline_ms}"
+        )
+    return deadline_ms
+
+
 class CpuEsSolver:
     """Isolated CPU-ES engine. Constructed once at provider init (loads a second
     ~12GB blueprint through es_resolver_real.dll); thread-safe per-solve (each
@@ -200,12 +298,21 @@ class CpuEsSolver:
         self._cev_bias_semantics = "uniform"
         # {selects, semantics} snapshot from the last bias-action solve.
         self._last_cont_ev_bias_action_stats = None
-        self._last_br_gap_objs = None  # NEXUS_BR_GAP_EXPOSE: {tree,table,sigma}
+        # NEXUS_BR_GAP_EXPOSE: {tree, table, sigma}; readout="both" adds
+        # sigmas={avg, final} while keeping legacy sigma=avg.
+        self._last_br_gap_objs = None
         self._last_solve_stats = None  # per-solve observability, incl. Gap 4
+        self._last_preflight_stats = None  # measurement guard, set before fill
         # NEXUS_LEAF_ROLLOUT: {leaf_fills, cache_hits, rollout_sims, oracle_errors}
         # from the last lazy-oracle solve (es_real_oracle_stats2). None on the
         # eager (default) path — _last_solve_stats.leaf_mode disambiguates.
         self._last_leaf_rollout_stats = None
+        # NEXUS_LEAF_SAMPLED: fresh per-visit oracle counters from the last
+        # sampled solve. None on every other leaf-value path.
+        self._last_sampled_stats = None
+        # NEXUS_LEAF_BIAS_CFR: table-backed continuation-bias oracle counters
+        # from the last marginal/joint solve. None on every other path.
+        self._last_bias_oracle_stats = None
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -429,7 +536,15 @@ class CpuEsSolver:
         readout: str = "avg",
         hero_replay: Optional[Dict[str, object]] = None,
         belief_stash_out: Optional[Dict[str, object]] = None,
-    ) -> Dict[int, Dict[int, Dict[str, float]]]:
+        deadline_ms: Optional[int] = None,
+        max_projected_fill_bytes: Optional[int] = None,
+        progress_callback: Optional[
+            Callable[[str, Dict[str, object]], None]
+        ] = None,
+    ) -> (
+        Dict[int, Dict[int, Dict[str, float]]]
+        | Dict[str, Dict[int, Dict[int, Dict[str, float]]]]
+    ):
         """Run an N-player flop/turn/river CPU-ES solve. Returns all_by_player:
         {player_idx: {hand_idx: {action_label: freq}}} — the SAME structure the
         GPU provider's get_all_avg_strategies produces, so the provider's
@@ -449,9 +564,11 @@ class CpuEsSolver:
             1 = vectorized traverser. vec-Linear is Gate-1-validated for the
             FINAL-iterate readout ONLY (vec-Linear-AVERAGE is seed-unstable at
             3+ players — VECTOR_TRAVERSER_DESIGN.md). Enforced below.
-        readout: "avg" = σ̄ (the frequency-display contract) or "final" =
+        readout: "avg" = σ̄ (the frequency-display contract), "final" =
             final iterate (the playing-agent contract; what the EC2 wall-clock
-            gate measured: 6p ~0.15%/pot floor in ~22s solve at 96 cores).
+            gate measured: 6p ~0.15%/pot floor in ~22s solve at 96 cores), or
+            "both" = one scalar solve with both mappings returned under their
+            readout names.
         hero_replay: optional {"player_idx": int, "street_actions": [int,...]}.
             When given, that player's strategy is read at the node reached by
             REPLAYING this street's action indices from the street root —
@@ -463,13 +580,52 @@ class CpuEsSolver:
             the dict is replaced with this street's PlainTree + sigma-bar
             readout. ``None`` (the default) performs no stash work.
         """
+        if deadline_ms is not None and int(deadline_ms) < 0:
+            raise ValueError(f"deadline_ms must be >= 0, got {deadline_ms}")
+        if (max_projected_fill_bytes is not None
+                and int(max_projected_fill_bytes) < 0):
+            raise ValueError(
+                "max_projected_fill_bytes must be >= 0, got "
+                f"{max_projected_fill_bytes}"
+            )
+        if vec_mode and readout == "both":
+            raise ValueError(
+                "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
+                "seed-unstable at 3+ players (Gate-1, VECTOR_TRAVERSER_DESIGN.md)"
+            )
+
+        # Sampled leaves are scalar-only. Apply their precedence before the
+        # normal vec/readout validation so a caller requesting vec + avg is
+        # accepted and run as scalar without changing the requested readout.
+        _sampled_requested = _leaf_sampled_enabled()
+        _rollout_requested = _leaf_rollout_enabled()
+        _bias_mode_requested = _leaf_bias_cfr_mode()
+        _leaf_bias_mode = _bias_mode_requested
+        _bias_rounds = None
+        _bias_nr = None
+        _sampled_policy = None
+        _sampled_deadline = 0
+        _sampled_iterations_run = None
+        self._last_sampled_stats = None
+        self._last_bias_oracle_stats = None
+        if _sampled_requested:
+            vec_mode = 0
+            _sampled_policy = _leaf_sampled_policy()
+            _sampled_deadline = _sampled_deadline_ms()
+        if _bias_mode_requested == "marginal":
+            _bias_rounds = _bias_cfr_rounds()
+        if _bias_mode_requested != "off":
+            _bias_nr = _bias_cfr_nr()
         if vec_mode and readout != "final":
             raise ValueError(
                 "vec_mode=1 requires readout='final' — vec-Linear-AVERAGE is "
                 "seed-unstable at 3+ players (Gate-1, VECTOR_TRAVERSER_DESIGN.md)"
             )
-        if readout not in ("avg", "final"):
-            raise ValueError(f"readout must be 'avg' or 'final', got {readout!r}")
+        if readout not in ("avg", "final", "both"):
+            raise ValueError(
+                "readout must be 'avg', 'final', or 'both', "
+                f"got {readout!r}"
+            )
         if not self._ready:
             raise RuntimeError("CpuEsSolver not initialized")
         # Belief-narrowed root ranges and offline-filled catalog boundary EVs
@@ -503,6 +659,105 @@ class CpuEsSolver:
                 f"{len(board_strs)}"
             )
         street = {3: "flop", 4: "turn", 5: "river"}[len(board_strs)]
+
+        # Sampled mode is a distinct leaf-value strategy even on a native
+        # zero-leaf river/chance tree, where no sampled context is constructed.
+        # Reject incompatible operator intent before the tree shape can bypass
+        # these guards.
+        if _sampled_requested:
+            if _bias_mode_requested != "off":
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_BIAS_CFR: these are two distinct leaf-value "
+                    "strategies; enable exactly one.")
+            if _rollout_requested:
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_ROLLOUT=1; enable exactly one leaf oracle")
+            if _a3_cont_ev_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_A3_CONT_EV=1")
+            if _a3_cont_ev_turn_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_A3_CONT_EV_TURN=1")
+            if _cont_ev_bias_action_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_CONT_EV_BIAS_ACTION=1")
+            if _cont_ev_miss_fallback_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "NEXUS_CONT_EV_MISS_FALLBACK=1")
+            if os.environ.get("CONT_EV_CATALOG_MANIFEST"):
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with "
+                    "CONT_EV_CATALOG_MANIFEST")
+            _sampled_cev_would_arm = (
+                self._cev_holder is not None
+                and ((street == "flop" and n_players >= 3)
+                     or (street == "turn" and n_players >= 3
+                         and _a3_cont_ev_turn_enabled()))
+            )
+            if _sampled_cev_would_arm:
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 is incompatible with the "
+                    "loaded/armed cont_ev boundary")
+            _sampled_cond_on = os.environ.get(
+                "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
+                    "0", "f", "F", "n", "N")
+            if _sampled_cond_on:
+                raise RuntimeError(
+                    "NEXUS_LEAF_SAMPLED=1 requires "
+                    "NEXUS_LEAF_RANGE_CONDITIONING=0: sampled leaves "
+                    "bypass the eager per-leaf range-conditioning construct")
+
+        if _bias_mode_requested != "off":
+            # ── INTERACTION GUARDS: bias-table CFR is its own eager leaf-value
+            # strategy. Combining it with another leaf oracle or an armed
+            # cont_ev boundary would silently discard one requested strategy.
+            # PRECEDENCE: neither wins — the operator must enable exactly one.
+            if _rollout_requested:
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with "
+                    "NEXUS_LEAF_ROLLOUT=1: these are two distinct leaf-value "
+                    "strategies; enable exactly one.")
+            _bias_cev_would_arm = (
+                self._cev_holder is not None
+                and ((street == "flop" and n_players >= 3)
+                     or (_a3_cont_ev_turn_enabled()
+                         and street == "turn" and n_players >= 3))
+            )
+            if _bias_cev_would_arm:
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with the armed "
+                    "cont_ev boundary (NEXUS_A3_CONT_EV / "
+                    "NEXUS_A3_CONT_EV_TURN): these are two distinct "
+                    "leaf-value strategies; enable exactly one.")
+            if _cont_ev_bias_action_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with "
+                    "NEXUS_CONT_EV_BIAS_ACTION: these are two distinct "
+                    "leaf-value strategies; enable exactly one.")
+            if _cont_ev_miss_fallback_enabled():
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR is incompatible with "
+                    "NEXUS_CONT_EV_MISS_FALLBACK: these are two distinct "
+                    "leaf-value strategies; enable exactly one.")
+            if _bias_mode_requested == "joint" and n_players != 2:
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR=joint requires n_players == 2")
+            _bias_cond_on = os.environ.get(
+                "NEXUS_LEAF_RANGE_CONDITIONING", "1")[:1] not in (
+                    "0", "f", "F", "n", "N")
+            if (_bias_mode_requested == "joint" and _bias_cond_on
+                    and n_players == 2 and street in ("flop", "turn")):
+                raise RuntimeError(
+                    "NEXUS_LEAF_BIAS_CFR=joint at 2p flop/turn requires "
+                    "NEXUS_LEAF_RANGE_CONDITIONING=0: the joint16 enumerator "
+                    "has no per-leaf range variant, and v1 will not silently "
+                    "drop conditioning.")
 
         _base_bet_sizes = list(bet_sizes)
         _base_subsequent_sizes = list(subsequent_bet_sizes)
@@ -664,6 +919,34 @@ class CpuEsSolver:
 
             n_leaf_nodes = int(gpu._tree.num_leaf_nodes)
             n_leaves = int(gpu._tree.num_leaves)
+            # The eager sampled fill materializes a float32 output table with
+            # shape [n_leaves, n_players, max_h] and a float64 accumulator of
+            # the same shape: 12 bytes per cell at peak.  num_samples_k changes
+            # how many samples are accumulated, not either allocation's shape.
+            # Expose the tree-derived projection before the first allocation so
+            # measurement drivers can abort one unsafe arm without killing the
+            # box. The callback/guard are default-off production no-ops.
+            projected_fill_bytes = (
+                int(n_leaves) * int(n_players) * int(max_h) * 12
+            )
+            self._last_preflight_stats = {
+                "n_leaves": int(n_leaves),
+                "n_players": int(n_players),
+                "max_hands": int(max_h),
+                "bytes_per_leaf_player_hand": 12,
+                "projected_fill_bytes": int(projected_fill_bytes),
+            }
+            if progress_callback is not None:
+                progress_callback("pre_fill", dict(self._last_preflight_stats))
+            if (max_projected_fill_bytes is not None
+                    and projected_fill_bytes > int(max_projected_fill_bytes)):
+                raise ProjectedFillMemoryExceeded(
+                    "projected eager-fill buffer "
+                    f"{projected_fill_bytes} bytes exceeds guard "
+                    f"{int(max_projected_fill_bytes)} bytes "
+                    f"(n_leaves={n_leaves}, n_players={n_players}, "
+                    f"max_hands={max_h}, bytes_per_cell=12)"
+                )
             # ZERO-LEAF trees terminate in SHOWDOWN/FOLD only and need NO leaf
             # table — the C ES settles those natively. Two cases:
             #   (a) RIVER: the builder disables cont-strat leaves at is_river.
@@ -699,7 +982,10 @@ class CpuEsSolver:
                 # the construct site and stats below stay well-defined.
                 leaf_mode = "table_eager"
                 _leaf_rollout = False
+                _leaf_sampled = False
+                _leaf_bias_mode = "off"
                 _oracle_arrays = None
+                self._last_leaf_rollout_stats = None
             else:
                 # Encode the per-leaf flop history under the TRAINED manifest
                 # vocab (bet-vocab desync fix) — NOT the subgame/tree-build
@@ -723,8 +1009,19 @@ class CpuEsSolver:
                 # leaves the CFR walk visits (the ~27min 6p exhaustive-fill
                 # bypass; the fill is >=99.7% of solve time). See
                 # _leaf_rollout_enabled() for the full contract.
-                _leaf_rollout = _leaf_rollout_enabled()
-                leaf_mode = "rollout_lazy" if _leaf_rollout else "table_eager"
+                _leaf_rollout = _rollout_requested
+                _leaf_sampled = _sampled_requested
+                if _leaf_sampled:
+                    leaf_mode = "sampled_per_visit"
+                elif _leaf_rollout:
+                    leaf_mode = "rollout_lazy"
+                elif _leaf_bias_mode == "marginal":
+                    leaf_mode = "table_eager_bias4"
+                elif _leaf_bias_mode == "joint":
+                    leaf_mode = "table_eager_joint16"
+                else:
+                    leaf_mode = "table_eager"
+                self._last_leaf_rollout_stats = None
 
                 if _leaf_rollout:
                     # ── INTERACTION GUARDS: rollout mode BYPASSES the eager
@@ -820,6 +1117,11 @@ class CpuEsSolver:
                 # THIS construct iff the flag is on, the table is loaded, and
                 # this is a flop multiway spot (the consumer's own predicate).
                 # When off, none of these globals are touched. ──
+                if _leaf_sampled:
+                    _oracle_arrays = self._build_real_oracle_leaf_state(
+                        gpu._tree, leaf_infos, n_players, player_seats)
+                    table = None
+
                 a3_armed = (
                     self._cev_holder is not None
                     and street == "flop"
@@ -960,8 +1262,59 @@ class CpuEsSolver:
                 # construct_s stays 0.0 and we go straight to construction.
                 t0 = time.time()
                 try:
-                    if _leaf_rollout:
-                        pass  # no eager fill; from_real_oracle at construct site
+                    if _leaf_rollout or _leaf_sampled:
+                        pass  # leaf oracle is constructed at the solver site
+                    elif _leaf_bias_mode == "marginal":
+                        if per_leaf_ranges is not None:
+                            table = rc.compute_subgame_leaf_values_bias4_perleaf(
+                                leaf_infos=leaf_infos, board=board_ints,
+                                street=street, player_hands=player_ranges,
+                                per_leaf_player_hands=per_leaf_ranges,
+                                active=[True] * n_players,
+                                acting_order=list(range(n_players)),
+                                player_seats=list(player_seats),
+                                game_action_history=list(
+                                    game_action_indices or []),
+                                blueprint=self._blueprint,
+                                starting_pot_chips=int(
+                                    round(pot_bb * scale)),
+                                stack_chips=stack_chips, max_hands=max_h,
+                                num_rollouts=_bias_nr,
+                                num_rounds=_bias_rounds,
+                                master_seed=master_seed,
+                            )
+                        else:
+                            table = rc.compute_subgame_leaf_values_bias4(
+                                leaf_infos=leaf_infos, board=board_ints,
+                                street=street, player_hands=player_ranges,
+                                active=[True] * n_players,
+                                acting_order=list(range(n_players)),
+                                player_seats=list(player_seats),
+                                game_action_history=list(
+                                    game_action_indices or []),
+                                blueprint=self._blueprint,
+                                starting_pot_chips=int(
+                                    round(pot_bb * scale)),
+                                stack_chips=stack_chips, max_hands=max_h,
+                                num_rollouts=_bias_nr,
+                                num_rounds=_bias_rounds,
+                                master_seed=master_seed,
+                            )
+                    elif _leaf_bias_mode == "joint":
+                        table = rc.compute_subgame_leaf_values_c(
+                            leaf_infos=leaf_infos, board=board_ints,
+                            street=street, player_hands=player_ranges,
+                            active=[True] * n_players,
+                            acting_order=list(range(n_players)),
+                            player_seats=list(player_seats),
+                            game_action_history=list(
+                                game_action_indices or []),
+                            blueprint=self._blueprint,
+                            starting_pot_chips=int(round(pot_bb * scale)),
+                            stack_chips=stack_chips, max_hands=max_h,
+                            num_rollouts=_bias_nr,
+                            master_seed=master_seed,
+                        )
                     elif per_leaf_ranges is not None:
                         table = rc.compute_subgame_leaf_values_sampled_perleaf_c(
                             leaf_infos=leaf_infos, board=board_ints, street=street,
@@ -1065,6 +1418,15 @@ class CpuEsSolver:
                                  "was NOT walked mean_field)")
                 construct_s = time.time() - t0
 
+            if progress_callback is not None:
+                progress_callback(
+                    "post_fill",
+                    {
+                        "construct_s": float(construct_s),
+                        "projected_fill_bytes": int(projected_fill_bytes),
+                    },
+                )
+
             # DIAG (NEXUS_ES_DIAG=1): dump leaf-table stats — isolate the 2p-flop
             # uniform-0.5 mystery (is the construct producing action-blind/zero
             # leaf values?). Cheap; off by default.
@@ -1099,7 +1461,29 @@ class CpuEsSolver:
                     print(f"CpuEsSolver DIAG: table dump failed: {_e}", file=sys.stderr, flush=True)
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
-            if _leaf_rollout:
+            if _leaf_sampled:
+                # Fresh per-visit blueprint rollout. The resolver seed is the
+                # sole RNG source for traversal hands, actions, continuation
+                # biases, and rollouts, so map the public master_seed here.
+                # There is deliberately no cache_k or oracle master_seed.
+                _street_code = 1 if street == "flop" else 2
+                (_so_n_leaves, _so_pot, _so_bets, _so_active,
+                 _so_hist, _so_hist_len, _so_seats) = _oracle_arrays
+                cs = self._CSolver.from_sampled_oracle(
+                    gpu._tree,
+                    self._bp_handle.value,
+                    street=_street_code,
+                    stack_chips=stack_chips,
+                    n_leaves=_so_n_leaves,
+                    max_h=max_h,
+                    pot=_so_pot, bets=_so_bets, active=_so_active,
+                    hist_flat=_so_hist, hist_len=_so_hist_len,
+                    player_seats=_so_seats,
+                    num_rollouts=num_rollouts,
+                    bias_policy=_sampled_policy,
+                    seed=master_seed,
+                )
+            elif _leaf_rollout:
                 # LAZY real-blueprint-rollout oracle (NEXUS_LEAF_ROLLOUT=1).
                 # Construct the solver over the SAME tree but with the C
                 # es_real_oracle instead of the eager table: leaf values are
@@ -1166,10 +1550,29 @@ class CpuEsSolver:
                     master_seed=master_seed,
                     seed=1,
                 )
+            elif _leaf_bias_mode != "off":
+                _bias_oracle_mode = (
+                    0 if _leaf_bias_mode == "marginal" else 1
+                )
+                _bias_n_leaves = (
+                    int(table.shape[0])
+                    if _bias_oracle_mode == 0
+                    else int(table.shape[0]) // 16
+                )
+                cs = self._CSolver.from_bias_table(
+                    gpu._tree, table, mode=_bias_oracle_mode,
+                    np_=n_players, max_h=max_h, n_leaves=_bias_n_leaves,
+                    seed=1,
+                )
             else:
                 cs = self._CSolver.from_table(
                     gpu._tree, table, n_players, max_h, seed=1)
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
+            if _sampled_requested:
+                # The C default inherits ES_OPP_ENUMERATE when opp_mode is -1.
+                # Pin sampling explicitly so a box-level research env cannot
+                # defeat sampled mode's no-opponent-enumeration precedence.
+                cs.set_opp_mode(0)
 
             # In-tree CHANCE handling. A 2p flop/turn tree extends through a chance
             # node (OP3 turn-extension). Single-card-per-iter sampling is high-
@@ -1197,7 +1600,8 @@ class CpuEsSolver:
             _reach = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
                 "1", "t", "T", "y", "Y")
             use_reach = (
-                tree_has_chance and n_players == 2 and _reach
+                not _sampled_requested
+                and tree_has_chance and n_players == 2 and _reach
                 and hasattr(cs, "set_reach_mode")
             )
             if use_reach:
@@ -1207,15 +1611,26 @@ class CpuEsSolver:
                 # iter-hungry; the default 2p turn never reaches here (gated to
                 # lookup above). Research / future higher-iter path.
                 cs.set_reach_mode(1)    # full reach; ignores cfr/chance/opp/vec
-                readout = "avg"         # σ̄ readout (the frequency-display contract)
+                if readout != "both":
+                    # Preserve the established reach-mode σ̄ contract for the
+                    # historical single-readout callers.  The new scalar
+                    # measurement readout explicitly requests both.
+                    readout = "avg"
                 vec_mode = 0
             elif tree_has_chance and hasattr(cs, "set_chance_mode"):
                 cs.set_chance_mode(1)   # enumerate card outcomes (correct)
-                if n_players <= 3 and hasattr(cs, "set_opp_mode"):
+                if (not _sampled_requested and n_players <= 3
+                        and hasattr(cs, "set_opp_mode")):
+                    if readout == "both":
+                        raise ValueError(
+                            "readout='both' is unsupported on chance-node trees "
+                            "(internal vec forcing would make the avg readout "
+                            "vec-Linear-AVERAGE)"
+                        )
                     cs.set_opp_mode(1)  # full CFR over opponent actions (2-3p)
                     cs.set_vec_mode(1)  # all traverser hands per walk
                     vec_mode = 1        # force vec for the readout below
-            if vec_mode:
+            if vec_mode and not _sampled_requested:
                 cs.set_vec_mode(1)
             # SMALL-TREE -> SINGLE-THREAD (2026-06-16). Multi-thread Hogwild on a
             # tiny tree is dominated by race noise: the Pluribus-faithful 2p flop
@@ -1227,11 +1642,64 @@ class CpuEsSolver:
             # threshold — deterministic AND correct. Large trees (873k flop ext,
             # 5-6p) keep multi-thread. Reach mode already runs single-thread.
             _nn = int(getattr(gpu._tree, "num_nodes", 0))
-            _eff_threads = 1 if (0 < _nn <= 2000 and not use_reach) else num_threads
+            # Sampled leaves are exempt from the small-tree single-thread
+            # force: their per-iteration work is rollout-dominated (~ms per
+            # leaf visit vs ~ns table reads), so Hogwild race windows are
+            # negligible relative to work and wall-clock scales with threads
+            # (measured 2026-07-17: 3p sampled 50k iters = 836s single-thread).
+            _eff_threads = (1 if (0 < _nn <= 2000 and not use_reach
+                                  and not _leaf_sampled)
+                            else num_threads)
+            effective_deadline_ms = (
+                int(_sampled_deadline) if _leaf_sampled
+                else (int(deadline_ms) if deadline_ms is not None else None)
+            )
+            if effective_deadline_ms is not None:
+                cs.set_deadline_ms(effective_deadline_ms)
+            if progress_callback is not None:
+                progress_callback(
+                    "pre_es_run",
+                    {"requested_iterations": int(iterations)},
+                )
             t1 = time.time()
             cs.run(iterations, num_threads=_eff_threads)
             solve_s = time.time() - t1
-            read_strategy = cs.final_strategy if readout == "final" else cs.avg_strategy
+            # Preserve the default production path: query the native counter
+            # only for sampled mode (historical behavior) or when a measurement
+            # caller explicitly supplies deadline_ms (including zero).
+            iterations_run_observed = (
+                (_leaf_sampled or deadline_ms is not None)
+                and hasattr(cs, "iterations_run")
+            )
+            if iterations_run_observed:
+                _sampled_iterations_run = cs.iterations_run()
+            else:
+                _sampled_iterations_run = int(iterations)
+            if progress_callback is not None:
+                progress_callback(
+                    "post_es_run",
+                    {
+                        "solve_s": float(solve_s),
+                        "iterations_run": int(_sampled_iterations_run),
+                    },
+                )
+            readout_t0 = time.time()
+            if readout == "both":
+                read_strategies = {
+                    "avg": cs.avg_strategy,
+                    "final": cs.final_strategy,
+                }
+                # Legacy optional diagnostics and the legacy BR-gap ``sigma``
+                # field still need one reader.  Keep σ̄ as their reference;
+                # the BR-gap stash adds both readers separately below.
+                read_strategy = read_strategies["avg"]
+            else:
+                read_strategy = (
+                    cs.final_strategy
+                    if readout == "final"
+                    else cs.avg_strategy
+                )
+                read_strategies = {readout: read_strategy}
 
             # BELIEF CARRY STASH (NEXUS_BELIEF_CARRY, default OFF). The output
             # dict is the entire gate: with the default None there is no import,
@@ -1298,6 +1766,55 @@ class CpuEsSolver:
                     logger.warning("leaf-rollout stats read failed: %s", _e)
                     self._last_leaf_rollout_stats = None
 
+            if _leaf_sampled:
+                try:
+                    (_visits, _rollouts, _errs, _uniform_visits,
+                     _uniform_rollouts, _regret_visits,
+                     _regret_rollouts) = cs.sampled_oracle_stats()
+                    self._last_sampled_stats = {
+                        "leaf_visits": int(_visits),
+                        "rollouts": int(_rollouts),
+                        "oracle_errors": int(_errs),
+                        "uniform_visits": int(_uniform_visits),
+                        "uniform_rollouts": int(_uniform_rollouts),
+                        "regret_visits": int(_regret_visits),
+                        "regret_rollouts": int(_regret_rollouts),
+                    }
+                    logger.info(
+                        "CpuEsSolver sampled-leaf: %dp %s policy=%d "
+                        "visits=%d rollouts=%d errors=%d uniform=%d/%d "
+                        "regret=%d/%d iterations=%d/%d deadline_ms=%d",
+                        n_players, street, _sampled_policy, _visits,
+                        _rollouts, _errs, _uniform_visits, _uniform_rollouts,
+                        _regret_visits, _regret_rollouts,
+                        _sampled_iterations_run, iterations,
+                        _sampled_deadline,
+                    )
+                    if _errs:
+                        logger.warning(
+                            "CpuEsSolver sampled-leaf: %d oracle errors", _errs)
+                except Exception as _e:  # observability must not break a solve
+                    logger.warning("sampled-leaf stats read failed: %s", _e)
+                    self._last_sampled_stats = None
+
+            if _leaf_bias_mode != "off":
+                try:
+                    _visits, _errs = cs.bias_oracle_stats()
+                    self._last_bias_oracle_stats = {
+                        "visits": int(_visits),
+                        "errors": int(_errs),
+                    }
+                    logger.info(
+                        "CpuEsSolver bias-table: %dp %s mode=%s visits=%d "
+                        "errors=%d", n_players, street, _leaf_bias_mode,
+                        _visits, _errs)
+                    if _errs:
+                        logger.warning(
+                            "CpuEsSolver bias-table: %d oracle errors", _errs)
+                except Exception as _e:  # observability must not break a solve
+                    logger.warning("bias-table stats read failed: %s", _e)
+                    self._last_bias_oracle_stats = None
+
             # BR-GAP EXPOSE (NEXUS_BR_GAP_EXPOSE=1, default OFF). Stash the GENUINE
             # production solve objects (tree snapshot + leaf table + served sigma)
             # so an offline per-spot correctness harness can compute the in-tree
@@ -1313,11 +1830,20 @@ class CpuEsSolver:
                     _ranges = [[(c0, c1, w) for (c0, c1, w) in rng]
                                for rng in player_ranges]
                     _tree_snap = _snap(gpu._tree, _ranges)
-                    _sigma = {}
-                    for _ni in _tree_snap.decision_node_indices:
-                        _a = read_strategy(_ni)
-                        if _a is not None:
-                            _sigma[_ni] = _a
+                    _sigmas = {}
+                    for _readout_name, _strategy_reader in (
+                            read_strategies.items()):
+                        _readout_sigma = {}
+                        for _ni in _tree_snap.decision_node_indices:
+                            _a = _strategy_reader(_ni)
+                            if _a is not None:
+                                _readout_sigma[_ni] = _a
+                        _sigmas[_readout_name] = _readout_sigma
+                    _sigma = (
+                        _sigmas["avg"]
+                        if readout == "both"
+                        else _sigmas[readout]
+                    )
                     # LEAF TABLE for the BR-gap best-responder. The EAGER path has
                     # a materialized `table`; the ROLLOUT path (NEXUS_LEAF_ROLLOUT)
                     # sets table=None (no eager fill — leaf values live in the C
@@ -1342,12 +1868,35 @@ class CpuEsSolver:
                             _br_table = None
                         if _br_table is None:
                             _br_table_source = "rollout_oracle_unavailable"
-                    self._last_br_gap_objs = {
+                    elif _leaf_bias_mode != "off":
+                        _br_table = None
+                        _br_table_source = "bias_oracle_effective"
+                        try:
+                            _br_table = cs.get_bias_effective_table()
+                        except Exception as _te:  # never break a real solve
+                            logger.warning(
+                                "BR-gap bias leaf-table readout failed: %s",
+                                _te)
+                        if _br_table is None:
+                            _br_table_source = (
+                                "bias_oracle_effective_unavailable")
+                    elif _leaf_sampled:
+                        # A fresh per-visit oracle has no coherent dense table
+                        # to expose for the optional offline BR-gap harness.
+                        _br_table = None
+                        _br_table_source = "sampled_oracle_unavailable"
+                    _br_gap_objs = {
                         "tree": _tree_snap, "table": _br_table, "sigma": _sigma,
                         "table_source": _br_table_source,
                         "n_players": n_players, "street": street,
                         "pot_chips": int(round(pot_bb * scale)),
                     }
+                    if readout == "both":
+                        # Additive research-only surface.  Keep the legacy
+                        # ``sigma`` key as σ̄ so every existing scorer retains
+                        # its exact input shape.
+                        _br_gap_objs["sigmas"] = _sigmas
+                    self._last_br_gap_objs = _br_gap_objs
                 except Exception as _e:  # never break a real solve for the stash
                     logger.warning("BR-gap expose stash failed: %s", _e)
                     self._last_br_gap_objs = None
@@ -1489,109 +2038,143 @@ class CpuEsSolver:
             # ── Extract strategies → all_by_player, with the weight-0 /
             #    never-visited filter the GPU's get_all_avg_strategies applies
             #    (freq>0.001; skip uniform-default rows so out-of-range hands
-            #    stay fold-100% placeholders in _build_response_strategies). ──
-            all_by_player: Dict[int, Dict[int, Dict[str, float]]] = {}
-            _hero_merged_mass_by_row: Dict[int, float] = {}
-            _hero_dropped_mass_by_row: Dict[int, float] = {}
-            _hero_drop_reason_by_row: Dict[int, str] = {}
-            _projection_skipped_players: List[Dict[str, object]] = []
-            for p_idx in range(n_players):
-                if hero_idx is not None and p_idx == hero_idx:
-                    node_idx = hero_node
-                else:
-                    node_idx = self._first_decision_node_for(tree, p_idx)
-                raw: Dict[int, Dict[str, float]] = {}
-                if node_idx is not None:
-                    if _offtree_replay is not None:
-                        # Extension labels are derived from the projected base
-                        # children below, never from the richer child universe.
-                        labels: List[str] = []
-                    elif hero_idx is not None and p_idx == hero_idx:
-                        # Replayed (possibly faced-bet) node: synthesize
-                        # labels from the tree's own chip deltas —
-                        # _build_labels is wrong off the street root.
-                        labels = self._node_action_labels(tree, node_idx, n_players)
+            #    stay fold-100% placeholders in _build_response_strategies).
+            #    The historical paths iterate exactly once; ``both`` reuses the
+            #    solved object and runs the same read-only extraction twice. ──
+            all_by_readout: Dict[
+                str, Dict[int, Dict[int, Dict[str, float]]]
+            ] = {}
+            for _readout_name, read_strategy in read_strategies.items():
+                all_by_player: Dict[int, Dict[int, Dict[str, float]]] = {}
+                _hero_merged_mass_by_row: Dict[int, float] = {}
+                _hero_dropped_mass_by_row: Dict[int, float] = {}
+                _hero_drop_reason_by_row: Dict[int, str] = {}
+                _projection_skipped_players: List[Dict[str, object]] = []
+                for p_idx in range(n_players):
+                    if hero_idx is not None and p_idx == hero_idx:
+                        node_idx = hero_node
                     else:
-                        labels = self._build_labels(gpu._tree, node_idx)
-                    sigma = read_strategy(node_idx)  # [nh, na] or None
-                    if _offtree_replay is not None and sigma is not None:
-                        try:
-                            projection = (
-                                hero_projection
-                                if hero_idx is not None and p_idx == hero_idx
-                                else build_node_projection(
-                                    tree,
-                                    node_idx,
-                                    n_players=n_players,
-                                    base_bet_sizes=_base_bet_sizes,
-                                    base_subsequent_bet_sizes=(
-                                        _base_subsequent_sizes
-                                    ),
-                                    bet_sizes=bet_sizes,
-                                    subsequent_bet_sizes=subsequent_bet_sizes,
-                                    add_explicit_allin=add_explicit_allin,
-                                )
+                        node_idx = self._first_decision_node_for(tree, p_idx)
+                    raw: Dict[int, Dict[str, float]] = {}
+                    if node_idx is not None:
+                        if _offtree_replay is not None:
+                            # Extension labels come from projected base
+                            # children, never the richer child universe.
+                            labels: List[str] = []
+                        elif hero_idx is not None and p_idx == hero_idx:
+                            # Replayed (possibly faced-bet) node: synthesize
+                            # labels from the tree's own chip deltas —
+                            # _build_labels is wrong off the street root.
+                            labels = self._node_action_labels(
+                                tree, node_idx, n_players
                             )
-                            if projection is None:
-                                raise ReplayUnsupported(
-                                    "missing base projection for player "
-                                    f"{p_idx} node {node_idx}"
+                        else:
+                            labels = self._build_labels(gpu._tree, node_idx)
+                        sigma = read_strategy(node_idx)  # [nh, na] or None
+                        if _offtree_replay is not None and sigma is not None:
+                            try:
+                                projection = (
+                                    hero_projection
+                                    if (hero_idx is not None
+                                        and p_idx == hero_idx)
+                                    else build_node_projection(
+                                        tree,
+                                        node_idx,
+                                        n_players=n_players,
+                                        base_bet_sizes=_base_bet_sizes,
+                                        base_subsequent_bet_sizes=(
+                                            _base_subsequent_sizes
+                                        ),
+                                        bet_sizes=bet_sizes,
+                                        subsequent_bet_sizes=(
+                                            subsequent_bet_sizes
+                                        ),
+                                        add_explicit_allin=(
+                                            add_explicit_allin
+                                        ),
+                                    )
                                 )
-                            if (len(projection.base_action_labels)
-                                    != len(projection.base_child_indices)):
-                                raise ReplayUnsupported(
-                                    f"node {node_idx} has "
-                                    f"{len(projection.base_child_indices)} "
-                                    "base children but "
-                                    f"{len(projection.base_action_labels)} "
-                                    "base labels"
+                                if projection is None:
+                                    raise ReplayUnsupported(
+                                        "missing base projection for player "
+                                        f"{p_idx} node {node_idx}"
+                                    )
+                                if (len(projection.base_action_labels)
+                                        != len(
+                                            projection.base_child_indices
+                                        )):
+                                    raise ReplayUnsupported(
+                                        f"node {node_idx} has "
+                                        f"{len(projection.base_child_indices)} "
+                                        "base children but "
+                                        f"{len(projection.base_action_labels)} "
+                                        "base labels"
+                                    )
+                                labels = list(
+                                    projection.base_action_labels
                                 )
-                            labels = list(projection.base_action_labels)
-                            (sigma, _merged_by_row, _dropped_by_row,
-                             _drop_reason_by_row) = (
-                                self._project_offtree_strategy(
-                                    sigma, projection
+                                (sigma, _merged_by_row, _dropped_by_row,
+                                 _drop_reason_by_row) = (
+                                    self._project_offtree_strategy(
+                                        sigma, projection
+                                    )
                                 )
-                            )
-                        except ReplayUnsupported as projection_error:
-                            # Only the replayed hero node is load-bearing for
-                            # the served mix.  A richer-tree projection miss at
-                            # another player's first display node must not
-                            # discard an otherwise faithful hero solve.
-                            if hero_idx is not None and p_idx == hero_idx:
-                                raise
-                            _projection_skipped_players.append(
-                                {
-                                    "player_idx": int(p_idx),
-                                    "node_index": int(node_idx),
-                                    "reason": str(projection_error),
-                                }
-                            )
-                            all_by_player[p_idx] = raw
-                            continue
-                        if hero_idx is not None and p_idx == hero_idx:
-                            _hero_merged_mass_by_row = _merged_by_row
-                            _hero_dropped_mass_by_row = _dropped_by_row
-                            _hero_drop_reason_by_row = _drop_reason_by_row
-                    na = sigma.shape[1] if sigma is not None else 0
-                    nh = len(player_ranges[p_idx])
-                    for h in range(min(nh, sigma.shape[0] if sigma is not None else 0)):
-                        # weight-0 hand → never visited → skip (fold-100% placeholder)
-                        if player_ranges[p_idx][h][2] <= 0.0:
-                            continue
-                        strat = {}
-                        for a in range(min(na, len(labels))):
-                            freq = float(sigma[h, a])
-                            # Match the shipped readout convention after
-                            # projection too: discard numerical dust and omit
-                            # all-zero rows.  LiveResolveSource independently
-                            # dense-fills a retained hero row at the serving
-                            # seam, so its legal-action arity remains exact.
-                            if freq > 0.001:
-                                strat[labels[a]] = freq
-                        if strat:
-                            raw[h] = strat
-                all_by_player[p_idx] = raw
+                            except ReplayUnsupported as projection_error:
+                                # Only the replayed hero node is load-bearing
+                                # for the served mix.  A projection miss at
+                                # another player's display node must not
+                                # discard an otherwise faithful hero solve.
+                                if (hero_idx is not None
+                                        and p_idx == hero_idx):
+                                    raise
+                                _projection_skipped_players.append(
+                                    {
+                                        "player_idx": int(p_idx),
+                                        "node_index": int(node_idx),
+                                        "reason": str(projection_error),
+                                    }
+                                )
+                                all_by_player[p_idx] = raw
+                                continue
+                            if (hero_idx is not None
+                                    and p_idx == hero_idx):
+                                _hero_merged_mass_by_row = _merged_by_row
+                                _hero_dropped_mass_by_row = _dropped_by_row
+                                _hero_drop_reason_by_row = _drop_reason_by_row
+                        na = sigma.shape[1] if sigma is not None else 0
+                        nh = len(player_ranges[p_idx])
+                        n_sigma_rows = (
+                            sigma.shape[0] if sigma is not None else 0
+                        )
+                        for h in range(min(nh, n_sigma_rows)):
+                            # weight-0 hand → never visited → skip
+                            # (fold-100% placeholder)
+                            if player_ranges[p_idx][h][2] <= 0.0:
+                                continue
+                            strat = {}
+                            for a in range(min(na, len(labels))):
+                                freq = float(sigma[h, a])
+                                # Match the shipped readout convention after
+                                # projection too: discard numerical dust and
+                                # omit all-zero rows.
+                                if freq > 0.001:
+                                    strat[labels[a]] = freq
+                            if strat:
+                                raw[h] = strat
+                    all_by_player[p_idx] = raw
+                all_by_readout[_readout_name] = all_by_player
+
+            solve_result = (
+                all_by_readout
+                if readout == "both"
+                else all_by_readout[readout]
+            )
+
+            readout_s = time.time() - readout_t0
+            if progress_callback is not None:
+                progress_callback(
+                    "post_readout", {"readout_s": float(readout_s)}
+                )
 
             # OBSERVABILITY STASH (2026-07-05, latency ladder): construct/solve
             # walls + tree shape for the LAST solve, as instance attributes —
@@ -1604,15 +2187,29 @@ class CpuEsSolver:
                 "n_players": n_players,
                 "street": street,
                 # leaf-value strategy for THIS solve: "table_eager" (shipped
-                # default: exhaustive fill + from_table) vs "rollout_lazy"
-                # (NEXUS_LEAF_ROLLOUT=1: lazy per-visited-leaf real oracle).
+                # default: exhaustive fill + from_table), "rollout_lazy"
+                # (cached all-hands oracle), "sampled_per_visit", or one of
+                # the table-backed bias-CFR modes.
                 "leaf_mode": leaf_mode,
                 "leaf_rollout_stats": self._last_leaf_rollout_stats,
+                "bias_oracle_stats": self._last_bias_oracle_stats,
+                "sampled_stats": self._last_sampled_stats,
                 "construct_s": float(construct_s),
                 "solve_s": float(solve_s),
+                "readout_s": float(readout_s),
+                "projected_fill_bytes": int(projected_fill_bytes),
                 "iterations": int(iterations),
+                "iterations_run": int(_sampled_iterations_run),
+                "iterations_run_observed": bool(iterations_run_observed),
+                "deadline_ms": effective_deadline_ms,
                 "num_rollouts": int(num_rollouts),
                 "master_seed": int(master_seed),
+                "sampled_policy": (
+                    int(_sampled_policy) if _leaf_sampled else None
+                ),
+                "sampled_deadline_ms": (
+                    int(_sampled_deadline) if _leaf_sampled else None
+                ),
                 "vec_mode": int(vec_mode),
                 "readout": readout,
                 "num_threads": int(num_threads),
@@ -1662,10 +2259,12 @@ class CpuEsSolver:
             logger.info(
                 "CpuEsSolver solve: %dp %s construct=%.1fs solve=%.1fs "
                 "(%d iters, %s threads, off-lock)",
-                n_players, street, construct_s, solve_s, iterations,
+                n_players, street, construct_s, solve_s,
+                (_sampled_iterations_run
+                 if _sampled_iterations_run is not None else iterations),
                 num_threads or "all",
             )
-            return all_by_player
+            return solve_result
         finally:
             gpu._freed = True  # native ss_free_tree hangs on this box; skip it
 
@@ -1673,8 +2272,8 @@ class CpuEsSolver:
         self, ss_tree, leaf_infos, n_players: int, player_seats,
     ) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                np.ndarray, np.ndarray]:
-        """Per-leaf flat int32 state arrays for CSolver.from_real_oracle
-        (NEXUS_LEAF_ROLLOUT). Returns
+        """Per-leaf flat int32 state arrays for ``from_real_oracle`` or
+        ``from_sampled_oracle``. Returns
         (n_leaves, pot, bets, active, hist_flat, hist_len, player_seats).
 
         Mirrors poker-solver python/es_resolver/run_real_spot_c.py
@@ -1689,8 +2288,8 @@ class CpuEsSolver:
         seat-relative blueprint lookup matches the served spot.
 
         The C ctx COPIES all arrays, so the numpy buffers here need only outlive
-        the from_real_oracle call. Contiguity/dtype coercion happens in
-        c_solver.from_real_oracle (it re-casts each to C-contiguous int32).
+        the factory call. Both c_solver factories coerce them to C-contiguous
+        int32.
 
         FIDELITY NOTE: the per-leaf active read here is the oracle's contract
         and is the more correct quantity than the eager fill's global
