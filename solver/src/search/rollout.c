@@ -19,6 +19,7 @@
 
 #include "hand_eval.h"
 #include "mccfr_cont_ev_table.h"  /* Phase F: cont_ev_table consumer */
+#include "rollout_bucket_memo.h"  /* per-solve turn/river bucket memo */
 
 /* External declarations for the trainer-side action_hash function. We
  * avoid including mccfr_blueprint.h because that pulls in the entire
@@ -1165,6 +1166,97 @@ static int rollout_sample_opp_hand(
 
 /* ── _simulate_one ───────────────────────────────────────────────────── */
 
+/* Diagnostic-only batch replay of the exact eager hero-first/fixed-seat-order
+ * opponent sampler.  Returned RNG states are immediately post-assignment. */
+BPS_EXPORT int32_t rollout_debug_sample_eager_hands_c(
+    const int *board, int32_t n_board_cards,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    int32_t hero_player, int32_t hero_hand_idx,
+    int32_t num_samples, uint64_t master_seed,
+    int32_t leaf_idx_for_seed, int32_t combo_for_seed,
+    int32_t *out_hands, uint64_t *out_rng_states,
+    int32_t *out_attempts
+) {
+    if (out_attempts) *out_attempts = 0;
+    if (!board || !active || !player_hands || !out_hands
+        || n_board_cards < 0 || n_board_cards > 5
+        || num_players < 2 || num_players > ROLLOUT_MAX_PLAYERS
+        || hero_player < 0 || hero_player >= num_players
+        || hero_hand_idx < 0
+        || hero_hand_idx >= player_hands[hero_player].n_hands
+        || num_samples <= 0)
+        return -1;
+    for (int32_t b = 0; b < n_board_cards; b++) {
+        if (board[b] < 0 || board[b] >= ROLLOUT_DECK) return -1;
+    }
+    for (int32_t p = 0; p < num_players; p++) {
+        if (player_hands[p].n_hands < 0
+            || player_hands[p].n_hands > ROLLOUT_MAX_HANDS
+            || (player_hands[p].n_hands > 0 && !player_hands[p].hands))
+            return -1;
+    }
+
+    const RolloutHand *hero =
+        &player_hands[hero_player].hands[hero_hand_idx];
+    if (hero->weight <= 0.0f || hero->c0 < 0 || hero->c0 >= ROLLOUT_DECK
+        || hero->c1 < 0 || hero->c1 >= ROLLOUT_DECK
+        || hero->c0 == hero->c1)
+        return -1;
+
+    uint64_t board_mask = 0ULL;
+    for (int32_t b = 0; b < n_board_cards; b++)
+        board_mask |= 1ULL << board[b];
+    if ((board_mask & (1ULL << hero->c0))
+        || (board_mask & (1ULL << hero->c1)))
+        return -1;
+
+    int32_t kept = 0;
+    for (int32_t sample = 0; sample < num_samples; sample++) {
+        uint64_t rng = rollout_derive_seed(
+            master_seed, leaf_idx_for_seed, combo_for_seed,
+            hero_player, hero_hand_idx, sample);
+        int32_t chosen[ROLLOUT_MAX_PLAYERS];
+        for (int32_t p = 0; p < num_players; p++) chosen[p] = -1;
+        chosen[hero_player] = hero_hand_idx;
+        uint64_t used = board_mask | (1ULL << hero->c0)
+                        | (1ULL << hero->c1);
+        int ok = 1;
+        for (int32_t p = 0; p < num_players; p++) {
+            if (p == hero_player || !active[p]) continue;
+            int32_t c0 = 0, c1 = 0;
+            if (rollout_sample_opp_hand(
+                    &rng, player_hands[p].hands,
+                    player_hands[p].n_hands, used, &c0, &c1) != 0) {
+                ok = 0;
+                break;
+            }
+            int32_t hand_idx = -1;
+            for (int32_t h = 0; h < player_hands[p].n_hands; h++) {
+                const RolloutHand *candidate = &player_hands[p].hands[h];
+                if (candidate->c0 == c0 && candidate->c1 == c1) {
+                    hand_idx = h;
+                    break;
+                }
+            }
+            if (hand_idx < 0) {
+                ok = 0;
+                break;
+            }
+            chosen[p] = hand_idx;
+            used |= (1ULL << c0) | (1ULL << c1);
+        }
+        if (!ok) continue;
+        for (int32_t p = 0; p < num_players; p++)
+            out_hands[(size_t)kept * (size_t)num_players + (size_t)p]
+                = chosen[p];
+        if (out_rng_states) out_rng_states[kept] = rng;
+        kept++;
+    }
+    if (out_attempts) *out_attempts = num_samples;
+    return kept;
+}
+
 /* Streets: 1=flop 2=turn 3=river. Returns 0 on success (payoff written
  * to *out_payoff), -1 on LeafValueUnavailable (last-error set).
  *
@@ -1305,9 +1397,27 @@ int rollout_simulate_one(
             if (n_board == 3) {
                 bucket = bps_hand_to_bucket(r, board, c0, c1);
             } else if (n_board == 4) {
-                bucket = bps_hand_to_bucket_turn(r, board, c0, c1);
+                /* Memo hit avoids the ca_compute_features/eval5 storm
+                 * (~64% of all solve cycles, ROLLOUT_PROFILE_2026-07-28).
+                 * MISS: compute + store. BYPASS: compute only. Cached ids
+                 * are bit-identical to recomputation by construction. */
+                bucket = rollout_bucket_memo_lookup_turn(r, board, c0, c1);
+                if (bucket < 0) {
+                    int cached = bucket;
+                    bucket = bps_hand_to_bucket_turn(r, board, c0, c1);
+                    if (cached == ROLLOUT_BUCKET_MEMO_MISS)
+                        rollout_bucket_memo_store_turn(r, board, c0, c1,
+                                                       bucket);
+                }
             } else if (n_board == 5) {
-                bucket = bps_hand_to_bucket_river(r, board, c0, c1);
+                bucket = rollout_bucket_memo_lookup_river(r, board, c0, c1);
+                if (bucket < 0) {
+                    int cached = bucket;
+                    bucket = bps_hand_to_bucket_river(r, board, c0, c1);
+                    if (cached == ROLLOUT_BUCKET_MEMO_MISS)
+                        rollout_bucket_memo_store_river(r, board, c0, c1,
+                                                        bucket);
+                }
             } else {
                 bucket = -1;
             }
@@ -1915,6 +2025,60 @@ street_closed:
 
 /* Common args → compute mean payoff for one hero hand. See
  * rollout_simulate_one for the skip_first_betting semantics. */
+BPS_EXPORT int32_t rollout_debug_simulate_fixed_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street, int32_t pot_chips,
+    const int32_t *active, int32_t num_players,
+    const int32_t *stacks, const int32_t *bets,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    const int32_t *bias_profile, int32_t hero_player,
+    const int32_t *sampled_hands_c0,
+    const int32_t *sampled_hands_c1,
+    const int32_t *has_sample,
+    int32_t skip_first_betting,
+    uint64_t rng_seed,
+    float *out_payoff, uint64_t *out_rng_state
+) {
+    if (!r || !board || !active || !stacks || !bets || !acting_order
+        || !player_seats || !game_action_history || !bias_profile
+        || !sampled_hands_c0 || !sampled_hands_c1 || !has_sample
+        || !out_payoff || n_board_cards < 0 || n_board_cards > 5
+        || num_players < 2 || num_players > ROLLOUT_MAX_PLAYERS
+        || acting_order_len < 0 || acting_order_len > num_players
+        || gah_len < 0 || gah_len > ROLLOUT_MAX_ACTION_HISTORY
+        || hero_player < 0 || hero_player >= num_players)
+        return -1;
+    uint64_t rng = rng_seed ? rng_seed : 0xdeadbeefcafebabeULL;
+    int32_t rc = rollout_simulate_one(
+        r, board, n_board_cards, street, pot_chips,
+        active, stacks, bets, num_players,
+        acting_order, acting_order_len, player_seats,
+        game_action_history, gah_len, bias_profile, hero_player,
+        sampled_hands_c0, sampled_hands_c1, has_sample,
+        skip_first_betting, &rng, out_payoff);
+    if (out_rng_state) *out_rng_state = rng;
+    return rc;
+}
+
+BPS_EXPORT uint32_t rollout_debug_flop_strength_c(
+    const int *board3, int32_t c0, int32_t c1
+) {
+    if (!board3 || c0 < 0 || c0 >= ROLLOUT_DECK
+        || c1 < 0 || c1 >= ROLLOUT_DECK || c0 == c1)
+        return 0;
+    uint64_t used = (1ULL << c0) | (1ULL << c1);
+    for (int b = 0; b < 3; b++) {
+        if (board3[b] < 0 || board3[b] >= ROLLOUT_DECK
+            || (used & (1ULL << board3[b])))
+            return 0;
+        used |= 1ULL << board3[b];
+    }
+    return eval5(board3[0], board3[1], board3[2], c0, c1);
+}
+
 static int rollout_compute_leaf_value_impl(
     const BPSReader *r,
     const int *board, int32_t n_board_cards,

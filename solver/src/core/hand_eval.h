@@ -36,8 +36,12 @@
 
 /**
  * Evaluate 5 cards. Returns a 32-bit strength value (higher = better).
+ *
+ * eval5_compute is the reference implementation; eval5 (below) dispatches to
+ * the init-time-generated lookup table when POKER_EVAL5_TABLE is on, using
+ * eval5_compute both to fill the table and as the exact fallback.
  */
-static inline uint32_t eval5(int c0, int c1, int c2, int c3, int c4) {
+static inline uint32_t eval5_compute(int c0, int c1, int c2, int c3, int c4) {
     int ranks[5] = {CARD_RANK(c0), CARD_RANK(c1), CARD_RANK(c2),
                     CARD_RANK(c3), CARD_RANK(c4)};
     int suits[5] = {CARD_SUIT(c0), CARD_SUIT(c1), CARD_SUIT(c2),
@@ -130,6 +134,99 @@ static inline uint32_t eval5(int c0, int c1, int c2, int c3, int c4) {
     return (HC_HIGH_CARD << 20) | (ranks[0] << 16) | (ranks[1] << 12) |
            (ranks[2] << 8) | (ranks[3] << 4) | ranks[4];
 }
+
+/* ── Table-backed eval5 (default ON; kill switch -DPOKER_EVAL5_TABLE_DISABLE) ──
+ *
+ * A process-global int32 table of all C(52,5) = 2,598,960 five-card ranks,
+ * filled once at library load by calling eval5_compute (exact by
+ * construction, nothing shipped on disk). The single definition of the table
+ * and its once-guard lives in hand_eval_table.c — every link target whose TUs
+ * include this header must link that file. Lookup = colex index from the 5
+ * sorted cards + one array probe. Device code (__CUDACC__) cannot reach the
+ * host table, so it keeps the compute path. */
+#if !defined(POKER_EVAL5_TABLE_DISABLE) && !defined(__CUDACC__)
+#define POKER_EVAL5_TABLE 1
+#endif
+
+void poker_eval5_table_init(void);  /* idempotent; no-op when disabled */
+
+#ifdef POKER_EVAL5_TABLE
+
+#define POKER_EVAL5_TABLE_SIZE 2598960u  /* C(52,5) */
+
+/* NULL until hand_eval_table.c publishes the fully built table
+ * (release-store); eval5 acquire-loads it and falls back to eval5_compute
+ * while NULL, so every read is exact at every point in time. */
+extern const int32_t *poker_eval5_table;
+
+/* Binomial tables for the colex index: poker_eval5_bcK[n] = C(n, K). */
+static const uint32_t poker_eval5_bc2[52] = {
+    0, 0, 1, 3, 6, 10, 15, 21,
+    28, 36, 45, 55, 66, 78, 91, 105,
+    120, 136, 153, 171, 190, 210, 231, 253,
+    276, 300, 325, 351, 378, 406, 435, 465,
+    496, 528, 561, 595, 630, 666, 703, 741,
+    780, 820, 861, 903, 946, 990, 1035, 1081,
+    1128, 1176, 1225, 1275
+};
+static const uint32_t poker_eval5_bc3[52] = {
+    0, 0, 0, 1, 4, 10, 20, 35,
+    56, 84, 120, 165, 220, 286, 364, 455,
+    560, 680, 816, 969, 1140, 1330, 1540, 1771,
+    2024, 2300, 2600, 2925, 3276, 3654, 4060, 4495,
+    4960, 5456, 5984, 6545, 7140, 7770, 8436, 9139,
+    9880, 10660, 11480, 12341, 13244, 14190, 15180, 16215,
+    17296, 18424, 19600, 20825
+};
+static const uint32_t poker_eval5_bc4[52] = {
+    0, 0, 0, 0, 1, 5, 15, 35,
+    70, 126, 210, 330, 495, 715, 1001, 1365,
+    1820, 2380, 3060, 3876, 4845, 5985, 7315, 8855,
+    10626, 12650, 14950, 17550, 20475, 23751, 27405, 31465,
+    35960, 40920, 46376, 52360, 58905, 66045, 73815, 82251,
+    91390, 101270, 111930, 123410, 135751, 148995, 163185, 178365,
+    194580, 211876, 230300, 249900
+};
+static const uint32_t poker_eval5_bc5[52] = {
+    0, 0, 0, 0, 0, 1, 6, 21,
+    56, 126, 252, 462, 792, 1287, 2002, 3003,
+    4368, 6188, 8568, 11628, 15504, 20349, 26334, 33649,
+    42504, 53130, 65780, 80730, 98280, 118755, 142506, 169911,
+    201376, 237336, 278256, 324632, 376992, 435897, 501942, 575757,
+    658008, 749398, 850668, 962598, 1086008, 1221759, 1370754, 1533939,
+    1712304, 1906884, 2118760, 2349060
+};
+
+/* Colex rank of the 5-card set {c0..c4} among all C(52,5) subsets: sort
+ * ascending (optimal 9-comparator network), then a0 + C(a1,2) + C(a2,3) +
+ * C(a3,4) + C(a4,5). Requires 5 DISTINCT cards in 0..51 (as every caller
+ * already guarantees — same precondition eval5_compute has always had). */
+static inline uint32_t poker_eval5_index(int c0, int c1, int c2, int c3, int c4) {
+    int a0 = c0, a1 = c1, a2 = c2, a3 = c3, a4 = c4;
+#define POKER_EVAL5_CSWAP(x, y) do { if ((x) > (y)) { int _t = (x); (x) = (y); (y) = _t; } } while (0)
+    POKER_EVAL5_CSWAP(a0, a1); POKER_EVAL5_CSWAP(a3, a4);
+    POKER_EVAL5_CSWAP(a2, a4); POKER_EVAL5_CSWAP(a2, a3);
+    POKER_EVAL5_CSWAP(a1, a4); POKER_EVAL5_CSWAP(a0, a3);
+    POKER_EVAL5_CSWAP(a0, a2); POKER_EVAL5_CSWAP(a1, a3);
+    POKER_EVAL5_CSWAP(a1, a2);
+#undef POKER_EVAL5_CSWAP
+    return (uint32_t)a0 + poker_eval5_bc2[a1] + poker_eval5_bc3[a2]
+           + poker_eval5_bc4[a3] + poker_eval5_bc5[a4];
+}
+
+static inline uint32_t eval5(int c0, int c1, int c2, int c3, int c4) {
+    const int32_t *t = __atomic_load_n(&poker_eval5_table, __ATOMIC_ACQUIRE);
+    if (t) return (uint32_t)t[poker_eval5_index(c0, c1, c2, c3, c4)];
+    return eval5_compute(c0, c1, c2, c3, c4);
+}
+
+#else  /* legacy compute path */
+
+static inline uint32_t eval5(int c0, int c1, int c2, int c3, int c4) {
+    return eval5_compute(c0, c1, c2, c3, c4);
+}
+
+#endif /* POKER_EVAL5_TABLE */
 
 /**
  * Evaluate best 5-card hand from 7 cards.

@@ -10,7 +10,17 @@
  * the storage-layout idiom of subgame_preflop.c (per-node offset tables into a
  * flat dense array) but NOT its math (that is vector CFR with reach weighting;
  * this is single-path external sampling).
+ *
+ * 1a SS_MAX_HANDS audit (2026-07-15): no additional live src/ hand/range/
+ * weight array was hard-coded to 200, so A4 required no replacement beyond
+ * the canonical SS_MAX_HANDS definition. Other live literal 200s are card-
+ * abstraction/sample constants or stale complexity comments; the archived
+ * FS_MAX_HANDS cap is outside this CPU-ES probe.
  */
+
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "es_resolver.h"
 #include "es_resolver_internal.h"
@@ -21,6 +31,15 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdatomic.h>
+#include <time.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "hand_eval.h"   /* eval7 (static inline) */
 
@@ -42,6 +61,59 @@ void es_set_error(const char *fmt, ...) {
 }
 const char *es_get_last_error(void) {
     return g_es_error[0] ? g_es_error : NULL;
+}
+
+/* The sampled oracle implementation lives only in es_resolver_real, while this
+ * resolver core is also compiled into the lightweight validation DLL. Keep the
+ * public callback identity here and dispatch through the sampled ctx's first
+ * member (`ESLeafOracle invoke`). A pointer to a struct, suitably converted,
+ * points to its initial member, so this typed load is alias-safe. The sampled
+ * TU pins the layout with a compile-time offsetof check. */
+static double es_sampled_oracle_adapter(
+    void *ctx, int leaf_idx, int traverser, int traverser_hand,
+    const int *sampled_hands, const SSNode *leaf_node, uint64_t *rng)
+{
+    if (!ctx) {
+        es_set_error("sampled oracle ctx is NULL");
+        return 0.0;
+    }
+    ESLeafOracle invoke = *(ESLeafOracle *)ctx;
+    if (!invoke) {
+        es_set_error("sampled oracle dispatch is NULL");
+        return 0.0;
+    }
+    return invoke(ctx, leaf_idx, traverser, traverser_hand, sampled_hands,
+                  leaf_node, rng);
+}
+
+ES_EXPORT ESLeafOracle es_sampled_oracle_fn(void) {
+    return es_sampled_oracle_adapter;
+}
+
+/* Monotonic milliseconds for deadline checks. QueryPerformanceCounter and
+ * CLOCK_MONOTONIC are unaffected by wall-clock adjustments. */
+uint64_t es_monotonic_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, now;
+    if (!QueryPerformanceFrequency(&freq) || !QueryPerformanceCounter(&now)
+        || freq.QuadPart <= 0)
+        return UINT64_MAX;
+    return (uint64_t)((double)now.QuadPart * 1000.0
+                      / (double)freq.QuadPart);
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return UINT64_MAX;
+    return (uint64_t)ts.tv_sec * 1000ULL
+           + (uint64_t)ts.tv_nsec / 1000000ULL;
+#endif
+}
+
+int es_deadline_expired(const ESResolver *r, uint64_t start_ms) {
+    if (!r || r->deadline_ms <= 0) return 0;
+    uint64_t now_ms = es_monotonic_ms();
+    if (start_ms == UINT64_MAX || now_ms == UINT64_MAX) return 0;
+    if (now_ms < start_ms) return 0;  /* backward jump: do not fire */
+    return now_ms - start_ms >= (uint64_t)r->deadline_ms;
 }
 
 /* ── RNG: xorshift64, identical to mccfr_blueprint.c:62 ──────────────────── */
@@ -253,6 +325,7 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->tree = tree;
     r->oracle = leaf_oracle;
     r->oracle_ctx = oracle_ctx;
+    r->oracle_is_sampled = (leaf_oracle == es_sampled_oracle_adapter);
     r->master_seed = seed ? seed : 0x9E3779B97F4A7C15ULL;
     r->chance_mode = -1;   /* inherit process/env default until set */
     r->opp_mode = -1;
@@ -290,6 +363,14 @@ void es_set_opp_mode(ESResolver *r, int mode) {
  * opponent reach, deterministic — no RNG). Set BEFORE es_run. */
 void es_set_reach_mode(ESResolver *r, int mode) {
     if (r) r->reach_mode = (mode == 1) ? 1 : 0;
+}
+
+void es_set_deadline_ms(ESResolver *r, int64_t ms) {
+    if (r) r->deadline_ms = (ms > 0) ? ms : 0;
+}
+
+int64_t es_iterations_run(const ESResolver *r) {
+    return r ? r->iterations_run : 0;
 }
 
 /* DEBUG visit counter (single-thread localization only). */
@@ -402,6 +483,70 @@ static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
  * base opponent draw is board+inter-opponent (NOT traverser-conditioned). This
  * compounds with opponent count (≈0 at 2p one-opponent, large at 3p+) — the
  * exact 2p-pass / 3p-fail signature. chosen[skip] is left = -1. */
+/* Diagnostic-only replay of scalar ES joint sampling.  Draw normally first,
+ * then retain the requested hero hand so randomized assignment order remains
+ * exactly production-identical. */
+ES_EXPORT int32_t es_debug_sample_hands_conditioned_c(
+    const SSTreeData *tree,
+    uint64_t stream_seed,
+    int32_t conditioned_player,
+    int32_t conditioned_hand,
+    int32_t num_samples,
+    int32_t max_attempts,
+    int32_t *out_hands,
+    uint64_t *out_rng_states,
+    int32_t *out_attempts,
+    int32_t *out_incomplete
+) {
+    if (out_attempts) *out_attempts = 0;
+    if (out_incomplete) *out_incomplete = 0;
+    if (!tree || !out_hands || num_samples <= 0
+        || max_attempts < num_samples
+        || tree->num_players < 2 || tree->num_players > SS_MAX_PLAYERS
+        || conditioned_player < 0
+        || conditioned_player >= tree->num_players
+        || conditioned_hand < 0
+        || conditioned_hand >= tree->num_hands[conditioned_player])
+        return -1;
+    for (int p = 0; p < tree->num_players; p++) {
+        if (tree->num_hands[p] < 0 || tree->num_hands[p] > SS_MAX_HANDS)
+            return -1;
+    }
+    if (tree->num_board < 0 || tree->num_board > SS_MAX_BOARD) return -1;
+    for (int b = 0; b < tree->num_board; b++) {
+        if (tree->board[b] < 0 || tree->board[b] >= 52) return -1;
+    }
+
+    ESResolver view;
+    memset(&view, 0, sizeof(view));
+    view.tree = tree;
+    view.np = tree->num_players;
+
+    uint64_t rng = stream_seed ? stream_seed : 0xD1B54A32D192ED03ULL;
+    int32_t kept = 0;
+    int32_t attempts = 0;
+    int32_t incomplete = 0;
+    int chosen[SS_MAX_PLAYERS];
+    while (kept < num_samples && attempts < max_attempts) {
+        es_sample_hands(&view, &rng, chosen);
+        attempts++;
+        if (chosen[conditioned_player] != conditioned_hand) continue;
+
+        int missing = 0;
+        for (int p = 0; p < view.np; p++) {
+            out_hands[(size_t)kept * (size_t)view.np + (size_t)p] = chosen[p];
+            if (chosen[p] < 0) missing = 1;
+        }
+        if (out_rng_states) out_rng_states[kept] = rng;
+        incomplete += missing;
+        kept++;
+    }
+    if (out_attempts) *out_attempts = attempts;
+    if (out_incomplete) *out_incomplete = incomplete;
+    return kept;
+}
+
+/* The opponent-only VEC implementation documented above begins here. */
 static void es_sample_opponents(ESResolver *r, uint64_t *rng, int skip,
                                 int *chosen) {
     const SSTreeData *t = r->tree;
@@ -809,6 +954,48 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     }
 }
 
+typedef double (*ESVecScratch)[SS_MAX_ACTIONS][SS_MAX_HANDS];
+
+/* Exact number of simultaneously-live traverser-decision frames on the
+ * deepest root-to-terminal path. The tree is acyclic by construction (the
+ * recursive traversals below rely on the same property), so this structural
+ * prepass gives a tight scratch bound without using SS_MAX_TREE_NODES slots. */
+static int es_vec_scratch_slots_node(const SSTreeData *t, int node_idx,
+                                     int traverser) {
+    const SSNode *nd = &t->nodes[node_idx];
+    int max_below = 0;
+    for (int a = 0; a < nd->num_children; a++) {
+        int child = t->children[nd->first_child + a];
+        int below = es_vec_scratch_slots_node(t, child, traverser);
+        if (below > max_below) max_below = below;
+    }
+    return max_below
+           + (nd->type == ES_T_DECISION && nd->player == traverser ? 1 : 0);
+}
+
+static int es_vec_scratch_slots(const ESResolver *r) {
+    int max_slots = 0;
+    for (int trav = 0; trav < r->np; trav++) {
+        int slots = es_vec_scratch_slots_node(r->tree, 0, trav);
+        if (slots > max_slots) max_slots = slots;
+    }
+    return max_slots;
+}
+
+static ESVecScratch es_alloc_vec_scratch(int slots) {
+    if (slots <= 0) return NULL;
+    ESVecScratch scratch = (ESVecScratch)malloc(
+        (size_t)slots * sizeof(*scratch));
+    if (!scratch) {
+        fprintf(stderr,
+                "FATAL es_run: OOM allocating vec scratch "
+                "(%d slots x %d actions x %d hands)\n",
+                slots, SS_MAX_ACTIONS, SS_MAX_HANDS);
+        abort();
+    }
+    return scratch;
+}
+
 /* ── Vectorized traverser ────────────────────────────────────────────────────
  *
  * One walk down a SINGLE opponent-sampled path updates ALL traverser hands at
@@ -833,6 +1020,7 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
 static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
                             const int *opp_sampled, const int *dead,
                             uint64_t *rng, ESStats *local, int64_t iter,
+                            ESVecScratch scratch, int scratch_depth,
                             double *out_vals) {
     const SSTreeData *t = r->tree;
     const SSNode *nd = &t->nodes[node_idx];
@@ -884,13 +1072,19 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         for (int p = 0; p < np; p++) {
             if (p == traverser || !nd->active_players[p]) continue;
             int hi = opp_sampled[p];
-            if (hi < 0) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
+            if (hi < 0) {
+                for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+                return;
+            }
             int c0 = t->hands[p][hi][0], c1 = t->hands[p][hi][1];
             int conflict = 0;
             if (!es_no_conflict_skip())
                 for (int b = 0; b < 5; b++)
                     if (c0 == board[b] || c1 == board[b]) { conflict = 1; break; }
-            if (conflict) { for (int h = 0; h < nh; h++) out_vals[h] = 0.0; return; }
+            if (conflict) {
+                for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
+                return;
+            }
             int cards[7] = { board[0], board[1], board[2], board[3], board[4], c0, c1 };
             opp_strength[p] = eval7(cards);
             opp_live[n_opp_live++] = p;
@@ -955,23 +1149,32 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         }
         if (es_chance_enumerate(r)) {
             /* ENUMERATE (default): per-hand average over all dealt cards. */
-            double tmp[SS_MAX_HANDS];
+            double *tmp = (double *)malloc(
+                (size_t)SS_MAX_HANDS * sizeof(*tmp));
+            if (!tmp) {
+                fprintf(stderr,
+                        "FATAL es_traverse_vec: OOM allocating chance tmp "
+                        "(%d hands)\n",
+                        SS_MAX_HANDS);
+                abort();
+            }
             for (int h = 0; h < nh; h++) out_vals[h] = 0.0;
             for (int a = 0; a < nc; a++) {
                 int child = t->children[nd->first_child + a];
                 es_traverse_vec(r, child, traverser, opp_sampled, dead, rng,
-                                local, iter, tmp);
+                                local, iter, scratch, scratch_depth, tmp);
                 for (int h = 0; h < nh; h++) out_vals[h] += tmp[h];
             }
             double inv = 1.0 / (double)nc;
             for (int h = 0; h < nh; h++) out_vals[h] *= inv;
+            free(tmp);
             return;
         }
         int a = es_chance_sampled_child_keyed(r->master_seed, nd->chance_node_idx,
                                               nd->num_board, nc, iter);
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                        iter, out_vals);
+                        iter, scratch, scratch_depth, out_vals);
         return;
     }
 
@@ -988,7 +1191,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         if (ohand < 0) {
             int child = t->children[nd->first_child];
             es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                            iter, out_vals);
+                            iter, scratch, scratch_depth, out_vals);
             return;
         }
         int64_t off = r->node_off[node_idx];
@@ -999,7 +1202,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         for (int k = 0; k < na; k++) { cum += sigma[k]; if (rd <= cum) { a = k; break; } }
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                        iter, out_vals);
+                        iter, scratch, scratch_depth, out_vals);
         return;
     }
 
@@ -1008,12 +1211,11 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
      * then per-hand regret-match + combine + update. */
     if (r->visit_count) r->visit_count[node_idx]++;
     int64_t off = r->node_off[node_idx];
-    /* child_vals[a][h] — na*nh doubles, depth-bounded stack (na<=8, nh<=200). */
-    double child_vals[SS_MAX_ACTIONS][SS_MAX_HANDS];
+    double (*child_vals)[SS_MAX_HANDS] = scratch[scratch_depth];
     for (int a = 0; a < na; a++) {
         int child = t->children[nd->first_child + a];
         es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
-                        iter, child_vals[a]);
+                        iter, scratch, scratch_depth + 1, child_vals[a]);
     }
     double d = (double)iter / ((double)iter + 1.0);
     for (int h = 0; h < nh; h++) {
@@ -1079,7 +1281,8 @@ void es_merge_stats(ESStats *dst, const ESStats *src) {
  * NOT be reserved — see es_sample_opponents), build the per-hand dead mask, then
  * walk once covering ALL of `trav`'s hands. */
 static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
-                               ESStats *local, int64_t iter) {
+                               ESStats *local, int64_t iter,
+                               ESVecScratch scratch) {
     int sampled[SS_MAX_PLAYERS];
     int dead[SS_MAX_HANDS];
     double out_vals[SS_MAX_HANDS];
@@ -1089,13 +1292,21 @@ static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
     es_sample_hands(r, rng, sampled);             /* VALIDATED sampler (default) */
 #endif
     es_build_dead_mask(r, trav, sampled, dead);
-    es_traverse_vec(r, 0, trav, sampled, dead, rng, local, iter, out_vals);
+    es_traverse_vec(r, 0, trav, sampled, dead, rng, local, iter,
+                    scratch, 0, out_vals);
 }
 
 /* ── Run loop ────────────────────────────────────────────────────────────── */
 
 int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     if (!r) { es_set_error("resolver is NULL"); return -1; }
+    r->iterations_run = 0;
+    if (r->oracle_is_sampled && (r->vec_traverser || r->reach_mode)) {
+        es_set_error("sampled leaf oracle is scalar-only "
+                     "(vec_mode=%d reach_mode=%d)",
+                     r->vec_traverser, r->reach_mode);
+        return -1;
+    }
     if (iterations <= 0) return 0;
 
     /* Full-per-hand-reach vector CFR: dedicated deterministic path (no sampling,
@@ -1114,19 +1325,27 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
 #endif
 
     int np = r->np;
+    int vec_scratch_count = r->vec_traverser ? es_vec_scratch_slots(r) : 0;
+    uint64_t deadline_start_ms = (r->deadline_ms > 0)
+                                 ? es_monotonic_ms() : 0;
 
     if (nthreads == 1) {
         /* Deterministic single-thread path (the validated reference). */
         uint64_t rng = r->master_seed ^ 0xD1B54A32D192ED03ULL;
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
+        int64_t completed = 0;
+        ESVecScratch vec_scratch = es_alloc_vec_scratch(vec_scratch_count);
         for (int64_t it = 0; it < iterations; it++) {
+            if ((it & 4095LL) == 0
+                && es_deadline_expired(r, deadline_start_ms))
+                break;
             for (int trav = 0; trav < np; trav++) {
                 if (r->vec_traverser) {
                     /* vec mode walks ALL traverser hands; es_vec_pass samples
                      * OPPONENTS ONLY (traverser cards not reserved). */
                     local.traversals++;
-                    es_vec_pass(r, trav, &rng, &local, it + 1);
+                    es_vec_pass(r, trav, &rng, &local, it + 1, vec_scratch);
                 } else {
                     es_sample_hands(r, &rng, sampled);
                     if (sampled[trav] < 0) continue;   /* traverser unassignable */
@@ -1134,8 +1353,11 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                     es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
                 }
             }
+            completed++;
         }
+        free(vec_scratch);
         es_merge_stats(&r->stats, &local);
+        r->iterations_run = completed;
         return 0;
     }
 
@@ -1143,6 +1365,16 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     /* Hogwild: partition iterations across threads. Shared regret/strat-sum
      * tables, per-thread RNG seeded distinctly. Racy accumulation (Pluribus
      * Hogwild) — validated to still converge. */
+    /* Explicit dynamic chunk dispatch is equivalent to schedule(dynamic, 2048)
+     * for global Linear-CFR iteration weights, but can stop claiming work when
+     * a deadline expires. An OpenMP worksharing loop cannot portably break and
+     * would otherwise churn through all remaining requested indices. */
+    _Atomic(int64_t) next_it;
+    _Atomic(int) deadline_stop;
+    atomic_init(&next_it, 0);
+    atomic_init(&deadline_stop, 0);
+    int64_t completed = 0;
+    int use_deadline = (r->deadline_ms > 0);
     #pragma omp parallel num_threads(nthreads)
     {
         int tid = omp_get_thread_num();
@@ -1153,33 +1385,50 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         (void)es_rng_next(&rng); (void)es_rng_next(&rng);
         ESStats local; memset(&local, 0, sizeof(local));
         int sampled[SS_MAX_PLAYERS];
+        int64_t local_completed = 0;
+        ESVecScratch vec_scratch = es_alloc_vec_scratch(vec_scratch_count);
 
-        /* schedule(dynamic) so OpenMP hands out `it` from a SHARED counter —
-         * concurrently-processed `it` values cluster near current global
-         * progress. This is load-bearing for LINEAR CFR: the Linear t-weight
-         * (it+1) must track global wall-progress, not a per-thread chunk index.
-         * Under schedule(static) thread 23 would stamp weight ≈ 23·T/24 onto the
-         * shared strat-sum from wall-time zero (while regrets are immature),
-         * incoherent across threads and silently killing Linear's acceleration.
-         * Coarse chunk amortizes the shared-counter atomic. (Vanilla mode 0
-         * ignores `it`, so it is unaffected either way.) */
-        #pragma omp for schedule(dynamic, 2048)
-        for (int64_t it = 0; it < iterations; it++) {
-            for (int trav = 0; trav < np; trav++) {
-                if (r->vec_traverser) {
-                    local.traversals++;
-                    es_vec_pass(r, trav, &rng, &local, it + 1);
-                } else {
-                    es_sample_hands(r, &rng, sampled);
-                    if (sampled[trav] < 0) continue;
-                    local.traversals++;
-                    es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+        /* The shared cursor keeps concurrently processed `it` values near
+         * current global progress. This is load-bearing for LINEAR CFR: the
+         * t-weight must be the global iteration, not a per-thread chunk index.
+         * A coarse chunk amortizes the shared-cursor atomic. */
+        for (;;) {
+            if (use_deadline && atomic_load(&deadline_stop)) break;
+            int64_t begin = atomic_fetch_add(&next_it, 2048);
+            if (begin >= iterations) break;
+            int64_t remain = iterations - begin;
+            int64_t end = begin + (remain < 2048 ? remain : 2048);
+
+            for (int64_t it = begin; it < end; it++) {
+                if (use_deadline && atomic_load(&deadline_stop)) break;
+                if ((it & 4095LL) == 0
+                    && es_deadline_expired(r, deadline_start_ms)) {
+                    atomic_store(&deadline_stop, 1);
+                    break;
                 }
+                for (int trav = 0; trav < np; trav++) {
+                    if (r->vec_traverser) {
+                        local.traversals++;
+                        es_vec_pass(r, trav, &rng, &local, it + 1,
+                                    vec_scratch);
+                    } else {
+                        es_sample_hands(r, &rng, sampled);
+                        if (sampled[trav] < 0) continue;
+                        local.traversals++;
+                        es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
+                    }
+                }
+                local_completed++;
             }
         }
+        free(vec_scratch);
         #pragma omp critical
-        es_merge_stats(&r->stats, &local);
+        {
+            es_merge_stats(&r->stats, &local);
+            completed += local_completed;
+        }
     }
+    r->iterations_run = completed;
 #endif
     return 0;
 }
@@ -1366,6 +1615,6 @@ ES_EXPORT double es_test_showdown_value_vec(
     uint64_t rng = 0x9E3779B97F4A7C15ULL;
     ESStats local; memset(&local, 0, sizeof(local));
     es_traverse_vec(&tmp, 0, traverser, opp_sampled, dead, &rng, &local,
-                    1, out_vals);
+                    1, NULL, 0, out_vals);
     return out_vals[0];
 }

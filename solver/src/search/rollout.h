@@ -382,6 +382,57 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_sampled_perleaf_c(
     float *out, int32_t out_size
 );
 
+/* Stratified four-bias marginal construct. For each (leaf, round), draws one
+ * independent permutation of {0,1,2,3} per player and runs four joint-profile
+ * batches. Each player's batch value is accumulated into that player's
+ * selected bias bin, so every [leaf][bias][player][hand] slot receives exactly
+ * one sample per round while opponent biases remain uniform in expectation.
+ *
+ * Output shape is float32[max_leaf_idx + 1][4][num_players][max_hands].
+ * Flat index:
+ *   out[(((leaf_idx * 4 + bias) * num_players) + player) * max_hands
+ *       + hand].
+ */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_bias4_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_rounds,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+);
+
+/* Per-leaf conditioned-range variant of the stratified B4 construct. The
+ * per_leaf_player_hands array is [n_leaves][num_players], indexed by the
+ * leaf_infos loop position exactly like the sampled per-leaf entry. */
+BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_bias4_perleaf_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street,
+    const RolloutLeafInfo *leaf_infos, int32_t n_leaves,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    const RolloutHandList *per_leaf_player_hands,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    int32_t stack_chips,
+    int32_t max_hands,
+    int32_t num_rollouts,
+    int32_t num_rounds,
+    uint64_t master_seed,
+    float *out, int32_t out_size
+);
+
 /* ── Error surface ───────────────────────────────────────────────────── */
 
 BPS_EXPORT void rollout_get_last_error(
@@ -650,6 +701,40 @@ BPS_EXPORT int rollout_hand_index_for_turn_test(const int32_t *board,
  * the .bps wasn't trained on. */
 BPS_EXPORT void rollout_set_tolerate_bucket_miss(int enabled);
 BPS_EXPORT int  rollout_get_tolerate_bucket_miss(void);
+
+/* Per-hand leaf-EV discriminator hooks.  These exports are diagnostic-only
+ * and are never called by the production rollout path. */
+BPS_EXPORT int32_t rollout_debug_sample_eager_hands_c(
+    const int *board, int32_t n_board_cards,
+    const int32_t *active, int32_t num_players,
+    const RolloutHandList *player_hands,
+    int32_t hero_player, int32_t hero_hand_idx,
+    int32_t num_samples, uint64_t master_seed,
+    int32_t leaf_idx_for_seed, int32_t combo_for_seed,
+    int32_t *out_hands, uint64_t *out_rng_states,
+    int32_t *out_attempts);
+
+BPS_EXPORT int32_t rollout_debug_simulate_fixed_c(
+    const BPSReader *r,
+    const int *board, int32_t n_board_cards,
+    int32_t street, int32_t pot_chips,
+    const int32_t *active, int32_t num_players,
+    const int32_t *stacks, const int32_t *bets,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_action_history, int32_t gah_len,
+    const int32_t *bias_profile, int32_t hero_player,
+    const int32_t *sampled_hands_c0,
+    const int32_t *sampled_hands_c1,
+    const int32_t *has_sample,
+    int32_t skip_first_betting,
+    uint64_t rng_seed,
+    float *out_payoff, uint64_t *out_rng_state);
+
+/* Current-flop five-card made-hand strength (category in bits 20+), using the
+ * same eval5 implementation as rollout showdowns.  Higher is stronger. */
+BPS_EXPORT uint32_t rollout_debug_flop_strength_c(
+    const int *board3, int32_t c0, int32_t c1);
 
 #ifdef __cplusplus
 }

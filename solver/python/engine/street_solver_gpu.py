@@ -31,7 +31,7 @@ import numpy as np
 
 # Constants matching street_solve.cuh
 SS_MAX_PLAYERS = 6
-SS_MAX_HANDS = 200
+SS_MAX_HANDS = 1400
 SS_MAX_ACTIONS = 8
 SS_MAX_BOARD = 5
 SCALE = 100
@@ -296,12 +296,16 @@ class StreetSolverGPU:
                     hands = parse_range_string(p_range)
                 else:
                     hands = list(p_range)
-                # Filter + trim
+                # Filter + validate the native/Python cap.
                 hands = [(c0, c1, w) for c0, c1, w in hands
                          if c0 not in board_set and c1 not in board_set]
                 if len(hands) > SS_MAX_HANDS:
-                    hands.sort(key=lambda x: -x[2])
-                    hands = hands[:SS_MAX_HANDS]
+                    raise ValueError(
+                        f"street_solver_gpu: {len(hands)} hands exceeds "
+                        f"SS_MAX_HANDS={SS_MAX_HANDS} "
+                        "(silent-truncation removed for the 1a probe — "
+                        "rebuild the C lib with a higher cap)"
+                    )
                 self.player_hands.append(hands)
         elif oop_range is not None and ip_range is not None:
             # 2-player backward compat
@@ -315,8 +319,12 @@ class StreetSolverGPU:
                 hands = [(c0, c1, w) for c0, c1, w in hands
                          if c0 not in board_set and c1 not in board_set]
                 if len(hands) > SS_MAX_HANDS:
-                    hands.sort(key=lambda x: -x[2])
-                    hands = hands[:SS_MAX_HANDS]
+                    raise ValueError(
+                        f"street_solver_gpu: {len(hands)} hands exceeds "
+                        f"SS_MAX_HANDS={SS_MAX_HANDS} "
+                        "(silent-truncation removed for the 1a probe — "
+                        "rebuild the C lib with a higher cap)"
+                    )
                 self.player_hands.append(hands)
         else:
             raise ValueError("Provide oop_range+ip_range or player_ranges")
