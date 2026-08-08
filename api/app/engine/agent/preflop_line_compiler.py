@@ -431,7 +431,7 @@ def _choose_supplied_action(
     log_distance: Optional[float] = None
     if supplied.action == "raise" and supplied.amount > 0:
         supplied_amount = float(supplied.amount)
-        if not used_compatibility:
+        if not used_open_compatibility:
             log_distance = abs(math.log(supplied_amount / chosen.amount))
             snapped = supplied_amount != chosen.amount
 
