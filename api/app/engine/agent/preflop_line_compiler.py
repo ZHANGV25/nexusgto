@@ -347,11 +347,39 @@ def _v1_threebet_compatibility_ordinal(
     return second_ordinal
 
 
+def _v1_single_open_compatibility_ordinal(
+    actions: Sequence[PreflopAction],
+) -> Optional[int]:
+    """Return the raise ordinal for a canonical v1 single-open line."""
+    raise_ordinals = [
+        index for index, action in enumerate(actions) if action.action == "raise"
+    ]
+    if len(raise_ordinals) != 1:
+        return None
+    raise_ordinal = raise_ordinals[0]
+    if any(action.action == "check" for action in actions):
+        return None
+    if any(
+        index <= raise_ordinal
+        for index, action in enumerate(actions)
+        if action.action == "call"
+    ):
+        return None
+    positions = [action.position for action in actions]
+    if len(positions) != len(set(positions)):
+        return None
+    order_indices = [PREFLOP_ORDER.index(position) for position in positions]
+    if order_indices != sorted(order_indices):
+        return None
+    return raise_ordinal
+
+
 def _choose_supplied_action(
     actions: Tuple[GeneratedAction, ...],
     supplied: PreflopAction,
     ordinal: int,
-    compatibility_ordinal: Optional[int],
+    open_compatibility_ordinal: Optional[int],
+    threebet_compatibility_ordinal: Optional[int],
     threebet_size_idx: int,
 ) -> Tuple[int, PreflopActionSnap]:
     if supplied.action != "raise" and supplied.amount > 0:
@@ -373,8 +401,14 @@ def _choose_supplied_action(
             f"generated action types are {[action.type for action in actions]}"
         )
 
-    used_compatibility = supplied.action == "raise" and ordinal == compatibility_ordinal
-    if used_compatibility:
+    used_open_compatibility = (
+        supplied.action == "raise" and ordinal == open_compatibility_ordinal
+    )
+    used_threebet_compatibility = (
+        supplied.action == "raise" and ordinal == threebet_compatibility_ordinal
+    )
+    used_compatibility = used_open_compatibility or used_threebet_compatibility
+    if used_threebet_compatibility:
         if threebet_size_idx >= len(candidates):
             raise PreflopLineIllegal(
                 f"action #{ordinal} for {supplied.position}: v1 3-bet size "
@@ -382,6 +416,8 @@ def _choose_supplied_action(
                 f"{len(candidates)}-size node"
             )
         chosen_index, chosen = candidates[threebet_size_idx]
+    elif used_open_compatibility:
+        chosen_index, chosen = candidates[0]
     elif supplied.action == "raise" and supplied.amount > 0:
         chosen_index, chosen = min(
             candidates,
@@ -395,8 +431,9 @@ def _choose_supplied_action(
     log_distance: Optional[float] = None
     if supplied.action == "raise" and supplied.amount > 0:
         supplied_amount = float(supplied.amount)
-        log_distance = abs(math.log(supplied_amount / chosen.amount))
-        snapped = supplied_amount != chosen.amount
+        if not used_compatibility:
+            log_distance = abs(math.log(supplied_amount / chosen.amount))
+            snapped = supplied_amount != chosen.amount
 
     return chosen_index, PreflopActionSnap(
         action_ordinal=ordinal,
@@ -485,7 +522,17 @@ def compile_preflop_line(
                 f"finite non-negative number, got {action.amount!r}"
             )
 
-    compatibility_ordinal = _v1_threebet_compatibility_ordinal(actions)
+    threebet_compatibility_ordinal = _v1_threebet_compatibility_ordinal(actions)
+    single_open_compatibility_ordinal = (
+        _v1_single_open_compatibility_ordinal(actions)
+    )
+    open_compatibility_ordinal = single_open_compatibility_ordinal
+    if threebet_compatibility_ordinal is not None:
+        open_compatibility_ordinal = next(
+            index
+            for index, action in enumerate(actions)
+            if action.action == "raise"
+        )
 
     state = _initial_state()
     supplied_ordinal = 0
@@ -572,7 +619,8 @@ def compile_preflop_line(
                 generated,
                 supplied,
                 supplied_ordinal,
-                compatibility_ordinal,
+                open_compatibility_ordinal,
+                threebet_compatibility_ordinal,
                 threebet_size_idx,
             )
             chosen = generated[chosen_index]
