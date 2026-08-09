@@ -207,8 +207,9 @@ class LookupSource(StrategySource):
         # trainer orders actions [fold][check/call][raises asc], so the
         # stored σ̄ is PREFIX-aligned with the pruned legal set: project by
         # truncating the tail and renormalizing (review 2026-06-10; without
-        # this, a covering bet/all-in on the hero crashed the hand). A
-        # SHORTER stored σ̄ remains a vocab BUG — fail loud.
+        # this, a covering bet/all-in on the hero crashed the hand). A SHORTER
+        # undercount; prefix-pad the phantom raise tail with zero, symmetric to
+        # the 2026-06-10 truncation above. Non-raise shortfalls still fail loud.
         if len(arr) > n_legal:
             n_nonraise = (1 if state.facing_bet else 0) + 1
             if n_legal < n_nonraise:
@@ -222,12 +223,15 @@ class LookupSource(StrategySource):
                 # All stored mass was on the pruned raise slots.
                 return self._on_miss(n_legal)
         elif len(arr) < n_legal:
-            raise ValueError(
-                f"action-count mismatch at {key.as_tuple()}: blueprint stores "
-                f"{len(arr)} actions but GameState vocab says {n_legal}. The "
-                f"GameState's postflop_bet_sizes/subsequent_bet_sizes/"
-                f"add_explicit_allin must match the loaded blueprint metadata."
-            )
+            n_nonraise = (1 if state.facing_bet else 0) + 1
+            if len(arr) < n_nonraise:
+                raise ValueError(
+                    f"action-count mismatch at {key.as_tuple()}: blueprint stores "
+                    f"{len(arr)} actions but GameState vocab says {n_legal}. The "
+                    f"GameState's postflop_bet_sizes/subsequent_bet_sizes/"
+                    f"add_explicit_allin must match the loaded blueprint metadata."
+                )
+            arr = np.pad(arr, (0, n_legal - len(arr)), constant_values=0.0)
 
         arr = arr / arr.sum()
         return ActionMix({i: float(arr[i]) for i in range(n_legal)})

@@ -31,6 +31,37 @@ def _ci(card: str) -> int:
     return (12 - ranks.index(card[0].upper())) * 4 + so.index(card[1].lower())
 
 
+class _StubStrategyReader:
+    def __init__(self, strategy):
+        self.strategy = strategy
+
+    def get_metadata(self):
+        return {}
+
+    def hand_to_bucket(self, *args):
+        return 0
+
+    def get_strategy(self, *args, **kwargs):
+        return self.strategy
+
+
+def _stub_lookup_state(*, facing_bet: bool):
+    state = new_postflop_state(
+        seats=["BB", "UTG"],
+        preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Ah"), _ci("Ks"), _ci("Td")],
+        pot=440,
+        stacks=[9780, 9780],
+    )
+    return state.advance(1) if facing_bet else state
+
+
+def _stub_lookup(strategy):
+    return LookupSource(
+        ModeConfig(mode="LOOKUP"), reader=_StubStrategyReader(strategy)
+    )
+
+
 # ── ActionMix invariants ──────────────────────────────────────────────────
 
 
@@ -53,6 +84,63 @@ def test_action_mix_uniform_factory():
     mix = ActionMix.uniform(3)
     assert set(mix.freqs.keys()) == {0, 1, 2}
     assert all(abs(f - 1 / 3) < 1e-9 for f in mix.freqs.values())
+
+
+
+
+def test_lookup_shorter_facing_bet_zero_fills_pruned_raise_tail():
+    state = _stub_lookup_state(facing_bet=True)
+    assert state.num_legal_actions() == 3
+
+    mix = _stub_lookup((2.0, 6.0)).get_mix(
+        state, hero_cards=(_ci("Qh"), _ci("Jh"))
+    )
+
+    assert mix.freqs == pytest.approx({0: 0.25, 1: 0.75, 2: 0.0})
+    assert sum(mix.freqs.values()) == pytest.approx(1.0)
+    assert not mix.is_uniform_fallback
+
+
+def test_lookup_shorter_not_facing_bet_zero_fills_pruned_bet_tail():
+    state = _stub_lookup_state(facing_bet=False)
+    assert state.num_legal_actions() == 2
+
+    mix = _stub_lookup((4.0,)).get_mix(
+        state, hero_cards=(_ci("Qh"), _ci("Jh"))
+    )
+
+    assert mix.freqs == pytest.approx({0: 1.0, 1: 0.0})
+    assert sum(mix.freqs.values()) == pytest.approx(1.0)
+    assert not mix.is_uniform_fallback
+
+
+def test_lookup_shorter_than_nonraise_slots_raises_value_error():
+    state = _stub_lookup_state(facing_bet=True)
+
+    with pytest.raises(ValueError, match="blueprint stores 1 actions"):
+        _stub_lookup((1.0,)).get_mix(
+            state, hero_cards=(_ci("Qh"), _ci("Jh"))
+        )
+
+
+def test_lookup_exact_action_count_path_remains_unchanged():
+    state = _stub_lookup_state(facing_bet=False)
+
+    mix = _stub_lookup((2.0, 6.0)).get_mix(
+        state, hero_cards=(_ci("Qh"), _ci("Jh"))
+    )
+
+    assert mix.freqs == pytest.approx({0: 0.25, 1: 0.75})
+
+
+def test_lookup_longer_action_count_still_truncates_raise_tail():
+    state = _stub_lookup_state(facing_bet=False)
+
+    mix = _stub_lookup((2.0, 6.0, 9.0)).get_mix(
+        state, hero_cards=(_ci("Qh"), _ci("Jh"))
+    )
+
+    assert mix.freqs == pytest.approx({0: 0.25, 1: 0.75})
 
 
 # ── ABC contract ──────────────────────────────────────────────────────────
