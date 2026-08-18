@@ -17,7 +17,7 @@ import ctypes
 import math
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -113,6 +113,7 @@ class CompiledPreflopLine:
     ends_preflop: bool
     snap_provenance: List[PreflopActionSnap]
     node_layouts: List[PreflopNodeLayout]
+    street_bets: Dict[str, int] = field(default_factory=dict)
 
     @property
     def action_snaps(self) -> List[PreflopActionSnap]:
@@ -484,6 +485,7 @@ def _terminal_result(
         ends_preflop=ends_preflop,
         snap_provenance=list(snaps),
         node_layouts=list(layouts),
+        street_bets=dict(state.street_bets),
     )
 
 
