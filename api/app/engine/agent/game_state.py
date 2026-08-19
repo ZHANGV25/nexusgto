@@ -425,7 +425,9 @@ class GameState:
     """Immutable state of one hand from a postflop street onward.
 
     Fields (all immutable — tuples/ints, no lists):
-        seat_of_slot: compact-slot -> full-seat (0-5). Ordered SB-first.
+        seat_of_slot: compact-slot -> full-seat (0-5). Ordered SB-first in
+            the six-max blueprint game; true-HU states use BB,SB so the BB
+            acts first postflop and the button/SB acts last.
         stacks: per-slot remaining chips (entering this hand's postflop play).
         active: per-slot bool; False = folded this hand.
         pot: chips in the pot.
@@ -433,6 +435,8 @@ class GameState:
         street: 1/2/3 (flop/turn/river).
         preflop_prefix: the preflop action-index sequence (given; see plan §6
             and the preflop_constructor for how it's built).
+        true_hu: whether this is the exact two-dealt-in heads-up postflop
+            game-model variant. False preserves the six-max blueprint order.
         postflop_history: action indices taken across ALL postflop streets so
             far (one per action), in the order they were taken. This is the
             postflop tail appended to preflop_prefix to form action_history.
@@ -462,6 +466,7 @@ class GameState:
     board: Tuple[int, ...]
     street: int
     preflop_prefix: Tuple[int, ...]
+    true_hu: bool = False
     postflop_history: Tuple[int, ...] = ()
     street_history: Tuple[int, ...] = ()
     street_offtree_raises: Tuple[Tuple[int, int, int, int, int], ...] = ()
@@ -1025,12 +1030,16 @@ def new_postflop_state(
     postflop_bet_sizes: Tuple[float, ...] = DEFAULT_POSTFLOP_BET_SIZES,
     subsequent_bet_sizes: Tuple[float, ...] = DEFAULT_SUBSEQUENT_BET_SIZES,
     add_explicit_allin: bool = DEFAULT_ADD_EXPLICIT_ALLIN,
+    true_hu: bool = False,
 ) -> GameState:
     """Build a fresh GameState entering a postflop street.
 
-    `seats` are position names of the players still in the hand (any order);
-    they're reordered SB-first into compact slots (the postflop acting order).
-    `preflop_prefix` is the given preflop action-index sequence.
+    `seats` are position names of the players still in the hand (any order).
+    The default six-max game reorders them SB-first.  With ``true_hu=True``,
+    the already-canonicalized seats must be exactly {SB, BB} and compact slot
+    order is BB,SB: the BB acts first on every postflop street and the
+    button/SB acts last. `preflop_prefix` is the given preflop action-index
+    sequence.
 
     Chips (3a): if `pot`/`stacks` are omitted they are DERIVED from the verified
     trainer convention via canonical_flop_chips (the correct flop-entry chips
@@ -1047,8 +1056,19 @@ def new_postflop_state(
         if p not in FULL_SEAT:
             raise ValueError(f"unknown position {p!r}; expected one of {list(FULL_SEAT)}")
 
-    # Order players SB-first by full seat => compact slot order.
-    order = sorted(range(len(seats)), key=lambda i: FULL_SEAT[seats[i]])
+    if true_hu:
+        if len(seats) != 2 or set(seats) != {"SB", "BB"}:
+            raise ValueError(
+                "true_hu postflop state requires exactly canonical seats "
+                "{'SB', 'BB'}"
+            )
+        # True heads-up flips only the POSTFLOP game model: BB acts first,
+        # button/SB last. Preflop translation has already used the existing
+        # BTN->SB alias and is deliberately unchanged.
+        order = [seats.index("BB"), seats.index("SB")]
+    else:
+        # Six-max blueprint game: preserve the historical SB-first order.
+        order = sorted(range(len(seats)), key=lambda i: FULL_SEAT[seats[i]])
     seat_of_slot = tuple(FULL_SEAT[seats[i]] for i in order)
     n = len(order)
 
@@ -1064,7 +1084,16 @@ def new_postflop_state(
             list(preflop_prefix), list(seats)
         )
         pot = derived_pot
-        slot_stacks = derived_slot_stacks
+        if true_hu:
+            # canonical_flop_chips returns the historical SB-first order.
+            # Re-key by seat before applying the true-HU BB,SB permutation.
+            canonical_order = sorted(seats, key=lambda seat: FULL_SEAT[seat])
+            stack_by_seat = dict(zip(canonical_order, derived_slot_stacks))
+            slot_stacks = tuple(
+                int(stack_by_seat[SEAT_NAME[seat]]) for seat in seat_of_slot
+            )
+        else:
+            slot_stacks = derived_slot_stacks
     else:
         if len(seats) != len(stacks):
             raise ValueError(
@@ -1080,6 +1109,7 @@ def new_postflop_state(
         board=tuple(board),
         street=int(street),
         preflop_prefix=tuple(preflop_prefix),
+        true_hu=bool(true_hu),
         postflop_history=(),
         street_history=(),
         street_offtree_raises=(),
