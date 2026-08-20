@@ -1959,15 +1959,9 @@ class CpuEsSolver:
                     _offtree_added_child_chips = dict(
                         _walk.added_child_chips
                     )
-                    reached = tree.nodes[hero_node]
-                    if reached.type != 0 or reached.player != hero_idx:
-                        raise ValueError(
-                            f"replayed street actions lead to node {hero_node} "
-                            f"(type={reached.type}, player={reached.player}) — "
-                            f"not a decision node owned by hero player "
-                            f"{hero_idx}. The recorded street history does "
-                            "not match the solved tree."
-                        )
+                    reached = self._require_replayed_hero_node(
+                        tree, hero_node, hero_idx,
+                    )
                     hero_projection = build_node_projection(
                         tree,
                         hero_node,
@@ -2013,14 +2007,9 @@ class CpuEsSolver:
                         list(hero_replay["street_actions"]),  # type: ignore[arg-type]
                         n_players=n_players,
                     )
-                    reached = tree.nodes[hero_node]
-                    if reached.type != 0 or reached.player != hero_idx:
-                        raise ValueError(
-                            f"replayed street actions lead to node {hero_node} "
-                            f"(type={reached.type}, player={reached.player}) — not a "
-                            f"decision node owned by hero player {hero_idx}. The "
-                            "recorded street history does not match the solved tree."
-                        )
+                    reached = self._require_replayed_hero_node(
+                        tree, hero_node, hero_idx,
+                    )
                     expected = hero_replay.get("expected_actions")
                     if expected is not None and reached.num_children != int(expected):  # type: ignore[arg-type]
                         # The tree's action set at the hero's node differs from
@@ -2420,6 +2409,19 @@ class CpuEsSolver:
             dropped_by_row,
             drop_reason_by_row,
         )
+
+    @staticmethod
+    def _require_replayed_hero_node(tree, node_idx: int, hero_idx: int):
+        """Return the replay target or surface a known tree-shape limit."""
+        reached = tree.nodes[node_idx]
+        if reached.type != 0 or reached.player != hero_idx:
+            raise ReplayUnsupported(
+                f"replayed street actions lead to node {node_idx} "
+                f"(type={reached.type}, player={reached.player}) — not a "
+                f"decision node owned by hero player {hero_idx}. The "
+                "recorded street history does not match the solved tree."
+            )
+        return reached
 
     def _replay_street_node(
         self,

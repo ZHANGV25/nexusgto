@@ -103,6 +103,18 @@ def _grid_k_from_env() -> GridK:
     return value
 
 
+def _hu_leaf_mirror_enabled() -> bool:
+    """Read the strict per-call true-HU leaf-key experiment flag."""
+    raw = os.environ.get("NEXUS_HU_LEAF_MIRROR", "0")
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(
+        f"NEXUS_HU_LEAF_MIRROR must be 0 or 1, got {raw!r}"
+    )
+
+
 def build_solve_inputs(
     state: GameState,
     range_weight_dicts: Optional[List[Dict[str, float]]] = None,
@@ -194,7 +206,21 @@ def build_solve_inputs(
     # task-mqgm2hpp). Pass the FULL seat per compact slot. (player_seats reaches
     # the engine ONLY as the rollout's blueprint seat key — cpu_es_solver passes
     # it straight to compute_subgame_leaf_values_sampled_c.)
+    # NEXUS_HU_LEAF_MIRROR is a default-off true-HU experiment: swap only
+    # the SB/BB leaf keys so BB-first sequence positions query the blueprint's
+    # positionally corresponding folded-to-SB continuation (OOP->OOP, IP->IP).
+    # Ranges and every game input stay put; 6-max states are never mirrored.
     player_seats = [state.seat_of_slot[s] for s in entry_slots]
+    if _hu_leaf_mirror_enabled() and getattr(state, "true_hu", False):
+        invalid_seats = [
+            seat for seat in state.seat_of_slot if seat not in (0, 1)
+        ]
+        if invalid_seats:
+            raise ValueError(
+                "true_hu leaf mirror requires only full seats {0, 1}; "
+                f"got seat_of_slot={list(state.seat_of_slot)}"
+            )
+        player_seats = [1 - seat for seat in player_seats]
     hero_player_idx = entry_slots.index(hero_slot)
 
     # K-combo grid per entry player, blocked by the board. NEXUS_GRID_K is a

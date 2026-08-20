@@ -238,6 +238,31 @@ def test_v2_replay_rejects_nondecision_node_mid_walk() -> None:
 
 
 @pytest.mark.parametrize(
+    "reached",
+    [
+        _node(idx=0, player=1, bets=(0, 0), children=(1,), ntype=4),
+        _node(idx=0, player=1, bets=(0, 0), children=(1,)),
+    ],
+)
+def test_replayed_hero_target_shape_is_typed_unsupported(
+    reached: SimpleNamespace,
+) -> None:
+    tree = SimpleNamespace(nodes=[reached])
+
+    with pytest.raises(ReplayUnsupported, match="not a decision node") as exc_info:
+        CpuEsSolver._require_replayed_hero_node(tree, 0, hero_idx=0)
+
+    assert type(exc_info.value) is ReplayUnsupported
+
+
+def test_solve_routes_both_replay_target_guards_through_typed_helper() -> None:
+    source = inspect.getsource(CpuEsSolver.solve)
+
+    assert source.count("self._require_replayed_hero_node(") == 2
+    assert "replayed street actions lead to node" not in source
+
+
+@pytest.mark.parametrize(
     ("base_bet_sizes", "base_subsequent_bet_sizes", "label"),
     [
         ((1.0, 0.75), (1.0,), "base_bet_sizes"),
