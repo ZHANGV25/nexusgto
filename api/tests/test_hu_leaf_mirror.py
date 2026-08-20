@@ -53,6 +53,28 @@ def test_enabled_mirror_swaps_only_player_seats(monkeypatch) -> None:
     }
 
 
+def test_mirrored_inputs_ignore_passive_offtree_event_channel(
+    monkeypatch,
+) -> None:
+    state = _state(true_hu=True).advance_observed(
+        "raise", amount=500,
+    ).state
+    assert state.street_offtree_raises == ((0, 500, 300, 0, 9700),)
+    without_event = replace(state, street_offtree_raises=())
+    monkeypatch.setenv("NEXUS_HU_LEAF_MIRROR", "1")
+    monkeypatch.setenv("NEXUS_OFFTREE_ADD", "0")
+
+    with_event_inputs = build_solve_inputs(state)
+    without_event_inputs = build_solve_inputs(without_event)
+
+    assert with_event_inputs["player_seats"] == [0, 1]
+    assert json.dumps(
+        with_event_inputs, sort_keys=True,
+    ).encode() == json.dumps(
+        without_event_inputs, sort_keys=True,
+    ).encode()
+
+
 def test_enabled_mirror_never_changes_six_max_model_inputs(monkeypatch) -> None:
     state = _state(true_hu=False)
     monkeypatch.setenv("NEXUS_HU_LEAF_MIRROR", "0")
