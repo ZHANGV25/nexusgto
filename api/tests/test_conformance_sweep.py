@@ -161,12 +161,12 @@ def test_play_table_final_readout_every_n():
         assert cfg.readout == "final", f"{n}p play config must be final"
 
 
-def test_display_table_sigma_bar_2p3p_has_per_hand_coverage_budget():
+def test_display_table_unchanged_sigma_bar_2p3p():
     # The /v1 frequency-display contract: 2p/3p stay sigma-bar.
     assert DEFAULT_LIVE_CONFIG_BY_N[2].readout == "avg"
     assert DEFAULT_LIVE_CONFIG_BY_N[3].readout == "avg"
-    assert DEFAULT_LIVE_CONFIG_BY_N[2].iterations == 4_000
-    assert DEFAULT_LIVE_CONFIG_BY_N[3].iterations == 4_000
+    assert DEFAULT_LIVE_CONFIG_BY_N[2].iterations == 400
+    assert DEFAULT_LIVE_CONFIG_BY_N[3].iterations == 400
 
 
 def test_play_rows_differ_only_in_readout_and_note():

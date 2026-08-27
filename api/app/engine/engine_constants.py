@@ -14,11 +14,8 @@ Sources (poker-solver repo, measured on EC2 2026-06-10):
   - measured_logs/VEC_SPEEDUP_2026-06-10.md — vec-Linear-FINAL is the only
     validated vec config (readout='final' REQUIRED; enforced by CpuEsSolver).
   - docs/CPU_ES_RESOLVER_BENCHMARK.md - 5p ships 0.122 %/pot at ~75 s;
-    2p/3p use the scalar/avg analysis surface. The serving floor is 4,000
-    iterations so a requested 169-class hero row is not left at its exact-
-    uniform initialization by scalar hand sampling.
-  - docs/OFFTREE_AB_2026-08-20.md - the 4,000-iteration 2p arm was exercised
-    on EC2 in the 2026-08-21 solve-budget A/B.
+    2p/3p live re-solves run 1-4 s at a few hundred iterations (the
+    historically validated scalar/avg analysis surface).
 """
 
 from __future__ import annotations
@@ -282,25 +279,19 @@ class LiveSolveConfig:
 
 
 # Per-player-count defaults. n = players in the street-root re-solve.
-#   n<=3: scalar traverser + sigma-bar readout at 4,000 iterations. The old
-#         400-iteration default under-sampled individual 169-class hero rows
-#         and silently served their exact-uniform initialization.
+#   n<=3: scalar traverser + sigma-bar readout at a few hundred iterations -
+#         the validated 2p/3p analysis surface (1-4 s). A zero-information
+#         hero row is retried at 10x by the /v1 serving path.
 #   n>=4: vec-Linear-FINAL at 5M iterations (the Gate-1-validated playing-agent
 #         path); nr=10 for 5p/6p (under-the-bar floor per NR_LADDER).
 DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     2: LiveSolveConfig(
-        iterations=4_000, num_rollouts=3, vec_mode=False, readout="avg",
-        note=(
-            "2p live re-solve at 4,000 iterations (scalar/avg analysis "
-            "surface; per-hand coverage floor)"
-        ),
+        iterations=400, num_rollouts=3, vec_mode=False, readout="avg",
+        note="2p live re-solve ~1-3s (validated scalar/avg analysis surface)",
     ),
     3: LiveSolveConfig(
-        iterations=4_000, num_rollouts=3, vec_mode=False, readout="avg",
-        note=(
-            "3p live re-solve at 4,000 iterations (scalar/avg analysis "
-            "surface; per-hand coverage floor)"
-        ),
+        iterations=400, num_rollouts=3, vec_mode=False, readout="avg",
+        note="3p live re-solve ~2-4s (validated scalar/avg analysis surface)",
     ),
     4: LiveSolveConfig(
         iterations=5_000_000, num_rollouts=3, vec_mode=True, readout="final",
