@@ -27,7 +27,10 @@ logger = logging.getLogger(__name__)
 
 from app.engine.agent.game_state import GameState
 from app.engine.agent.key_builder import build_key
-from app.engine.agent.live_resolve_adapter import LiveResolveUnsupported
+from app.engine.agent.live_resolve_adapter import (
+    LiveResolveConvergenceError,
+    LiveResolveUnsupported,
+)
 from app.engine.agent.modes import ModeConfig
 from app.engine.agent.preflop_range import hand_class_169
 
@@ -40,6 +43,7 @@ __all__ = [
     "OfflineLiftedSource",
     "LiveResolveSource",
     "HybridSource",
+    "LiveResolveConvergenceError",
     "LiveResolveUnsupported",
 ]
 
@@ -372,8 +376,8 @@ class OfflineLiftedSource(StrategySource):
 class LiveResolveSource(StrategySource):
     """Live per-decision CPU re-solve behind the StrategySource ABC (plan §3.6).
 
-    This is the NON-real-time ceiling — a real-time CFR re-solve, seconds per
-    decision (2p-flop ~3s, 3p-turn ~18s at a few hundred iters), NOT sub-second.
+    This is the NON-real-time ceiling — a CFR re-solve whose latency depends on
+    the configured iteration budget, NOT a sub-second lookup.
     It must be flagged not-real-time in any UI. It is the ceiling MODE, not the
     blueprint FLOOR (that is LookupSource).
 
@@ -981,11 +985,11 @@ class LiveResolveSource(StrategySource):
         n_legal = int(inputs["n_legal"])
 
         if not strat:
-            # The engine returned no strategy for the hero's hand (e.g. a
-            # never-visited / weight-0 row). Fall back to uniform-over-legal,
-            # flagged honestly — same Pluribus Algorithm-1 substitution LOOKUP
-            # uses on a miss.
-            return ActionMix.uniform(n_legal, is_fallback=True)
+            # A missing row means the solve never accumulated a usable hero
+            # strategy. Live resolve owns no policy fallback.
+            raise LiveResolveConvergenceError(
+                "live resolve produced no strategy for the requested hero hand"
+            )
 
         # The hero's node-local label set maps with the size vocab in force
         # AT THAT NODE: subsequent sizes once this street has a bet/raise.
@@ -998,7 +1002,9 @@ class LiveResolveSource(StrategySource):
             add_explicit_allin=add_allin,
         )
         if not freqs:
-            return ActionMix.uniform(n_legal, is_fallback=True)
+            raise LiveResolveConvergenceError(
+                "live resolve produced no positive hero action frequencies"
+            )
         if _offtree_extension_served:
             # CpuEsSolver projects all extended children into the base label
             # universe. Preserve literal-zero base actions as keys so the
@@ -1007,7 +1013,21 @@ class LiveResolveSource(StrategySource):
                 action_idx: float(freqs.get(action_idx, 0.0))
                 for action_idx in range(n_legal)
             }
-        return ActionMix(freqs)
+        mix = ActionMix(freqs)
+        uniform = 1.0 / n_legal
+        if (
+            len(mix.freqs) == n_legal
+            and all(mix.freqs.get(i) == uniform for i in range(n_legal))
+        ):
+            # CpuEsSolver's scalar average readout is mathematically exact
+            # uniform when the per-hand strategy sum is untouched. Its first
+            # update also accumulates the initial uniform regret-matched row.
+            # Neither is a converged hero policy, so it must never be served or
+            # cached as a successful live resolve.
+            raise LiveResolveConvergenceError(
+                "live resolve produced an exactly uniform hero strategy"
+            )
+        return mix
 
 
 # ── HYBRID (full-hand playability: live where supported, lookup elsewhere) ─

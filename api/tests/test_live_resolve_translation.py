@@ -136,6 +136,16 @@ def test_build_inputs_rejects_terminal():
         build_solve_inputs(st)
 
 
+def test_build_inputs_rejects_wrong_length_range_weights():
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+
+    with pytest.raises(ValueError, match="range_weight_dicts length"):
+        build_solve_inputs(st, range_weight_dicts=[{}])
+
+
 def test_build_inputs_faced_bet_first_action_builds_replay():
     # FORMERLY rejected (the v1 fail-loud guard). Now a mid-street entry is
     # SERVED: the solve is posed from the street ROOT (chips rolled back) and

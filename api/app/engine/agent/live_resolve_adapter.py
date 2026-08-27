@@ -10,7 +10,7 @@ ENGINE CHOICE (empirically validated — docs/BENCHMARK_RESULTS.md §3c):
   - flop / turn  → CpuEsSolver (poker-solver CPU external-sampling ES). Builds
     real blueprint-grounded leaf values off the GPU lock; N-player generic, so
     it serves 2p AND 3p (the "5p only" in postflop_provider is a routing policy,
-    not an engine limit). 2p-flop ~3s, 3p-turn ~18s at a few hundred iters.
+    not an engine limit). Latency depends on the configured iteration budget.
   - river        → CpuEsSolver too (2026-06-11). River trees terminate in
     exact showdown/fold terminals settled natively by the C ES
     (es_showdown_value — side-pot validated, poker-solver
@@ -71,6 +71,14 @@ class LiveResolveUnsupported(Exception):  # noqa: N818 - sibling-naming conventi
     engine as ReplayUnsupported (tree raise cap, action-count divergence,
     unvalidated vocab shape) and converted by LiveResolveSource. Fail loud —
     never serve a wrong node.
+    """
+
+
+class LiveResolveConvergenceError(RuntimeError):
+    """The live solve did not produce a usable strategy for the hero row.
+
+    This is a server-side solve failure, not an unsupported abstraction node.
+    Callers must surface it explicitly and must never route it to lookup.
     """
 
 
@@ -137,7 +145,8 @@ def build_solve_inputs(
         compact-slot order, aligned to state.seat_of_slot). When given, each
         player's 169 grid is seeded IN-DISTRIBUTION (preflop σ̄) instead of
         uniform — removes the over-bet confound (see live_resolve_ranges). When
-        None (or wrong length), the grid is uniform-on-legal.
+        None, the grid is uniform-on-legal. A wrong-length list is an internal
+        contract violation and raises instead of silently discarding weights.
 
     Raises:
         LiveResolveUnsupported: terminal state or a non-postflop street.
@@ -229,10 +238,15 @@ def build_solve_inputs(
     # COMPACT SLOT order), else uniform-on-legal. Flagged belief carry is
     # composed into the weight dicts by LiveResolveSource before this call.
     blocked = set(board_ints)
-    use_weights = (
+    if (
         range_weight_dicts is not None
-        and len(range_weight_dicts) == state.n_slots
-    )
+        and len(range_weight_dicts) != state.n_slots
+    ):
+        raise ValueError(
+            "range_weight_dicts length must match GameState slots: "
+            f"got {len(range_weight_dicts)} for {state.n_slots} slots"
+        )
+    use_weights = range_weight_dicts is not None
     grid_k = _grid_k_from_env()
     player_ranges: List[List[Tuple[int, int, float]]] = []
     player_range_metadata: List[List[HandGridMetadata]] = []
