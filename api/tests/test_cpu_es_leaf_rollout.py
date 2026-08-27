@@ -147,6 +147,9 @@ class _FakeSolver:
     opp_calls = []
     reach_calls = []
     deadline_calls = []
+    actual_hand_calls = []
+    strategy_sum_mass_calls = []
+    strategy_sum_mass_value = 321.0
     iterations_run_calls = 0
     sampled_stats_calls = 0
     bias_stats_calls = 0
@@ -202,6 +205,15 @@ class _FakeSolver:
     def set_deadline_ms(self, ms):
         type(self).deadline_calls.append(ms)
         type(self).events.append(("deadline", ms))
+
+    def set_traverser_actual_hand(self, player_idx, hand_idx, fraction):
+        type(self).actual_hand_calls.append(
+            (player_idx, hand_idx, fraction)
+        )
+
+    def strategy_sum_mass(self, node_idx, hand_idx):
+        type(self).strategy_sum_mass_calls.append((node_idx, hand_idx))
+        return type(self).strategy_sum_mass_value
 
     def run(self, iterations, num_threads=0):
         type(self).events.append(("run", iterations, num_threads))
@@ -368,6 +380,9 @@ def _reset_fake_solver(monkeypatch):
     _FakeSolver.opp_calls = []
     _FakeSolver.reach_calls = []
     _FakeSolver.deadline_calls = []
+    _FakeSolver.actual_hand_calls = []
+    _FakeSolver.strategy_sum_mass_calls = []
+    _FakeSolver.strategy_sum_mass_value = 321.0
     _FakeSolver.iterations_run_calls = 0
     _FakeSolver.sampled_stats_calls = 0
     _FakeSolver.bias_stats_calls = 0
@@ -417,6 +432,30 @@ def test_flag_off_uses_eager_fill(monkeypatch):
     assert _FakeSolver.last_from_real_oracle is None, "rollout path untouched"
     assert s._last_solve_stats["leaf_mode"] == "table_eager"
     assert s._last_solve_stats["leaf_rollout_stats"] is None
+
+
+def test_actual_hero_row_config_and_coverage_mass_are_plumbed(monkeypatch):
+    monkeypatch.setenv("NEXUS_LEAF_RANGE_CONDITIONING", "0")
+    tree = _FakeTree(2, with_decision_root=True)
+    s = _make_solver(2, tree, _FakeRollout())
+    s._build_labels = lambda _tree, _node: ["Check", "Bet 75%"]
+    kwargs = _solve_kwargs(2)
+    kwargs["player_ranges"][0][1] = (2, 3, 0.0)
+    kwargs["hero_actual_hand"] = {
+        "player_idx": 0,
+        "hand_idx": 1,
+        "traverser_fraction": 0.5,
+    }
+
+    result = s.solve(**kwargs)
+
+    assert _FakeSolver.actual_hand_calls == [(0, 1, 0.5)]
+    assert _FakeSolver.strategy_sum_mass_calls == [(0, 1)]
+    assert s._last_solve_stats["hero_row_strategy_sum_mass"] == 321.0
+    assert s._last_solve_stats["hero_row_strategy_sum_mass_by_row"] == {
+        1: 321.0,
+    }
+    assert 1 in result[0], "the configured actual row bypasses weight-0 filtering"
 
 
 # ── flag-on: eager fill SKIPPED, from_real_oracle with mapped args ─────────

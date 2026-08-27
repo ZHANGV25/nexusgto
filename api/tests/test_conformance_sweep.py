@@ -23,6 +23,10 @@ from app.engine.agent.action_translation import (
 )
 from app.engine.engine_constants import (
     DEFAULT_LIVE_CONFIG_BY_N,
+    HERO_ROW_MIN_STRATEGY_SUM_MASS_DEFAULT,
+    HERO_ROW_MIN_STRATEGY_SUM_MASS_ENV,
+    HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT,
+    HERO_TRAVERSER_ACTUAL_FRACTION_ENV,
     PLAY_LIVE_CONFIG_BY_N,
     live_config_for,
 )
@@ -167,6 +171,46 @@ def test_display_table_unchanged_sigma_bar_2p3p():
     assert DEFAULT_LIVE_CONFIG_BY_N[3].readout == "avg"
     assert DEFAULT_LIVE_CONFIG_BY_N[2].iterations == 400
     assert DEFAULT_LIVE_CONFIG_BY_N[3].iterations == 400
+
+
+def test_hero_traverser_mixture_and_coverage_defaults(monkeypatch):
+    monkeypatch.delenv(HERO_TRAVERSER_ACTUAL_FRACTION_ENV, raising=False)
+    monkeypatch.delenv(HERO_ROW_MIN_STRATEGY_SUM_MASS_ENV, raising=False)
+
+    cfg = live_config_for(2)
+
+    assert cfg.hero_traverser_actual_fraction == (
+        HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT
+    )
+    assert cfg.hero_row_min_strategy_sum_mass == (
+        HERO_ROW_MIN_STRATEGY_SUM_MASS_DEFAULT
+    )
+
+
+def test_hero_traverser_mixture_and_coverage_env_plumbing(monkeypatch):
+    monkeypatch.setenv(HERO_TRAVERSER_ACTUAL_FRACTION_ENV, "0.25")
+    monkeypatch.setenv(HERO_ROW_MIN_STRATEGY_SUM_MASS_ENV, "42")
+
+    cfg = live_config_for(2)
+
+    assert cfg.hero_traverser_actual_fraction == 0.25
+    assert cfg.hero_row_min_strategy_sum_mass == 42.0
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (HERO_TRAVERSER_ACTUAL_FRACTION_ENV, "1.1"),
+        (HERO_TRAVERSER_ACTUAL_FRACTION_ENV, "nan"),
+        (HERO_ROW_MIN_STRATEGY_SUM_MASS_ENV, "-1"),
+    ],
+)
+def test_hero_traverser_env_rejects_invalid_values(
+    monkeypatch, name, value,
+):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        live_config_for(2)
 
 
 def test_play_rows_differ_only_in_readout_and_note():

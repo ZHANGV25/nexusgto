@@ -20,10 +20,21 @@ Sources (poker-solver repo, measured on EC2 2026-06-10):
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
 QUALITY_SOURCE = "poker-solver/measured_logs/NR_LADDER_2026-06-10.md"
+
+HERO_TRAVERSER_ACTUAL_FRACTION_ENV = (
+    "NEXUS_HERO_TRAVERSER_ACTUAL_FRACTION"
+)
+HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT = 0.5
+HERO_ROW_MIN_STRATEGY_SUM_MASS_ENV = (
+    "NEXUS_HERO_ROW_MIN_STRATEGY_SUM_MASS"
+)
+HERO_ROW_MIN_STRATEGY_SUM_MASS_DEFAULT = 10.0
 BLUEPRINT_QUALITY_SOURCE = (
     "blueprint v4 8.05B-iteration sigma-bar (postflop 995M IS, converged "
     "L1<0.1pp)"
@@ -276,6 +287,40 @@ class LiveSolveConfig:
     vec_mode: bool
     readout: str  # 'avg' | 'final'; vec_mode requires 'final' (CpuEsSolver)
     note: Optional[str] = None
+    hero_traverser_actual_fraction: float = (
+        HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT
+    )
+    hero_row_min_strategy_sum_mass: float = (
+        HERO_ROW_MIN_STRATEGY_SUM_MASS_DEFAULT
+    )
+
+
+def _finite_float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: Optional[float] = None,
+) -> float:
+    """Read one finite serving float, failing loud on operator typos."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name} must be a finite number, got {raw!r}") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {raw!r}")
+    if value < minimum:
+        raise ValueError(
+            f"{name}={value:g} must be at least {minimum:g}"
+        )
+    if maximum is not None and value > maximum:
+        raise ValueError(
+            f"{name}={value:g} outside [{minimum:g}, {maximum:g}]"
+        )
+    return value
 
 
 # Per-player-count defaults. n = players in the street-root re-solve.
@@ -401,12 +446,25 @@ def live_config_for(
                 f"measured bounds [{NUM_ROLLOUTS_MIN}, {NUM_ROLLOUTS_MAX}]"
             )
         num_rollouts = num_rollouts_override
+    actual_fraction = _finite_float_env(
+        HERO_TRAVERSER_ACTUAL_FRACTION_ENV,
+        HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    minimum_mass = _finite_float_env(
+        HERO_ROW_MIN_STRATEGY_SUM_MASS_ENV,
+        HERO_ROW_MIN_STRATEGY_SUM_MASS_DEFAULT,
+        minimum=0.0,
+    )
     return LiveSolveConfig(
         iterations=iterations,
         num_rollouts=num_rollouts,
         vec_mode=base.vec_mode,
         readout=base.readout,
         note=base.note,
+        hero_traverser_actual_fraction=actual_fraction,
+        hero_row_min_strategy_sum_mass=minimum_mass,
     )
 
 

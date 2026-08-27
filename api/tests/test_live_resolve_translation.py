@@ -679,6 +679,25 @@ class _FakeEsEngine:
         return {0: _AnyRowDict(labels), 1: _AnyRowDict(labels)}
 
 
+class _CoverageEsEngine:
+    def __init__(self, mass: float) -> None:
+        self.mass = mass
+        self.calls = []
+        self._last_solve_stats = None
+
+    def solve(self, **kwargs):
+        self.calls.append(kwargs)
+        actual = kwargs["hero_actual_hand"]
+        player_idx = int(actual["player_idx"])
+        hand_idx = int(actual["hand_idx"])
+        assert kwargs["player_ranges"][player_idx][hand_idx][2] == 0.0
+        self._last_solve_stats = {
+            "hero_row_strategy_sum_mass_by_row": {hand_idx: self.mass},
+        }
+        labels = {"Check": 0.8, "Bet 75%": 0.2}
+        return {player_idx: _AnyRowDict(labels)}
+
+
 def test_live_resolve_source_records_uniform_seeding_without_reader():
     from app.engine.agent.strategy_source import LiveResolveSource
     from app.engine.agent.modes import ModeConfig
@@ -715,3 +734,57 @@ def test_live_resolve_source_records_blueprint_seeding_with_reader():
     )
     src.get_mix(st, (_ci("Ah"), _ci("Kh")))
     assert src.last_range_seeding == "blueprint_preflop_sigma"
+
+
+def test_zero_weight_actual_hand_is_wired_to_resolver_mixture_and_served():
+    from app.engine.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LiveResolveSource
+
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    engine = _CoverageEsEngine(mass=321.0)
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"), cpu_es_solver=engine,
+        hero_traverser_actual_fraction=0.5,
+        hero_row_min_strategy_sum_mass=10.0,
+    )
+    # Deliberately remove the actual AKs class from the modeled hero range.
+    src._seat_range_dicts = lambda _state, _engine: [  # type: ignore[method-assign]
+        {"AKs": 0.0},
+        {"AKs": 1.0},
+    ]
+
+    mix = src.get_mix(st, (_ci("Ah"), _ci("Kh")))
+
+    actual = engine.calls[0]["hero_actual_hand"]
+    assert actual["player_idx"] == 0
+    assert actual["traverser_fraction"] == 0.5
+    assert src.last_hero_row_strategy_sum_mass == 321.0
+    assert mix.freqs == {0: 0.8, 1: 0.2}
+
+
+def test_low_actual_row_coverage_is_non_converged_even_when_non_uniform():
+    from app.engine.agent.live_resolve_adapter import (
+        LiveResolveConvergenceError,
+    )
+    from app.engine.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LiveResolveSource
+
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"),
+        cpu_es_solver=_CoverageEsEngine(mass=9.0),
+        hero_row_min_strategy_sum_mass=10.0,
+    )
+    src._seat_range_dicts = lambda _state, _engine: [  # type: ignore[method-assign]
+        {"AKs": 0.0},
+        {"AKs": 1.0},
+    ]
+
+    with pytest.raises(LiveResolveConvergenceError, match="strategy-sum mass"):
+        src.get_mix(st, (_ci("Ah"), _ci("Kh")))

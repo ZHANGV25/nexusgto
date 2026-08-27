@@ -535,6 +535,7 @@ class CpuEsSolver:
         vec_mode: int = 0,
         readout: str = "avg",
         hero_replay: Optional[Dict[str, object]] = None,
+        hero_actual_hand: Optional[Dict[str, object]] = None,
         belief_stash_out: Optional[Dict[str, object]] = None,
         deadline_ms: Optional[int] = None,
         max_projected_fill_bytes: Optional[int] = None,
@@ -575,6 +576,10 @@ class CpuEsSolver:
             the mid-street / faced-bet entry the live game loop needs — not
             at the first-BFS (no-bet) decision node. Fail-loud on any
             replay mismatch (off-tree action / vocab drift).
+        hero_actual_hand: optional ``player_idx`` + ``hand_idx`` resolver-row
+            identity and ``traverser_fraction``. In scalar ES, only that
+            player's traverser pass mixes the modeled range with this actual
+            row. Opponent-as-traverser passes retain modeled hero sampling.
         belief_stash_out: optional in/out dict for cross-street belief carry.
             The caller seeds ``entry_slots`` and ``hist_start``. After CFR,
             the dict is replaced with this street's PlainTree + sigma-bar
@@ -651,6 +656,44 @@ class CpuEsSolver:
                     "values; disable one feature")
         rc = self._rollout_c
         n_players = len(player_ranges)
+        _actual_player_idx: Optional[int] = None
+        _actual_hand_idx: Optional[int] = None
+        _actual_fraction = 0.0
+        if hero_actual_hand is not None:
+            if not isinstance(hero_actual_hand, dict):
+                raise ValueError("hero_actual_hand must be a dict")
+            try:
+                _actual_player_idx = int(hero_actual_hand["player_idx"])
+                _actual_hand_idx = int(hero_actual_hand["hand_idx"])
+                _actual_fraction = float(
+                    hero_actual_hand["traverser_fraction"]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "hero_actual_hand requires integer player_idx/hand_idx "
+                    "and numeric traverser_fraction"
+                ) from exc
+            if not (0 <= _actual_player_idx < n_players):
+                raise ValueError(
+                    "hero_actual_hand.player_idx outside solver players: "
+                    f"{_actual_player_idx} for {n_players} players"
+                )
+            if not (
+                0 <= _actual_hand_idx
+                < len(player_ranges[_actual_player_idx])
+            ):
+                raise ValueError(
+                    "hero_actual_hand.hand_idx outside player range: "
+                    f"{_actual_hand_idx} for player {_actual_player_idx}"
+                )
+            if (
+                not np.isfinite(_actual_fraction)
+                or not 0.0 <= _actual_fraction <= 1.0
+            ):
+                raise ValueError(
+                    "hero_actual_hand.traverser_fraction must be finite and "
+                    f"within [0, 1], got {_actual_fraction!r}"
+                )
         scale = 100.0
         stack_chips = int(round(stack_bb * scale))
         if len(board_strs) not in (3, 4, 5):
@@ -1567,6 +1610,12 @@ class CpuEsSolver:
             else:
                 cs = self._CSolver.from_table(
                     gpu._tree, table, n_players, max_h, seed=1)
+            if _actual_player_idx is not None and _actual_hand_idx is not None:
+                cs.set_traverser_actual_hand(
+                    _actual_player_idx,
+                    _actual_hand_idx,
+                    _actual_fraction,
+                )
             cs.set_cfr_mode(1)  # Linear CFR (matches the GPU, ~3x more iter-efficient)
             if _sampled_requested:
                 # The C default inherits ES_OPP_ENUMERATE when opp_mode is -1.
@@ -2030,6 +2079,28 @@ class CpuEsSolver:
             #    stay fold-100% placeholders in _build_response_strategies).
             #    The historical paths iterate exactly once; ``both`` reuses the
             #    solved object and runs the same read-only extraction twice. ──
+            _hero_row_strategy_sum_mass_by_row: Dict[int, float] = {}
+            if _actual_player_idx is not None and _actual_hand_idx is not None:
+                coverage_node = (
+                    hero_node
+                    if (
+                        hero_node is not None
+                        and hero_idx == _actual_player_idx
+                    )
+                    else self._first_decision_node_for(
+                        tree, _actual_player_idx
+                    )
+                )
+                if coverage_node is None:
+                    raise RuntimeError(
+                        "actual hero player has no decision node for coverage"
+                    )
+                _hero_row_strategy_sum_mass_by_row[_actual_hand_idx] = float(
+                    cs.strategy_sum_mass(
+                        coverage_node, _actual_hand_idx,
+                    )
+                )
+
             all_by_readout: Dict[
                 str, Dict[int, Dict[int, Dict[str, float]]]
             ] = {}
@@ -2138,7 +2209,13 @@ class CpuEsSolver:
                         for h in range(min(nh, n_sigma_rows)):
                             # weight-0 hand → never visited → skip
                             # (fold-100% placeholder)
-                            if player_ranges[p_idx][h][2] <= 0.0:
+                            if (
+                                player_ranges[p_idx][h][2] <= 0.0
+                                and not (
+                                    p_idx == _actual_player_idx
+                                    and h == _actual_hand_idx
+                                )
+                            ):
                                 continue
                             strat = {}
                             for a in range(min(na, len(labels))):
@@ -2212,6 +2289,17 @@ class CpuEsSolver:
                 "num_decision_nodes": int(
                     getattr(gpu._tree, "num_decision_nodes", 0)),
                 "max_depth": int(getattr(gpu._tree, "max_depth", 0)),
+                "hero_traverser_actual_fraction": (
+                    float(_actual_fraction)
+                    if _actual_player_idx is not None else None
+                ),
+                "hero_row_strategy_sum_mass": (
+                    next(iter(_hero_row_strategy_sum_mass_by_row.values()))
+                    if _hero_row_strategy_sum_mass_by_row else None
+                ),
+                "hero_row_strategy_sum_mass_by_row": dict(
+                    _hero_row_strategy_sum_mass_by_row
+                ),
                 "offtree_added": {
                     "first": [
                         float(value) for value in bet_sizes

@@ -401,6 +401,8 @@ class LiveResolveSource(StrategySource):
         seed_ranges: bool = True, strategy_reader=None,
         vec_mode: bool = False, readout: str = "avg", num_threads: int = 0,
         num_rollouts: int = 3, cache_k: int = 1,
+        hero_traverser_actual_fraction: float = 0.5,
+        hero_row_min_strategy_sum_mass: float = 10.0,
         belief_carry: Optional[bool] = None,
         offtree_add: Optional[bool] = None,
     ) -> None:
@@ -423,6 +425,12 @@ class LiveResolveSource(StrategySource):
         # 6p playing-agent config should use >=10; default 3 preserves the
         # validated 2p/3p analysis surface.
         self._num_rollouts = int(num_rollouts)
+        self._hero_traverser_actual_fraction = float(
+            hero_traverser_actual_fraction
+        )
+        self._hero_row_min_strategy_sum_mass = float(
+            hero_row_min_strategy_sum_mass
+        )
         # vec_mode + readout="final" = the PLAYING-AGENT configuration
         # (vec-Linear-FINAL — the Gate-1-validated, EC2-measured config that
         # makes a 6p re-solve viable in tens of seconds at ~0.15%/pot:
@@ -458,6 +466,7 @@ class LiveResolveSource(StrategySource):
         # Structured per-call disclosure. None is the flag-OFF contract.
         self.last_belief_carry: Optional[dict] = None
         self.last_offtree_add: Optional[dict] = None
+        self.last_hero_row_strategy_sum_mass: Optional[float] = None
 
     def _belief_carry_enabled(self) -> bool:
         if self._belief_carry_override is not None:
@@ -527,6 +536,8 @@ class LiveResolveSource(StrategySource):
             hero_grid_rows,
             labels_to_index_freqs,
         )
+
+        self.last_hero_row_strategy_sum_mass = None
 
         offtree_enabled = self._offtree_add_enabled()
         if offtree_enabled:
@@ -683,6 +694,27 @@ class LiveResolveSource(StrategySource):
                     )
 
         hero_idx = inputs["hero_player_idx"]
+        hero_rows = hero_grid_rows(
+            inputs["player_ranges"], hero_idx, hero_cards,
+            inputs.get("player_range_metadata"),
+        )
+        # K=ALL contains the physical combo; the shipped K=1 grid contains one
+        # representative combo per 169 class. In the latter case that class row
+        # is the resolver's lossless private-hand identity.
+        actual_row = next(
+            (
+                row_idx
+                for row_idx, _weight in hero_rows
+                if set(inputs["player_ranges"][hero_idx][row_idx][:2])
+                == set(hero_cards)
+            ),
+            hero_rows[0][0],
+        )
+        hero_actual_hand = {
+            "player_idx": hero_idx,
+            "hand_idx": actual_row,
+            "traverser_fraction": self._hero_traverser_actual_fraction,
+        }
         belief_stash = None
         belief_solve_kwargs = {}
         if belief_session is not None:
@@ -753,6 +785,7 @@ class LiveResolveSource(StrategySource):
                                     ),
                                 },
                             },
+                            hero_actual_hand=hero_actual_hand,
                             **belief_solve_kwargs,
                         )
                         _offtree_extension_served = True
@@ -788,6 +821,7 @@ class LiveResolveSource(StrategySource):
                                 "street_actions": inputs["street_actions"],
                                 "expected_actions": inputs["n_legal"],
                             },
+                            hero_actual_hand=hero_actual_hand,
                             **belief_solve_kwargs,
                         )
                 else:
@@ -814,6 +848,7 @@ class LiveResolveSource(StrategySource):
                             "street_actions": inputs["street_actions"],
                             "expected_actions": inputs["n_legal"],
                         },
+                        hero_actual_hand=hero_actual_hand,
                         **belief_solve_kwargs,
                     )
         except Exception as e:
@@ -911,10 +946,6 @@ class LiveResolveSource(StrategySource):
                     )
             self.last_belief_carry = belief_session.summary()
 
-        hero_rows = hero_grid_rows(
-            inputs["player_ranges"], hero_idx, hero_cards,
-            inputs.get("player_range_metadata"),
-        )
         # Preserve the exact K=1 lookup path, including hero_grid_row's
         # fail-loud contract. K>1 uses the first row only as an observability
         # anchor; the served strategy below aggregates every class row.
@@ -923,6 +954,33 @@ class LiveResolveSource(StrategySource):
             hero_grid_row(inputs["player_ranges"], hero_idx, hero_cards)
             if legacy_k1 else hero_rows[0][0]
         )
+        solve_stats = getattr(engine, "_last_solve_stats", None)
+        # CpuEsSolver always supplies this key and fails loud if the native
+        # coverage export is missing. The conditional preserves only injected
+        # test/third-party solver compatibility; production cannot skip it.
+        if (
+            isinstance(solve_stats, dict)
+            and "hero_row_strategy_sum_mass_by_row" in solve_stats
+        ):
+            mass_by_row = (
+                solve_stats.get("hero_row_strategy_sum_mass_by_row") or {}
+            )
+            mass = float(
+                mass_by_row.get(
+                    actual_row,
+                    mass_by_row.get(str(actual_row), float("nan")),
+                )
+            )
+            self.last_hero_row_strategy_sum_mass = mass
+            if (
+                not np.isfinite(mass)
+                or mass < self._hero_row_min_strategy_sum_mass
+            ):
+                raise LiveResolveConvergenceError(
+                    "live resolve hero row strategy-sum mass "
+                    f"{mass:g} is below the configured minimum "
+                    f"{self._hero_row_min_strategy_sum_mass:g}"
+                )
         if self.last_offtree_add is not None and offtree_plan is not None:
             stats = getattr(engine, "_last_solve_stats", None) or {}
             self.last_offtree_add["replayed_through_added"] = bool(
@@ -981,7 +1039,14 @@ class LiveResolveSource(StrategySource):
                     )
 
         per_hand = all_by_player.get(hero_idx, {})
-        strat = aggregate_grid_row_strategies(per_hand, hero_rows)
+        positive_class_mass = sum(
+            weight for _row_idx, weight in hero_rows if weight > 0.0
+        )
+        strat = (
+            per_hand.get(actual_row)
+            if legacy_k1 or positive_class_mass <= 0.0
+            else aggregate_grid_row_strategies(per_hand, hero_rows)
+        )
         n_legal = int(inputs["n_legal"])
 
         if not strat:
