@@ -127,6 +127,16 @@ ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
  * resolver using es_sampled_oracle_fn(). */
 ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
 
+/* Configure scalar traverser-hand sampling for one actual private-hand row.
+ * On that player's traverser pass, sample the fixed row with probability
+ * `fraction` and use the tree's modeled range otherwise. Other players'
+ * traverser passes remain unchanged. fraction must be finite in [0,1].
+ * This is inert in vec/reach modes, which already update all traverser rows.
+ * Returns 0 on success, -1 on invalid arguments. Set before es_run. */
+ES_EXPORT int es_set_traverser_actual_hand(
+    ESResolver *r, int player, int hand, double fraction
+);
+
 /* Chance-node handling: 1 = ENUMERATE (correct, zero chance-variance: average
  * the value over ALL dealt cards — the GPU's full-reach equivalent), 0 = SAMPLE
  * (one card per iter — high variance + cross-line incoherence; the original OP3
@@ -226,6 +236,14 @@ ES_EXPORT int es_forward_ev_uniform(
  * CSolver: .avg_strategy(node_idx) -> [nh, na]). */
 ES_EXPORT int es_avg_strategy(
     const ESResolver *r, int node_idx, double *out, int out_cap
+);
+
+/* Accumulated pre-normalization strategy-sum mass for one decision-node hand
+ * row: sum_a strat_sum[node, hand, a]. This distinguishes a genuinely visited
+ * row from es_avg_strategy's uniform rendering of an untouched row. Returns
+ * NAN on invalid resolver/node/hand arguments. */
+ES_EXPORT double es_strategy_sum_mass(
+    const ESResolver *r, int node_idx, int hand
 );
 
 /* Final-iteration regret-matched strategy at `node_idx` (Pluribus play-path).

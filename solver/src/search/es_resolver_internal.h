@@ -37,6 +37,13 @@ struct ESResolver {
     void *oracle_ctx;
     uint64_t master_seed;
 
+    /* Scalar ES only: one player's traverser pass may mix its modeled range
+     * with a fixed actual-hand row. Opponent-as-traverser passes never consult
+     * these fields, so their belief about this player's range is unchanged. */
+    int actual_traverser_player;  /* -1 = disabled */
+    int actual_traverser_hand;
+    double actual_traverser_fraction;
+
     /* Tagged automatically by es_create from the resolver-local sampled
      * trampoline callback. Sampled leaves require scalar traversal: vec mode
      * evaluates hands with incoherent fresh bias draws, while reach mode

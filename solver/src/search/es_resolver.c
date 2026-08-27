@@ -327,6 +327,9 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->oracle_ctx = oracle_ctx;
     r->oracle_is_sampled = (leaf_oracle == es_sampled_oracle_adapter);
     r->master_seed = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    r->actual_traverser_player = -1;
+    r->actual_traverser_hand = -1;
+    r->actual_traverser_fraction = 0.0;
     r->chance_mode = -1;   /* inherit process/env default until set */
     r->opp_mode = -1;
     r->reach_mode = 0;     /* OFF until set (validated sampling path is default) */
@@ -336,6 +339,26 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
 
 void es_set_cfr_mode(ESResolver *r, int mode) {
     if (r) r->cfr_mode = (mode == 1) ? 1 : 0;
+}
+
+int es_set_traverser_actual_hand(ESResolver *r, int player, int hand,
+                                  double fraction) {
+    if (!r) {
+        es_set_error("resolver is NULL");
+        return -1;
+    }
+    if (player < 0 || player >= r->np
+        || hand < 0 || hand >= r->tree->num_hands[player]
+        || !isfinite(fraction) || fraction < 0.0 || fraction > 1.0) {
+        es_set_error(
+            "invalid actual traverser hand (player=%d hand=%d fraction=%g)",
+            player, hand, fraction);
+        return -1;
+    }
+    r->actual_traverser_player = player;
+    r->actual_traverser_hand = hand;
+    r->actual_traverser_fraction = fraction;
+    return 0;
 }
 
 void es_set_vec_mode(ESResolver *r, int mode) {
@@ -419,12 +442,13 @@ void es_regret_match(const double *r, int na, double *out) {
 }
 
 /* ── Hand sampling ───────────────────────────────────────────────────────────
- * One hand index per player from their reach-weighted range, avoiding card
- * conflicts (board + other players' sampled cards). chosen[p] = -1 if a player
- * can't be assigned a conflict-free hand. Mirrors es_solver.py _sample_hands,
- * including the randomized assignment order so no player is starved.
+ * The internal form optionally reserves one fixed hand before sampling every
+ * other player. fixed_player=-1 is the existing modeled joint sampler exactly.
+ * chosen[p] = -1 if a conflict-free hand cannot be assigned.
  */
-static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
+static void es_sample_hands_with_fixed(ESResolver *r, uint64_t *rng,
+                                       int *chosen, int fixed_player,
+                                       int fixed_hand) {
     const SSTreeData *t = r->tree;
     int np = r->np;
 
@@ -434,15 +458,29 @@ static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
 
     for (int p = 0; p < np; p++) chosen[p] = -1;
 
-    /* randomized order (Fisher-Yates) */
+    if (fixed_player >= 0) {
+        int c0 = t->hands[fixed_player][fixed_hand][0];
+        int c1 = t->hands[fixed_player][fixed_hand][1];
+        if (((used >> c0) & 1ULL) || ((used >> c1) & 1ULL)) return;
+        chosen[fixed_player] = fixed_hand;
+        used |= (1ULL << c0);
+        used |= (1ULL << c1);
+    }
+
+    /* Randomized assignment order (Fisher-Yates). The fixed player's cards
+     * are already reserved, so opponents are drawn from the correctly
+     * card-conditioned modeled ranges without any hot-loop allocation. */
     int order[SS_MAX_PLAYERS];
-    for (int p = 0; p < np; p++) order[p] = p;
-    for (int i = 0; i < np; i++) {
-        int j = i + es_rng_int(rng, np - i);
+    int n_order = 0;
+    for (int p = 0; p < np; p++) {
+        if (p != fixed_player) order[n_order++] = p;
+    }
+    for (int i = 0; i < n_order; i++) {
+        int j = i + es_rng_int(rng, n_order - i);
         int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
     }
 
-    for (int oi = 0; oi < np; oi++) {
+    for (int oi = 0; oi < n_order; oi++) {
         int p = order[oi];
         int nh = t->num_hands[p];
         /* reservoir over conflict-free, weighted hands: one weighted pick in a
@@ -466,6 +504,37 @@ static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
             used |= (1ULL << t->hands[p][pick][0]);
             used |= (1ULL << t->hands[p][pick][1]);
         }
+    }
+}
+
+/* One modeled hand per player, matching the historical sampler and RNG use. */
+static void es_sample_hands(ESResolver *r, uint64_t *rng, int *chosen) {
+    es_sample_hands_with_fixed(r, rng, chosen, -1, -1);
+}
+
+static inline void es_sample_hands_for_traverser(
+    ESResolver *r, uint64_t *rng, int traverser, int *chosen
+) {
+    if (traverser != r->actual_traverser_player
+        || r->actual_traverser_fraction <= 0.0) {
+        /* In particular, every villain-as-traverser pass stays on the modeled
+         * joint range exactly as before. */
+        es_sample_hands(r, rng, chosen);
+        return;
+    }
+
+    int use_actual = (r->actual_traverser_fraction >= 1.0)
+        || (es_rng_double(rng) < r->actual_traverser_fraction);
+    if (use_actual) {
+        /* External-sampling MCCFR's traverser-hand proposal changes only the
+         * convergence RATE of each separate infoset row, never its regret
+         * fixed point. Thus oversampling the request's actual row is unbiased;
+         * no range epsilon floor or importance correction belongs here. */
+        es_sample_hands_with_fixed(r, rng, chosen,
+                                   r->actual_traverser_player,
+                                   r->actual_traverser_hand);
+    } else {
+        es_sample_hands(r, rng, chosen);
     }
 }
 
@@ -1347,7 +1416,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                     local.traversals++;
                     es_vec_pass(r, trav, &rng, &local, it + 1, vec_scratch);
                 } else {
-                    es_sample_hands(r, &rng, sampled);
+                    es_sample_hands_for_traverser(r, &rng, trav, sampled);
                     if (sampled[trav] < 0) continue;   /* traverser unassignable */
                     local.traversals++;
                     es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
@@ -1412,7 +1481,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                         es_vec_pass(r, trav, &rng, &local, it + 1,
                                     vec_scratch);
                     } else {
-                        es_sample_hands(r, &rng, sampled);
+                        es_sample_hands_for_traverser(r, &rng, trav, sampled);
                         if (sampled[trav] < 0) continue;
                         local.traversals++;
                         es_traverse(r, 0, trav, sampled, &rng, &local, it + 1);
@@ -1514,6 +1583,29 @@ int es_avg_strategy(const ESResolver *r, int node_idx, double *out, int out_cap)
         }
     }
     return nh * na;
+}
+
+double es_strategy_sum_mass(const ESResolver *r, int node_idx, int hand) {
+    if (!r || node_idx < 0 || node_idx >= r->num_nodes) {
+        es_set_error("bad node_idx");
+        return NAN;
+    }
+    int64_t off = r->node_off[node_idx];
+    int na = r->node_na[node_idx];
+    if (off < 0 || na <= 0) {
+        es_set_error("node %d not a decision node", node_idx);
+        return NAN;
+    }
+    int acting = r->tree->nodes[node_idx].player;
+    int nh = r->tree->num_hands[acting];
+    if (hand < 0 || hand >= nh) {
+        es_set_error("hand %d outside [0,%d) at node %d", hand, nh, node_idx);
+        return NAN;
+    }
+    const double *row = &r->strat_sum[off + (int64_t)hand * na];
+    double mass = 0.0;
+    for (int a = 0; a < na; a++) mass += row[a];
+    return mass;
 }
 
 int es_final_strategy(const ESResolver *r, int node_idx, double *out, int out_cap) {

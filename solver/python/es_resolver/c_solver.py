@@ -81,6 +81,11 @@ if hasattr(_lib, "es_set_cfr_mode"):
     _lib.es_set_cfr_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_vec_mode"):
     _lib.es_set_vec_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if hasattr(_lib, "es_set_traverser_actual_hand"):
+    _lib.es_set_traverser_actual_hand.restype = ctypes.c_int
+    _lib.es_set_traverser_actual_hand.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double,
+    ]
 if hasattr(_lib, "es_set_chance_mode"):
     _lib.es_set_chance_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_opp_mode"):
@@ -122,6 +127,10 @@ _lib.es_avg_strategy.argtypes = [
 _lib.es_final_strategy.restype = ctypes.c_int
 _lib.es_final_strategy.argtypes = [
     ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
+if hasattr(_lib, "es_strategy_sum_mass"):
+    _lib.es_strategy_sum_mass.restype = ctypes.c_double
+    _lib.es_strategy_sum_mass.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 _lib.es_get_last_error.restype = ctypes.c_char_p
 
 # oracle factories
@@ -641,6 +650,26 @@ class CSolver:
         elif mode == 1:
             raise RuntimeError("es_set_vec_mode not in this DLL (rebuild)")
 
+    def set_traverser_actual_hand(
+        self, player_idx: int, hand_idx: int, fraction: float,
+    ) -> None:
+        """Configure the scalar traverser-hand mixture for one actual row."""
+        if not np.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+            raise ValueError("fraction must be finite and within [0, 1]")
+        if not hasattr(_lib, "es_set_traverser_actual_hand"):
+            raise RuntimeError(
+                "es_set_traverser_actual_hand not in this DLL (rebuild)"
+            )
+        rc = _lib.es_set_traverser_actual_hand(
+            self._handle, int(player_idx), int(hand_idx), float(fraction),
+        )
+        if rc != 0:
+            err = _lib.es_get_last_error()
+            raise RuntimeError(
+                "es_set_traverser_actual_hand failed: "
+                f"{err.decode() if err else '?'}"
+            )
+
     def set_chance_mode(self, mode: int) -> None:
         """In-tree chance-node handling: 1 = ENUMERATE (correct, zero chance-
         variance — average over all dealt cards), 0 = SAMPLE (one card/iter,
@@ -752,6 +781,21 @@ class CSolver:
         if n < 0:
             return None
         return np.ctypeslib.as_array(buf).reshape(nh, na).copy()
+
+    def strategy_sum_mass(self, node_idx: int, hand_idx: int) -> float:
+        """Pre-normalization strategy-sum mass for one decision-node row."""
+        if not hasattr(_lib, "es_strategy_sum_mass"):
+            raise RuntimeError("es_strategy_sum_mass not in this DLL (rebuild)")
+        mass = float(_lib.es_strategy_sum_mass(
+            self._handle, int(node_idx), int(hand_idx),
+        ))
+        if not np.isfinite(mass) or mass < 0.0:
+            err = _lib.es_get_last_error()
+            raise RuntimeError(
+                "es_strategy_sum_mass failed: "
+                f"{err.decode() if err else '?'}"
+            )
+        return mass
 
     def final_strategy(self, node_idx: int) -> Optional[np.ndarray]:
         node = self._tree.nodes[node_idx]
