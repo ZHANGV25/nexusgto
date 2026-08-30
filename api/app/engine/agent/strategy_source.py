@@ -405,10 +405,14 @@ class LiveResolveSource(StrategySource):
         hero_row_min_strategy_sum_mass: float = 10.0,
         belief_carry: Optional[bool] = None,
         offtree_add: Optional[bool] = None,
+        deadline_ms: Optional[int] = None,
     ) -> None:
         self._config = config
         self._engine = cpu_es_solver  # held across calls (12GB load is one-time)
         self._iterations = int(iterations)
+        self._deadline_ms = (
+            int(deadline_ms) if deadline_ms is not None else None
+        )
         self._num_threads = int(num_threads)  # 0 = all cores
         # cache_k = bias-profile samples per leaf (each leaf value averages over
         # cache_k random continuation-strategy draws). cache_k=1 is one random
@@ -467,6 +471,8 @@ class LiveResolveSource(StrategySource):
         self.last_belief_carry: Optional[dict] = None
         self.last_offtree_add: Optional[dict] = None
         self.last_hero_row_strategy_sum_mass: Optional[float] = None
+        self.last_deadline_ms: Optional[int] = None
+        self.last_iterations_run: Optional[int] = None
 
     def _belief_carry_enabled(self) -> bool:
         if self._belief_carry_override is not None:
@@ -538,6 +544,8 @@ class LiveResolveSource(StrategySource):
         )
 
         self.last_hero_row_strategy_sum_mass = None
+        self.last_deadline_ms = self._deadline_ms
+        self.last_iterations_run = None
 
         offtree_enabled = self._offtree_add_enabled()
         if offtree_enabled:
@@ -766,6 +774,7 @@ class LiveResolveSource(StrategySource):
                             add_explicit_allin=add_allin,
                             game_action_indices=inputs["game_action_indices"],
                             iterations=self._iterations,
+                            deadline_ms=self._deadline_ms,
                             num_threads=self._num_threads,
                             num_rollouts=self._num_rollouts,
                             cache_k=self._cache_k,
@@ -811,6 +820,7 @@ class LiveResolveSource(StrategySource):
                             add_explicit_allin=add_allin,
                             game_action_indices=inputs["game_action_indices"],
                             iterations=self._iterations,
+                            deadline_ms=self._deadline_ms,
                             num_threads=self._num_threads,
                             num_rollouts=self._num_rollouts,
                             cache_k=self._cache_k,
@@ -838,6 +848,7 @@ class LiveResolveSource(StrategySource):
                         add_explicit_allin=add_allin,
                         game_action_indices=inputs["game_action_indices"],
                         iterations=self._iterations,
+                        deadline_ms=self._deadline_ms,
                         num_threads=self._num_threads,
                         num_rollouts=self._num_rollouts,
                         cache_k=self._cache_k,
@@ -955,6 +966,18 @@ class LiveResolveSource(StrategySource):
             if legacy_k1 else hero_rows[0][0]
         )
         solve_stats = getattr(engine, "_last_solve_stats", None)
+        if (
+            self._deadline_ms is not None
+            and isinstance(solve_stats, dict)
+            and solve_stats.get("deadline_ms") is not None
+        ):
+            self.last_deadline_ms = int(solve_stats["deadline_ms"])
+        if (
+            isinstance(solve_stats, dict)
+            and solve_stats.get("iterations_run_observed") is True
+            and solve_stats.get("iterations_run") is not None
+        ):
+            self.last_iterations_run = int(solve_stats["iterations_run"])
         # CpuEsSolver always supplies this key and fails loud if the native
         # coverage export is missing. The conditional preserves only injected
         # test/third-party solver compatibility; production cannot skip it.

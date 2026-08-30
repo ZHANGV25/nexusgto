@@ -123,6 +123,8 @@ NUM_ROLLOUTS_MIN = 3
 NUM_ROLLOUTS_MAX = 30
 ITERATIONS_MIN = 50
 ITERATIONS_MAX = 50_000_000
+DEADLINE_MS_MIN = 100
+DEADLINE_MS_MAX = 60_000
 
 
 # ── cont_ev serving policy (Step E default flip, 2026-07-08) ────────────────
@@ -293,6 +295,7 @@ class LiveSolveConfig:
     hero_row_min_strategy_sum_mass: float = (
         HERO_ROW_MIN_STRATEGY_SUM_MASS_DEFAULT
     )
+    deadline_ms: Optional[int] = None
 
 
 def _finite_float_env(
@@ -402,6 +405,7 @@ def live_config_for(
     n_players: int,
     iterations_override: Optional[int] = None,
     num_rollouts_override: Optional[int] = None,
+    deadline_ms_override: Optional[int] = None,
     *,
     purpose: str = "display",
 ) -> LiveSolveConfig:
@@ -446,6 +450,12 @@ def live_config_for(
                 f"measured bounds [{NUM_ROLLOUTS_MIN}, {NUM_ROLLOUTS_MAX}]"
             )
         num_rollouts = num_rollouts_override
+    if deadline_ms_override is not None:
+        if not (DEADLINE_MS_MIN <= deadline_ms_override <= DEADLINE_MS_MAX):
+            raise ValueError(
+                f"deadline_ms override {deadline_ms_override} outside the "
+                f"validated bounds [{DEADLINE_MS_MIN}, {DEADLINE_MS_MAX}]"
+            )
     actual_fraction = _finite_float_env(
         HERO_TRAVERSER_ACTUAL_FRACTION_ENV,
         HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT,
@@ -462,6 +472,7 @@ def live_config_for(
         num_rollouts=num_rollouts,
         vec_mode=base.vec_mode,
         readout=base.readout,
+        deadline_ms=deadline_ms_override,
         note=base.note,
         hero_traverser_actual_fraction=actual_fraction,
         hero_row_min_strategy_sum_mass=minimum_mass,
