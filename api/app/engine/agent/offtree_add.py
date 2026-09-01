@@ -65,6 +65,17 @@ class OffTreeSkip:
     reason: str
 
 
+class OffTreeExactUnsupported(ValueError):
+    """A strict real-geometry event cannot be represented exactly."""
+
+    def __init__(self, skip: OffTreeSkip):
+        self.skip = skip
+        super().__init__(
+            "strict off-tree extension cannot represent street step "
+            f"{skip.step}: {skip.reason}"
+        )
+
+
 @dataclass(frozen=True)
 class ExtensionPlan:
     """The request-scoped size lists and surviving event-to-size mapping."""
@@ -74,6 +85,7 @@ class ExtensionPlan:
     added_first: Tuple[float, ...]
     added_subsequent: Tuple[float, ...]
     event_fractions: Dict[int, float]
+    event_amounts: Dict[int, int]
 
 
 @dataclass(frozen=True)
@@ -166,6 +178,8 @@ def build_offtree_extension(
     state: _OffTreeState,
     bet_sizes: Sequence[float],
     subsequent_bet_sizes: Sequence[float],
+    *,
+    strict: bool = False,
 ) -> Optional[OffTreeExtensionAnalysis]:
     """Analyze this street's events and build a bounded size-list extension.
 
@@ -175,6 +189,12 @@ def build_offtree_extension(
     node and treats a difference of at most one chip as already represented.
     Unsorted base lists fail safe with a disclosed skip because recorded
     indices, replay enumeration, and builder list order must agree.
+
+    ``strict=True`` is the request-local real-geometry contract.  It uses an
+    exact (zero-chip) duplicate test, admits large non-all-in sizes and implicit
+    all-ins, and raises :class:`OffTreeExactUnsupported` for any event that
+    cannot be replayed at the observed chip amount.  The default path retains
+    the production planner's skip-and-disclose behavior.
     """
 
     raw_events = tuple(state.street_offtree_raises)
@@ -195,9 +215,11 @@ def build_offtree_extension(
     accepted_first: list[float] = []
     accepted_subsequent: list[float] = []
     event_fractions: Dict[int, float] = {}
+    event_amounts: Dict[int, int] = {}
     seen_steps: set[int] = set()
     events: list[OffTreeEvent] = []
     skipped: list[OffTreeSkip] = []
+    dedup_tolerance = 0 if strict else _CHIP_DEDUP_TOLERANCE
 
     for raw in raw_events:
         step, increment, pot_before, to_call_before, stack_before = (
@@ -227,11 +249,13 @@ def build_offtree_extension(
             reason = SKIP_DUPLICATE_STEP
         elif not valid_denominator:
             reason = SKIP_INVALID_DENOMINATOR
-        elif increment >= stack_before:
+        elif increment > stack_before:
+            reason = SKIP_ALL_IN_FAMILY
+        elif increment == stack_before and not strict:
             reason = SKIP_ALL_IN_FAMILY
         elif fraction <= 0.0:
             reason = SKIP_NON_POSITIVE
-        elif fraction >= _ALL_IN_FAMILY_FRACTION:
+        elif (fraction >= _ALL_IN_FAMILY_FRACTION and not strict):
             reason = SKIP_ALL_IN_FAMILY
         seen_steps.add(step)
 
@@ -241,20 +265,22 @@ def build_offtree_extension(
             if raise_level == FIRST_RAISE
             else accepted_subsequent
         )
+        duplicate_base_fraction: Optional[float] = None
         duplicate_added_fraction: Optional[float] = None
         if reason is None:
             candidate_amount = _clamped_builder_amount(
                 fraction, pot_before, to_call_before, stack_before,
             )
-            if any(
-                abs(
+            duplicate_base_fraction = next((
+                size for size in base
+                if abs(
                     candidate_amount
                     - _clamped_builder_amount(
                         size, pot_before, to_call_before, stack_before,
                     )
-                ) <= _CHIP_DEDUP_TOLERANCE
-                for size in base
-            ):
+                ) <= dedup_tolerance
+            ), None)
+            if duplicate_base_fraction is not None:
                 reason = SKIP_DUPLICATE_BASE
             else:
                 duplicate_added_fraction = next((
@@ -264,7 +290,7 @@ def build_offtree_extension(
                         - _clamped_builder_amount(
                             size, pot_before, to_call_before, stack_before,
                         )
-                    ) <= _CHIP_DEDUP_TOLERANCE
+                    ) <= dedup_tolerance
                 ), None)
             if reason is None and duplicate_added_fraction is not None:
                 reason = SKIP_DUPLICATE_ADDED
@@ -272,21 +298,33 @@ def build_offtree_extension(
                 reason = SKIP_ADDED_SIZE_CAP
 
         if reason is not None:
-            skipped.append(OffTreeSkip(
+            skip = OffTreeSkip(
                 step=step,
                 fraction=fraction,
                 raise_level=raise_level,
                 reason=reason,
-            ))
-            if (reason == SKIP_DUPLICATE_ADDED
+            )
+            skipped.append(skip)
+            if (strict and reason == SKIP_DUPLICATE_BASE
+                    and duplicate_base_fraction is not None):
+                # The exact child already exists in the base vocabulary.  Map
+                # this event to that fraction so amount-based replay, rather
+                # than the recorded nearest-index replay, owns the transition.
+                event_fractions[step] = duplicate_base_fraction
+                event_amounts[step] = increment
+            elif (reason == SKIP_DUPLICATE_ADDED
                     and duplicate_added_fraction is not None):
                 # No second global size is needed, but replay must still walk
                 # the already-present added child at this observed step.
                 event_fractions[step] = duplicate_added_fraction
+                event_amounts[step] = increment
+            elif strict:
+                raise OffTreeExactUnsupported(skip)
             continue
 
         accepted.append(fraction)
         event_fractions[step] = fraction
+        event_amounts[step] = increment
 
     if not event_fractions:
         return OffTreeExtensionAnalysis(
@@ -305,6 +343,7 @@ def build_offtree_extension(
         added_first=added_first,
         added_subsequent=added_subsequent,
         event_fractions=event_fractions,
+        event_amounts=event_amounts,
     )
     return OffTreeExtensionAnalysis(
         events=tuple(events),

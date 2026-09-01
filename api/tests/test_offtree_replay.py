@@ -122,6 +122,7 @@ def _walk(
     base_subsequent_bet_sizes: tuple[float, ...] = (1.0,),
     bet_sizes: tuple[float, ...] = (0.75,),
     subsequent_bet_sizes: tuple[float, ...] = (1.0,),
+    expected_event_amounts: dict[int, int] | None = None,
 ):
     return replay_offtree_street_node(
         tree,
@@ -133,6 +134,7 @@ def _walk(
         subsequent_bet_sizes=subsequent_bet_sizes,
         add_explicit_allin=False,
         event_fractions=event_fractions or {},
+        expected_event_amounts=expected_event_amounts,
     )
 
 
@@ -147,11 +149,29 @@ def test_v2_replay_walks_added_child_by_exact_integer_amount() -> None:
         subsequent_bet_sizes=(0.5, 1.0),
         add_explicit_allin=False,
         event_fractions={0: 1.4},
+        expected_event_amounts={0: 1400},
     )
 
     assert walked.node_index == 3
     assert walked.replayed_through_added is True
     assert dict(walked.added_child_chips) == {0: 1400}
+
+
+def test_strict_replay_rejects_scalar_stack_amount_clamp() -> None:
+    tree = _extended_tree()
+    tree.effective_stack = 1000
+
+    with pytest.raises(
+        ReplayUnsupported,
+        match="generated raise amount 1000.*observed increment 1400",
+    ):
+        _walk(
+            tree,
+            (1,),
+            event_fractions={0: 1.4},
+            bet_sizes=(0.75, 1.4),
+            expected_event_amounts={0: 1400},
+        )
 
 
 def test_v2_replay_reuses_one_added_fraction_for_later_deduped_event() -> None:

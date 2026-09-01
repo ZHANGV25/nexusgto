@@ -437,6 +437,9 @@ class GameState:
             and the preflop_constructor for how it's built).
         true_hu: whether this is the exact two-dealt-in heads-up postflop
             game-model variant. False preserves the six-max blueprint order.
+        real_geometry: whether live resolve must preserve observed current-
+            street raise amounts exactly and fail closed if it cannot. False
+            preserves the production snapping/fallback contract.
         postflop_history: action indices taken across ALL postflop streets so
             far (one per action), in the order they were taken. This is the
             postflop tail appended to preflop_prefix to form action_history.
@@ -446,8 +449,9 @@ class GameState:
             here so callers never re-derive street segmentation by hand.
         street_offtree_raises: off-tree genuine-raise observations on the
             CURRENT street as (step, increment, pot_before, to_call_before,
-            stack_before). Reset with street_history when the betting round
-            closes.
+            stack_before). Real geometry records every genuine raise here so
+            native replay can also verify nominally on-tree chip amounts.
+            Reset with street_history when the betting round closes.
         to_act_slot: compact slot whose turn it is, or None if the hand/street
             is terminal (one player left or river betting complete).
         current_bet: chips the current outstanding bet requires (street-local).
@@ -483,6 +487,7 @@ class GameState:
     postflop_bet_sizes: Tuple[float, ...] = DEFAULT_POSTFLOP_BET_SIZES
     subsequent_bet_sizes: Tuple[float, ...] = DEFAULT_SUBSEQUENT_BET_SIZES
     add_explicit_allin: bool = DEFAULT_ADD_EXPLICIT_ALLIN
+    real_geometry: bool = False
 
     # ── Derived / read-only helpers ──────────────────────────────────────
 
@@ -877,7 +882,7 @@ class GameState:
                 current_bet = max(current_bet, street_bets[slot])
                 raises += 1
                 applied = increment
-                if off_tree:
+                if off_tree or self.real_geometry:
                     street_offtree_raises = street_offtree_raises + ((
                         len(self.street_history),
                         increment,
@@ -1031,6 +1036,7 @@ def new_postflop_state(
     subsequent_bet_sizes: Tuple[float, ...] = DEFAULT_SUBSEQUENT_BET_SIZES,
     add_explicit_allin: bool = DEFAULT_ADD_EXPLICIT_ALLIN,
     true_hu: bool = False,
+    real_geometry: bool = False,
 ) -> GameState:
     """Build a fresh GameState entering a postflop street.
 
@@ -1122,4 +1128,5 @@ def new_postflop_state(
         postflop_bet_sizes=tuple(postflop_bet_sizes),
         subsequent_bet_sizes=tuple(subsequent_bet_sizes),
         add_explicit_allin=bool(add_explicit_allin),
+        real_geometry=bool(real_geometry),
     )

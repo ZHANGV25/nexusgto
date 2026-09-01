@@ -805,6 +805,7 @@ class CpuEsSolver:
         _base_bet_sizes = list(bet_sizes)
         _base_subsequent_sizes = list(subsequent_bet_sizes)
         _event_fractions: Dict[int, float] = {}
+        _expected_event_amounts: Optional[Dict[int, int]] = None
         if _offtree_replay is not None:
             try:
                 _base_bet_sizes = [
@@ -821,6 +822,16 @@ class CpuEsSolver:
                         _offtree_replay["event_fractions"]  # type: ignore[index]
                     ).items()
                 }
+                _raw_expected_amounts = _offtree_replay.get(
+                    "expected_event_amounts"
+                )
+                if _raw_expected_amounts is not None:
+                    _expected_event_amounts = {
+                        int(step): int(amount)
+                        for step, amount in dict(
+                            _raw_expected_amounts
+                        ).items()
+                    }
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"invalid hero_replay.offtree descriptor: {exc}"
@@ -828,6 +839,14 @@ class CpuEsSolver:
             if not _event_fractions:
                 raise ValueError(
                     "hero_replay.offtree requires at least one event fraction"
+                )
+            if (
+                _expected_event_amounts is not None
+                and set(_expected_event_amounts) != set(_event_fractions)
+            ):
+                raise ValueError(
+                    "hero_replay.offtree expected_event_amounts steps must "
+                    "match event_fractions steps"
                 )
 
         # ── 2p-TURN: Pluribus-DEPTH-LIMITED by default (2026-06-18) ──
@@ -2000,6 +2019,7 @@ class CpuEsSolver:
                         subsequent_bet_sizes=subsequent_bet_sizes,
                         add_explicit_allin=add_explicit_allin,
                         event_fractions=_event_fractions,
+                        expected_event_amounts=_expected_event_amounts,
                     )
                     hero_node = int(_walk.node_index)
                     _offtree_replayed_through = bool(

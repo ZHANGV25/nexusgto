@@ -547,7 +547,11 @@ class LiveResolveSource(StrategySource):
         self.last_deadline_ms = self._deadline_ms
         self.last_iterations_run = None
 
-        offtree_enabled = self._offtree_add_enabled()
+        # Real geometry is a request-local exactness contract.  It cannot be
+        # disabled by the process-level/default off-tree gate: observed street
+        # sizes must either be inserted and replayed exactly or fail closed.
+        real_geometry = bool(getattr(state, "real_geometry", False))
+        offtree_enabled = real_geometry or self._offtree_add_enabled()
         if offtree_enabled:
             self.last_offtree_add = {
                 "enabled": True,
@@ -661,11 +665,33 @@ class LiveResolveSource(StrategySource):
         offtree_analysis = None
         offtree_plan = None
         if offtree_enabled:
-            from app.engine.agent.offtree_add import build_offtree_extension
-
-            offtree_analysis = build_offtree_extension(
-                state, bet_sizes, subsequent
+            from app.engine.agent.offtree_add import (
+                OffTreeExactUnsupported,
+                build_offtree_extension,
             )
+
+            try:
+                offtree_analysis = build_offtree_extension(
+                    state,
+                    bet_sizes,
+                    subsequent,
+                    strict=real_geometry,
+                )
+            except OffTreeExactUnsupported as unsupported:
+                if self.last_offtree_add is None:
+                    raise RuntimeError(
+                        "strict off-tree failure without enabled disclosure"
+                    ) from unsupported
+                skip = unsupported.skip
+                self.last_offtree_add["skipped"] = [{
+                    "step": int(skip.step),
+                    "fraction": float(skip.fraction),
+                    "raise_level": str(skip.raise_level),
+                    "reason": str(skip.reason),
+                }]
+                self.last_offtree_add["dropped"] = True
+                self.last_offtree_add["drop_reason"] = str(unsupported)
+                raise LiveResolveUnsupported(str(unsupported)) from unsupported
             if offtree_analysis is not None:
                 offtree_plan = offtree_analysis.plan
                 if self.last_offtree_add is None:
@@ -741,6 +767,23 @@ class LiveResolveSource(StrategySource):
         # unit). When no router is attached (default OFF), the nullcontext branch
         # runs the identical engine.solve — byte-identical to the shipped path.
         _router = getattr(engine, "cont_ev_router", None)
+        _direct_cev_holder = getattr(engine, "_cev_holder", None)
+        if real_geometry and (
+            _router is not None or _direct_cev_holder is not None
+        ):
+            cont_ev_source = (
+                "cont_ev catalog"
+                if _router is not None
+                else "single-table cont_ev"
+            )
+            reason = (
+                "real geometry is incompatible with the canonical-geometry "
+                f"{cont_ev_source}"
+            )
+            if self.last_offtree_add is not None:
+                self.last_offtree_add["dropped"] = True
+                self.last_offtree_add["drop_reason"] = reason
+            raise LiveResolveUnsupported(reason)
         if _router is not None:
             _arm_cm = _router.arm_for_solve(
                 engine,
@@ -792,6 +835,11 @@ class LiveResolveSource(StrategySource):
                                     "event_fractions": dict(
                                         offtree_plan.event_fractions
                                     ),
+                                    **({
+                                        "expected_event_amounts": dict(
+                                            offtree_plan.event_amounts
+                                        ),
+                                    } if real_geometry else {}),
                                 },
                             },
                             hero_actual_hand=hero_actual_hand,
@@ -805,6 +853,8 @@ class LiveResolveSource(StrategySource):
                             ) from unsafe
                         self.last_offtree_add["dropped"] = True
                         self.last_offtree_add["drop_reason"] = str(unsafe)
+                        if real_geometry:
+                            raise LiveResolveUnsupported(str(unsafe)) from unsafe
                         # Fail safe exactly once: rebuild/solve the unextended
                         # base tree through the shipped replay path.
                         all_by_player = engine.solve(

@@ -241,8 +241,33 @@ def replay_offtree_street_node(
     subsequent_bet_sizes: Sequence[float],
     add_explicit_allin: bool,
     event_fractions: Mapping[int, float],
+    expected_event_amounts: Optional[Mapping[int, int]] = None,
 ) -> ReplayWalk:
-    """Walk a street by base-index/observed-amount matching."""
+    """Walk a street by base-index/observed-amount matching.
+
+    ``expected_event_amounts`` is the strict real-geometry contract.  When
+    supplied, every generated event child must add exactly the observed chip
+    increment; this catches scalar-effective-stack clamps in the native tree.
+    Legacy off-tree callers omit it and retain the shipped replay behavior.
+    """
+
+    expected_amounts = (
+        None
+        if expected_event_amounts is None
+        else {
+            int(step): int(amount)
+            for step, amount in expected_event_amounts.items()
+        }
+    )
+    if (
+        expected_amounts is not None
+        and set(expected_amounts) != {
+            int(step) for step in event_fractions
+        }
+    ):
+        raise ReplayUnsupported(
+            "expected event amount steps do not match event fraction steps"
+        )
 
     # Recorded agent raise indices follow the state's list order, while the
     # amount mirror below sorts sizes.  Require the ordering invariant rather
@@ -315,6 +340,15 @@ def replay_offtree_street_node(
                         f"node {node_index}"
                     )
                 target_amount = owned[0].amount
+                if (
+                    expected_amounts is not None
+                    and target_amount != expected_amounts[int(step)]
+                ):
+                    raise ReplayUnsupported(
+                        f"street replay step {step}: generated raise amount "
+                        f"{target_amount} does not match observed increment "
+                        f"{expected_amounts[int(step)]}"
+                    )
                 child_index = _unique_raise_child(
                     tree, node_index, n_players, target_amount,
                     context=f"street replay step {step} added action",
