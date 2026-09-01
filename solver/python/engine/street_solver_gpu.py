@@ -25,7 +25,7 @@ import ctypes
 import os
 import platform
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -73,6 +73,16 @@ def _get_lib(lib_filename: Optional[str] = None):
     # symbol only when subsequent_bet_sizes is actually passed.
     if hasattr(lib, "ss_build_tree2"):
         lib.ss_build_tree2.restype = ctypes.c_int
+    if hasattr(lib, "ss_build_tree_stacks"):
+        lib.ss_build_tree_stacks.restype = ctypes.c_int
+        lib.ss_build_tree_stacks.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
     lib.ss_solve_gpu.restype = ctypes.c_int
     lib.ss_free_tree.restype = None
     lib.ss_free_output.restype = None
@@ -168,7 +178,7 @@ class SSOutput(ctypes.Structure):
 
 # ── Action label helpers ─────────────────────────────────────────────────
 
-def _build_labels_at_node(tree_data, node_idx):
+def _build_labels_at_node(tree_data, node_idx, root_stacks_chips=None):
     """Build action labels for a decision node."""
     node = tree_data.nodes[node_idx]
     labels = []
@@ -179,19 +189,54 @@ def _build_labels_at_node(tree_data, node_idx):
     # is the per-player starting stack (poker-solver/src/cuda/street_solve.cu's
     # build_street_tree_n keeps `stack` constant down the tree), so chips
     # left to bet = effective_stack - already-committed.
-    eff_stack = tree_data.effective_stack
+    eff_stack = (tree_data.effective_stack
+                 if root_stacks_chips is None
+                 else root_stacks_chips[acting])
     acting_remaining = eff_stack - acting_bet if acting >= 0 else eff_stack
 
     # Max bet among all players
     mx = 0
     for p in range(SS_MAX_PLAYERS):
-        if node.bets[p] > mx:
+        if (root_stacks_chips is None or node.active_players[p]) \
+                and node.bets[p] > mx:
             mx = node.bets[p]
     to_call = mx - acting_bet if acting >= 0 else 0
 
     for i in range(node.num_children):
         child_idx = tree_data.children[node.first_child + i]
         child = tree_data.nodes[child_idx]
+
+        # The builder's non-raise slots are structural: facing a bet they are
+        # [fold, call], otherwise slot 0 is check.  Use those slots only for the
+        # additive path so a short all-in call that leads to another player's
+        # decision remains "Call", never the trailing all-in raise action.
+        if root_stacks_chips is not None:
+            if to_call > 0 and i == 0:
+                labels.append("Fold")
+                continue
+            if to_call > 0 and i == 1:
+                labels.append("Call")
+                continue
+            if to_call == 0 and i == 0:
+                labels.append("Check")
+                continue
+
+            child_bet = child.bets[acting] if acting >= 0 else 0
+            bet_amount = child_bet - acting_bet
+            if bet_amount >= acting_remaining and acting_remaining > 0:
+                labels.append("All-in")
+            elif pot > 0:
+                if to_call > 0:
+                    denom = pot + to_call
+                    pct = int(round(
+                        100 * (bet_amount - to_call) / max(denom, 1)))
+                    labels.append(f"Raise {pct}%")
+                else:
+                    pct = int(round(100 * bet_amount / pot))
+                    labels.append(f"Bet {pct}%")
+            else:
+                labels.append("Bet" if to_call == 0 else "Raise")
+            continue
 
         if child.type == 1:  # FOLD
             labels.append("Fold")
@@ -249,7 +294,10 @@ class StreetSolverGPU:
                  # Phase 5.1 (nexusgto-api): pick a non-default street_solve
                  # variant (e.g. "street_solve_joint.so" compiled with
                  # -DSS_CONT_STRAT_MODE=0). None → platform default.
-                 lib_filename: Optional[str] = None):
+                 lib_filename: Optional[str] = None,
+                 # Additive native-river ABI: compact-player remaining stacks
+                 # at the subgame root. None preserves the scalar path exactly.
+                 root_stacks_bb: Optional[Sequence[float]] = None):
         """
         Args:
             board: list of card strings or ints
@@ -273,6 +321,9 @@ class StreetSolverGPU:
                 False omits it for blueprints whose training action set excluded
                 all-in (off-tree branches get uniform-on-zero σ̄ substitution
                 and CFR can pick the artifact). v3 sets this to False.
+            root_stacks_bb: optional per-player remaining stacks at a river
+                subgame root. Zero means already all-in but still contesting.
+                Unequal flop/turn leaf-oracle settlement is not yet supported.
         """
         self.lib = _get_lib(lib_filename)
 
@@ -344,7 +395,48 @@ class StreetSolverGPU:
             acting_order = list(range(self.num_players))
         self.acting_order = acting_order
 
-        pot = int(pot_bb * SCALE)
+        self.root_stacks_chips = None
+        if root_stacks_bb is not None:
+            if not self.is_river:
+                raise ValueError(
+                    "root_stacks_bb currently supports native river solves only"
+                )
+            if self.num_players < 2 or self.num_players > 3:
+                raise ValueError(
+                    "root_stacks_bb requires 2-3 compact players"
+                )
+            if len(root_stacks_bb) != self.num_players:
+                raise ValueError(
+                    f"root_stacks_bb has {len(root_stacks_bb)} entries; "
+                    f"expected {self.num_players}"
+                )
+            if len(acting_order) != self.num_players \
+                    or sorted(acting_order) != list(range(self.num_players)):
+                raise ValueError(
+                    "acting_order must be a permutation of compact players"
+                )
+            root_stack_values = tuple(float(x) for x in root_stacks_bb)
+            if any(not np.isfinite(x) or x < 0.0
+                   for x in root_stack_values):
+                raise ValueError(
+                    "root_stacks_bb entries must be finite and non-negative"
+                )
+            root_stack_chips = tuple(
+                int(round(x * SCALE)) for x in root_stack_values
+            )
+            if any(x > np.iinfo(np.int32).max for x in root_stack_chips):
+                raise ValueError("root_stacks_bb entries exceed native int32 chips")
+            self.root_stacks_chips = root_stack_chips
+
+        if self.root_stacks_chips is None:
+            pot = int(pot_bb * SCALE)
+        else:
+            pot_value = float(pot_bb)
+            if not np.isfinite(pot_value) or pot_value < 0.0:
+                raise ValueError("pot_bb must be finite and non-negative")
+            pot = int(round(pot_value * SCALE))
+            if pot > np.iinfo(np.int32).max:
+                raise ValueError("pot_bb exceeds native int32 chips")
         stack = int(stack_bb * SCALE)
 
         # Build tree
@@ -355,12 +447,38 @@ class StreetSolverGPU:
         self._tree = SSTreeData()
         use_cs = 1 if (use_cont_strats and not self.is_river) else 0
 
+        if self.root_stacks_chips is not None:
+            if not hasattr(self.lib, "ss_build_tree_stacks"):
+                raise RuntimeError(
+                    "ss_build_tree_stacks is missing; rebuild street_solve"
+                )
+            stack_arr = (ctypes.c_int * self.num_players)(
+                *self.root_stacks_chips)
+            if subsequent_bet_sizes is not None:
+                sub_arr = (ctypes.c_float * len(subsequent_bet_sizes))(
+                    *subsequent_bet_sizes)
+                sub_ptr = sub_arr
+                sub_count = len(subsequent_bet_sizes)
+            else:
+                sub_arr = None
+                sub_ptr = None
+                sub_count = 0
+            err = self.lib.ss_build_tree_stacks(
+                board_arr, self.num_board,
+                pot, stack_arr,
+                bet_arr, len(bet_sizes),
+                sub_ptr, sub_count,
+                self.num_players, order_arr,
+                1, 0,
+                1 if add_explicit_allin else 0,
+                ctypes.byref(self._tree))
         # Phase R Block B.3 (Step 6): if caller provided
         # subsequent_bet_sizes, route through ss_build_tree2 (per-level
         # bet_sizes API). Otherwise fall through to the legacy
         # ss_build_tree shim, which forwards subsequent=NULL/0 → kernel
-        # replicates first.
-        if subsequent_bet_sizes is not None:
+        # replicates first. This branch is intentionally unchanged for scalar
+        # callers.
+        elif subsequent_bet_sizes is not None:
             sub_arr = (ctypes.c_float * len(subsequent_bet_sizes))(*subsequent_bet_sizes)
             err = self.lib.ss_build_tree2(
                 board_arr, self.num_board,
@@ -383,7 +501,9 @@ class StreetSolverGPU:
                 1 if add_explicit_allin else 0,
                 ctypes.byref(self._tree))
         if err != 0:
-            raise RuntimeError("ss_build_tree failed")
+            symbol = ("ss_build_tree_stacks" if self.root_stacks_chips is not None
+                      else "ss_build_tree")
+            raise RuntimeError(f"{symbol} failed")
 
         # Populate hands and weights
         for p in range(self.num_players):
@@ -448,7 +568,8 @@ class StreetSolverGPU:
                 break
 
             # Find matching child action
-            labels = _build_labels_at_node(self._tree, current)
+            labels = _build_labels_at_node(
+                self._tree, current, self.root_stacks_chips)
             matched = -1
             for i, lbl in enumerate(labels):
                 if lbl.lower() == action_label.lower():
@@ -469,6 +590,11 @@ class StreetSolverGPU:
         self._tree.frozen_action = ctypes.cast(frozen, ctypes.POINTER(ctypes.c_int))
 
     def solve(self, iterations=200):
+        if self.root_stacks_chips is not None:
+            raise RuntimeError(
+                "root_stacks_bb trees are CPU-ES-only; GPU terminal kernels "
+                "do not receive root-pot eligibility"
+            )
         err = self.lib.ss_solve_gpu(
             ctypes.byref(self._tree), iterations, ctypes.byref(self._output))
         if err != 0:
@@ -520,7 +646,8 @@ class StreetSolverGPU:
             if self._output.root_player == player_idx:
                 root_nh = len(self.player_hands[player_idx])
                 root_na = self._output.root_num_actions
-                labels = _build_labels_at_node(self._tree, 0)
+                labels = _build_labels_at_node(
+                    self._tree, 0, self.root_stacks_chips)
                 result = {}
                 for a in range(min(root_na, len(labels))):
                     freq = self._output.root_strategy[a * root_nh + hand_idx]
@@ -544,7 +671,8 @@ class StreetSolverGPU:
 
             # Follow the next frozen action at this node (any player's node)
             frozen_label = frozen_actions[frozen_idx]
-            labels = _build_labels_at_node(self._tree, current_node)
+            labels = _build_labels_at_node(
+                self._tree, current_node, self.root_stacks_chips)
 
             matched = False
             for c in range(node.num_children):
@@ -586,7 +714,8 @@ class StreetSolverGPU:
             if node.player != player_idx or node.type != 0:
                 continue
             na = node.num_children
-            labels = _build_labels_at_node(self._tree, nidx)
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
             result = {}
             for a in range(min(na, len(labels))):
                 freq = self._output.final_strategies[
@@ -605,7 +734,8 @@ class StreetSolverGPU:
             if node.player != player_idx or node.type != 0:
                 continue
             na = node.num_children
-            labels = _build_labels_at_node(self._tree, nidx)
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
             result = {}
             for a in range(min(na, len(labels))):
                 freq = self._output.final_strategies[
@@ -654,7 +784,8 @@ class StreetSolverGPU:
             if node.type != 0 or node.player != player_idx:
                 continue
             na = node.num_children
-            labels = _build_labels_at_node(self._tree, nidx)
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
             result = {}
             for h in range(len(self.player_hands[player_idx])):
                 strat = {}
@@ -683,7 +814,8 @@ class StreetSolverGPU:
             if node.type != 0 or node.player != player_idx:
                 continue
             na = node.num_children
-            labels = _build_labels_at_node(self._tree, nidx)
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
             result = {}
             for h in range(len(hands)):
                 c0, c1, w = hands[h]

@@ -150,6 +150,27 @@ $(BUILD_DIR)/test_es_sampled_oracle: tests/test_es_sampled_oracle.c \
 test_es_sampled_oracle: $(BUILD_DIR)/test_es_sampled_oracle
 	./$(BUILD_DIR)/test_es_sampled_oracle
 
+# Additive unequal-stack live-resolve ABI.  CPU-only and deterministic: checks
+# scalar/equal-vector tree identity, a short all-in call, a zero-stack root
+# contestant, and 2-3p root-pot eligibility layers.  No CUDA or blueprint
+# artifact is required.
+$(BUILD_DIR)/test_unequal_stack_abi: tests/test_unequal_stack_abi.c \
+        $(SEARCH_DIR)/ss_tree_api.c $(SEARCH_DIR)/ss_tree_builder.c \
+        $(SEARCH_DIR)/ss_tree_builder.h \
+        $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+        $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h \
+        $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h \
+        $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_unequal_stack_abi.c \
+	    $(SEARCH_DIR)/ss_tree_api.c $(SEARCH_DIR)/ss_tree_builder.c \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+	    $(CORE_DIR)/hand_eval_table.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_unequal_stack_abi
+test_unequal_stack_abi: $(BUILD_DIR)/test_unequal_stack_abi
+	./$(BUILD_DIR)/test_unequal_stack_abi
+
 # Stratified B4 fill contracts. rollout_compute_leaf_values_all_hands_c and
 # the error surface are supplied by in-test stubs, so ONLY rollout_sampled.c
 # may be linked (linking rollout.c would duplicate the stubbed symbols).

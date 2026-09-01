@@ -40,9 +40,10 @@ SS_EXPORT int ss_build_tree(
                           add_explicit_allin, tree_out);
 }
 
-SS_EXPORT int ss_build_tree2(
+static int ss_build_tree_impl(
     const int *board, int num_board,
     int starting_pot, int effective_stack,
+    const int *root_stacks, int unequal_stack_mode,
     const float *bet_sizes_first, int num_bet_sizes_first,
     const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
     int num_players, const int *acting_order,
@@ -72,7 +73,8 @@ SS_EXPORT int ss_build_tree2(
      * multi-street trees with a clear error. */
     {
         const char *d = getenv("POKER_SEARCH_DEPTH");
-        tb.depth_rule_enabled = (d && strcmp(d, "full") == 0) ? 1 : 0;
+        tb.depth_rule_enabled = (d && strcmp(d, "full") == 0)
+                                ? STB_MODE_DEPTH_RULE : 0;
         tb.root_street = num_board;
         tb.orig_num_players = num_players;
         /* PLURIBUS-FAITHFUL flop depth limit (2026-06-15). Default 1: a FLOP
@@ -96,6 +98,8 @@ SS_EXPORT int ss_build_tree2(
         tb.turn_depth_limit = (tdl && (tdl[0] == '0' || tdl[0] == 'n' || tdl[0] == 'N'))
                               ? 0 : 1;
     }
+    if (unequal_stack_mode)
+        tb.depth_rule_enabled |= STB_MODE_UNEQUAL_STACK;
 
     /* Initialize betting state */
     int bets[SS_MAX_PLAYERS] = {0};
@@ -103,11 +107,12 @@ SS_EXPORT int ss_build_tree2(
     int active[SS_MAX_PLAYERS] = {0};
     for (int i = 0; i < num_players; i++) active[i] = 1;
 
-    /* Per-player street-entry stacks (chip-convention §2 fix). The API takes a
-     * single effective_stack, so every seat enters with it; the builder derives
-     * each actor's remaining as stacks[p] - bets[p]. Public ABI unchanged. */
+    /* Per-player street-entry stacks (chip-convention §2 fix). Legacy callers
+     * still populate every seat from effective_stack. The additive vector ABI
+     * copies root_stacks and separates contesting from can-act state. */
     int stacks[SS_MAX_PLAYERS] = {0};
-    for (int i = 0; i < num_players; i++) stacks[i] = effective_stack;
+    for (int i = 0; i < num_players; i++)
+        stacks[i] = unequal_stack_mode ? root_stacks[i] : effective_stack;
 
     build_street_tree_n(&tb, is_river, num_players,
                         acting_order, num_players,
@@ -331,6 +336,79 @@ SS_EXPORT int ss_build_tree2(
                num_players, tree_out->max_depth);
 
     return 0;
+}
+
+SS_EXPORT int ss_build_tree2(
+    const int *board, int num_board,
+    int starting_pot, int effective_stack,
+    const float *bet_sizes_first, int num_bet_sizes_first,
+    const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
+    int num_players, const int *acting_order,
+    int is_river, int use_cont_strats,
+    int add_explicit_allin,
+    SSTreeData *tree_out
+) {
+    return ss_build_tree_impl(
+        board, num_board, starting_pot, effective_stack,
+        NULL, 0,
+        bet_sizes_first, num_bet_sizes_first,
+        bet_sizes_subsequent, num_bet_sizes_subsequent,
+        num_players, acting_order,
+        is_river, use_cont_strats, add_explicit_allin, tree_out);
+}
+
+SS_EXPORT int ss_build_tree_stacks(
+    const int *board, int num_board,
+    int starting_pot, const int *root_stacks,
+    const float *bet_sizes_first, int num_bet_sizes_first,
+    const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
+    int num_players, const int *acting_order,
+    int is_river, int use_cont_strats,
+    int add_explicit_allin,
+    SSTreeData *tree_out
+) {
+    if (!tree_out) return -1;
+    memset(tree_out, 0, sizeof(*tree_out));
+
+    /* This first coherent slice is deliberately river-only.  Non-river trees
+     * terminate in leaf/chance paths whose rollout ABI still has scalar root
+     * geometry and cannot settle pre-existing side pots correctly. */
+    if (!board || num_board != 5 || !is_river || use_cont_strats
+        || starting_pot < 0 || !root_stacks || !acting_order
+        || num_players < 2 || num_players > 3
+        || num_bet_sizes_first < 0 || num_bet_sizes_subsequent < 0
+        || (num_bet_sizes_first > 0 && !bet_sizes_first)
+        || (num_bet_sizes_subsequent > 0 && !bet_sizes_subsequent))
+        return -1;
+    int max_size_count = SS_MAX_ACTIONS - 2
+                         - (add_explicit_allin ? 1 : 0);
+    if (num_bet_sizes_first > max_size_count
+        || num_bet_sizes_subsequent > max_size_count)
+        return -1;
+
+    unsigned seen = 0;
+    int all_equal = 1;
+    for (int i = 0; i < num_players; i++) {
+        int p = acting_order[i];
+        if (root_stacks[i] < 0 || p < 0 || p >= num_players
+            || (seen & (1u << p)))
+            return -1;
+        seen |= 1u << p;
+        if (root_stacks[i] != root_stacks[0]) all_equal = 0;
+    }
+
+    /* Positive equal vectors route through the literal legacy builder.  This
+     * makes both tree bytes and solve hot loops identical for the equal-stack
+     * case; zero-vector roots still need the can-act-aware termination rule. */
+    int unequal_stack_mode = !all_equal || root_stacks[0] == 0;
+    int effective_stack = all_equal ? root_stacks[0] : -1;
+    return ss_build_tree_impl(
+        board, num_board, starting_pot, effective_stack,
+        root_stacks, unequal_stack_mode,
+        bet_sizes_first, num_bet_sizes_first,
+        bet_sizes_subsequent, num_bet_sizes_subsequent,
+        num_players, acting_order,
+        is_river, use_cont_strats, add_explicit_allin, tree_out);
 }
 
 SS_EXPORT void ss_free_tree(SSTreeData *td) {

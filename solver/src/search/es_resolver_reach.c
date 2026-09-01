@@ -622,6 +622,10 @@ void es_reach_profile_read(double *t1, double *t2, double *t3, double *t4) {
  * <= 0 -> all cores. 2p-first: rejects np>2 (5-6p MUST sample; 3p reach is a later
  * extension needing odometer terminal integration). */
 int es_run_reach(ESResolver *r, int64_t iterations, int num_threads) {
+    if (r->root_pot_count > 0) {
+        es_set_error("reach mode does not support root-pot geometry");
+        return -1;
+    }
     uint64_t deadline_start_ms = (r->deadline_ms > 0)
                                  ? es_monotonic_ms() : 0;
     if (r->np != 2) {
@@ -715,6 +719,10 @@ static int es_fill_strat_from_avg(ESResolver *r) {
 double es_exploitability_2p(ESResolver *r, double *out_gap0, double *out_gap1) {
     if (!r) { es_set_error("resolver NULL"); return NAN; }
     if (r->np != 2) { es_set_error("exploitability_2p: np!=2"); return NAN; }
+    if (r->root_pot_count > 0) {
+        es_set_error("exploitability_2p does not support root-pot geometry");
+        return NAN;
+    }
     if (!r->rc_reach && es_reach_alloc(r) != 0) return NAN;
     const SSTreeData *t = r->tree;
     int max_h = r->reach_max_h;

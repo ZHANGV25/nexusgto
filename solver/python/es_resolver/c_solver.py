@@ -25,6 +25,7 @@ joint/table oracles ARE bit-exact, so the deterministic primitives match.
 from __future__ import annotations
 
 import ctypes
+import operator
 import os
 import sys
 from typing import Optional
@@ -68,6 +69,7 @@ def _load_dll() -> ctypes.CDLL:
 _lib = _load_dll()
 _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 _HAS_SAMPLED = hasattr(_lib, "es_make_sampled_oracle")
+_HAS_ROOT_POTS = hasattr(_lib, "es_create_with_root_pots")
 _BIAS_SYMBOLS = (
     "es_make_bias_oracle", "es_bias_oracle_fn", "es_free_bias_oracle",
     "es_bias_oracle_stats", "es_bias_oracle_get_effective_table",
@@ -76,6 +78,13 @@ _HAS_BIAS = all(hasattr(_lib, name) for name in _BIAS_SYMBOLS)
 # void* es_create(const SSTreeData*, ESLeafOracle, void* ctx, uint64_t seed)
 _lib.es_create.restype = ctypes.c_void_p
 _lib.es_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
+if _HAS_ROOT_POTS:
+    _lib.es_create_with_root_pots.restype = ctypes.c_void_p
+    _lib.es_create_with_root_pots.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_int,
+    ]
 _lib.es_free.argtypes = [ctypes.c_void_p]
 if hasattr(_lib, "es_set_cfr_mode"):
     _lib.es_set_cfr_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -287,7 +296,8 @@ class CSolver:
     """
 
     def __init__(self, tree, oracle_fn_ptr, oracle_ctx, seed: int = 0,
-                 _keepalive=None, _sampled_oracle: bool = False):
+                 _keepalive=None, _sampled_oracle: bool = False,
+                 _root_pot_amounts=None, _root_pot_eligible_masks=None):
         self._tree = tree
         self._oracle_ctx = oracle_ctx
         self._real_oracle_ctx = None  # set by from_real_oracle (different free)
@@ -299,11 +309,32 @@ class CSolver:
         # free only releases the outer allocation).
         self._sampled_oracle_ctx = oracle_ctx if _sampled_oracle else None
         self._keepalive = _keepalive  # numpy buffers the oracle borrows
-        self._handle = _lib.es_create(
-            ctypes.byref(tree), oracle_fn_ptr, oracle_ctx, ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF))
+        if _root_pot_amounts is None:
+            self._handle = _lib.es_create(
+                ctypes.byref(tree), oracle_fn_ptr, oracle_ctx,
+                ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF))
+            create_name = "es_create"
+        else:
+            if not _HAS_ROOT_POTS:
+                raise RuntimeError(
+                    "es_create_with_root_pots is missing; rebuild es_resolver"
+                )
+            self._handle = _lib.es_create_with_root_pots(
+                ctypes.byref(tree), oracle_fn_ptr, oracle_ctx,
+                ctypes.c_uint64(seed & 0xFFFFFFFFFFFFFFFF),
+                _root_pot_amounts.ctypes.data_as(
+                    ctypes.POINTER(ctypes.c_int)),
+                _root_pot_eligible_masks.ctypes.data_as(
+                    ctypes.POINTER(ctypes.c_uint32)),
+                int(_root_pot_amounts.size))
+            create_name = "es_create_with_root_pots"
         if not self._handle:
             err = _lib.es_get_last_error()
-            raise RuntimeError(f"es_create failed: {err.decode() if err else '?'}")
+            if _root_pot_amounts is not None and self._oracle_ctx:
+                _lib.es_free_oracle_ctx(self._oracle_ctx)
+                self._oracle_ctx = None
+            raise RuntimeError(
+                f"{create_name} failed: {err.decode() if err else '?'}")
         self.num_players = tree.num_players_field
         self._np = self.num_players
         # decision-node indices from the tree (for the info-view shim)
@@ -323,6 +354,60 @@ class CSolver:
             t.ctypes.data_as(ctypes.c_void_p), np_players, max_h)
         fn = _lib.es_table_oracle_fn()
         return cls(tree, fn, ctx, seed=seed, _keepalive=t)
+
+    @classmethod
+    def from_table_with_root_pots(
+        cls, tree, table: np.ndarray, np_players: int, max_h: int,
+        root_pot_amounts, root_pot_eligible_masks, seed: int = 0,
+    ) -> "CSolver":
+        """Native-river table solver with explicit root-pot eligibility.
+
+        Root masks use compact-player bits, not blueprint seat ids.  The C
+        constructor copies both arrays and validates that amounts sum exactly
+        to ``tree.starting_pot``.
+        """
+        if not _HAS_ROOT_POTS:
+            raise RuntimeError(
+                "es_create_with_root_pots is missing; rebuild es_resolver"
+            )
+        if np_players < 2 or np_players > 3:
+            raise ValueError("root-pot geometry requires 2-3 players")
+        if np_players != int(tree.num_players_field):
+            raise ValueError(
+                f"np_players={np_players} does not match tree players="
+                f"{tree.num_players_field}"
+            )
+        if not bool(tree.is_river) or int(tree.num_leaf_nodes) != 0 \
+                or int(tree.num_chance_nodes) != 0:
+            raise ValueError("root-pot geometry currently requires a native river tree")
+
+        try:
+            amounts_py = tuple(operator.index(x) for x in root_pot_amounts)
+            masks_py = tuple(
+                operator.index(x) for x in root_pot_eligible_masks)
+        except TypeError as exc:
+            raise ValueError("root-pot amounts and masks must be integers") from exc
+        if not amounts_py or len(amounts_py) != len(masks_py) \
+                or len(amounts_py) > 3:
+            raise ValueError("root-pot arrays must have the same length in [1, 3]")
+        if any(x < 0 or x > np.iinfo(np.int32).max for x in amounts_py):
+            raise ValueError("root-pot amounts must fit non-negative int32")
+        if any(x <= 0 or x > np.iinfo(np.uint32).max for x in masks_py):
+            raise ValueError("root-pot masks must fit nonzero uint32")
+
+        amounts = np.ascontiguousarray(amounts_py, dtype=np.int32)
+        masks = np.ascontiguousarray(masks_py, dtype=np.uint32)
+        t = np.ascontiguousarray(table, dtype=np.float32)
+        ctx = _lib.es_make_table_oracle(
+            t.ctypes.data_as(ctypes.c_void_p), np_players, max_h)
+        if not ctx:
+            raise RuntimeError("es_make_table_oracle returned NULL")
+        fn = _lib.es_table_oracle_fn()
+        return cls(
+            tree, fn, ctx, seed=seed, _keepalive=t,
+            _root_pot_amounts=amounts,
+            _root_pot_eligible_masks=masks,
+        )
 
     @classmethod
     def from_bias_table(cls, tree, values: np.ndarray, mode: int, np_: int,

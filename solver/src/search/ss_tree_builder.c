@@ -37,6 +37,14 @@ void stb_init(SSTreeBuilder *tb) {
     tb->chance_card_per_child_cap = 0;
 }
 
+static int stb_depth_rule_enabled(const SSTreeBuilder *tb) {
+    return (tb->depth_rule_enabled & STB_MODE_DEPTH_RULE) != 0;
+}
+
+static int stb_unequal_stack_mode(const SSTreeBuilder *tb) {
+    return (tb->depth_rule_enabled & STB_MODE_UNEQUAL_STACK) != 0;
+}
+
 static int stb_alloc_chance_cards(SSTreeBuilder *tb, int count) {
     if (tb->chance_card_per_child_len + count > tb->chance_card_per_child_cap) {
         int new_cap = tb->chance_card_per_child_cap == 0
@@ -107,6 +115,35 @@ static int next_active_player(const int *acting_order, int num_in_order,
     return -1; /* shouldn't happen if >1 active */
 }
 
+/* Unequal-stack action rotation.  `active` means still contesting the pot;
+ * stack exhaustion is a separate state and removes a player only from future
+ * decisions, never from showdown eligibility. */
+static int player_can_act(int player, const int *stacks, const int *bets,
+                          const int *active) {
+    return active[player] && stacks[player] > bets[player];
+}
+
+static int count_can_act(const int *stacks, const int *bets,
+                         const int *active, int num_players) {
+    int count = 0;
+    for (int p = 0; p < num_players; p++)
+        if (player_can_act(p, stacks, bets, active)) count++;
+    return count;
+}
+
+static int next_action_player(const int *acting_order, int num_in_order,
+                              const int *stacks, const int *bets,
+                              const int *active, int num_players,
+                              int current_order_idx) {
+    for (int i = 1; i <= num_in_order; i++) {
+        int idx = (current_order_idx + i) % num_in_order;
+        int p = acting_order[idx];
+        if (p < num_players && player_can_act(p, stacks, bets, active))
+            return idx;
+    }
+    return -1;
+}
+
 /* Find the max bet among active players */
 static int max_bet(const int *bets, const int *active, int n) {
     int mx = 0;
@@ -137,7 +174,7 @@ static int max_bet(const int *bets, const int *active, int n) {
 static int should_extend_via_chance(const SSTreeBuilder *tb,
                                     int current_num_board,
                                     int is_river) {
-    if (!tb->depth_rule_enabled) return 0;
+    if (!stb_depth_rule_enabled(tb)) return 0;
     if (is_river || current_num_board >= 5) return 0;
     if (current_num_board == tb->root_street) {
         /* FLOP root: Pluribus-faithful = terminate at a cont-strat LEAF at the
@@ -167,6 +204,29 @@ static int round_complete(const int *bets, const int *active, const int *has_act
         if (!active[i]) continue;
         if (!has_acted[i]) return 0;
         if (bets[i] != mx) return 0;
+    }
+    return 1;
+}
+
+/* Unequal-stack completion ignores all-in contestants.  With one player still
+ * able to act, the round closes automatically once that player is not facing a
+ * bet: poker does not offer a bet into opponents who cannot respond. */
+static int round_complete_stacks(const int *stacks, const int *bets,
+                                 const int *active, const int *has_acted,
+                                 int num_players) {
+    int mx = max_bet(bets, active, num_players);
+    int n_can_act = 0;
+    int sole = -1;
+    for (int p = 0; p < num_players; p++) {
+        if (!player_can_act(p, stacks, bets, active)) continue;
+        n_can_act++;
+        sole = p;
+    }
+    if (n_can_act == 0) return 1;
+    if (n_can_act == 1) return bets[sole] >= mx;
+    for (int p = 0; p < num_players; p++) {
+        if (!player_can_act(p, stacks, bets, active)) continue;
+        if (!has_acted[p] || bets[p] != mx) return 0;
     }
     return 1;
 }
@@ -217,7 +277,12 @@ int build_street_tree_n(
     }
 
     /* Check if round is complete */
-    if (round_complete(bets, active, has_acted, num_players)) {
+    int is_complete = stb_unequal_stack_mode(tb)
+                      ? round_complete_stacks(
+                            stacks, bets, active, has_acted, num_players)
+                      : round_complete(
+                            bets, active, has_acted, num_players);
+    if (is_complete) {
         if (should_extend_via_chance(tb, num_board, is_river)) {
             return build_chance_node(tb, num_players,
                                      acting_order, num_in_order,
@@ -243,9 +308,16 @@ int build_street_tree_n(
 
     int acting_player = acting_order[current_order_idx];
 
-    if (!active[acting_player]) {
-        int next_idx = next_active_player(acting_order, num_in_order,
-                                           active, num_players, current_order_idx);
+    if (!active[acting_player]
+        || (stb_unequal_stack_mode(tb)
+            && !player_can_act(acting_player, stacks, bets, active))) {
+        int next_idx = stb_unequal_stack_mode(tb)
+                       ? next_action_player(
+                             acting_order, num_in_order, stacks, bets, active,
+                             num_players, current_order_idx)
+                       : next_active_player(
+                             acting_order, num_in_order, active, num_players,
+                             current_order_idx);
         if (next_idx < 0) {
             int idx = stb_alloc_node(tb);
             tb->nodes[idx].type = SS_NODE_SHOWDOWN;
@@ -288,8 +360,13 @@ int build_street_tree_n(
     int temp_children[16];
     int nc = 0;
 
-    int next_order = next_active_player(acting_order, num_in_order,
-                                         active, num_players, current_order_idx);
+    int next_order = stb_unequal_stack_mode(tb)
+                     ? next_action_player(
+                           acting_order, num_in_order, stacks, bets, active,
+                           num_players, current_order_idx)
+                     : next_active_player(
+                           acting_order, num_in_order, active, num_players,
+                           current_order_idx);
     if (next_order < 0) next_order = current_order_idx;
 
     /* ── Fold (only if facing a bet) ────────────────── */
@@ -340,12 +417,15 @@ int build_street_tree_n(
     /* ── Bet / Raise ────────────────────────────────── */
     int raise_cap = SS_MAX_RAISES;
     if (num_players > 2 && !is_river && num_board < 5) {
-        int at_root_street = !tb->depth_rule_enabled
+        int at_root_street = !stb_depth_rule_enabled(tb)
                              || (num_board == tb->root_street);
         if (at_root_street) raise_cap = SS_MULTIWAY_MAX_RAISES;
     }
 
-    if (num_raises < raise_cap && nc < 14) {
+    int responders_available = !stb_unequal_stack_mode(tb)
+                               || count_can_act(
+                                      stacks, bets, active, num_players) > 1;
+    if (responders_available && num_raises < raise_cap && nc < 14) {
         int added_allin = 0;
         for (int i = 0; i < num_bet_sizes && nc < 14; i++) {
             int bet_amount;
@@ -467,7 +547,11 @@ int build_chance_node(
     int new_first_order_idx = 0;
     for (int i = 0; i < num_in_order; i++) {
         int p = acting_order[i];
-        if (p < num_players && active[p]) { new_first_order_idx = i; break; }
+        if (p < num_players && active[p]
+            && (!stb_unequal_stack_mode(tb) || next_stacks[p] > 0)) {
+            new_first_order_idx = i;
+            break;
+        }
     }
 
     int temp_children[64];

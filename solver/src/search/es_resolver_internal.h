@@ -144,6 +144,13 @@ struct ESResolver {
      * off (zero overhead). Used to localize the vec reachability bug — find the
      * first node on a path where vec's count diverges from scalar. */
     int64_t *visit_count;   /* [num_nodes] or NULL */
+
+    /* Cold additive sidecar at the end so the historical hot fields keep their
+     * layout/cache locality.  es_create's calloc leaves root_pot_count=0. */
+    int root_pot_count;
+    int root_pot_total;
+    int root_pot_amounts[ES_MAX_ROOT_POT_LAYERS];
+    uint32_t root_pot_eligible_masks[ES_MAX_ROOT_POT_LAYERS];
 };
 
 

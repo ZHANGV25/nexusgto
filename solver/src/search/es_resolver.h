@@ -97,6 +97,14 @@ ES_EXPORT ESLeafOracle es_sampled_oracle_fn(void);
  * tables and per-node offset metadata derived once from the tree. */
 typedef struct ESResolver ESResolver;
 
+/* Unequal-stack live resolves are capped at three contesting players.  A
+ * pre-existing root pot is represented as one or more independently awarded
+ * layers: amounts[i] chips may be won only by players whose bit is set in
+ * eligible_masks[i]. Valid poker geometry uses a nested main-to-side chain;
+ * after equal-eligibility layers are consolidated, three contesting players
+ * require at most three root layers. */
+#define ES_MAX_ROOT_POT_LAYERS 3
+
 /* Create a resolver bound to a tree + leaf oracle. The tree pointer must
  * outlive the resolver (read-only, not copied). `seed` seeds the master RNG.
  * Returns NULL on allocation failure or invalid tree (see es_get_last_error). */
@@ -105,6 +113,26 @@ ES_EXPORT ESResolver *es_create(
     ESLeafOracle leaf_oracle,
     void *oracle_ctx,
     uint64_t seed
+);
+
+/* Additive unequal-stack/root-side-pot constructor.  The tree ABI remains the
+ * legacy SSTreeData layout; root-pot metadata is copied into the opaque
+ * resolver sidecar.  The layer amounts must be non-negative, masks must be
+ * non-empty subsets of the tree's 2-3 compact players, masks must form a proper
+ * nested all-player-main to side-pot chain, and amounts must sum to
+ * tree->starting_pot. Every static terminal must retain an eligible winner for
+ * each layer. This coherent first slice accepts native river trees
+ * only (no LEAF/CHANCE nodes); reach mode and exploitability grading reject
+ * root-pot resolvers until their own side-pot CFV path is extended.  Existing
+ * es_create callers and semantics are unchanged. */
+ES_EXPORT ESResolver *es_create_with_root_pots(
+    const SSTreeData *tree,
+    ESLeafOracle leaf_oracle,
+    void *oracle_ctx,
+    uint64_t seed,
+    const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks,
+    int num_root_pots
 );
 
 ES_EXPORT void es_free(ESResolver *r);
@@ -279,6 +307,22 @@ ES_EXPORT double es_test_showdown_value(
 ES_EXPORT double es_test_showdown_value_vec(
     int np, const int *board5, const int *hand_c0, const int *hand_c1,
     const int *active, const int *bets, int pot, int traverser);
+
+/* TEST-ONLY root-pot-layer probes for the additive unequal-stack path.  Drive
+ * the production scalar/vector evaluators with pre-existing root eligibility
+ * layers; current-street contributions remain in bets[]. */
+ES_EXPORT double es_test_showdown_value_root_pots(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser,
+    const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks,
+    int num_root_pots);
+ES_EXPORT double es_test_showdown_value_root_pots_vec(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser,
+    const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks,
+    int num_root_pots);
 
 /* ── Deterministic validation oracles (es_oracles.c) ──────────────────────
  * Each make_* returns an opaque ctx to pass to es_create alongside the

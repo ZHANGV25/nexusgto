@@ -318,6 +318,29 @@ SS_EXPORT int ss_build_tree2(
 );
 
 /**
+ * Additive 2-3 player unequal-stack river-tree ABI.
+ *
+ * `root_stacks[p]` is player p's remaining stack at the subgame root.  Zero is
+ * valid: the player remains active/eligible for showdown but receives no
+ * decision node.  Positive equal vectors take the literal legacy tree-builder
+ * path.  Unequal-stack flop/turn leaf-oracle settlement is not yet supported,
+ * so this entry point currently rejects non-river/use_cont_strats requests.
+ * The resulting vector-geometry tree is for the CPU ES resolver together with
+ * es_create_with_root_pots; ss_solve_gpu has no root-pot-mask ABI.
+ * Existing ss_build_tree/ss_build_tree2 signatures and behavior are unchanged.
+ */
+SS_EXPORT int ss_build_tree_stacks(
+    const int *board, int num_board,
+    int starting_pot, const int *root_stacks,
+    const float *bet_sizes_first, int num_bet_sizes_first,
+    const float *bet_sizes_subsequent, int num_bet_sizes_subsequent,
+    int num_players, const int *acting_order,
+    int is_river, int use_cont_strats,
+    int add_explicit_allin,
+    SSTreeData *tree_out
+);
+
+/**
  * Solve the N-player single-street tree on GPU using Linear CFR.
  *
  * CFR cycles through all num_players traversers per iteration.

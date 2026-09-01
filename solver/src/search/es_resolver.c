@@ -30,6 +30,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -334,6 +335,129 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->opp_mode = -1;
     r->reach_mode = 0;     /* OFF until set (validated sampling path is default) */
     if (es_build_offsets(r) != 0) { es_free(r); return NULL; }
+    return r;
+}
+
+ESResolver *es_create_with_root_pots(
+    const SSTreeData *tree, ESLeafOracle leaf_oracle, void *oracle_ctx,
+    uint64_t seed, const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks, int num_root_pots)
+{
+    ESResolver *r = es_create(tree, leaf_oracle, oracle_ctx, seed);
+    if (!r) return NULL;
+
+    if (r->np < 2 || r->np > 3) {
+        es_set_error("root-pot geometry supports 2-3 players, got %d", r->np);
+        es_free(r);
+        return NULL;
+    }
+    if (!tree->is_river || tree->num_leaf_nodes > 0
+        || tree->num_chance_nodes > 0) {
+        es_set_error("root-pot geometry currently supports native river trees "
+                     "only (is_river=%d leaves=%d chance=%d)",
+                     tree->is_river, tree->num_leaf_nodes,
+                     tree->num_chance_nodes);
+        es_free(r);
+        return NULL;
+    }
+    if (!root_pot_amounts || !root_pot_eligible_masks
+        || num_root_pots < 1 || num_root_pots > ES_MAX_ROOT_POT_LAYERS) {
+        es_set_error("invalid root-pot arrays/count (%d)", num_root_pots);
+        es_free(r);
+        return NULL;
+    }
+
+    const uint32_t allowed = (1u << r->np) - 1u;
+    int64_t total = 0;
+    for (int i = 0; i < num_root_pots; i++) {
+        int amount = root_pot_amounts[i];
+        uint32_t mask = root_pot_eligible_masks[i];
+        if (amount < 0 || mask == 0 || (mask & ~allowed) != 0) {
+            es_set_error(
+                "invalid root-pot layer %d (amount=%d mask=0x%x allowed=0x%x)",
+                i, amount, (unsigned)mask, (unsigned)allowed);
+            es_free(r);
+            return NULL;
+        }
+        total += (int64_t)amount;
+        if (total > INT_MAX) {
+            es_set_error("root-pot layer sum exceeds INT_MAX");
+            es_free(r);
+            return NULL;
+        }
+        r->root_pot_amounts[i] = amount;
+        r->root_pot_eligible_masks[i] = mask;
+    }
+    if (root_pot_eligible_masks[0] != allowed) {
+        es_set_error("root-pot layer 0 must be the all-player main pot "
+                     "(mask=0x%x, expected=0x%x)",
+                     (unsigned)root_pot_eligible_masks[0],
+                     (unsigned)allowed);
+        es_free(r);
+        return NULL;
+    }
+    for (int i = 1; i < num_root_pots; i++) {
+        if (root_pot_eligible_masks[i] == root_pot_eligible_masks[i - 1]
+            || (root_pot_eligible_masks[i]
+                & ~root_pot_eligible_masks[i - 1]) != 0) {
+            es_set_error("root-pot masks must form a proper nested main-to-side "
+                         "chain (layer %d mask=0x%x previous=0x%x)",
+                         i, (unsigned)root_pot_eligible_masks[i],
+                         (unsigned)root_pot_eligible_masks[i - 1]);
+            es_free(r);
+            return NULL;
+        }
+    }
+    if (total != (int64_t)tree->starting_pot) {
+        es_set_error("root-pot layers sum to %lld, starting_pot=%d",
+                     (long long)total, tree->starting_pot);
+        es_free(r);
+        return NULL;
+    }
+
+    /* Validate the masks against every terminal in the static tree.  A valid
+     * poker side-pot chain always retains at least one eligible contestant per
+     * showdown layer; at a fold terminal the sole winner must be eligible for
+     * every layer.  Reject inconsistent metadata instead of silently dropping
+     * or mis-awarding chips during a 500k-iteration solve. */
+    for (int n = 0; n < tree->num_nodes; n++) {
+        const SSNode *nd = &tree->nodes[n];
+        if (nd->type == ES_T_LEAF || nd->type == ES_T_CHANCE) {
+            es_set_error("root-pot geometry found unsupported node type %d "
+                         "at node %d", nd->type, n);
+            es_free(r);
+            return NULL;
+        } else if (nd->type == ES_T_SHOWDOWN) {
+            uint32_t live = 0;
+            for (int p = 0; p < r->np; p++)
+                if (nd->active_players[p]) live |= 1u << p;
+            for (int i = 0; i < num_root_pots; i++) {
+                if ((live & root_pot_eligible_masks[i]) == 0) {
+                    es_set_error("root-pot layer %d has no eligible player at "
+                                 "showdown node %d", i, n);
+                    es_free(r);
+                    return NULL;
+                }
+            }
+        } else if (nd->type == ES_T_FOLD) {
+            int winner = nd->player;
+            if (winner < 0 || winner >= r->np) {
+                es_set_error("invalid fold winner %d at node %d", winner, n);
+                es_free(r);
+                return NULL;
+            }
+            for (int i = 0; i < num_root_pots; i++) {
+                if (!(root_pot_eligible_masks[i] & (1u << winner))) {
+                    es_set_error("fold winner %d is ineligible for root-pot "
+                                 "layer %d at node %d", winner, i, n);
+                    es_free(r);
+                    return NULL;
+                }
+            }
+        }
+    }
+    r->root_pot_count = num_root_pots;
+    r->root_pot_total = (int)total;
     return r;
 }
 
@@ -669,40 +793,28 @@ static inline double es_fold_value(const SSNode *nd, int traverser) {
 
 /* ── SHOWDOWN terminal (river): multiway side-pot layering ────────────────────
  *
- * REPRESENTABLE-SCOPE NOTE (2026-06-10, Lane 3). SSNode carries only
+ * LEGACY-SCALAR SCOPE NOTE (2026-06-10, Lane 3; qualified 2026-09-01).
+ * SSNode carries only
  * per-THIS-STREET bets (SSNode.bets[]) plus a lump `pot` that folds in all
  * prior-street money. Consequences:
  *
- *   1. EXACTLY representable: side pots layered by THIS-street contribution
- *      caps. The lump entry pot is common money every street-entry contestant
- *      has equal claim to — true because the builder zeroes bets[] at every
- *      street entry (subgame root: ss_tree_api.c:76; chance-node street
- *      transition: ss_tree_builder.c:432) with all entrants active and an
- *      equal shared `effective_stack`.
- *   2. NOT representable: side pots from PRIOR-street unequal all-ins (the
- *      per-player prior contributions are unrecoverable from the lump pot).
- *      Out of scope — the river LOOKUP fallback remains for those spots.
- *   3. The CURRENT builder cannot even emit a showdown with unequal ACTIVE
- *      street bets: round_complete (ss_tree_builder.c:146-155) requires
- *      bets[p] == max for every active player, there is no per-player stack
- *      state (`stack` is constant down the street, ss_tree_builder.c:345), a
- *      call always equalizes to max (ss_tree_builder.c:295), and a folder's
- *      street bet is strictly < the final max (you fold facing a bet; max
- *      never decreases). So on every REACHABLE node today the single-pot
- *      award is exact, and es_showdown_is_single_pot routes those nodes
- *      through the historical code BIT-EXACTLY (the regression gate). The
- *      layered path below makes this function correct for any in-scope SSNode
- *      (per-player stacks / unequal mid-street seeding / off-tree all-in
- *      translation — the playing-agent work that lands next).
- *   4. ACCOUNTING CAVEAT (pre-existing, reported not fixed): on a
- *      raise-over-bet the builder sets new_bets = mx + bet_amount where
- *      bet_amount already contains to_call (ss_tree_builder.c:340), while the
- *      trainer does bets[ap] += amount (mccfr_blueprint.c:1981) and BOTH add
- *      only bet_amount to the pot. The builder's bets[] therefore exceed its
- *      own pot increments by to_call per raise-over-bet, so pot − Σ bets is
- *      NOT exactly the entry pot. The layered award is constructed to
- *      distribute EXACTLY nd->pot regardless (slack lands in the base layer),
- *      preserving the system invariant Σ_p award_p == nd->pot.
+ *   1. EXACTLY representable by legacy es_create: a common lump entry pot plus
+ *      side pots layered only by THIS-street contribution caps. The legacy
+ *      model zeroes bets[] at each street entry and has no entry-pot
+ *      eligibility metadata.
+ *   2. NOT representable through legacy es_create: side pots from prior-street
+ *      unequal all-ins. The additive es_create_with_root_pots constructor now
+ *      supplies those eligibility layers in an opaque resolver sidecar.
+ *   3. The legacy scalar wrapper gives every player the same cap, its legacy
+ *      completion rule requires equal active bets, and its calls equalize to
+ *      the active maximum. On those reachable nodes es_showdown_is_single_pot
+ *      retains the historical award BIT-EXACTLY. The additive
+ *      ss_build_tree_stacks path can emit short all-in calls; its root-pot
+ *      constructor routes them through the stack-aware award below.
+ *   4. Defensive accounting: the layered award distributes EXACTLY nd->pot.
+ *      Any accounting slack (or folded contribution above the top active
+ *      level) lands in the base layer, preserving the system invariant
+ *      Σ_p award_p == nd->pot.
  *
  * CONVENTIONS (shared with the Python exact reference validate_sidepot.py):
  *   - Levels = distinct ACTIVE street-bet values, ascending.
@@ -795,6 +907,98 @@ static double es_layered_award(const SSNode *nd, int np,
     return award;
 }
 
+/* Award one independently eligible layer.  `eligible_mask` is rooted at the
+ * subgame's compact player indices; players who folded after the root are
+ * removed by intersecting with nd->active_players. */
+static double es_masked_layer_award(
+    const SSNode *nd, int np, const uint32_t *strength, int target,
+    double layer, uint32_t eligible_mask)
+{
+    uint32_t best = 0;
+    int nwin = 0;
+    int target_in = 0;
+    for (int p = 0; p < np; p++) {
+        if (!(eligible_mask & (1u << p)) || !nd->active_players[p]) continue;
+        uint32_t s = strength[p];
+        if (nwin == 0 || s > best) {
+            best = s;
+            nwin = 1;
+            target_in = (p == target);
+        } else if (s == best) {
+            nwin++;
+            if (p == target) target_in = 1;
+        }
+    }
+    return (nwin > 0 && target_in) ? layer / (double)nwin : 0.0;
+}
+
+/* GROSS award for the additive unequal-stack ABI.  Root-pot layers settle
+ * first using their explicit eligibility masks.  Contributions made after the
+ * subgame root (SSNode.bets[]) are then stripped into ordinary side-pot levels.
+ * The target's current-subgame contribution is subtracted by the caller.
+ *
+ * Contributions are capped at the highest ACTIVE level, exactly like the
+ * legacy layered evaluator.  Folded excess and any defensive accounting slack
+ * therefore become common dead money attached to root layer 0, whose
+ * constructor contract requires the all-player main-pot mask. */
+static double es_root_pot_award(const ESResolver *r, const SSNode *nd,
+                                const uint32_t *strength, int target) {
+    const int np = r->np;
+    /* Distinct positive ACTIVE contribution levels, ascending.  Folded chips
+     * are included in each layer's amount but never in its eligible mask. */
+    int levels[3];
+    int nlev = 0;
+    for (int p = 0; p < np; p++) {
+        if (!nd->active_players[p] || nd->bets[p] <= 0) continue;
+        int b = nd->bets[p];
+        int j = 0;
+        while (j < nlev && levels[j] < b) j++;
+        if (j < nlev && levels[j] == b) continue;
+        for (int k = nlev; k > j; k--) levels[k] = levels[k - 1];
+        levels[j] = b;
+        nlev++;
+    }
+
+    int top_active = nlev > 0 ? levels[nlev - 1] : 0;
+    int64_t capped_future_total = 0;
+    for (int p = 0; p < np; p++) {
+        int contribution = nd->bets[p];
+        if (contribution < 0) contribution = 0;
+        if (contribution > top_active) contribution = top_active;
+        capped_future_total += (int64_t)contribution;
+    }
+    double slack = (double)((int64_t)nd->pot
+                            - (int64_t)r->root_pot_total
+                            - capped_future_total);
+
+    double award = 0.0;
+    for (int i = 0; i < r->root_pot_count; i++) {
+        double layer = (double)r->root_pot_amounts[i];
+        if (i == 0) layer += slack;
+        award += es_masked_layer_award(
+            nd, np, strength, target, layer,
+            r->root_pot_eligible_masks[i]);
+    }
+
+    int prev = 0;
+    for (int j = 0; j < nlev; j++) {
+        int level = levels[j];
+        double layer = 0.0;
+        uint32_t eligible = 0;
+        for (int p = 0; p < np; p++) {
+            int contribution = nd->bets[p] > 0 ? nd->bets[p] : 0;
+            int hi = contribution < level ? contribution : level;
+            if (hi > prev) layer += (double)(hi - prev);
+            if (nd->active_players[p] && contribution >= level)
+                eligible |= 1u << p;
+        }
+        award += es_masked_layer_award(
+            nd, np, strength, target, layer, eligible);
+        prev = level;
+    }
+    return award;
+}
+
 /* SHOWDOWN terminal (river). Single-pot fast path (bit-exact historical
  * behavior, exact for every node the current builder can emit) + layered
  * side-pot path for uneven this-street all-in contributions (scope above). */
@@ -845,7 +1049,7 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
         live[nlive++] = p;
         if (s > best) best = s;
     }
-    if (es_showdown_is_single_pot(nd, np)) {
+    if (r->root_pot_count == 0 && es_showdown_is_single_pot(nd, np)) {
         int nwin = 0;
         int trav_wins = 0;
         for (int k = 0; k < nlive; k++) {
@@ -858,6 +1062,8 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
         if (trav_wins) return (double)nd->pot / (double)nwin - my_bet;
         return -my_bet;
     }
+    if (r->root_pot_count > 0)
+        return es_root_pot_award(r, nd, strength, traverser) - my_bet;
     return es_layered_award(nd, np, strength, traverser) - my_bet;
 }
 
@@ -1158,7 +1364,8 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
             opp_strength[p] = eval7(cards);
             opp_live[n_opp_live++] = p;
         }
-        int single_pot = es_showdown_is_single_pot(nd, np);
+        int single_pot = r->root_pot_count == 0
+                         && es_showdown_is_single_pot(nd, np);
         for (int h = 0; h < nh; h++) {
             if (dead[h]) { out_vals[h] = 0.0; continue; }
             int c0 = t->hands[traverser][h][0], c1 = t->hands[traverser][h][1];
@@ -1185,8 +1392,12 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
                 for (int k = 0; k < n_opp_live; k++)
                     strength[opp_live[k]] = opp_strength[opp_live[k]];
                 strength[traverser] = hs;
-                out_vals[h] = es_layered_award(nd, np, strength, traverser)
-                              - my_bet;
+                double award = r->root_pot_count > 0
+                               ? es_root_pot_award(
+                                     r, nd, strength, traverser)
+                               : es_layered_award(
+                                     nd, np, strength, traverser);
+                out_vals[h] = award - my_bet;
             }
         }
         return;
@@ -1370,6 +1581,10 @@ static inline void es_vec_pass(ESResolver *r, int trav, uint64_t *rng,
 int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     if (!r) { es_set_error("resolver is NULL"); return -1; }
     r->iterations_run = 0;
+    if (r->root_pot_count > 0 && r->reach_mode) {
+        es_set_error("root-pot geometry is not supported by reach mode");
+        return -1;
+    }
     if (r->oracle_is_sampled && (r->vec_traverser || r->reach_mode)) {
         es_set_error("sampled leaf oracle is scalar-only "
                      "(vec_mode=%d reach_mode=%d)",
@@ -1700,6 +1915,102 @@ ES_EXPORT double es_test_showdown_value_vec(
     SSTreeData td; SSNode node; ESResolver tmp;
     es_test_build_ctx(&td, &node, &tmp, np, board5, hand_c0, hand_c1,
                       active, bets, pot);
+    int opp_sampled[SS_MAX_PLAYERS];
+    for (int p = 0; p < np; p++) opp_sampled[p] = 0;
+    int dead[1] = { 0 };
+    double out_vals[1] = { 0.0 };
+    uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    ESStats local; memset(&local, 0, sizeof(local));
+    es_traverse_vec(&tmp, 0, traverser, opp_sampled, dead, &rng, &local,
+                    1, NULL, 0, out_vals);
+    return out_vals[0];
+}
+
+static int es_test_build_root_pot_ctx(
+    SSTreeData *td, SSNode *node, ESResolver *tmp,
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot,
+    const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks,
+    int num_root_pots)
+{
+    if (np < 2 || np > 3
+        || !td || !node || !tmp || !board5 || !hand_c0 || !hand_c1
+        || !active || !bets
+        || !root_pot_amounts || !root_pot_eligible_masks
+        || num_root_pots < 1 || num_root_pots > ES_MAX_ROOT_POT_LAYERS)
+        return -1;
+
+    const uint32_t allowed = (1u << np) - 1u;
+    int64_t root_total = 0;
+    int64_t bet_total = 0;
+    for (int i = 0; i < num_root_pots; i++) {
+        int amount = root_pot_amounts[i];
+        uint32_t mask = root_pot_eligible_masks[i];
+        if (amount < 0 || mask == 0 || (mask & ~allowed) != 0)
+            return -1;
+        root_total += (int64_t)amount;
+        if (root_total > INT_MAX) return -1;
+    }
+    if (root_pot_eligible_masks[0] != allowed) return -1;
+    for (int i = 1; i < num_root_pots; i++)
+        if (root_pot_eligible_masks[i] == root_pot_eligible_masks[i - 1]
+            || (root_pot_eligible_masks[i]
+                & ~root_pot_eligible_masks[i - 1]) != 0)
+            return -1;
+    for (int p = 0; p < np; p++) {
+        if (bets[p] < 0) return -1;
+        bet_total += (int64_t)bets[p];
+    }
+    if (root_total + bet_total != (int64_t)pot) return -1;
+
+    es_test_build_ctx(td, node, tmp, np, board5, hand_c0, hand_c1,
+                      active, bets, pot);
+    td->starting_pot = (int)root_total;
+    tmp->root_pot_count = num_root_pots;
+    tmp->root_pot_total = (int)root_total;
+    for (int i = 0; i < num_root_pots; i++) {
+        tmp->root_pot_amounts[i] = root_pot_amounts[i];
+        tmp->root_pot_eligible_masks[i] = root_pot_eligible_masks[i];
+    }
+    return 0;
+}
+
+ES_EXPORT double es_test_showdown_value_root_pots(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser,
+    const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks,
+    int num_root_pots)
+{
+    if (traverser < 0 || traverser >= np) return NAN;
+    SSTreeData td; SSNode node; ESResolver tmp;
+    if (es_test_build_root_pot_ctx(
+            &td, &node, &tmp, np, board5, hand_c0, hand_c1,
+            active, bets, pot, root_pot_amounts,
+            root_pot_eligible_masks, num_root_pots) != 0)
+        return NAN;
+
+    int sampled[SS_MAX_PLAYERS];
+    for (int p = 0; p < np; p++) sampled[p] = 0;
+    return es_showdown_value(&tmp, &node, traverser, sampled);
+}
+
+ES_EXPORT double es_test_showdown_value_root_pots_vec(
+    int np, const int *board5, const int *hand_c0, const int *hand_c1,
+    const int *active, const int *bets, int pot, int traverser,
+    const int *root_pot_amounts,
+    const uint32_t *root_pot_eligible_masks,
+    int num_root_pots)
+{
+    if (traverser < 0 || traverser >= np) return NAN;
+    SSTreeData td; SSNode node; ESResolver tmp;
+    if (es_test_build_root_pot_ctx(
+            &td, &node, &tmp, np, board5, hand_c0, hand_c1,
+            active, bets, pot, root_pot_amounts,
+            root_pot_eligible_masks, num_root_pots) != 0)
+        return NAN;
+
     int opp_sampled[SS_MAX_PLAYERS];
     for (int p = 0; p < np; p++) opp_sampled[p] = 0;
     int dead[1] = { 0 };

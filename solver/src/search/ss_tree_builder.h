@@ -42,6 +42,9 @@ typedef struct SSTreeBuilder {
      * depth_rule_enabled=1, `root_street` and `orig_num_players` drive
      * the §4 depth-rule dispatch, and `chance_card_per_child` accumulates
      * a flat array of valid next-street cards alongside tree building. */
+    /* Mode bits. Existing callers continue to use literal 0/1 for the depth
+     * rule; the additive public wrapper ORs the private stack-aware bit without
+     * changing this structure's ABI. */
     int depth_rule_enabled;
     int root_street;
     int orig_num_players;
@@ -78,6 +81,9 @@ typedef struct SSTreeBuilder {
     int  chance_card_per_child_len;
     int  chance_card_per_child_cap;
 } SSTreeBuilder;
+
+#define STB_MODE_DEPTH_RULE      0x1
+#define STB_MODE_UNEQUAL_STACK   0x2
 
 void stb_init(SSTreeBuilder *tb);
 
