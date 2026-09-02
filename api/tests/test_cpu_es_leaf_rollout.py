@@ -139,6 +139,7 @@ class _FakeSolver:
     last_from_bias_table = None
     last_from_real_oracle = None
     last_from_sampled_oracle = None
+    last_from_table_with_root_pots = None
     avg_calls = []
     final_calls = []
     cfr_calls = []
@@ -168,6 +169,28 @@ class _FakeSolver:
         cls.last_from_table = {
             "tree": tree, "table": table, "n_players": n_players,
             "max_h": max_h, "seed": seed}
+        return cls()
+
+    @classmethod
+    def from_table_with_root_pots(
+        cls,
+        tree,
+        table,
+        n_players,
+        max_h,
+        root_pot_amounts,
+        root_pot_eligible_masks,
+        seed=1,
+    ):
+        cls.last_from_table_with_root_pots = {
+            "tree": tree,
+            "table": table,
+            "n_players": n_players,
+            "max_h": max_h,
+            "root_pot_amounts": tuple(root_pot_amounts),
+            "root_pot_eligible_masks": tuple(root_pot_eligible_masks),
+            "seed": seed,
+        }
         return cls()
 
     @classmethod
@@ -300,6 +323,12 @@ def _make_solver(n_players, tree, rc, cev_holder=None):
     s._ready = True
     s._rollout_c = rc
     s._CSolver = _FakeSolver
+    s._es_lib = type(
+        "_FakeEsLib", (), {"es_create_with_root_pots": object()}
+    )()
+    s._get_street_solver_lib = lambda: type(
+        "_FakeStreetLib", (), {"ss_build_tree_stacks": object()}
+    )()
     s._bp_handle = _FakeBpHandle()
     s._blueprint = object()
     s._cev_holder = cev_holder
@@ -318,9 +347,11 @@ def _make_solver(n_players, tree, rc, cev_holder=None):
     tree_for_snapshot = tree
     s._StreetSolverGPU = lambda **kw: _FakeGpu(tree)
     s._snapshot_tree = lambda t, ranges: tree_for_snapshot
-    s._build_labels = lambda t, ni: []
+    s._build_labels = lambda t, ni, root_stacks_chips=None: []
 
     def _extract(t, num_players, postflop_bet_sizes, subsequent_bet_sizes):
+        if int(t.num_leaf_nodes) == 0:
+            return []
         return [
             _FakeLeafInfo(0, pot=200, bets=[100] * num_players, hist=[1, 2]),
             _FakeLeafInfo(1, pot=400, bets=[200] * num_players, hist=[3]),
@@ -331,7 +362,8 @@ def _make_solver(n_players, tree, rc, cev_holder=None):
 
 def _solve_kwargs(n_players, street="flop"):
     board = {"flop": ["Ah", "Kh", "2c"],
-             "turn": ["Ah", "Kh", "2c", "7d"]}[street]
+             "turn": ["Ah", "Kh", "2c", "7d"],
+             "river": ["Ah", "Kh", "2c", "7d", "9s"]}[street]
     ranges = [[(0, 1, 1.0), (2, 3, 1.0)] for _ in range(n_players)]
     return dict(
         board_strs=board, board_ints=list(range(len(board))),
@@ -363,6 +395,7 @@ _ISOLATED_ENV_KEYS = (
     "NEXUS_LEAF_RANGE_CONDITIONING",
     "NEXUS_ALLOW_CHANCE_SOLVE",
     "NEXUS_ES_REACH",
+    "NEXUS_BR_GAP_EXPOSE",
 )
 
 
@@ -372,6 +405,7 @@ def _reset_fake_solver(monkeypatch):
     _FakeSolver.last_from_bias_table = None
     _FakeSolver.last_from_real_oracle = None
     _FakeSolver.last_from_sampled_oracle = None
+    _FakeSolver.last_from_table_with_root_pots = None
     _FakeSolver.avg_calls = []
     _FakeSolver.final_calls = []
     _FakeSolver.cfr_calls = []
@@ -398,6 +432,118 @@ def _reset_fake_solver(monkeypatch):
 
 
 # ── flag parsing ──────────────────────────────────────────────────────────
+def test_unequal_stack_river_uses_both_additive_factories():
+    tree = _FakeTree(3, n_leaves=0, n_nodes=3)
+    tree.starting_pot = 700
+    rollout = _FakeRollout()
+    solver = _make_solver(3, tree, rollout)
+    captured_tree_kwargs = {}
+
+    def build_tree(**kwargs):
+        captured_tree_kwargs.update(kwargs)
+        gpu = _FakeGpu(tree)
+        gpu.root_stacks_chips = tuple(
+            int(round(float(value) * 100.0))
+            for value in kwargs["root_stacks_bb"]
+        )
+        return gpu
+
+    solver._StreetSolverGPU = build_tree
+    kwargs = _solve_kwargs(3, street="river")
+    kwargs.update(
+        pot_bb=7.0,
+        stack_bb=0.0,
+        root_stacks_bb=[0.0, 2.0, 3.0],
+        root_pot_amounts=[300, 400],
+        root_pot_eligible_masks=[0b111, 0b110],
+    )
+
+    solver.solve(**kwargs)
+
+    root_call = _FakeSolver.last_from_table_with_root_pots
+    assert captured_tree_kwargs["root_stacks_bb"] == (0.0, 2.0, 3.0)
+    assert captured_tree_kwargs["use_cont_strats"] is False
+    assert _FakeSolver.last_from_table is None
+    assert root_call is not None
+    assert root_call["tree"] is tree
+    assert root_call["table"].shape == (0, 3, 6)
+    assert root_call["n_players"] == 3
+    assert root_call["max_h"] == 6
+    assert root_call["root_pot_amounts"] == (300, 400)
+    assert root_call["root_pot_eligible_masks"] == (0b111, 0b110)
+    assert root_call["seed"] == 1
+    assert tree.root_stacks_chips == (0, 200, 300)
+    assert tree.root_pot_amounts == (300, 400)
+    assert tree.root_pot_eligible_masks == (0b111, 0b110)
+
+
+def test_unequal_stack_capability_probe_requires_both_native_symbols():
+    tree = _FakeTree(3, n_leaves=0, n_nodes=3)
+    solver = _make_solver(3, tree, _FakeRollout())
+    assert solver.supports_unequal_stack_abi() is True
+
+    solver._es_lib = object()
+    assert solver.supports_unequal_stack_abi() is False
+
+    solver._es_lib = type(
+        "_FakeEsLib", (), {"es_create_with_root_pots": object()}
+    )()
+    solver._CSolver = object()
+    assert solver.supports_unequal_stack_abi() is False
+
+    solver._CSolver = _FakeSolver
+    solver._get_street_solver_lib = lambda: object()
+    assert solver.supports_unequal_stack_abi() is False
+
+    solver._get_street_solver_lib = lambda: type(
+        "_FakeStreetLib", (), {"ss_build_tree_stacks": object()}
+    )()
+    solver._StreetSolverGPU = lambda board: None
+    assert solver.supports_unequal_stack_abi() is False
+
+    solver._StreetSolverGPU = lambda **kwargs: None
+    solver._build_labels = lambda tree, node_idx: []
+    assert solver.supports_unequal_stack_abi() is False
+
+    solver._build_labels = (
+        lambda tree, node_idx, root_stacks_chips=None: []
+    )
+
+    class _StaleCSolver:
+        @classmethod
+        def from_table_with_root_pots(cls, tree, table, n_players, max_h):
+            return cls()
+
+    solver._CSolver = _StaleCSolver
+    assert solver.supports_unequal_stack_abi() is False
+
+    def failed_street_probe():
+        raise OSError("synthetic load failure")
+
+    solver._CSolver = _FakeSolver
+    solver._get_street_solver_lib = failed_street_probe
+    assert solver.supports_unequal_stack_abi() is False
+
+
+def test_scalar_river_keeps_historical_tree_and_solver_factories():
+    tree = _FakeTree(3, n_leaves=0, n_nodes=3)
+    solver = _make_solver(3, tree, _FakeRollout())
+    captured_tree_kwargs = {}
+
+    def build_tree(**kwargs):
+        captured_tree_kwargs.update(kwargs)
+        return _FakeGpu(tree)
+
+    solver._StreetSolverGPU = build_tree
+
+    solver.solve(**_solve_kwargs(3, street="river"))
+
+    assert "root_stacks_bb" not in captured_tree_kwargs
+    assert captured_tree_kwargs["use_cont_strats"] is True
+    assert _FakeSolver.last_from_table is not None
+    assert _FakeSolver.last_from_table_with_root_pots is None
+
+
 def test_flag_default_off(monkeypatch):
     monkeypatch.delenv("NEXUS_LEAF_ROLLOUT", raising=False)
     assert ces._leaf_rollout_enabled() is False

@@ -498,6 +498,21 @@ class LiveResolveSource(StrategySource):
         self._engine = CpuEsSolver(self._config.blueprint_path)
         return self._engine
 
+    @staticmethod
+    def _supports_unequal_stack_abi(engine) -> bool:
+        """Probe both additive native entry points through the held engine."""
+        probe = getattr(engine, "supports_unequal_stack_abi", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logger.info(
+                "unequal-stack solver ABI probe failed",
+                exc_info=True,
+            )
+            return False
+
     def _get_strategy_reader(self, engine):
         """A reader.get_strategy callable for preflop-σ̄ range seeding.
 
@@ -655,6 +670,21 @@ class LiveResolveSource(StrategySource):
 
         inputs = build_solve_inputs(state, range_weight_dicts=range_dicts)
         #   raises LiveResolveUnsupported on terminal / river / mid-street re-entry.
+
+        unequal_solve_kwargs = {}
+        if "root_stacks_bb" in inputs:
+            if not self._supports_unequal_stack_abi(engine):
+                raise LiveResolveUnsupported(
+                    "loaded poker-solver lacks ss_build_tree_stacks and/or "
+                    "es_create_with_root_pots"
+                )
+            unequal_solve_kwargs = {
+                "root_stacks_bb": inputs["root_stacks_bb"],
+                "root_pot_amounts": inputs["root_pot_amounts"],
+                "root_pot_eligible_masks": inputs[
+                    "root_pot_eligible_masks"
+                ],
+            }
 
         # bet_sizes == the agent's blueprint vocab so the solver's action count
         # matches state.num_legal_actions() 1:1 (clean label->index mapping).
@@ -844,6 +874,7 @@ class LiveResolveSource(StrategySource):
                             },
                             hero_actual_hand=hero_actual_hand,
                             **belief_solve_kwargs,
+                            **unequal_solve_kwargs,
                         )
                         _offtree_extension_served = True
                     except OffTreeExtensionUnsafe as unsafe:
@@ -883,6 +914,7 @@ class LiveResolveSource(StrategySource):
                             },
                             hero_actual_hand=hero_actual_hand,
                             **belief_solve_kwargs,
+                            **unequal_solve_kwargs,
                         )
                 else:
                     all_by_player = engine.solve(
@@ -911,6 +943,7 @@ class LiveResolveSource(StrategySource):
                         },
                         hero_actual_hand=hero_actual_hand,
                         **belief_solve_kwargs,
+                        **unequal_solve_kwargs,
                     )
         except Exception as e:
             if belief_session is not None and belief_stash is not None:

@@ -28,13 +28,14 @@ effect, no leaf-sampling noise); the bypass is fail-loud (see solve()).
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import logging
 import os
 import sys
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -285,6 +286,7 @@ class CpuEsSolver:
         self._extract_leaf_info = None
         self._build_labels = None
         self._StreetSolverGPU = None
+        self._get_street_solver_lib = None
         # Trained postflop bet vocab from the .bps manifest (bet-vocab desync
         # fix). Set in _init from the loaded blueprint's manifest footer.
         self._train_postflop_sizes: Optional[List[float]] = None
@@ -364,11 +366,16 @@ class CpuEsSolver:
                     _ES_DLL_NAME, time.time() - t0)
 
         # Tree builder + helpers (shared, read-only use).
-        from engine.street_solver_gpu import StreetSolverGPU, _build_labels_at_node  # type: ignore
+        from engine.street_solver_gpu import (  # type: ignore
+            StreetSolverGPU,
+            _build_labels_at_node,
+            _get_lib,
+        )
         from es_resolver.es_solver import snapshot_tree  # type: ignore
         from engine.leaf_values import extract_leaf_info_from_tree  # type: ignore
         self._StreetSolverGPU = StreetSolverGPU
         self._build_labels = _build_labels_at_node
+        self._get_street_solver_lib = _get_lib
         self._snapshot_tree = snapshot_tree
         self._extract_leaf_info = extract_leaf_info_from_tree
 
@@ -513,6 +520,65 @@ class CpuEsSolver:
     def ready(self) -> bool:
         return self._ready
 
+    def supports_unequal_stack_abi(self) -> bool:
+        """Return whether the complete additive native/Python ABI is loaded."""
+        get_street_lib = getattr(self, "_get_street_solver_lib", None)
+        c_solver = getattr(self, "_CSolver", None)
+        es_lib = getattr(self, "_es_lib", None)
+        street_solver = getattr(self, "_StreetSolverGPU", None)
+        label_builder = getattr(self, "_build_labels", None)
+        root_pot_factory = getattr(
+            c_solver, "from_table_with_root_pots", None
+        )
+        if (
+            not callable(get_street_lib)
+            or c_solver is None
+            or not callable(root_pot_factory)
+            or es_lib is None
+            or not hasattr(es_lib, "es_create_with_root_pots")
+            or not self._callable_accepts_keyword(
+                street_solver, "root_stacks_bb"
+            )
+            or not self._callable_accepts_keyword(
+                label_builder, "root_stacks_chips"
+            )
+            or not self._callable_accepts_keyword(
+                root_pot_factory, "root_pot_amounts"
+            )
+            or not self._callable_accepts_keyword(
+                root_pot_factory, "root_pot_eligible_masks"
+            )
+        ):
+            return False
+        try:
+            return hasattr(get_street_lib(), "ss_build_tree_stacks")
+        except Exception:
+            logger.info(
+                "street-solver unequal-stack ABI probe failed",
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _callable_accepts_keyword(candidate, keyword: str) -> bool:
+        """Conservatively reject a stale Python wrapper around a new DLL."""
+        if not callable(candidate):
+            return False
+        try:
+            parameters = inspect.signature(candidate).parameters
+        except (TypeError, ValueError):
+            return False
+        parameter = parameters.get(keyword)
+        if parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+        return any(
+            item.kind == inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values()
+        )
+
     def solve(
         self,
         *,
@@ -542,6 +608,9 @@ class CpuEsSolver:
         progress_callback: Optional[
             Callable[[str, Dict[str, object]], None]
         ] = None,
+        root_stacks_bb: Optional[Sequence[float]] = None,
+        root_pot_amounts: Optional[Sequence[int]] = None,
+        root_pot_eligible_masks: Optional[Sequence[int]] = None,
     ) -> (
         Dict[int, Dict[int, Dict[str, float]]]
         | Dict[str, Dict[int, Dict[int, Dict[str, float]]]]
@@ -656,6 +725,73 @@ class CpuEsSolver:
                     "values; disable one feature")
         rc = self._rollout_c
         n_players = len(player_ranges)
+        root_geometry_present = tuple(
+            value is not None
+            for value in (
+                root_stacks_bb,
+                root_pot_amounts,
+                root_pot_eligible_masks,
+            )
+        )
+        if any(root_geometry_present) and not all(root_geometry_present):
+            raise ValueError(
+                "root_stacks_bb, root_pot_amounts, and "
+                "root_pot_eligible_masks must be provided together"
+            )
+        use_root_geometry = all(root_geometry_present)
+        root_stack_values: Tuple[float, ...] = ()
+        root_amount_values: Tuple[int, ...] = ()
+        root_mask_values: Tuple[int, ...] = ()
+        if use_root_geometry:
+            if not self.supports_unequal_stack_abi():
+                raise ReplayUnsupported(
+                    "loaded poker-solver lacks ss_build_tree_stacks and/or "
+                    "es_create_with_root_pots"
+                )
+            if len(board_strs) != 5:
+                raise ReplayUnsupported(
+                    "unequal-stack root geometry is supported only on river"
+                )
+            if n_players not in (2, 3):
+                raise ReplayUnsupported(
+                    "unequal-stack root geometry requires 2 or 3 players"
+                )
+            root_stack_values = tuple(float(x) for x in root_stacks_bb)
+            root_amount_values = tuple(int(x) for x in root_pot_amounts)
+            root_mask_values = tuple(int(x) for x in root_pot_eligible_masks)
+            if len(root_stack_values) != n_players:
+                raise ValueError(
+                    "root_stacks_bb length does not match compact players"
+                )
+            if any(
+                not np.isfinite(value) or value < 0.0
+                for value in root_stack_values
+            ):
+                raise ValueError(
+                    "root_stacks_bb entries must be finite and non-negative"
+                )
+            if (
+                not root_amount_values
+                or len(root_amount_values) != len(root_mask_values)
+                or len(root_amount_values) > n_players
+            ):
+                raise ValueError(
+                    "root-pot arrays must have the same length in [1, players]"
+                )
+            if any(value <= 0 for value in root_amount_values):
+                raise ValueError("root-pot amounts must be positive")
+            all_players_mask = (1 << n_players) - 1
+            if any(
+                value <= 0 or value & ~all_players_mask
+                for value in root_mask_values
+            ):
+                raise ValueError(
+                    "root-pot masks must contain compact-player bits only"
+                )
+            if sum(root_amount_values) != int(round(float(pot_bb) * 100.0)):
+                raise ValueError(
+                    "root-pot amounts must sum to the street-root pot"
+                )
         _actual_player_idx: Optional[int] = None
         _actual_hand_idx: Optional[int] = None
         _actual_fraction = 0.0
@@ -884,15 +1020,27 @@ class CpuEsSolver:
             except BaseException:
                 _ENV_MUTATION_LOCK.release()
                 raise
+        street_geometry_kwargs = {}
+        if use_root_geometry:
+            street_geometry_kwargs = {
+                "root_stacks_bb": root_stack_values,
+            }
         try:
             # ── Build the tree (CPU tree-builder; no GPU solve / no leaf_value_fn) ──
             gpu = self._StreetSolverGPU(
                 board=board_strs, pot_bb=pot_bb, stack_bb=stack_bb,
                 player_ranges=player_ranges, bet_sizes=bet_sizes,
                 subsequent_bet_sizes=subsequent_bet_sizes,
-                use_cont_strats=True, leaf_value_fn=None,
+                use_cont_strats=(not use_root_geometry), leaf_value_fn=None,
                 add_explicit_allin=add_explicit_allin,
+                **street_geometry_kwargs,
             )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            if use_root_geometry:
+                raise ReplayUnsupported(
+                    f"unequal-stack river tree construction failed: {exc}"
+                ) from exc
+            raise
         finally:
             # Restore immediately after the build (the env only matters during
             # ss_build_tree2); keep the window minimal. Restore THEN release the
@@ -917,6 +1065,17 @@ class CpuEsSolver:
                 # an unsafe optional extension and re-solve with base sizes.
                 validate_extended_tree(gpu._tree)
             tree = self._snapshot_tree(gpu._tree, player_ranges)
+            if use_root_geometry:
+                # PlainTree is intentionally an open Python sidecar.  Replay
+                # and label helpers need the same per-actor cap as the native
+                # tree, while every scalar tree remains byte-for-byte shaped
+                # as before.
+                tree.root_stacks_chips = tuple(
+                    int(round(value * 100.0))
+                    for value in root_stack_values
+                )
+                tree.root_pot_amounts = root_amount_values
+                tree.root_pot_eligible_masks = root_mask_values
             max_h = gpu._max_hands
 
             # IN-TREE CHANCE NODE GATE (2026-06-14, narrowed 2026-06-15).
@@ -1523,7 +1682,23 @@ class CpuEsSolver:
                     print(f"CpuEsSolver DIAG: table dump failed: {_e}", file=sys.stderr, flush=True)
 
             # ── Solve: C ES, Linear CFR, multi-thread Hogwild ──
-            if _leaf_sampled:
+            if use_root_geometry:
+                try:
+                    cs = self._CSolver.from_table_with_root_pots(
+                        gpu._tree,
+                        table,
+                        n_players,
+                        max_h,
+                        root_amount_values,
+                        root_mask_values,
+                        seed=1,
+                    )
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    raise ReplayUnsupported(
+                        "unequal-stack river root-pot construction failed: "
+                        f"{exc}"
+                    ) from exc
+            elif _leaf_sampled:
                 # Fresh per-visit blueprint rollout. The resolver seed is the
                 # sole RNG source for traversal hands, actions, continuation
                 # biases, and rollouts, so map the public master_seed here.
@@ -1774,7 +1949,19 @@ class CpuEsSolver:
             # tree copy, sigma-bar read, or metadata access. Extraction must
             # happen here while `cs` (and its strategy sums) is alive. It always
             # reads avg_strategy, independent of the strategy served above.
-            if belief_stash_out is not None:
+            if belief_stash_out is not None and use_root_geometry:
+                _belief_meta = dict(belief_stash_out)
+                belief_stash_out.clear()
+                belief_stash_out.update(
+                    status="empty",
+                    reason=(
+                        "belief-stash extraction is unsupported for "
+                        "unequal-stack root geometry"
+                    ),
+                    entry_slots=_belief_meta.get("entry_slots"),
+                    hist_start=_belief_meta.get("hist_start"),
+                )
+            elif belief_stash_out is not None:
                 _belief_meta = dict(belief_stash_out)
                 try:
                     from app.engine.agent.belief_stash import pack_belief_stash
@@ -1891,8 +2078,18 @@ class CpuEsSolver:
             # risking diverging from) the solve. Pure read-only stash, no behavior
             # change; only allocates when the flag is set. See
             # scripts/measure_per_spot_correctness.py.
-            if os.environ.get("NEXUS_BR_GAP_EXPOSE", "")[:1] in (
-                    "1", "t", "T", "y", "Y"):
+            _br_gap_expose = os.environ.get(
+                "NEXUS_BR_GAP_EXPOSE", ""
+            )[:1] in ("1", "t", "T", "y", "Y")
+            if _br_gap_expose and use_root_geometry:
+                # Root-pot reach/exploitability CFVs are explicitly outside
+                # the additive ABI. Never expose a scalar PlainTree snapshot
+                # that an offline harness could score as if it were faithful.
+                self._last_br_gap_objs = None
+                logger.info(
+                    "BR-gap expose unavailable for unequal-stack root geometry"
+                )
+            elif _br_gap_expose:
                 try:
                     from es_resolver.es_solver import snapshot_tree as _snap
                     _ranges = [[(c0, c1, w) for (c0, c1, w) in rng]
@@ -2145,11 +2342,30 @@ class CpuEsSolver:
                             # Replayed (possibly faced-bet) node: synthesize
                             # labels from the tree's own chip deltas —
                             # _build_labels is wrong off the street root.
-                            labels = self._node_action_labels(
-                                tree, node_idx, n_players
-                            )
+                            if use_root_geometry:
+                                # The additive binding's helper recognizes
+                                # structural short-call slots and uses the
+                                # acting player's own root stack.
+                                labels = self._build_labels(
+                                    gpu._tree,
+                                    node_idx,
+                                    root_stacks_chips=gpu.root_stacks_chips,
+                                )
+                            else:
+                                labels = self._node_action_labels(
+                                    tree, node_idx, n_players
+                                )
                         else:
-                            labels = self._build_labels(gpu._tree, node_idx)
+                            if use_root_geometry:
+                                labels = self._build_labels(
+                                    gpu._tree,
+                                    node_idx,
+                                    root_stacks_chips=gpu.root_stacks_chips,
+                                )
+                            else:
+                                labels = self._build_labels(
+                                    gpu._tree, node_idx
+                                )
                         sigma = read_strategy(node_idx)  # [nh, na] or None
                         if _offtree_replay is not None and sigma is not None:
                             try:
@@ -2601,8 +2817,22 @@ class CpuEsSolver:
                         "convention drift (fail loud)"
                     )
             elif want == n_nonraise - 1:
-                # check/call: actor matches the outstanding max bet.
-                if not child.active[actor] or child.bets[actor] != mx:
+                # check/call: scalar trees match the outstanding max bet;
+                # an additive tree may instead emit a short all-in call.
+                root_stacks = getattr(tree, "root_stacks_chips", None)
+                expected_call_bet = mx
+                if root_stacks is not None:
+                    remaining = max(
+                        int(root_stacks[actor]) - int(nd.bets[actor]),
+                        0,
+                    )
+                    expected_call_bet = int(nd.bets[actor]) + min(
+                        int(to_call), remaining
+                    )
+                if (
+                    not child.active[actor]
+                    or child.bets[actor] != expected_call_bet
+                ):
                     raise ValueError(
                         f"street replay step {step}: child {want} of node {ni} "
                         "does not look like a CHECK/CALL — tree child-order "

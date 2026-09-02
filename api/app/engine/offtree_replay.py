@@ -100,7 +100,13 @@ def _node_terms(
     pot = int(getattr(tree, "starting_pot")) + sum(
         int(node.bets[q]) for q in range(n_players)
     )
-    remaining = int(getattr(tree, "effective_stack")) - actor_bet
+    root_stacks = getattr(tree, "root_stacks_chips", None)
+    actor_root_stack = (
+        int(getattr(tree, "effective_stack"))
+        if root_stacks is None
+        else int(root_stacks[actor])
+    )
+    remaining = actor_root_stack - actor_bet
     return actor, max_bet, to_call, pot if pot > 0 else 0, remaining
 
 
@@ -116,6 +122,20 @@ def _raise_actions(
     _actor, _max_bet, to_call, pot, remaining = _node_terms(
         tree, node, n_players
     )
+    root_stacks = getattr(tree, "root_stacks_chips", None)
+    if root_stacks is not None:
+        can_act = sum(
+            1
+            for player in range(n_players)
+            if bool(node.active[player])
+            and int(node.bets[player]) < int(root_stacks[player])
+        )
+        if can_act <= 1:
+            # The additive native builder never lets a lone player bet or
+            # raise into opponents who cannot respond.  Keep the scalar
+            # projection unchanged, but mirror that responder rule whenever
+            # the translation-owned per-player stack sidecar is present.
+            return ()
     if remaining <= to_call:
         return ()
 
@@ -146,7 +166,7 @@ def _structural_nonraise_children(
     tree: object, node_index: int, n_players: int
 ) -> Tuple[int, ...]:
     node = tree.nodes[node_index]
-    actor, max_bet, to_call, _pot, _remaining = _node_terms(
+    actor, max_bet, to_call, _pot, remaining = _node_terms(
         tree, node, n_players
     )
     n_nonraise = 2 if to_call > 0 else 1
@@ -165,8 +185,11 @@ def _structural_nonraise_children(
                     f"node {node_index} child 0 is not a structural fold"
                 )
         else:
+            expected_call_bet = int(node.bets[actor]) + min(
+                to_call, max(remaining, 0)
+            )
             if (not child.active[actor]
-                    or int(child.bets[actor]) != max_bet):
+                    or int(child.bets[actor]) != expected_call_bet):
                 raise ValueError(
                     f"node {node_index} child {child_index} is not a "
                     "structural check/call"

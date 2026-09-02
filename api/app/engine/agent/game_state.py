@@ -440,6 +440,12 @@ class GameState:
         real_geometry: whether live resolve must preserve observed current-
             street raise amounts exactly and fail closed if it cannot. False
             preserves the production snapping/fallback contract.
+        real_root_stacks_chips / real_root_pot_*: translation-owned compact
+            solver geometry for a real request that cannot use the historical
+            scalar-stack ABI.  Empty tuples preserve every legacy path.
+        real_scalar_stack_fallback_verified: translation has verified from
+            its ledger that this positive-stack/common-pot request may retain
+            the pre-existing disclosed scalar-min fallback.
         postflop_history: action indices taken across ALL postflop streets so
             far (one per action), in the order they were taken. This is the
             postflop tail appended to preflop_prefix to form action_history.
@@ -488,6 +494,11 @@ class GameState:
     subsequent_bet_sizes: Tuple[float, ...] = DEFAULT_SUBSEQUENT_BET_SIZES
     add_explicit_allin: bool = DEFAULT_ADD_EXPLICIT_ALLIN
     real_geometry: bool = False
+    real_root_stacks_chips: Tuple[int, ...] = ()
+    real_root_pot_amounts: Tuple[int, ...] = ()
+    real_root_pot_eligible_masks: Tuple[int, ...] = ()
+    real_requires_unequal_stack_abi: bool = False
+    real_scalar_stack_fallback_verified: bool = False
 
     # ── Derived / read-only helpers ──────────────────────────────────────
 
@@ -534,7 +545,7 @@ class GameState:
         pot = int(self.pot)
         stack = int(self.stacks[slot]) if slot < len(self.stacks) else INITIAL_STACK
         to_call = max(0, self.current_bet - self.street_bets[slot])
-        return legal_categories_chips(
+        categories = legal_categories_chips(
             facing_bet=self.facing_bet,
             raises_so_far=self.raises_this_street,
             pot=pot,
@@ -544,6 +555,16 @@ class GameState:
             subsequent_bet_sizes=self.subsequent_bet_sizes,
             add_explicit_allin=self.add_explicit_allin,
         )
+        if (
+            self._uses_stack_aware_real_vocabulary()
+            and self.facing_bet
+            and not self._has_live_responder(slot)
+        ):
+            # The additive builder does not offer a raise when every opponent
+            # is already all-in: the sole player who can act may only fold or
+            # call the outstanding wager. Production keeps its trained vocab.
+            return categories[:2]
+        return categories
 
     def num_legal_actions(self) -> int:
         return len(self.legal_action_categories())
@@ -554,6 +575,11 @@ class GameState:
         don't exceed the call; clamp+dedup at the stack; optional explicit
         all-in last). Position i here == raise slot i of
         legal_action_categories()."""
+        if (
+            self._uses_stack_aware_real_vocabulary()
+            and not self._has_live_responder(slot)
+        ):
+            return []
         pot = int(self.pot)
         stack = int(self.stacks[slot])
         to_call = max(0, self.current_bet - self.street_bets[slot])
@@ -575,6 +601,25 @@ class GameState:
         if self.add_explicit_allin and not added_allin and stack > to_call:
             survivors.append(stack)
         return survivors
+
+    def _has_live_responder(self, actor_slot: int) -> bool:
+        return any(
+            slot != actor_slot
+            and self.active[slot]
+            and self.stacks[slot] > 0
+            for slot in range(self.n_slots)
+        )
+
+    def _uses_stack_aware_real_vocabulary(self) -> bool:
+        roots = self.real_root_stacks_chips
+        return bool(
+            self.real_requires_unequal_stack_abi
+            and roots
+            and (
+                any(stack <= 0 for stack in roots)
+                or len(set(roots)) > 1
+            )
+        )
 
     def _raise_amount_for(self, action_idx: int, slot: int) -> int:
         """Chip INCREMENT for the raise at `action_idx`, bit-exact to the
@@ -943,6 +988,12 @@ class GameState:
             s = (start_after + step) % n
             if not active[s]:
                 continue
+            if self.real_geometry and stacks[s] <= 0:
+                # Real geometry follows the additive native ABI: a player who
+                # is already all-in remains a contestant but has no decision.
+                # The production blueprint path deliberately retains its
+                # historical forced-action convention.
+                continue
             if not acted[s]:
                 return s
             if street_bets[s] < current_bet and stacks[s] > 0:
@@ -979,7 +1030,7 @@ class GameState:
             )
 
         n_slots = self.n_slots
-        first = self._first_live_slot(active)
+        first = self._first_live_slot(active, stacks)
         return replace(
             self,
             active=tuple(active),
@@ -997,9 +1048,26 @@ class GameState:
             betting_round_closed_count=closed_count,
         )
 
-    def _first_live_slot(self, active: List[bool]) -> Optional[int]:
+    def _first_live_slot(
+        self, active: List[bool], stacks: Optional[List[int]] = None,
+    ) -> Optional[int]:
+        if self.real_geometry and stacks is not None:
+            can_act = [
+                slot
+                for slot in range(self.n_slots)
+                if active[slot] and stacks[slot] > 0
+            ]
+            # With no outstanding bet, a lone player with chips cannot bet
+            # into all-in opponents. The native river tree closes immediately.
+            if len(can_act) <= 1:
+                return None
+            return can_act[0]
         for s in range(self.n_slots):
-            if active[s]:
+            if active[s] and not (
+                self.real_geometry
+                and stacks is not None
+                and stacks[s] <= 0
+            ):
                 return s
         return None
 
@@ -1107,6 +1175,13 @@ def new_postflop_state(
             )
         slot_stacks = tuple(int(stacks[i]) for i in order)
 
+    initial_to_act: Optional[int] = 0
+    if real_geometry:
+        can_act = [
+            slot for slot, stack in enumerate(slot_stacks) if stack > 0
+        ]
+        initial_to_act = can_act[0] if len(can_act) >= 2 else None
+
     return GameState(
         seat_of_slot=seat_of_slot,
         stacks=slot_stacks,
@@ -1119,7 +1194,7 @@ def new_postflop_state(
         postflop_history=(),
         street_history=(),
         street_offtree_raises=(),
-        to_act_slot=0,
+        to_act_slot=initial_to_act,
         current_bet=0,
         street_bets=tuple([0] * n),
         acted=tuple([False] * n),

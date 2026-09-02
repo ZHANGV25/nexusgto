@@ -207,6 +207,79 @@ def build_solve_inputs(
     # (already SB-first); solver player index == position in entry_slots.
     positions_sorted = [SEAT_NAME[state.seat_of_slot[s]] for s in entry_slots]
     n = len(entry_slots)
+    root_stack_chips = tuple(
+        int(state.stacks[slot]) + int(state.street_bets[slot])
+        for slot in entry_slots
+    )
+    unequal_stack_inputs: Dict[str, object] = {}
+    requires_unequal_stack_abi = bool(
+        getattr(state, "real_requires_unequal_stack_abi", False)
+    )
+    scalar_fallback_verified = bool(getattr(
+        state, "real_scalar_stack_fallback_verified", False
+    ))
+    if (
+        bool(getattr(state, "real_geometry", False))
+        and not requires_unequal_stack_abi
+        and (
+            any(stack <= 0 for stack in root_stack_chips)
+            or (
+                len(set(root_stack_chips)) > 1
+                and not scalar_fallback_verified
+            )
+        )
+    ):
+        raise LiveResolveUnsupported(
+            "real unequal-stack geometry is missing its translation-owned "
+            "root-pot ledger"
+        )
+    if requires_unequal_stack_abi:
+        if not bool(getattr(state, "real_geometry", False)):
+            raise ValueError(
+                "unequal-stack solver sidecar exists outside real geometry"
+            )
+        if state.street != 3:
+            raise LiveResolveUnsupported(
+                "unequal-stack real geometry is supported only on the river"
+            )
+        if n not in (2, 3):
+            raise LiveResolveUnsupported(
+                "unequal-stack river geometry requires 2 or 3 players"
+            )
+        translated_stacks = tuple(
+            int(value)
+            for value in getattr(state, "real_root_stacks_chips", ())
+        )
+        root_pot_amounts = tuple(
+            int(value)
+            for value in getattr(state, "real_root_pot_amounts", ())
+        )
+        root_pot_masks = tuple(
+            int(value)
+            for value in getattr(
+                state, "real_root_pot_eligible_masks", ()
+            )
+        )
+        if translated_stacks != root_stack_chips:
+            raise LiveResolveUnsupported(
+                "real root-stack sidecar disagrees with the translated state"
+            )
+        if (
+            not root_pot_amounts
+            or len(root_pot_amounts) != len(root_pot_masks)
+            or sum(root_pot_amounts) != pot_entry
+        ):
+            raise LiveResolveUnsupported(
+                "real root-pot sidecar is incomplete or does not cover the pot"
+            )
+        unequal_stack_inputs = {
+            "root_stacks_bb": [
+                float(chips) / BIG_BLIND for chips in translated_stacks
+            ],
+            "root_stack_chips": list(translated_stacks),
+            "root_pot_amounts": list(root_pot_amounts),
+            "root_pot_eligible_masks": list(root_pot_masks),
+        }
     # The C rollout keys the blueprint's postflop CONTINUATION strategies by FULL
     # seat id (mccfr_blueprint.c stores key.player = the seat; bps_query_strategy
     # looks up by that seat). player_seats passed compact indices range(n) here,
@@ -271,7 +344,7 @@ def build_solve_inputs(
         full_history[:-n_street] if n_street else full_history
     )
 
-    return {
+    result = {
         "board_strs": board_strs,
         "board_ints": board_ints,
         "positions_sorted": positions_sorted,
@@ -290,6 +363,8 @@ def build_solve_inputs(
         "n_legal": state.num_legal_actions(),
         "has_to_call": _has_to_call(state),
     }
+    result.update(unequal_stack_inputs)
+    return result
 
 
 def hero_grid_row(player_ranges: Sequence, hero_player_idx: int,
