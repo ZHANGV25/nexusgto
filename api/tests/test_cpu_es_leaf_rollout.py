@@ -1078,3 +1078,48 @@ def test_rollout_2p_with_conditioning_off_ok(monkeypatch):
     assert rc.eager_fill_calls == 0
     assert _FakeSolver.last_from_real_oracle is not None
     monkeypatch.delenv("NEXUS_LEAF_RANGE_CONDITIONING", raising=False)
+
+
+# ── projected-fill guard: env default (2026-09-03, F-10) ─────────────────
+#
+# One resolve spent construct=1353.5s in the eager fill and held the box's
+# single solve slot for 22 minutes. The projection is knowable from the built
+# tree before the first allocation, and it is the only workable predicate:
+# player count does not predict cost (a 4p spot replays at 247s, a six-way
+# limped flop at 8.6s). These pin the env plumbing; the guard's raise itself
+# is covered by test_projected_fill_guard_raises above.
+
+
+def test_max_projected_fill_bytes_default_is_off(monkeypatch):
+    monkeypatch.delenv("NEXUS_MAX_PROJECTED_FILL_BYTES", raising=False)
+    assert ces._max_projected_fill_bytes_default() is None
+
+
+def test_max_projected_fill_bytes_default_parses_a_ceiling(monkeypatch):
+    monkeypatch.setenv("NEXUS_MAX_PROJECTED_FILL_BYTES", "2000000000")
+    assert ces._max_projected_fill_bytes_default() == 2_000_000_000
+
+
+def test_zero_means_off_not_refuse_everything(monkeypatch):
+    # 0 must not turn into "refuse every solve" - that would take the box
+    # from one stuck spot to no service at all.
+    monkeypatch.setenv("NEXUS_MAX_PROJECTED_FILL_BYTES", "0")
+    assert ces._max_projected_fill_bytes_default() is None
+
+
+def test_empty_and_whitespace_are_off(monkeypatch):
+    monkeypatch.setenv("NEXUS_MAX_PROJECTED_FILL_BYTES", "")
+    assert ces._max_projected_fill_bytes_default() is None
+
+
+@pytest.mark.parametrize("raw", ["abc", "1.5", "12kb"])
+def test_a_non_integer_ceiling_fails_loud(monkeypatch, raw):
+    monkeypatch.setenv("NEXUS_MAX_PROJECTED_FILL_BYTES", raw)
+    with pytest.raises(ValueError):
+        ces._max_projected_fill_bytes_default()
+
+
+def test_a_negative_ceiling_fails_loud(monkeypatch):
+    monkeypatch.setenv("NEXUS_MAX_PROJECTED_FILL_BYTES", "-1")
+    with pytest.raises(ValueError):
+        ces._max_projected_fill_bytes_default()
