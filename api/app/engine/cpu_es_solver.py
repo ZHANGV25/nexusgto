@@ -144,6 +144,38 @@ def _cont_ev_miss_fallback_enabled() -> bool:
     return v[:1] in ("1", "t", "T", "y", "Y")
 
 
+def _max_projected_fill_bytes_default() -> Optional[int]:
+    """Env-sourced ceiling on the eager fill's projected buffer, default OFF.
+
+    The eager fill materialises [n_leaves, n_players, max_hands] at 12 bytes
+    per cell and is >=99.7% of solve time; on 2026-09-03 one resolve spent
+    1353.5s in it and held the box's single solve slot for 22 minutes while
+    every other table fell back to the blueprint. The projection is computed
+    from the built tree BEFORE the first allocation, so the cost of a spot is
+    knowable before it is paid - which is the only predicate that works here,
+    because player count does not predict cost (a 4p spot replays at 247s and
+    a 6-way limped flop at 8.6s).
+
+    Unset or 0 keeps the shipped behaviour exactly: no ceiling, nothing
+    refused. An explicit ``max_projected_fill_bytes`` argument always wins.
+    """
+    raw = os.environ.get("NEXUS_MAX_PROJECTED_FILL_BYTES", "")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_MAX_PROJECTED_FILL_BYTES={raw!r} is not an integer"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            "NEXUS_MAX_PROJECTED_FILL_BYTES must be >= 0, got "
+            f"{value}"
+        )
+    return value or None
+
+
 def _leaf_rollout_enabled() -> bool:
     """LAZY per-visited-leaf rollout leaf-value oracle — DEFAULT OFF. When
     unset/0 the solve constructs its leaf values EAGERLY (the shipped path:
@@ -1159,6 +1191,18 @@ class CpuEsSolver:
             }
             if progress_callback is not None:
                 progress_callback("pre_fill", dict(self._last_preflight_stats))
+            # Log the projection on EVERY solve. The 2026-09-03 runaway could
+            # not be attributed afterwards because the box recorded only a job
+            # id and no shape; this line makes the next one self-describing.
+            logger.info(
+                "CpuEsSolver pre-fill: %dp %s n_leaves=%d max_hands=%d "
+                "projected_fill_bytes=%d guard=%s",
+                n_players, street, n_leaves, max_h, projected_fill_bytes,
+                max_projected_fill_bytes
+                if max_projected_fill_bytes is not None else "off",
+            )
+            if max_projected_fill_bytes is None:
+                max_projected_fill_bytes = _max_projected_fill_bytes_default()
             if (max_projected_fill_bytes is not None
                     and projected_fill_bytes > int(max_projected_fill_bytes)):
                 raise ProjectedFillMemoryExceeded(
