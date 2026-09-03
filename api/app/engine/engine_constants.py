@@ -383,8 +383,6 @@ DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
 # same objects as DEFAULT (already final); only 2p/3p differ. Floors are
 # keyed on the FULL config, so the flipped 2p/3p play rows correctly cite no
 # measured floor (measured_floor_for returns None on a readout mismatch).
-MAX_LIVE_RESOLVE_PLAYERS = 4
-
 PLAY_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     n: (
         cfg
