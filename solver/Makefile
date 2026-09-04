@@ -185,6 +185,24 @@ $(BUILD_DIR)/test_rollout_bias4: tests/test_rollout_bias4.c \
 test_rollout_bias4: $(BUILD_DIR)/test_rollout_bias4
 	./$(BUILD_DIR)/test_rollout_bias4
 
+# Betting-closed leaf accuracy and eager-fill de-duplication.  The test uses
+# link-only stubs for blueprint/continuation-EV symbols, so no BPS artifact is
+# required; hand_eval_table.c supplies the real showdown evaluator.
+$(BUILD_DIR)/test_rollout_allin_leaf: tests/test_rollout_allin_leaf.c \
+        $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c \
+        $(SEARCH_DIR)/rollout_internal.h $(SEARCH_DIR)/rollout_bucket_memo.h \
+        $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/mccfr_cont_ev_table.h \
+        $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_rollout_allin_leaf.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c \
+	    $(CORE_DIR)/hand_eval_table.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_rollout_allin_leaf
+test_rollout_allin_leaf: $(BUILD_DIR)/test_rollout_allin_leaf
+	./$(BUILD_DIR)/test_rollout_allin_leaf
+
 # Table-backed bias-oracle fixed points. The oracle is exercised directly
 # through its function pointer; no resolver or rollout objects are needed.
 $(BUILD_DIR)/test_es_bias_oracle: tests/test_es_bias_oracle.c \
