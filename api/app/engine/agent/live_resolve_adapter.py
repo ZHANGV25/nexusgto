@@ -94,8 +94,17 @@ def _has_to_call(state: GameState) -> bool:
 
 
 def _grid_k_from_env() -> GridK:
-    """Read the research grid dose without changing the shipped K=1 default."""
-    raw = os.environ.get("NEXUS_GRID_K", "1").strip()
+    """Read the hand-grid dose. Default ALL: every live physical combo.
+
+    The historical K=1 grid held ONE representative combo per 169 class,
+    chosen clubs-first among unblocked suits, and served the hero's real
+    cards from that class row. On any non-club flush board no hand in the
+    model could make a flush or hold a flush draw; on a club board every
+    suited hand was a flush (measured 2026-09-04: real flushes folded 100%
+    to a river jam, non-club suited hands raised 100% on a club board).
+    K=1 remains selectable for measurement only.
+    """
+    raw = os.environ.get("NEXUS_GRID_K", "ALL").strip()
     if raw.upper() == "ALL":
         return "ALL"
     try:
@@ -387,6 +396,26 @@ def hero_grid_row(player_ranges: Sequence, hero_player_idx: int,
     raise ValueError(
         f"hero hand ({c0},{c1}) maps to no grid class — corrupted range grid"
     )
+
+
+def hero_exact_row(
+    player_ranges: Sequence,
+    hero_player_idx: int,
+    hero_rows: Sequence[Tuple[int, float]],
+    hero_cards: Tuple[int, int],
+) -> Optional[int]:
+    """Row holding the hero's PHYSICAL combo among its class rows, or None.
+
+    K=ALL grids contain the combo; the K=1 grid holds one representative
+    per class, so this returns None there and callers fall back to the
+    class row. Serving the exact row is what makes suits real for hero.
+    """
+    grid = player_ranges[hero_player_idx]
+    target = set(hero_cards)
+    for row_idx, _weight in hero_rows:
+        if set(grid[row_idx][:2]) == target:
+            return row_idx
+    return None
 
 
 def hero_grid_rows(

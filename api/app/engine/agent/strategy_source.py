@@ -467,6 +467,12 @@ class LiveResolveSource(StrategySource):
         # uniform seeding on unparsed preflop shapes was an unflagged
         # quality compromise).
         self.last_range_seeding: Optional[str] = None
+        # Hand-grid disclosure for the provider: the dose used and whether
+        # the served row was the hero's physical combo (K=ALL) or a 169-class
+        # representative (K=1, suit-blind for the hero).
+        self.last_grid_k: Optional[object] = None
+        self.last_grid_rows: Optional[int] = None
+        self.last_hero_row_exact: Optional[bool] = None
         # Structured per-call disclosure. None is the flag-OFF contract.
         self.last_belief_carry: Optional[dict] = None
         self.last_offtree_add: Optional[dict] = None
@@ -553,6 +559,7 @@ class LiveResolveSource(StrategySource):
         from app.engine.agent.live_resolve_adapter import (
             aggregate_grid_row_strategies,
             build_solve_inputs,
+            hero_exact_row,
             hero_grid_row,
             hero_grid_rows,
             labels_to_index_freqs,
@@ -762,18 +769,16 @@ class LiveResolveSource(StrategySource):
             inputs["player_ranges"], hero_idx, hero_cards,
             inputs.get("player_range_metadata"),
         )
-        # K=ALL contains the physical combo; the shipped K=1 grid contains one
+        # K=ALL contains the physical combo; a K=1 grid contains one
         # representative combo per 169 class. In the latter case that class row
-        # is the resolver's lossless private-hand identity.
-        actual_row = next(
-            (
-                row_idx
-                for row_idx, _weight in hero_rows
-                if set(inputs["player_ranges"][hero_idx][row_idx][:2])
-                == set(hero_cards)
-            ),
-            hero_rows[0][0],
+        # is the resolver's private-hand identity (and suit-blind for hero).
+        exact_row = hero_exact_row(
+            inputs["player_ranges"], hero_idx, hero_rows, hero_cards,
         )
+        actual_row = exact_row if exact_row is not None else hero_rows[0][0]
+        self.last_grid_k = inputs.get("grid_k", 1)
+        self.last_grid_rows = len(inputs["player_ranges"][hero_idx])
+        self.last_hero_row_exact = exact_row is not None
         hero_actual_hand = {
             "player_idx": hero_idx,
             "hand_idx": actual_row,
@@ -1148,9 +1153,13 @@ class LiveResolveSource(StrategySource):
         positive_class_mass = sum(
             weight for _row_idx, weight in hero_rows if weight > 0.0
         )
+        # Serve the hero's PHYSICAL combo row whenever the grid holds it: the
+        # class average would blend a flush with three non-flushes. Only a
+        # K=1 grid (no physical row) or a zero-mass class falls back to the
+        # class row / class aggregate.
         strat = (
             per_hand.get(actual_row)
-            if legacy_k1 or positive_class_mass <= 0.0
+            if legacy_k1 or positive_class_mass <= 0.0 or exact_row is not None
             else aggregate_grid_row_strategies(per_hand, hero_rows)
         )
         n_legal = int(inputs["n_legal"])
