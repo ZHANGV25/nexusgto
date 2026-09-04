@@ -31,6 +31,7 @@ extern uint64_t bp_compute_action_hash(const int *actions, int num_actions);
 /* ── Compile-time caps ───────────────────────────────────────────────── */
 
 #define ROLLOUT_MAX_HANDS          1326
+#define ROLLOUT_ALLIN_ROLLOUTS_DEFAULT 64
 /* ROLLOUT_MAX_ACTION_HISTORY now lives in rollout.h — it sizes a public
  * field on RolloutLeafInfo. */
 #define ROLLOUT_DECK               52
@@ -749,6 +750,31 @@ BPS_EXPORT void rollout_apply_bias_c(
  * if you load a blueprint that WAS trained with the gate on. */
 static int g_rollout_add_explicit_allin = -1;
 
+/* Betting-closed leaves need enough independent runouts to keep CFR from
+ * best-responding to a tiny, fixed sample.  The live solve still passes the
+ * normal rollout count (currently 3); only leaves where fewer than two live
+ * players retain chips use this separately configurable count. */
+static int32_t g_rollout_allin_rollouts = -1;
+
+static int32_t rollout_allin_rollouts(void) {
+    int32_t v = __atomic_load_n(&g_rollout_allin_rollouts, __ATOMIC_RELAXED);
+    if (v > 0) return v;
+
+    int32_t parsed = ROLLOUT_ALLIN_ROLLOUTS_DEFAULT;
+    const char *e = getenv("BPS_ROLLOUT_ALLIN_ROLLOUTS");
+    if (e && e[0] != '\0') {
+        char *end = NULL;
+        long requested = strtol(e, &end, 10);
+        if (end != e && *end == '\0' && requested > 0
+            && requested <= INT32_MAX) {
+            parsed = (int32_t)requested;
+        }
+    }
+
+    __atomic_store_n(&g_rollout_allin_rollouts, parsed, __ATOMIC_RELAXED);
+    return parsed;
+}
+
 static int rollout_should_add_explicit_allin(void) {
     int v = __atomic_load_n(&g_rollout_add_explicit_allin, __ATOMIC_RELAXED);
     if (v >= 0) return v;
@@ -758,6 +784,19 @@ static int rollout_should_add_explicit_allin(void) {
                   ? 1 : 0;
     __atomic_store_n(&g_rollout_add_explicit_allin, parsed, __ATOMIC_RELAXED);
     return parsed;
+}
+
+/* Same betting-closed predicate used by rollout_simulate_one and by both leaf
+ * fill paths: fewer than two active players still have chips with which to
+ * take an action. */
+static int rollout_betting_closed(
+    const int32_t *active, const int32_t *stacks, int32_t num_players
+) {
+    int32_t n_live_can_act = 0;
+    for (int32_t p = 0; p < num_players; p++) {
+        if (active[p] && stacks[p] > 0) n_live_can_act++;
+    }
+    return n_live_can_act < 2;
 }
 
 /* ── Training bet-vocab (runtime, bet-vocab desync fix 2026-07-01) ──────
@@ -1332,13 +1371,8 @@ int rollout_simulate_one(
          * showdown. Without this check, a post-allin river node would
          * query σ̄ at a closed betting line (ah_len overflow into a
          * terminal info set), producing spurious blueprint misses. */
-        {
-            int32_t n_live_can_act = 0;
-            for (int32_t i = 0; i < num_players; i++) {
-                if (active[i] && stacks[i] > 0) n_live_can_act++;
-            }
-            if (n_live_can_act < 2) goto street_closed;
-        }
+        if (rollout_betting_closed(active, stacks, num_players))
+            goto street_closed;
 
         /* Skip the betting loop on the leaf's street when the leaf
          * already represents end-of-street state (its flop_history was
@@ -2136,10 +2170,15 @@ static int rollout_compute_leaf_value_impl(
         return 0;
     }
 
+    int32_t effective_rollouts = num_rollouts;
+    if (rollout_betting_closed(active, stacks, num_players)) {
+        effective_rollouts = rollout_allin_rollouts();
+    }
+
     double payoff_sum = 0.0;
     int32_t payoffs_recorded = 0;
 
-    for (int32_t r_idx = 0; r_idx < num_rollouts; r_idx++) {
+    for (int32_t r_idx = 0; r_idx < effective_rollouts; r_idx++) {
         uint64_t rng = rollout_derive_seed(
             master_seed, leaf_idx_for_seed, combo_for_seed,
             hero_player, hero_hand_idx, r_idx);
@@ -2370,6 +2409,29 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
 
     memset(out, 0, (size_t)floats_needed * sizeof(float));
 
+    /* Bias profiles cannot affect a betting-closed leaf: the rollout only
+     * deals the remaining board and evaluates showdown.  Identify those
+     * leaves before entering the collapsed OpenMP loop so only combo 0 needs
+     * to be computed there; the other slots are copied after the barrier. */
+    unsigned char *allin_leaves = NULL;
+    if (n_leaves > 0) {
+        allin_leaves = (unsigned char *)calloc((size_t)n_leaves, 1);
+        if (!allin_leaves) {
+            rollout_set_error(street, num_players,
+                              "failed to allocate all-in leaf flags");
+            return -1;
+        }
+        for (int32_t li_idx = 0; li_idx < n_leaves; li_idx++) {
+            int32_t leaf_stacks[ROLLOUT_MAX_PLAYERS];
+            for (int32_t p = 0; p < num_players; p++) {
+                int32_t s = stack_chips - leaf_infos[li_idx].bets[p];
+                leaf_stacks[p] = s < 0 ? 0 : s;
+            }
+            allin_leaves[li_idx] = (unsigned char)rollout_betting_closed(
+                active, leaf_stacks, num_players);
+        }
+    }
+
     /* OpenMP parallelization over (leaf × combo). The RNG is per-tuple
      * splitmix64 with no shared state; `out` is written to disjoint
      * per-(leaf_idx, combo) regions by construction (flat indexing in
@@ -2404,10 +2466,11 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
                 r, board, n_board_cards, street, active, player_hands, \
                 acting_order, acting_order_len, player_seats, \
                 game_action_history, gah_len, g_fail, \
-                cap_reason, cap_street, cap_num_players)
+                cap_reason, cap_street, cap_num_players, allin_leaves)
     for (int32_t li_idx = 0; li_idx < n_leaves; li_idx++) {
         for (int64_t combo = 0; combo < cont_per_leaf; combo++) {
             if (g_fail) continue;
+            if (allin_leaves[li_idx] && combo > 0) continue;
 
             const RolloutLeafInfo *li = &leaf_infos[li_idx];
             int32_t stacks[ROLLOUT_MAX_PLAYERS];
@@ -2486,6 +2549,7 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
     }
 
     if (g_fail) {
+        free(allin_leaves);
         /* Re-raise into the caller's TLS slot so rollout_get_last_error
          * continues to work on the main thread. */
         rollout_set_error(cap_street, cap_num_players, "%s",
@@ -2493,5 +2557,19 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
                                         : "rollout worker failed");
         return -1;
     }
+
+    /* The implicit barrier at the end of the OpenMP region guarantees every
+     * combo-0 slot is complete before it is replicated. */
+    int64_t slot_floats = (int64_t)num_players * (int64_t)max_hands;
+    for (int32_t li_idx = 0; li_idx < n_leaves; li_idx++) {
+        if (!allin_leaves[li_idx]) continue;
+        int64_t base = (int64_t)leaf_infos[li_idx].leaf_idx * cont_per_leaf;
+        const float *src = out + base * slot_floats;
+        for (int64_t combo = 1; combo < cont_per_leaf; combo++) {
+            float *dst = out + (base + combo) * slot_floats;
+            memcpy(dst, src, (size_t)slot_floats * sizeof(float));
+        }
+    }
+    free(allin_leaves);
     return 0;
 }
