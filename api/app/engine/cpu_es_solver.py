@@ -71,6 +71,39 @@ class ProjectedFillMemoryExceeded(MemoryError):
     """An eager-fill arm exceeded its pre-allocation measurement guard."""
 
 
+class LivePlayerCountExceeded(ValueError):
+    """A live re-solve was requested for more players than the served arm.
+
+    2026-09-09: the 7 MB projected-fill guard used to separate 3p from 4p
+    fills by size. With the ISO grid the row count depends on the board
+    texture (a 4p monotone flop projects ~2.3 MB, a 3p rainbow flop ~4 MB),
+    so bytes no longer tell the player counts apart. The policy is stated
+    suppresses 4+ live players and the multiway vec path is not a served
+    arm. NEXUS_MAX_LIVE_RESOLVE_PLAYERS raises the cap for measurement.
+    """
+
+
+_MAX_LIVE_RESOLVE_PLAYERS_ENV = "NEXUS_MAX_LIVE_RESOLVE_PLAYERS"
+_MAX_LIVE_RESOLVE_PLAYERS_DEFAULT = 3
+
+
+def _max_live_resolve_players() -> int:
+    raw = os.environ.get(_MAX_LIVE_RESOLVE_PLAYERS_ENV, "").strip()
+    if not raw:
+        return _MAX_LIVE_RESOLVE_PLAYERS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{_MAX_LIVE_RESOLVE_PLAYERS_ENV}={raw!r} is not an integer"
+        ) from None
+    if not (2 <= value <= 6):
+        raise ValueError(
+            f"{_MAX_LIVE_RESOLVE_PLAYERS_ENV} must be within [2, 6], got {value}"
+        )
+    return value
+
+
 # poker-solver locations (the provider side-loads python/ onto sys.path at init;
 # we resolve the DLL + python dir from the same env the provider uses).
 _POKER_SOLVER = os.environ.get(
@@ -757,6 +790,16 @@ class CpuEsSolver:
                     "values; disable one feature")
         rc = self._rollout_c
         n_players = len(player_ranges)
+        # LIVE PLAYER CAP (2026-09-09): refuse 4+ player subgames before any
+        # tree or fill work; see LivePlayerCountExceeded. The byte guard
+        # below stays as the secondary bound.
+        _max_live_players = _max_live_resolve_players()
+        if n_players > _max_live_players:
+            raise LivePlayerCountExceeded(
+                f"live re-solve serves at most {_max_live_players} players, "
+                f"got {n_players}; 4+ player subgames are refused by policy "
+                "is not a served arm)"
+            )
         root_geometry_present = tuple(
             value is not None
             for value in (

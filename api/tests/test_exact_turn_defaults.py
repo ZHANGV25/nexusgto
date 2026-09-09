@@ -35,3 +35,22 @@ def test_solver_defaults_extend_the_turn_sample_the_river_and_skip_reach():
     assert '"NEXUS_CHANCE_SAMPLE", "1")' in source
     assert '"NEXUS_FREEZE_HERO_LINE", "1")' in source
     assert '"NEXUS_EXACT_ALLIN_LEAVES", "1")' in source
+
+
+def test_live_player_cap_default_and_placement(monkeypatch):
+    from app.engine.cpu_es_solver import _max_live_resolve_players
+    monkeypatch.delenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", raising=False)
+    assert _max_live_resolve_players() == 3
+    monkeypatch.setenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", "6")
+    assert _max_live_resolve_players() == 6
+    monkeypatch.setenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", "7")
+    try:
+        _max_live_resolve_players()
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("cap outside [2, 6] must fail loud")
+    source = inspect.getsource(CpuEsSolver.solve)
+    i_cap = source.index("raise LivePlayerCountExceeded(")
+    i_tree = source.index("Build the tree")
+    assert i_cap < i_tree
