@@ -17,7 +17,7 @@ from app.engine.engine_constants import (
 
 
 def test_two_and_three_player_defaults_are_vec_final_20k():
-    assert LIVE_2P3P_ITERATIONS == 20_000
+    assert LIVE_2P3P_ITERATIONS == 100_000
     for n in (2, 3):
         cfg = DEFAULT_LIVE_CONFIG_BY_N[n]
         assert cfg.vec_mode is True

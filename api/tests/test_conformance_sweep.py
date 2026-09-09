@@ -172,7 +172,8 @@ def test_display_table_2p3p_is_vec_final_20k():
         cfg = DEFAULT_LIVE_CONFIG_BY_N[n]
         assert cfg.readout == "final"
         assert cfg.vec_mode is True
-        assert cfg.iterations == 20_000
+        assert cfg.iterations == 100_000
+        assert cfg.deadline_ms == 3_000
 
 
 def test_hero_traverser_mixture_and_coverage_defaults(monkeypatch):

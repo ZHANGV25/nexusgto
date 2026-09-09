@@ -337,11 +337,23 @@ def _finite_float_env(
 #         leaves with exact per-pair all-in cells. 20k is the measured budget
 #   n>=4: vec-Linear-FINAL at 5M iterations (the Gate-1-validated playing-agent
 #         path); nr=10 for 5p/6p (under-the-bar floor per NR_LADDER).
-LIVE_2P3P_ITERATIONS = 20_000
+# 2026-09-09 (vec-sampled leaf, NEXUS_LEAF_VEC_SAMPLED=1 staged): the 2p flop
+# and 3p flop/turn leaves are rolled out per visit, so a FIXED 20k-iteration
+# solve is 16-41 s on a flop whose bucket memo is cold. The 2p/3p live config
+# therefore carries a CFR wall budget (the C deadline, anytime readout) and
+# the iteration count is a CEILING: a warm flop reaches ~20k in 3 s, a cold
+# one returns ~100-500 iterations (still better than the old frozen table
+# under the common referee, poker-solver docs/VEC_SAMPLED_LEAF_MODE_2026-09-09
+# .md), and the river-extended turn uses the whole budget (100k in 1.9 s).
+# The budget applies to EVERY route (/v1/analyze's live resolve and
+# /v1/solve) so no caller can fall back to the unbounded fixed count; a
+# client deadline_ms override still wins. Measured 2026-09-09 on r7a.2xlarge:
+LIVE_2P3P_ITERATIONS = 100_000
+LIVE_2P3P_DEADLINE_MS = 3_000
 DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     2: LiveSolveConfig(
         iterations=LIVE_2P3P_ITERATIONS, num_rollouts=3, vec_mode=True,
-        readout="final",
+        readout="final", deadline_ms=LIVE_2P3P_DEADLINE_MS,
         note=(
             "2p live re-solve: vec-Linear-FINAL 20k (2026-09-09); turn "
             "extends through the river in-tree (sampled river, hero line "
@@ -351,7 +363,7 @@ DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     ),
     3: LiveSolveConfig(
         iterations=LIVE_2P3P_ITERATIONS, num_rollouts=3, vec_mode=True,
-        readout="final",
+        readout="final", deadline_ms=LIVE_2P3P_DEADLINE_MS,
         note=(
             "3p live re-solve: vec-Linear-FINAL 20k (2026-09-09), "
             "depth-limited leaves with exact all-in cells; no measured "
