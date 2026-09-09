@@ -422,7 +422,7 @@ def hero_exact_row(
     grid = player_ranges[hero_player_idx]
     target = set(hero_cards)
     if board is not None:
-        from app.engine.agent.suit_isomorphism import canonical_combo
+        from app.services.suit_isomorphism import canonical_combo
         target = set(canonical_combo(hero_cards[0], hero_cards[1], board))
     for row_idx, _weight in hero_rows:
         if set(grid[row_idx][:2]) == target:
