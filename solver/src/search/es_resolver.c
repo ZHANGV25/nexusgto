@@ -1993,12 +1993,15 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     uint64_t deadline_start_ms = (r->deadline_ms > 0)
                                  ? es_monotonic_ms() : 0;
     /* Deadline check granularity. The historical 4096-iteration stride was
-     * sized for ~ns table leaves; a per-visit rollout oracle spends 0.1-3 ms
-     * per iteration, so 4096 iterations overshoot a 3 s budget by tens of
-     * seconds (measured 2026-09-09: a 3.0 s deadline ran 38.9 s cold). A
-     * monotonic clock read is ~25 ns, so checking every 16 iterations costs
-     * nothing on any path; without a deadline the mask is never consulted. */
-    int64_t deadline_mask = (r->vec_oracle != NULL) ? 15LL : 4095LL;
+     * sized for ~ns table leaves; a per-visit rollout oracle spends 0.1 ms
+     * (warm) to ~0.5 s (cold bucket memo, 8 threads sharing) per iteration,
+     * so a 4096 stride overshot a 3 s budget by tens of seconds and a 16
+     * stride by up to 1.2 s (measured 2026-09-09). A monotonic clock read is
+     * ~25 ns, so with a vector oracle the deadline is checked before EVERY
+     * iteration and between traverser passes; other paths keep the 4096
+     * stride. Without a deadline none of this is consulted. */
+    int fine_deadline = (r->vec_oracle != NULL) && (r->deadline_ms > 0);
+    int64_t deadline_mask = fine_deadline ? 0LL : 4095LL;
 
     if (nthreads == 1) {
         /* Deterministic single-thread path (the validated reference). */
@@ -2015,6 +2018,9 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                 if (r->vec_traverser) {
                     /* vec mode walks ALL traverser hands; es_vec_pass samples
                      * OPPONENTS ONLY (traverser cards not reserved). */
+                    if (fine_deadline && trav > 0
+                        && es_deadline_expired(r, deadline_start_ms))
+                        break;
                     local.traversals++;
                     es_vec_pass(r, trav, &rng, &local, it + 1, vec_scratch);
                 } else {
@@ -2079,6 +2085,11 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                 }
                 for (int trav = 0; trav < np; trav++) {
                     if (r->vec_traverser) {
+                        if (fine_deadline && trav > 0
+                            && es_deadline_expired(r, deadline_start_ms)) {
+                            atomic_store(&deadline_stop, 1);
+                            break;
+                        }
                         local.traversals++;
                         es_vec_pass(r, trav, &rng, &local, it + 1,
                                     vec_scratch);
