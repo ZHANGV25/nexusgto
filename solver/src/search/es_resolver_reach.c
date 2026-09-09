@@ -460,7 +460,7 @@ static void es_reach_leaf_cfv(ESResolver *r, int node_idx, int traverser,
             if (oc0 == c0 || oc0 == c1 || oc1 == c0 || oc1 == c1) continue;
             sampled[opp] = o;
             r->stats.leaf_rollouts++;
-            val += w * r->oracle(r->oracle_ctx, nd->leaf_idx, traverser, h, sampled, nd, rng);
+            val += w * es_leaf_payoff(r, node_idx, traverser, sampled, rng);
             z += w;
         }
         cfv[h] = val;   /* oracle already returns absolute chip value; reach-weighted sum */
@@ -723,6 +723,8 @@ double es_exploitability_2p(ESResolver *r, double *out_gap0, double *out_gap1) {
         es_set_error("exploitability_2p does not support root-pot geometry");
         return NAN;
     }
+    if (r->exact_allin_leaves && es_prepare_exact_allin_leaves(r) != 0)
+        return NAN;
     if (!r->rc_reach && es_reach_alloc(r) != 0) return NAN;
     const SSTreeData *t = r->tree;
     int max_h = r->reach_max_h;

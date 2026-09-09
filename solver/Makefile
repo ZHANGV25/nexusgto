@@ -130,6 +130,50 @@ $(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_
 	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
 
+# Exact sampled-pair showdown values at betting-closed depth-limit leaves.
+# Hand-built trees + eval7 only; no blueprint artifact or CUDA dependency.
+$(BUILD_DIR)/test_es_allin_exact: tests/test_es_allin_exact.c \
+        $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+        $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h \
+        $(SEARCH_DIR)/es_oracles.c \
+        $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h \
+        $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_allin_exact.c \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+	    $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval_table.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_allin_exact
+test_es_allin_exact: $(BUILD_DIR)/test_es_allin_exact
+	./$(BUILD_DIR)/test_es_allin_exact
+
+# Deterministic ES terminal/table primitives. Kept as a standalone make target
+# because the source is also used directly by validation harnesses.
+$(BUILD_DIR)/test_es_resolver_primitives: tests/test_es_resolver_primitives.c \
+        $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+        $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h \
+        $(SEARCH_DIR)/es_oracles.c \
+        $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h \
+        $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_resolver_primitives.c \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+	    $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval_table.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_resolver_primitives
+test_es_resolver_primitives: $(BUILD_DIR)/test_es_resolver_primitives
+	./$(BUILD_DIR)/test_es_resolver_primitives
+
+# Pure-C CPU/GPU chance-sample formula equality gate.
+$(BUILD_DIR)/test_es_chance_sample_bitexact: \
+        tests/test_es_chance_sample_bitexact.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_es_chance_sample_bitexact.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_chance_sample_bitexact
+test_es_chance_sample_bitexact: $(BUILD_DIR)/test_es_chance_sample_bitexact
+	./$(BUILD_DIR)/test_es_chance_sample_bitexact
+
 # Per-visit sampled leaf oracle contracts. rollout_simulate_one is supplied by
 # a deterministic stub, so no blueprint artifact or live rollout is required.
 $(BUILD_DIR)/test_es_sampled_oracle: tests/test_es_sampled_oracle.c \
