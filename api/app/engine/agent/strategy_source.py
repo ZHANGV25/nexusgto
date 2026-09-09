@@ -774,6 +774,10 @@ class LiveResolveSource(StrategySource):
         # is the resolver's private-hand identity (and suit-blind for hero).
         exact_row = hero_exact_row(
             inputs["player_ranges"], hero_idx, hero_rows, hero_cards,
+            board=(
+                inputs["board_ints"] if inputs.get("grid_k") == "ISO"
+                else None
+            ),
         )
         actual_row = exact_row if exact_row is not None else hero_rows[0][0]
         self.last_grid_k = inputs.get("grid_k", 1)

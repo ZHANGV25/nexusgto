@@ -105,17 +105,20 @@ def _grid_k_from_env() -> GridK:
     K=1 remains selectable for measurement only.
     """
     raw = os.environ.get("NEXUS_GRID_K", "ALL").strip()
-    if raw.upper() == "ALL":
-        return "ALL"
+    if raw.upper() in ("ALL", "ISO"):
+        # ISO (2026-09-09): one row per board-relative suit-isomorphism
+        # class (flush-irrelevant suits pooled); exact for hand strength,
+        # roughly a third of the ALL rows on a turn. See suit_isomorphism.py.
+        return raw.upper()
     try:
         value = int(raw)
     except ValueError:
         raise ValueError(
-            f"NEXUS_GRID_K must be a positive integer or ALL, got {raw!r}"
+            f"NEXUS_GRID_K must be a positive integer, ALL or ISO, got {raw!r}"
         ) from None
     if value <= 0:
         raise ValueError(
-            f"NEXUS_GRID_K must be a positive integer or ALL, got {raw!r}"
+            f"NEXUS_GRID_K must be a positive integer, ALL or ISO, got {raw!r}"
         )
     return value
 
@@ -335,7 +338,7 @@ def build_solve_inputs(
     for slot in entry_slots:
         weights = range_weight_dicts[slot] if use_weights else None
         grid, metadata = _build_hand_grid_range_with_metadata(
-            blocked, weights=weights, k=grid_k,
+            blocked, weights=weights, k=grid_k, board=board_ints,
         )
         player_ranges.append([(r[0], r[1], r[2]) for r in grid])
         player_range_metadata.append(metadata)
@@ -403,15 +406,24 @@ def hero_exact_row(
     hero_player_idx: int,
     hero_rows: Sequence[Tuple[int, float]],
     hero_cards: Tuple[int, int],
+    board: Optional[Sequence[int]] = None,
 ) -> Optional[int]:
     """Row holding the hero's PHYSICAL combo among its class rows, or None.
 
     K=ALL grids contain the combo; the K=1 grid holds one representative
     per class, so this returns None there and callers fall back to the
     class row. Serving the exact row is what makes suits real for hero.
+
+    With ``board`` given (the ISO grid), the match is by board-relative
+    canonical form: the row holding the canonical representative of the
+    hero's combo is the hero's row (isomorphic under the pooled suits, so
+    exact for strength).
     """
     grid = player_ranges[hero_player_idx]
     target = set(hero_cards)
+    if board is not None:
+        from app.engine.agent.suit_isomorphism import canonical_combo
+        target = set(canonical_combo(hero_cards[0], hero_cards[1], board))
     for row_idx, _weight in hero_rows:
         if set(grid[row_idx][:2]) == target:
             return row_idx
