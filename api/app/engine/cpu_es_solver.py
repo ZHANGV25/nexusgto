@@ -1108,6 +1108,47 @@ class CpuEsSolver:
                 )
                 tree.root_pot_amounts = root_amount_values
                 tree.root_pot_eligible_masks = root_mask_values
+            # ── HERO-LINE FREEZING (Pluribus safe re-solving, 2026-09-09) ──
+            # The subgame is rooted at the street start, but the served node
+            # can be several actions deep (facing a jam after a check-raise).
+            # Without freezing, villain's nodes on hero's real line are only
+            # trained when self-play wanders there, so villain still jams too
+            # wide after 100k iterations and hero calls with air. Freezing
+            # hero's OWN earlier decisions on this street (never the served
+            # node) makes every iteration walk the real line. The pairs come
+            # from the same replay walk the readout uses; the C resolver
+            # consumes SSTreeData.frozen_action. NEXUS_FREEZE_HERO_LINE=0
+            # disables it for measurement.
+            _frozen_steps: Tuple[Tuple[int, int], ...] = ()
+            _freeze_hero_line = os.environ.get(
+                "NEXUS_FREEZE_HERO_LINE", "1")[:1] in ("1", "t", "T", "y", "Y")
+            if (_freeze_hero_line and _offtree_replay is not None
+                    and hero_replay is not None
+                    and hero_replay.get("street_actions")
+                    and hasattr(gpu, "set_frozen_action_indices")):
+                try:
+                    _pre_walk = replay_offtree_street_node(
+                        tree,
+                        list(hero_replay["street_actions"]),  # type: ignore[arg-type]
+                        n_players=n_players,
+                        base_bet_sizes=_base_bet_sizes,
+                        base_subsequent_bet_sizes=_base_subsequent_sizes,
+                        bet_sizes=bet_sizes,
+                        subsequent_bet_sizes=subsequent_bet_sizes,
+                        add_explicit_allin=add_explicit_allin,
+                        event_fractions=_event_fractions,
+                        expected_event_amounts=_expected_event_amounts,
+                    )
+                    _frozen_steps = _pre_walk.hero_frozen_steps(
+                        int(hero_replay["player_idx"])  # type: ignore[arg-type]
+                    )
+                except ReplayUnsupported:
+                    # The post-solve walk raises the same error with the
+                    # served-path context; do not duplicate it here.
+                    _frozen_steps = ()
+                if _frozen_steps:
+                    gpu.set_frozen_action_indices(_frozen_steps)
+            _chance_sampled = False
             max_h = gpu._max_hands
 
             # IN-TREE CHANCE NODE GATE (2026-06-14, narrowed 2026-06-15).
@@ -1905,7 +1946,17 @@ class CpuEsSolver:
                     readout = "avg"
                 vec_mode = 0
             elif tree_has_chance and hasattr(cs, "set_chance_mode"):
-                cs.set_chance_mode(1)   # enumerate card outcomes (correct)
+                # NEXUS_CHANCE_SAMPLE=1: deal ONE next-street card per
+                # iteration (keyed by iteration and chance node, so every
+                # visit inside one iteration sees the same runout) instead of
+                # enumerating all outcomes. Measured 2026-09-09 on a 2p turn
+                # with the river in-tree: enumerate 75 ms/iteration, sample
+                # 0.16 ms/iteration at 1128 rows; sampling is the only way
+                # the river-extended turn fits a live budget. Unbiased in
+                # expectation; convergence comes from iterations.
+                _chance_sampled = os.environ.get(
+                    "NEXUS_CHANCE_SAMPLE", "")[:1] in ("1", "t", "T", "y", "Y")
+                cs.set_chance_mode(0 if _chance_sampled else 1)
                 if (not _sampled_requested and n_players <= 3
                         and hasattr(cs, "set_opp_mode")):
                     if readout == "both":
@@ -2562,6 +2613,8 @@ class CpuEsSolver:
                 # reach mode ignores num_threads in C (single-threaded pass)
                 "eff_threads": 1 if use_reach else int(_eff_threads),
                 "use_reach": bool(use_reach),
+                "hero_frozen_steps": int(len(_frozen_steps)),
+                "chance_sampled": bool(_chance_sampled),
                 "num_nodes": int(_nn),
                 "num_leaf_nodes": int(n_leaf_nodes),
                 "num_leaves": int(n_leaves),

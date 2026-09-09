@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 
+# SSNode.type of a card-deal node (street_solve.cuh SS_NODE_CHANCE).
+_CHANCE_NODE_TYPE = 3
+
+
 class ReplayUnsupported(Exception):
     """The extended tree cannot faithfully represent the recorded replay."""
 
@@ -61,11 +65,28 @@ class NodeProjection:
 
 @dataclass(frozen=True)
 class ReplayWalk:
-    """Result of walking the recorded street inside an extended tree."""
+    """Result of walking the recorded street inside an extended tree.
+
+    ``path`` records every replayed step as ``(node_index, actor, child)``
+    in walk order, so a caller can freeze the hero's own earlier decisions
+    on this street (Pluribus safe re-solving) without re-walking.
+    """
 
     node_index: int
     replayed_through_added: bool
     added_child_chips: Tuple[Tuple[int, int], ...]
+    path: Tuple[Tuple[int, int, int], ...] = ()
+
+    def hero_frozen_steps(
+        self, hero_player: int,
+    ) -> Tuple[Tuple[int, int], ...]:
+        """``(node_index, child)`` for the hero's decisions before the served
+        node, in walk order. The served node itself is never frozen."""
+        return tuple(
+            (int(node), int(child))
+            for node, actor, child in self.path
+            if int(actor) == int(hero_player) and int(node) != self.node_index
+        )
 
 
 def validate_extended_tree(tree: object, max_actions: int = 8) -> None:
@@ -188,6 +209,14 @@ def _structural_nonraise_children(
             expected_call_bet = int(node.bets[actor]) + min(
                 to_call, max(remaining, 0)
             )
+            if int(getattr(child, "type", 0)) == _CHANCE_NODE_TYPE:
+                # A check/call that closes the street on a river-extended
+                # tree lands on a CHANCE node: the builder resets the street
+                # bets there (cross-street stack carryover), so the bet
+                # equality below cannot hold. It is the structural call child
+                # by position (fold first when facing a bet, then call).
+                result.append(child_index)
+                continue
             if (not child.active[actor]
                     or int(child.bets[actor]) != expected_call_bet):
                 raise ValueError(
@@ -309,6 +338,7 @@ def replay_offtree_street_node(
     replayed_added = False
     added_child_chips: Dict[int, int] = {}
     consumed_event_steps: set[int] = set()
+    path: List[Tuple[int, int, int]] = []
 
     for step, raw_index in enumerate(street_actions):
         node = tree.nodes[node_index]
@@ -412,6 +442,7 @@ def replay_offtree_street_node(
                 raise ValueError(
                     f"street replay step {step}: matched child is not a raise"
                 )
+        path.append((int(node_index), int(actor), int(child_index)))
         node_index = int(node.children[child_index])
 
     missing_event_steps = sorted(
@@ -427,6 +458,7 @@ def replay_offtree_street_node(
         node_index=node_index,
         replayed_through_added=bool(replayed_added),
         added_child_chips=tuple(sorted(added_child_chips.items())),
+        path=tuple(path),
     )
 
 
