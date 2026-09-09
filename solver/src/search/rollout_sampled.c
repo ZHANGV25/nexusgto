@@ -14,6 +14,7 @@
 
 #include "rollout.h"
 #include "rollout_internal.h"
+#include "rollout_bucket_memo.h"  /* per-solve turn/river bucket memo */
 
 #include <limits.h>
 #include <stdarg.h>
@@ -130,6 +131,20 @@ static int32_t rollout_sampled_core(
     char cap_reason[512] = {0};
     int32_t cap_street = street;
     int32_t cap_num_players = num_players;
+
+    /* Arm the per-solve turn/river bucket memo for this fill's fixed flop,
+     * single-threaded, before the parallel region below. Mirrors the oracle
+     * constructors (es_real_oracle.c / es_sampled_oracle.c). Cached bucket ids
+     * are pure functions of (reader, board, hole pair), so the same-value
+     * stores under the Hogwild fill are idempotent and the memoized fill is
+     * bit-identical to the unmemoized one; arming only removes the
+     * ca_compute_features/eval5 recompute storm (~86% of fill cycles,
+     * ROLLOUT_PROFILE_2026-07-28) that the eager fill path used to pay because
+     * it never armed the memo (the two oracle constructors did). */
+    if (r && board && n_board_cards >= 3) {
+        int rbm_flop3[3] = { board[0], board[1], board[2] };
+        rollout_bucket_memo_reset((const void *)r, rbm_flop3);
+    }
 
     #pragma omp parallel for collapse(2) schedule(dynamic, 1) default(none) \
         shared(acc, leaf_infos, n_leaves, num_samples_k, stack_chips, \
@@ -438,6 +453,14 @@ static int32_t rollout_bias4_core(
     char cap_reason[512] = {0};
     int32_t cap_street = street;
     int32_t cap_num_players = num_players;
+
+    /* Arm the per-solve turn/river bucket memo before the parallel region;
+     * see the rationale in rollout_sampled_core above. Bit-identical fill,
+     * removes the per-rollout bucket-feature recompute. */
+    if (r && board && n_board_cards >= 3) {
+        int rbm_flop3[3] = { board[0], board[1], board[2] };
+        rollout_bucket_memo_reset((const void *)r, rbm_flop3);
+    }
 
     #pragma omp parallel for collapse(3) schedule(dynamic, 1) default(none) \
         shared(acc, leaf_infos, n_leaves, num_rounds, stack_chips, \

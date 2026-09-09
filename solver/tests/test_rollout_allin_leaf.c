@@ -442,6 +442,14 @@ void rollout_bucket_memo_store_river(const void *reader, const int *board,
     note_unexpected_dependency_call();
 }
 
+/* The fill cores now arm the memo before their parallel region. Unlike the
+ * lookup/store stubs above (which flag an unexpected blueprint dependency if a
+ * stubbed-out rollout somehow reached them), reset is an EXPECTED single-
+ * threaded setup call, so it is a plain no-op. */
+void rollout_bucket_memo_reset(const void *reader, const int flop[3]) {
+    (void)reader; (void)flop;
+}
+
 uint64_t bp_compute_action_hash(const int *actions, int num_actions) {
     (void)actions; (void)num_actions;
     note_unexpected_dependency_call();

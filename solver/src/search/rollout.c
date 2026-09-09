@@ -2452,6 +2452,15 @@ BPS_EXPORT int32_t rollout_compute_subgame_leaf_values_c(
     int32_t cap_street = street;
     int32_t cap_num_players = num_players;
 
+    /* Arm the per-solve turn/river bucket memo before the collapsed parallel
+     * region; see the rationale in rollout_sampled.c::rollout_sampled_core.
+     * Bit-identical fill (same-value idempotent stores), removes the
+     * per-rollout bucket-feature recompute the eager joint fill used to pay. */
+    if (r && board && n_board_cards >= 3) {
+        int rbm_flop3[3] = { board[0], board[1], board[2] };
+        rollout_bucket_memo_reset((const void *)r, rbm_flop3);
+    }
+
     /* Parallelize across the full (leaf × combo) cartesian product.
      * collapse(2) requires perfectly-nested loops, so stack computation
      * moves inside. `g_fail` guards short-circuit; break is illegal in

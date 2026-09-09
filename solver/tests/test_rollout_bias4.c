@@ -61,6 +61,13 @@ void rollout_get_last_error(
     if (num_players) *num_players = g_error_np;
 }
 
+/* The fill cores arm the per-solve bucket memo before their parallel region
+ * (rollout_sampled.c). The rollout boundary is stubbed below, so no bucket
+ * lookup/store is ever reached; reset is a harmless expected setup call. */
+void rollout_bucket_memo_reset(const void *reader, const int flop[3]) {
+    (void)reader; (void)flop;
+}
+
 /* Exact public all-hands boundary used by rollout_sampled.c. */
 int32_t rollout_compute_leaf_values_all_hands_c(
     const BPSReader *r,
