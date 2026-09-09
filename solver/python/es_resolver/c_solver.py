@@ -69,6 +69,8 @@ def _load_dll() -> ctypes.CDLL:
 _lib = _load_dll()
 _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 _HAS_SAMPLED = hasattr(_lib, "es_make_sampled_oracle")
+_HAS_VEC_SAMPLED = (hasattr(_lib, "es_make_vec_sampled_oracle")
+                    and hasattr(_lib, "es_set_vec_leaf_oracle"))
 _HAS_ROOT_POTS = hasattr(_lib, "es_create_with_root_pots")
 _HAS_EXACT_ALLIN_LEAVES = hasattr(_lib, "es_set_exact_allin_leaves")
 _BIAS_SYMBOLS = (
@@ -247,6 +249,36 @@ if _HAS_SAMPLED:
     _lib.es_free_sampled_oracle.restype = None
     _lib.es_free_sampled_oracle.argtypes = [ctypes.c_void_p]
 
+if _HAS_VEC_SAMPLED:
+    _lib.es_make_vec_sampled_oracle.restype = ctypes.c_void_p
+    _lib.es_make_vec_sampled_oracle.argtypes = [
+        ctypes.c_void_p,                   # bp
+        ctypes.c_void_p,                   # SSTreeData*
+        ctypes.c_int, ctypes.c_int,        # street, stack_chips
+        ctypes.c_int, ctypes.c_int,        # num_rollouts, hero_bias_mode
+        ctypes.c_int, ctypes.c_double,     # runout_mode, explore_eps
+        ctypes.c_int, ctypes.c_int,        # n_leaves, max_h
+        ctypes.POINTER(ctypes.c_int),      # pot
+        ctypes.POINTER(ctypes.c_int),      # bets
+        ctypes.POINTER(ctypes.c_int),      # active
+        ctypes.POINTER(ctypes.c_int),      # hist_flat
+        ctypes.POINTER(ctypes.c_int),      # hist_len
+        ctypes.POINTER(ctypes.c_int),      # player_seats
+    ]
+    _lib.es_vec_sampled_oracle_vec_fn.restype = ctypes.c_void_p
+    _lib.es_vec_sampled_oracle_scalar_fn.restype = ctypes.c_void_p
+    _lib.es_set_vec_leaf_oracle.restype = None
+    _lib.es_set_vec_leaf_oracle.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    _lib.es_vec_sampled_oracle_stats.restype = None
+    _lib.es_vec_sampled_oracle_stats.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64)]
+    _lib.es_free_vec_sampled_oracle.restype = None
+    _lib.es_free_vec_sampled_oracle.argtypes = [ctypes.c_void_p]
+
 
 class ESStats(ctypes.Structure):
     _fields_ = [
@@ -312,6 +344,7 @@ class CSolver:
         # still cleaned up by the type-specific destructor (the generic oracle
         # free only releases the outer allocation).
         self._sampled_oracle_ctx = oracle_ctx if _sampled_oracle else None
+        self._vec_sampled_oracle_ctx = None  # set by from_vec_sampled_oracle
         self._keepalive = _keepalive  # numpy buffers the oracle borrows
         if _root_pot_amounts is None:
             self._handle = _lib.es_create(
@@ -583,6 +616,84 @@ class CSolver:
         return cls(tree, fn, ctx, seed=seed, _keepalive=None,
                    _sampled_oracle=True)
 
+    @classmethod
+    def from_vec_sampled_oracle(cls, tree, bp_handle, street: int,
+                                stack_chips: int, n_leaves: int, max_h: int,
+                                pot, bets, active, hist_flat, hist_len,
+                                player_seats, num_rollouts: int = 1,
+                                hero_bias_mode: int = 0, runout_mode: int = 1,
+                                explore_eps: float = 0.05,
+                                seed: int = 0) -> "CSolver":
+        """Vec-coherent per-visit sampled blueprint-rollout oracle.
+
+        One VECTOR leaf visit draws its world once (opponent continuation
+        biases regret-sampled from their persistent rows; with
+        ``runout_mode=1`` also one shared turn/river runout) and values every
+        live traverser hand in that world with its own regret-matched bias.
+        ``hero_bias_mode`` 0 = ENUMERATE all four traverser biases per hand
+        (literal Pluribus, 4 rollout batches per hand visit); 1 = SAMPLE one
+        bias per hand from the epsilon-explored mixture with the unbiased
+        importance-weighted regret update (1 batch per hand visit).
+
+        Per-leaf arrays have the ``from_sampled_oracle`` layouts; the C
+        context copies them. The scalar single-hand entry is registered with
+        es_create and the vector entry with es_set_vec_leaf_oracle, so this
+        solver REQUIRES vec_mode=1 at run() (the C core fails loud otherwise)
+        and rejects reach mode. ``seed`` is the resolver's sole master seed.
+        """
+        if not _HAS_VEC_SAMPLED:
+            raise RuntimeError(
+                "es_make_vec_sampled_oracle not in this DLL; rebuild "
+                "es_resolver_real with es_vec_sampled_oracle.c")
+        if hero_bias_mode not in (0, 1):
+            raise ValueError("hero_bias_mode must be 0 (enumerate) or 1 (sample)")
+        if runout_mode not in (0, 1):
+            raise ValueError("runout_mode must be 0 (fresh) or 1 (shared)")
+        if not (0.0 <= float(explore_eps) <= 0.5):
+            raise ValueError("explore_eps must be in [0, 0.5]")
+        ka = [np.ascontiguousarray(a, dtype=np.int32)
+              for a in (pot, bets, active, hist_flat, hist_len, player_seats)]
+        ctx = _lib.es_make_vec_sampled_oracle(
+            ctypes.c_void_p(bp_handle), ctypes.byref(tree),
+            int(street), int(stack_chips), int(num_rollouts),
+            int(hero_bias_mode), int(runout_mode), float(explore_eps),
+            int(n_leaves), int(max_h),
+            ka[0].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[1].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[2].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[3].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[4].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ka[5].ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+        if not ctx:
+            raise RuntimeError(
+                "es_make_vec_sampled_oracle returned NULL "
+                "(invalid arguments or OOM)")
+        scalar_fn = _lib.es_vec_sampled_oracle_scalar_fn()
+        try:
+            solver = cls(tree, scalar_fn, ctx, seed=seed, _keepalive=None)
+        except Exception:
+            _lib.es_free_vec_sampled_oracle(ctx)
+            raise
+        solver._oracle_ctx = None  # freed by the type-specific destructor
+        solver._vec_sampled_oracle_ctx = ctx
+        _lib.es_set_vec_leaf_oracle(
+            solver._handle, _lib.es_vec_sampled_oracle_vec_fn(), ctx)
+        return solver
+
+    def vec_sampled_oracle_stats(self):
+        """(leaf_visits, hand_visits, rollouts, oracle_errors, oracle_ns)
+        for the last vec-sampled solve; zeros on any other oracle."""
+        ctx = getattr(self, "_vec_sampled_oracle_ctx", None)
+        if ctx is None:
+            return (0, 0, 0, 0, 0)
+        lv = ctypes.c_uint64(0); hv = ctypes.c_uint64(0)
+        ro = ctypes.c_uint64(0); er = ctypes.c_uint64(0)
+        ns = ctypes.c_uint64(0)
+        _lib.es_vec_sampled_oracle_stats(
+            ctx, ctypes.byref(lv), ctypes.byref(hv), ctypes.byref(ro),
+            ctypes.byref(er), ctypes.byref(ns))
+        return (lv.value, hv.value, ro.value, er.value, ns.value)
+
     def real_oracle_stats(self):
         """(leaf_fills, cache_hits, rollout_sims, oracle_errors)."""
         ctx = getattr(self, "_real_oracle_ctx", None)
@@ -803,7 +914,8 @@ class CSolver:
         deterministic; np==2 only), 0 = OFF (default; sampling traversers). When
         ON it supersedes cfr/vec/chance/opp modes. Set before run(). Raises if the
         DLL predates the feature and mode==1."""
-        if mode == 1 and getattr(self, "_sampled_oracle_ctx", None) is not None:
+        if mode == 1 and (getattr(self, "_sampled_oracle_ctx", None) is not None
+                          or getattr(self, "_vec_sampled_oracle_ctx", None) is not None):
             raise ValueError(
                 "sampled leaf mode is scalar-only and cannot use full-hand reach mode")
         if hasattr(_lib, "es_set_reach_mode"):
@@ -942,6 +1054,10 @@ class CSolver:
             elif getattr(self, "_sampled_oracle_ctx", None):
                 _lib.es_free_sampled_oracle(self._sampled_oracle_ctx)
                 self._sampled_oracle_ctx = None
+                self._oracle_ctx = None  # same ptr; don't double-free
+            elif getattr(self, "_vec_sampled_oracle_ctx", None):
+                _lib.es_free_vec_sampled_oracle(self._vec_sampled_oracle_ctx)
+                self._vec_sampled_oracle_ctx = None
                 self._oracle_ctx = None  # same ptr; don't double-free
             elif getattr(self, "_oracle_ctx", None):
                 _lib.es_free_oracle_ctx(self._oracle_ctx)

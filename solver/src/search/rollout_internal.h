@@ -67,6 +67,28 @@ static inline uint64_t rollout_derive_seed(
 NEXUS_INTERNAL void rollout_set_error(int32_t street, int32_t num_players,
                        const char *fmt, ...);
 
+/* Pinned-runout deal helper (header-inline; no symbol). A caller that wants
+ * every hero hand of one vector leaf visit to see the SAME turn/river draws
+ * the runout once (from the deck minus board minus the opponents' cards) and
+ * passes it as `pinned`; the simulator consumes it in order, skipping cards
+ * that are already used in the current world (the hero's own hole cards).
+ * Returns -1 when `pinned` is NULL or exhausted so the caller falls back to a
+ * fresh deal. Never touches the RNG, so a NULL sequence is byte-identical to
+ * the historical deal path. The first two surviving cards of a uniformly
+ * random sequence are a uniform ordered pair from the hand-conditioned deck,
+ * so the shared runout is unbiased for every hero hand. */
+static inline int32_t rollout_pinned_next_card(
+    const int32_t *pinned, int32_t pinned_len, int32_t *pos, uint64_t used_mask
+) {
+    if (!pinned || !pos) return -1;
+    while (*pos < pinned_len) {
+        int32_t c = pinned[(*pos)++];
+        if (c < 0 || c >= 52) continue;
+        if (!(used_mask & (1ULL << c))) return c;
+    }
+    return -1;
+}
+
 /* Simulate one full rollout from a subgame leaf to terminal; writes payoff.
  * Definition in rollout.c (owns the simulator state/globals). */
 NEXUS_INTERNAL int rollout_simulate_one(
@@ -87,6 +109,31 @@ NEXUS_INTERNAL int rollout_simulate_one(
     const int32_t *sampled_hands_c1,
     const int32_t *has_sample,
     int32_t skip_first_betting,
+    uint64_t *rng,
+    float *out_payoff
+);
+
+/* Same simulator with an optional caller-pinned turn/river sequence (see
+ * rollout_pinned_next_card). rollout_simulate_one is this with NULL/0. */
+NEXUS_INTERNAL int rollout_simulate_one_ex(
+    const BPSReader *r,
+    const int *board_in, int32_t n_board_in,
+    int32_t leaf_street,
+    int32_t pot_in,
+    const int32_t *active_in,
+    const int32_t *stacks_in,
+    const int32_t *bets_in,
+    int32_t num_players,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_history_in, int32_t gah_len_in,
+    const int32_t *bias_profile,
+    int32_t hero_player,
+    const int32_t *sampled_hands_c0,
+    const int32_t *sampled_hands_c1,
+    const int32_t *has_sample,
+    int32_t skip_first_betting,
+    const int32_t *pinned_runout, int32_t pinned_len,
     uint64_t *rng,
     float *out_payoff
 );

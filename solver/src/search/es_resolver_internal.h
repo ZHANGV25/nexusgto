@@ -180,6 +180,12 @@ struct ESResolver {
      * single-street tree, which keeps that path byte-identical. */
     int *node_carry;                        /* [num_nodes*np] or NULL */
     ESExactAllinLeafCache *exact_allin_leaf_cache; /* [num_nodes] */
+
+    /* Optional vector leaf oracle (es_set_vec_leaf_oracle, 2026-09-09).
+     * NULL = the historical per-hand scalar-oracle loop in the vector
+     * traverser. Cold additive sidecar; calloc leaves it unset. */
+    ESLeafOracleVec vec_oracle;
+    void *vec_oracle_ctx;
 };
 
 

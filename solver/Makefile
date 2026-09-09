@@ -123,9 +123,9 @@ $(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/es_vec_sampled_oracle.c $(SEARCH_DIR)/es_vec_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
-	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c \
+	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_vec_sampled_oracle.c \
 	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
 	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
@@ -202,6 +202,28 @@ $(BUILD_DIR)/test_es_sampled_oracle: tests/test_es_sampled_oracle.c \
 .PHONY: test_es_sampled_oracle
 test_es_sampled_oracle: $(BUILD_DIR)/test_es_sampled_oracle
 	./$(BUILD_DIR)/test_es_sampled_oracle
+
+# Vec-coherent per-visit sampled leaf oracle contracts (coherence,
+# determinism, both hero-bias estimators, the resolver's vector-oracle hook).
+# rollout_simulate_one_ex is supplied by a deterministic stub, so no blueprint
+# artifact or live rollout is required.
+$(BUILD_DIR)/test_es_vec_sampled_oracle: tests/test_es_vec_sampled_oracle.c \
+        $(SEARCH_DIR)/es_vec_sampled_oracle.c $(SEARCH_DIR)/es_vec_sampled_oracle.h \
+        $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c \
+        $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h \
+        $(SEARCH_DIR)/es_oracles.c \
+        $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h \
+        $(SEARCH_DIR)/rollout_internal.h $(SEARCH_DIR)/rollout.h \
+        $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_vec_sampled_oracle.c \
+	    $(SEARCH_DIR)/es_vec_sampled_oracle.c $(SEARCH_DIR)/es_resolver.c \
+	    $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c \
+	    $(SEARCH_DIR)/rollout_bucket_memo.c $(CORE_DIR)/hand_eval_table.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_vec_sampled_oracle
+test_es_vec_sampled_oracle: $(BUILD_DIR)/test_es_vec_sampled_oracle
+	./$(BUILD_DIR)/test_es_vec_sampled_oracle
 
 # Additive unequal-stack live-resolve ABI.  CPU-only and deterministic: checks
 # scalar/equal-vector tree identity, a short all-in call, a zero-stack root

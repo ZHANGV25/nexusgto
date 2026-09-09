@@ -1308,7 +1308,14 @@ BPS_EXPORT int32_t rollout_debug_sample_eager_hands_c(
  * (b) miss training storage on the CURRENT street because training
  * stored end-of-flop info sets at street=2 (turn), not street=1 (flop).
  * See PHASE0_STATUS.md / advisor analysis 2026-04-30. */
-int rollout_simulate_one(
+/* Pinned-runout variant (2026-09-09, vec-coherent per-visit sampled leaves).
+ * `pinned_runout` (or NULL) is a caller-drawn card sequence consumed in order
+ * for the turn/river deals; cards already used in this world (the hero's own
+ * hole cards) are skipped and an exhausted sequence falls back to a fresh
+ * deal from `rng`. With pinned_runout == NULL the deal path is byte-identical
+ * to the historical simulator: rollout_pinned_next_card returns -1 without
+ * touching the RNG. */
+int rollout_simulate_one_ex(
     const BPSReader *r,
     /* immutable inputs */
     const int *board_in, int32_t n_board_in,
@@ -1327,10 +1334,12 @@ int rollout_simulate_one(
     const int32_t *sampled_hands_c1,
     const int32_t *has_sample,  /* 1 if sampled_hands[p] is set */
     int32_t skip_first_betting,
+    const int32_t *pinned_runout, int32_t pinned_len,
     uint64_t *rng,
     /* out */
     float *out_payoff
 ) {
+    int32_t pinned_pos = 0;
     /* Local copies (mutable during rollout) */
     int32_t active[ROLLOUT_MAX_PLAYERS];
     int32_t stacks[ROLLOUT_MAX_PLAYERS];
@@ -1978,7 +1987,9 @@ street_closed:
                 used |= (1ULL << sampled_hands_c1[i]);
             }
         }
-        int32_t new_card = rollout_deal_one_card(rng, used);
+        int32_t new_card = rollout_pinned_next_card(pinned_runout, pinned_len,
+                                                    &pinned_pos, used);
+        if (new_card < 0) new_card = rollout_deal_one_card(rng, used);
         if (new_card < 0) {
             rollout_set_error(street, num_players, "deck exhausted during deal");
             return -1;
@@ -2021,7 +2032,9 @@ street_closed:
                 used |= (1ULL << sampled_hands_c1[i]);
             }
         }
-        int32_t new_card = rollout_deal_one_card(rng, used);
+        int32_t new_card = rollout_pinned_next_card(pinned_runout, pinned_len,
+                                                    &pinned_pos, used);
+        if (new_card < 0) new_card = rollout_deal_one_card(rng, used);
         if (new_card < 0) {
             rollout_set_error(street, num_players, "deck exhausted pre-showdown");
             return -1;
@@ -2053,6 +2066,36 @@ street_closed:
         rollout_cont_ev_fill_commit(cev_fill_slot, cev_fill_street,
                                     *out_payoff);
     return 0;
+}
+
+/* Historical entry point: no pinned runout (byte-identical deal path). */
+int rollout_simulate_one(
+    const BPSReader *r,
+    const int *board_in, int32_t n_board_in,
+    int32_t leaf_street,
+    int32_t pot_in,
+    const int32_t *active_in,
+    const int32_t *stacks_in,
+    const int32_t *bets_in,
+    int32_t num_players,
+    const int32_t *acting_order, int32_t acting_order_len,
+    const int32_t *player_seats,
+    const int32_t *game_history_in, int32_t gah_len_in,
+    const int32_t *bias_profile,
+    int32_t hero_player,
+    const int32_t *sampled_hands_c0,
+    const int32_t *sampled_hands_c1,
+    const int32_t *has_sample,
+    int32_t skip_first_betting,
+    uint64_t *rng,
+    float *out_payoff
+) {
+    return rollout_simulate_one_ex(
+        r, board_in, n_board_in, leaf_street, pot_in, active_in, stacks_in,
+        bets_in, num_players, acting_order, acting_order_len, player_seats,
+        game_history_in, gah_len_in, bias_profile, hero_player,
+        sampled_hands_c0, sampled_hands_c1, has_sample, skip_first_betting,
+        NULL, 0, rng, out_payoff);
 }
 
 /* ── Public entry points ─────────────────────────────────────────────── */

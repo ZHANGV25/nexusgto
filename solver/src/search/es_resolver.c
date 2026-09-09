@@ -722,6 +722,12 @@ void es_set_exact_allin_leaves(ESResolver *r, int enabled) {
     if (r) r->exact_allin_leaves = enabled ? 1 : 0;
 }
 
+void es_set_vec_leaf_oracle(ESResolver *r, ESLeafOracleVec fn, void *ctx) {
+    if (!r) return;
+    r->vec_oracle = fn;
+    r->vec_oracle_ctx = fn ? ctx : NULL;
+}
+
 /* Chance-node handling: 1 = ENUMERATE (correct, zero-variance — average over all
  * dealt cards), 0 = SAMPLE (single card/iter — high variance), -1 = inherit the
  * env default. Set BEFORE es_run. */
@@ -1739,6 +1745,25 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         return;
     }
     if (type == ES_T_LEAF) {
+        /* Vector leaf oracle (2026-09-09): one call values every live
+         * traverser hand in ONE sampled world (runout + opponent biases drawn
+         * once per visit), so the hand vector is coherent. Exact betting-
+         * closed leaves keep the per-hand exact path below, exactly as before;
+         * the carry convention matches es_leaf_payoff. */
+        int exact_here = r->exact_allin_leaves && r->exact_allin_ready
+                         && r->exact_allin_leaf_flags
+                         && r->exact_allin_leaf_flags[node_idx];
+        if (r->vec_oracle && !exact_here) {
+            double carry = es_carry(r, node_idx, traverser);
+            int live = 0;
+            for (int h = 0; h < nh; h++) if (!dead[h]) live++;
+            local->leaf_rollouts += live;
+            r->vec_oracle(r->vec_oracle_ctx, nd->leaf_idx, traverser,
+                          opp_sampled, nd, rng, nh, dead, out_vals);
+            for (int h = 0; h < nh; h++)
+                out_vals[h] = dead[h] ? 0.0 : out_vals[h] - carry;
+            return;
+        }
         /* Per-hand oracle: set sampled[traverser] = hand h's slot, read the
          * opponents' fixed sampled hands. Dead hands skipped. */
         int sampled[SS_MAX_PLAYERS];
@@ -1938,6 +1963,12 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                      r->vec_traverser, r->reach_mode);
         return -1;
     }
+    if (r->vec_oracle && (!r->vec_traverser || r->reach_mode)) {
+        es_set_error("vector leaf oracle requires vec_mode=1 and "
+                     "reach_mode=0 (vec_mode=%d reach_mode=%d)",
+                     r->vec_traverser, r->reach_mode);
+        return -1;
+    }
     if (r->exact_allin_leaves && es_prepare_exact_allin_leaves(r) != 0)
         return -1;
     if (iterations <= 0) return 0;
@@ -1961,6 +1992,13 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
     int vec_scratch_count = r->vec_traverser ? es_vec_scratch_slots(r) : 0;
     uint64_t deadline_start_ms = (r->deadline_ms > 0)
                                  ? es_monotonic_ms() : 0;
+    /* Deadline check granularity. The historical 4096-iteration stride was
+     * sized for ~ns table leaves; a per-visit rollout oracle spends 0.1-3 ms
+     * per iteration, so 4096 iterations overshoot a 3 s budget by tens of
+     * seconds (measured 2026-09-09: a 3.0 s deadline ran 38.9 s cold). A
+     * monotonic clock read is ~25 ns, so checking every 16 iterations costs
+     * nothing on any path; without a deadline the mask is never consulted. */
+    int64_t deadline_mask = (r->vec_oracle != NULL) ? 15LL : 4095LL;
 
     if (nthreads == 1) {
         /* Deterministic single-thread path (the validated reference). */
@@ -1970,7 +2008,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
         int64_t completed = 0;
         ESVecScratch vec_scratch = es_alloc_vec_scratch(vec_scratch_count);
         for (int64_t it = 0; it < iterations; it++) {
-            if ((it & 4095LL) == 0
+            if ((it & deadline_mask) == 0
                 && es_deadline_expired(r, deadline_start_ms))
                 break;
             for (int trav = 0; trav < np; trav++) {
@@ -2034,7 +2072,7 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
 
             for (int64_t it = begin; it < end; it++) {
                 if (use_deadline && atomic_load(&deadline_stop)) break;
-                if ((it & 4095LL) == 0
+                if ((it & deadline_mask) == 0
                     && es_deadline_expired(r, deadline_start_ms)) {
                     atomic_store(&deadline_stop, 1);
                     break;

@@ -83,6 +83,32 @@ typedef double (*ESLeafOracle)(
     uint64_t *rng
 );
 
+/* ── Vector leaf oracle (2026-09-09, vec-coherent per-visit sampled leaves) ──
+ *
+ * The vector traverser walks ONE opponent-sampled path and values ALL of the
+ * traverser's hands at each leaf. The scalar ESLeafOracle is called once per
+ * hand there, so a per-visit sampling oracle would draw a fresh world (runout,
+ * opponent continuation bias) for every hand and the hands' values would be
+ * mutually incoherent. A vector oracle receives the whole hand vector of one
+ * visit in a single call: it draws the world ONCE per visit, values every live
+ * hand in that world, and writes out_vals[h] for h < num_hands (dead[h] != 0
+ * hands must be written as 0.0). Payoff convention is the scalar oracle's:
+ * the traverser's net chips minus THIS street's bets; the resolver charges any
+ * earlier-street carry itself. `rng` is the traversal's per-thread stream.
+ * Betting-closed leaves flagged by es_set_exact_allin_leaves never reach the
+ * vector oracle (the exact per-pair path handles them per hand, as before). */
+typedef void (*ESLeafOracleVec)(
+    void *ctx,
+    int leaf_idx,
+    int traverser,
+    const int *opp_sampled,
+    const SSNode *leaf_node,
+    uint64_t *rng,
+    int num_hands,
+    const int *dead,
+    double *out_vals
+);
+
 /* Resolver-owned trampoline for the sampled-rollout oracle. The sampled
  * oracle factory returns a ctx whose first member is its immutable dispatch
  * callback; this trampoline forwards each visit to that callback. Keeping the
@@ -154,6 +180,14 @@ ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
  * Sampled leaf mode is scalar-only: es_run fails if vec mode is enabled on a
  * resolver using es_sampled_oracle_fn(). */
 ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
+
+/* Register a vector leaf oracle. NULL (the default) keeps the historical
+ * per-hand scalar-oracle loop, byte-identical. A registered vector oracle
+ * requires vec_mode=1 and reach_mode=0 at es_run (fails loud otherwise); the
+ * scalar oracle passed to es_create is still used by every non-vector path
+ * (scalar traversal, forward walks, exploitability). */
+ES_EXPORT void es_set_vec_leaf_oracle(ESResolver *r, ESLeafOracleVec fn,
+                                      void *ctx);
 
 /* Opt in to exact sampled-hand-pair showdown values at betting-closed
  * depth-limit leaves. The default is OFF, preserving the external leaf-oracle
