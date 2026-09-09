@@ -269,6 +269,73 @@ def _leaf_sampled_policy() -> int:
     return policy
 
 
+def _leaf_vec_sampled_enabled() -> bool:
+    """Vec-coherent per-visit sampled leaf oracle -- DEFAULT OFF (2026-09-09).
+
+    The Pluribus per-visit leaf inside the served VECTOR traverser: each
+    vector leaf visit draws its world once (opponent continuation biases
+    regret-sampled from persistent rows; one shared turn/river runout) and
+    values every traverser hand in it (poker-solver es_vec_sampled_oracle.c).
+    No leaf table is built. Requires vec_mode=1; the eager serving path is
+    untouched while the flag is absent/off.
+    """
+    v = os.environ.get("NEXUS_LEAF_VEC_SAMPLED", "")
+    return v[:1] in ("1", "t", "T", "y", "Y")
+
+
+def _vec_sampled_hero_bias_mode() -> int:
+    """0 = enumerate all four traverser biases per hand visit (literal
+    Pluribus, 4 rollout batches); 1 = sample one bias per hand visit with the
+    unbiased importance-weighted regret update (1 batch). Default sample."""
+    raw = (os.environ.get("NEXUS_VEC_SAMPLED_HERO_BIAS") or "sample").lower()
+    if raw in ("0", "enumerate", "enum"):
+        return 0
+    if raw in ("1", "sample"):
+        return 1
+    raise ValueError(
+        "NEXUS_VEC_SAMPLED_HERO_BIAS must be enumerate or sample, "
+        f"got {raw!r}")
+
+
+def _vec_sampled_runout_mode() -> int:
+    """1 = one shared turn/river runout per leaf visit (default);
+    0 = fresh per-rollout dealing."""
+    raw = (os.environ.get("NEXUS_VEC_SAMPLED_RUNOUT") or "shared").lower()
+    if raw in ("1", "shared"):
+        return 1
+    if raw in ("0", "fresh"):
+        return 0
+    raise ValueError(
+        f"NEXUS_VEC_SAMPLED_RUNOUT must be shared or fresh, got {raw!r}")
+
+
+def _vec_sampled_explore_eps() -> float:
+    raw = os.environ.get("NEXUS_VEC_SAMPLED_EPS") or "0.05"
+    try:
+        eps = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_VEC_SAMPLED_EPS={raw!r} is not a number") from None
+    if not (0.0 <= eps <= 0.5):
+        raise ValueError(f"NEXUS_VEC_SAMPLED_EPS={eps} outside [0, 0.5]")
+    return eps
+
+
+def _vec_sampled_num_rollouts() -> int:
+    """Rollouts per (hand visit, bias) evaluation. Default 1: nr is
+    quality-flat on the per-visit path (ARCH_AB 2026-07-28) and wall-linear,
+    so the request's num_rollouts (a leaf-TABLE knob) is not inherited."""
+    raw = os.environ.get("NEXUS_VEC_SAMPLED_NR") or "1"
+    try:
+        nr = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"NEXUS_VEC_SAMPLED_NR={raw!r} is not an integer") from None
+    if not (1 <= nr <= 100):
+        raise ValueError(f"NEXUS_VEC_SAMPLED_NR={nr} outside [1, 100]")
+    return nr
+
+
 def _leaf_bias_cfr_mode() -> str:
     """Parse the table-backed continuation-bias CFR mode."""
     raw = os.environ.get("NEXUS_LEAF_BIAS_CFR") or "off"
@@ -380,6 +447,9 @@ class CpuEsSolver:
         # NEXUS_LEAF_BIAS_CFR: table-backed continuation-bias oracle counters
         # from the last marginal/joint solve. None on every other path.
         self._last_bias_oracle_stats = None
+        # NEXUS_LEAF_VEC_SAMPLED: vec-coherent per-visit oracle counters from
+        # the last such solve. None on every other leaf-value path.
+        self._last_vec_sampled_stats = None
         self._init(blueprint_path)
 
     def _init(self, blueprint_path: str) -> None:
@@ -737,7 +807,13 @@ class CpuEsSolver:
         # normal vec/readout validation so a caller requesting vec + avg is
         # accepted and run as scalar without changing the requested readout.
         _sampled_requested = _leaf_sampled_enabled()
+        _vec_sampled_requested = _leaf_vec_sampled_enabled()
         _rollout_requested = _leaf_rollout_enabled()
+        # MEASUREMENT ONLY: a multi-seed A/B needs distinct master seeds per
+        # run; the serving callers never set this.
+        _seed_override = os.environ.get("NEXUS_MASTER_SEED_OVERRIDE")
+        if _seed_override:
+            master_seed = int(_seed_override, 0)
         _bias_mode_requested = _leaf_bias_cfr_mode()
         _leaf_bias_mode = _bias_mode_requested
         _bias_rounds = None
@@ -747,6 +823,15 @@ class CpuEsSolver:
         _sampled_iterations_run = None
         self._last_sampled_stats = None
         self._last_bias_oracle_stats = None
+        self._last_vec_sampled_stats = None
+        _vec_sampled_cfg = None
+        if _vec_sampled_requested:
+            _vec_sampled_cfg = {
+                "hero_bias_mode": _vec_sampled_hero_bias_mode(),
+                "runout_mode": _vec_sampled_runout_mode(),
+                "explore_eps": _vec_sampled_explore_eps(),
+                "num_rollouts": _vec_sampled_num_rollouts(),
+            }
         if _sampled_requested:
             vec_mode = 0
             _sampled_policy = _leaf_sampled_policy()
@@ -966,6 +1051,33 @@ class CpuEsSolver:
                     "NEXUS_LEAF_SAMPLED=1 requires "
                     "NEXUS_LEAF_RANGE_CONDITIONING=0: sampled leaves "
                     "bypass the eager per-leaf range-conditioning construct")
+
+        if _vec_sampled_requested:
+            # Vec-coherent per-visit sampled leaves are their own leaf-value
+            # strategy: no eager table, no lazy cache, no cont_ev boundary.
+            if _sampled_requested:
+                raise RuntimeError(
+                    "NEXUS_LEAF_VEC_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_SAMPLED=1; enable exactly one leaf oracle")
+            if _rollout_requested:
+                raise RuntimeError(
+                    "NEXUS_LEAF_VEC_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_ROLLOUT=1; enable exactly one leaf oracle")
+            if _bias_mode_requested != "off":
+                raise RuntimeError(
+                    "NEXUS_LEAF_VEC_SAMPLED=1 is incompatible with "
+                    "NEXUS_LEAF_BIAS_CFR")
+            if (_a3_cont_ev_enabled() or _a3_cont_ev_turn_enabled()
+                    or _cont_ev_bias_action_enabled()
+                    or _cont_ev_miss_fallback_enabled()
+                    or os.environ.get("CONT_EV_CATALOG_MANIFEST")):
+                raise RuntimeError(
+                    "NEXUS_LEAF_VEC_SAMPLED=1 is incompatible with the "
+                    "cont_ev boundary flags")
+            if not vec_mode:
+                raise RuntimeError(
+                    "NEXUS_LEAF_VEC_SAMPLED=1 requires vec_mode=1 (the "
+                    "vector oracle values all traverser hands per visit)")
 
         if _bias_mode_requested != "off":
             # ── INTERACTION GUARDS: bias-table CFR is its own eager leaf-value
@@ -1341,6 +1453,7 @@ class CpuEsSolver:
                 leaf_mode = "table_eager"
                 _leaf_rollout = False
                 _leaf_sampled = False
+                _leaf_vec_sampled = False
                 _leaf_bias_mode = "off"
                 _oracle_arrays = None
                 self._last_leaf_rollout_stats = None
@@ -1369,8 +1482,11 @@ class CpuEsSolver:
                 # _leaf_rollout_enabled() for the full contract.
                 _leaf_rollout = _rollout_requested
                 _leaf_sampled = _sampled_requested
+                _leaf_vec_sampled = _vec_sampled_requested
                 if _leaf_sampled:
                     leaf_mode = "sampled_per_visit"
+                elif _leaf_vec_sampled:
+                    leaf_mode = "vec_sampled_per_visit"
                 elif _leaf_rollout:
                     leaf_mode = "rollout_lazy"
                 elif _leaf_bias_mode == "marginal":
@@ -1475,7 +1591,7 @@ class CpuEsSolver:
                 # THIS construct iff the flag is on, the table is loaded, and
                 # this is a flop multiway spot (the consumer's own predicate).
                 # When off, none of these globals are touched. ──
-                if _leaf_sampled:
+                if _leaf_sampled or _leaf_vec_sampled:
                     _oracle_arrays = self._build_real_oracle_leaf_state(
                         gpu._tree, leaf_infos, n_players, player_seats)
                     table = None
@@ -1620,7 +1736,7 @@ class CpuEsSolver:
                 # construct_s stays 0.0 and we go straight to construction.
                 t0 = time.time()
                 try:
-                    if _leaf_rollout or _leaf_sampled:
+                    if _leaf_rollout or _leaf_sampled or _leaf_vec_sampled:
                         pass  # leaf oracle is constructed at the solver site
                     elif _leaf_bias_mode == "marginal":
                         if per_leaf_ranges is not None:
@@ -1857,6 +1973,32 @@ class CpuEsSolver:
                     bias_policy=_sampled_policy,
                     seed=master_seed,
                 )
+            elif _leaf_vec_sampled:
+                # Vec-coherent per-visit sampled oracle (NEXUS_LEAF_VEC_SAMPLED
+                # =1): scalar entry registered with es_create, vector entry
+                # registered with es_set_vec_leaf_oracle. The world is drawn
+                # once per vector leaf visit; no table, no cache. Opponent
+                # hands are the traversal's sampled hands, so the eager
+                # per-leaf range conditioning construct is not used here.
+                _street_code = 1 if street == "flop" else 2
+                (_so_n_leaves, _so_pot, _so_bets, _so_active,
+                 _so_hist, _so_hist_len, _so_seats) = _oracle_arrays
+                cs = self._CSolver.from_vec_sampled_oracle(
+                    gpu._tree,
+                    self._bp_handle.value,
+                    street=_street_code,
+                    stack_chips=stack_chips,
+                    n_leaves=_so_n_leaves,
+                    max_h=max_h,
+                    pot=_so_pot, bets=_so_bets, active=_so_active,
+                    hist_flat=_so_hist, hist_len=_so_hist_len,
+                    player_seats=_so_seats,
+                    num_rollouts=int(_vec_sampled_cfg["num_rollouts"]),
+                    hero_bias_mode=int(_vec_sampled_cfg["hero_bias_mode"]),
+                    runout_mode=int(_vec_sampled_cfg["runout_mode"]),
+                    explore_eps=float(_vec_sampled_cfg["explore_eps"]),
+                    seed=master_seed,
+                )
             elif _leaf_rollout:
                 # LAZY real-blueprint-rollout oracle (NEXUS_LEAF_ROLLOUT=1).
                 # Construct the solver over the SAME tree but with the C
@@ -1980,7 +2122,7 @@ class CpuEsSolver:
             _reach = os.environ.get("NEXUS_ES_REACH", "0")[:1] in (
                 "1", "t", "T", "y", "Y")
             use_reach = (
-                not _sampled_requested
+                not _sampled_requested and not _vec_sampled_requested
                 and tree_has_chance and n_players == 2 and _reach
                 and hasattr(cs, "set_reach_mode")
             )
@@ -2058,7 +2200,8 @@ class CpuEsSolver:
             # negligible relative to work and wall-clock scales with threads
             # (measured 2026-07-17: 3p sampled 50k iters = 836s single-thread).
             _eff_threads = (1 if (0 < _nn <= 2000 and not use_reach
-                                  and not _leaf_sampled)
+                                  and not _leaf_sampled
+                                  and not _leaf_vec_sampled)
                             else num_threads)
             effective_deadline_ms = (
                 int(_sampled_deadline) if _leaf_sampled
@@ -2078,7 +2221,8 @@ class CpuEsSolver:
             # only for sampled mode (historical behavior) or when a measurement
             # caller explicitly supplies deadline_ms (including zero).
             iterations_run_observed = (
-                (_leaf_sampled or deadline_ms is not None)
+                (_leaf_sampled or _leaf_vec_sampled
+                 or deadline_ms is not None)
                 and hasattr(cs, "iterations_run")
             )
             if iterations_run_observed:
@@ -2187,6 +2331,45 @@ class CpuEsSolver:
                 except Exception as _e:  # never break a real solve for stats
                     logger.warning("leaf-rollout stats read failed: %s", _e)
                     self._last_leaf_rollout_stats = None
+
+            if _leaf_vec_sampled:
+                try:
+                    (_vlv, _vhv, _vro, _verr, _vns) = (
+                        cs.vec_sampled_oracle_stats())
+                    _vs = float(solve_s) if solve_s > 0 else 1e-9
+                    self._last_vec_sampled_stats = {
+                        "leaf_visits": int(_vlv),
+                        "hand_visits": int(_vhv),
+                        "rollouts": int(_vro),
+                        "oracle_errors": int(_verr),
+                        "oracle_ns": int(_vns),
+                        "rollouts_per_s": float(_vro) / _vs,
+                        "oracle_core_s": float(_vns) / 1e9,
+                        "hero_bias_mode": int(_vec_sampled_cfg["hero_bias_mode"]),
+                        "runout_mode": int(_vec_sampled_cfg["runout_mode"]),
+                        "explore_eps": float(_vec_sampled_cfg["explore_eps"]),
+                        "num_rollouts": int(_vec_sampled_cfg["num_rollouts"]),
+                    }
+                    logger.info(
+                        "CpuEsSolver vec-sampled-leaf: %dp %s hero_bias=%d "
+                        "runout=%d nr=%d visits=%d hands=%d rollouts=%d "
+                        "(%.0f/s) oracle_core_s=%.2f errors=%d "
+                        "iterations=%d/%d deadline_ms=%s",
+                        n_players, street,
+                        int(_vec_sampled_cfg["hero_bias_mode"]),
+                        int(_vec_sampled_cfg["runout_mode"]),
+                        int(_vec_sampled_cfg["num_rollouts"]),
+                        _vlv, _vhv, _vro, float(_vro) / _vs,
+                        float(_vns) / 1e9, _verr,
+                        _sampled_iterations_run, iterations,
+                        effective_deadline_ms)
+                    if _verr:
+                        logger.warning(
+                            "CpuEsSolver vec-sampled-leaf: %d oracle errors "
+                            "(those hand visits valued 0 in C)", _verr)
+                except Exception as _e:  # never break a real solve for stats
+                    logger.warning("vec-sampled stats read failed: %s", _e)
+                    self._last_vec_sampled_stats = None
 
             if _leaf_sampled:
                 try:
@@ -2312,7 +2495,7 @@ class CpuEsSolver:
                         if _br_table is None:
                             _br_table_source = (
                                 "bias_oracle_effective_unavailable")
-                    elif _leaf_sampled:
+                    elif _leaf_sampled or _leaf_vec_sampled:
                         # A fresh per-visit oracle has no coherent dense table
                         # to expose for the optional offline BR-gap harness.
                         _br_table = None
@@ -2663,6 +2846,7 @@ class CpuEsSolver:
                 "leaf_rollout_stats": self._last_leaf_rollout_stats,
                 "bias_oracle_stats": self._last_bias_oracle_stats,
                 "sampled_stats": self._last_sampled_stats,
+                "vec_sampled_stats": self._last_vec_sampled_stats,
                 "construct_s": float(construct_s),
                 "solve_s": float(solve_s),
                 "readout_s": float(readout_s),
@@ -2738,6 +2922,46 @@ class CpuEsSolver:
                     _offtree_added_child_chips
                 ),
             }
+
+            # BR-GAP DUMP (research only): with NEXUS_BR_GAP_EXPOSE=1 and
+            # NEXUS_BR_GAP_DUMP_DIR set, pickle the stash + solve stats so an
+            # offline scorer can grade this sigma under a common referee
+            # table (the ARCH_AB protocol). Never set on the serving path.
+            _dump_dir = os.environ.get("NEXUS_BR_GAP_DUMP_DIR")
+            if _dump_dir and self._last_br_gap_objs is not None:
+                try:
+                    import pickle as _pk
+                    _stash = self._last_br_gap_objs
+                    _rec = {
+                        "schema": "brgap_dump_v1",
+                        "tree": _stash.get("tree"),
+                        "sigma": _stash.get("sigma"),
+                        "sigmas": _stash.get("sigmas"),
+                        "table": (
+                            None if _stash.get("table") is None
+                            else np.asarray(_stash["table"], dtype=np.float32)
+                        ),
+                        "table_source": _stash.get("table_source"),
+                        "solve_stats": self._last_solve_stats,
+                        "leaf_mode": leaf_mode,
+                        "master_seed": int(master_seed),
+                        "n_players": int(n_players),
+                        "street": street,
+                        "board_ints": list(board_ints),
+                        "readout": readout,
+                        "wall_s": float(construct_s) + float(solve_s),
+                    }
+                    os.makedirs(_dump_dir, exist_ok=True)
+                    _fn = os.path.join(
+                        _dump_dir,
+                        "%s_seed%d_%s.pkl" % (
+                            leaf_mode, int(master_seed),
+                            time.strftime("%H%M%S")))
+                    with open(_fn, "wb") as _f:
+                        _pk.dump(_rec, _f, protocol=4)
+                    logger.info("CpuEsSolver BR-gap dump: %s", _fn)
+                except Exception as _e:  # never break a real solve
+                    logger.warning("BR-gap dump failed: %s", _e)
 
             logger.info(
                 "CpuEsSolver solve: %dp %s construct=%.1fs solve=%.1fs "
