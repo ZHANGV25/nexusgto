@@ -660,3 +660,13 @@ def test_solve_exposes_chance_sampling_knob() -> None:
     source = inspect.getsource(CpuEsSolver.solve)
     assert "NEXUS_CHANCE_SAMPLE" in source
     assert "cs.set_chance_mode(0 if _chance_sampled else 1)" in source
+
+
+def test_solve_enables_exact_allin_leaves_when_available() -> None:
+    source = inspect.getsource(CpuEsSolver.solve)
+    i_enable = source.index("cs.set_exact_allin_leaves(True)")
+    i_run = source.index("cs.run(iterations")
+    assert i_enable < i_run
+    assert "NEXUS_EXACT_ALLIN_LEAVES" in source
+    assert 'hasattr(cs, "set_exact_allin_leaves")' in source
+    assert '"exact_allin_leaves": bool(_exact_allin)' in source

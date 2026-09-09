@@ -1970,6 +1970,26 @@ class CpuEsSolver:
                     vec_mode = 1        # force vec for the readout below
             if vec_mode and not _sampled_requested:
                 cs.set_vec_mode(1)
+            # ── EXACT ALL-IN LEAVES (2026-09-09) ──────────────────────────
+            # The eager leaf table indexes by the traverser's hand only, so a
+            # betting-closed (all-in) leaf priced hero's hand against the
+            # villain's whole leaf range and ignored the hand in the walk;
+            # measured: a bare 6-2 flush and ace-high called a 190 jam at
+            # 1.00 at pot odds against a random range. With the resolver's
+            # exact per-pair oracle enabled, such leaves are the exact
+            # expected showdown of the traverser's hand against the sampled
+            # opponent hands over every remaining runout. Depth-limit trees
+            # only (river trees have no leaves); NEXUS_EXACT_ALLIN_LEAVES=0
+            # disables it for measurement. Older resolver builds without the
+            # entry point simply keep the table path.
+            _exact_allin = (
+                not _leaf_sampled and n_leaves > 0
+                and os.environ.get("NEXUS_EXACT_ALLIN_LEAVES", "1")[:1]
+                in ("1", "t", "T", "y", "Y")
+                and hasattr(cs, "set_exact_allin_leaves")
+            )
+            if _exact_allin:
+                cs.set_exact_allin_leaves(True)
             # SMALL-TREE -> SINGLE-THREAD (2026-06-16). Multi-thread Hogwild on a
             # tiny tree is dominated by race noise: the Pluribus-faithful 2p flop
             # is only ~21 nodes / 8 decision nodes, and at num_threads=0 (all
@@ -2615,6 +2635,7 @@ class CpuEsSolver:
                 "use_reach": bool(use_reach),
                 "hero_frozen_steps": int(len(_frozen_steps)),
                 "chance_sampled": bool(_chance_sampled),
+                "exact_allin_leaves": bool(_exact_allin),
                 "num_nodes": int(_nn),
                 "num_leaf_nodes": int(n_leaf_nodes),
                 "num_leaves": int(n_leaves),
