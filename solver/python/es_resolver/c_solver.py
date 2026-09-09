@@ -70,6 +70,7 @@ _lib = _load_dll()
 _HAS_REAL = hasattr(_lib, "es_make_real_oracle")
 _HAS_SAMPLED = hasattr(_lib, "es_make_sampled_oracle")
 _HAS_ROOT_POTS = hasattr(_lib, "es_create_with_root_pots")
+_HAS_EXACT_ALLIN_LEAVES = hasattr(_lib, "es_set_exact_allin_leaves")
 _BIAS_SYMBOLS = (
     "es_make_bias_oracle", "es_bias_oracle_fn", "es_free_bias_oracle",
     "es_bias_oracle_stats", "es_bias_oracle_get_effective_table",
@@ -90,6 +91,9 @@ if hasattr(_lib, "es_set_cfr_mode"):
     _lib.es_set_cfr_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_vec_mode"):
     _lib.es_set_vec_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+if _HAS_EXACT_ALLIN_LEAVES:
+    _lib.es_set_exact_allin_leaves.restype = None
+    _lib.es_set_exact_allin_leaves.argtypes = [ctypes.c_void_p, ctypes.c_int]
 if hasattr(_lib, "es_set_traverser_actual_hand"):
     _lib.es_set_traverser_actual_hand.restype = ctypes.c_int
     _lib.es_set_traverser_actual_hand.argtypes = [
@@ -734,6 +738,23 @@ class CSolver:
             _lib.es_set_vec_mode(self._handle, int(mode))
         elif mode == 1:
             raise RuntimeError("es_set_vec_mode not in this DLL (rebuild)")
+
+    def set_exact_allin_leaves(self, enabled: bool) -> None:
+        """Use exact sampled-pair runout values at betting-closed leaves.
+
+        This is opt-in and should be configured before run(). Disabling is a
+        no-op with an older shared library; enabling fails clearly so callers
+        cannot silently fall back to eager hand-versus-range leaf values.
+        """
+        enabled_int = 1 if enabled else 0
+        if not _HAS_EXACT_ALLIN_LEAVES:
+            if enabled_int:
+                raise RuntimeError(
+                    f"{_DLL_NAME} is missing es_set_exact_allin_leaves; "
+                    "rebuild es_resolver or es_resolver_real"
+                )
+            return
+        _lib.es_set_exact_allin_leaves(self._handle, enabled_int)
 
     def set_traverser_actual_hand(
         self, player_idx: int, hand_idx: int, fraction: float,

@@ -81,13 +81,18 @@ class _CondStats:
     one instance per build call)."""
 
     __slots__ = ("nodes_conditioned", "bucket_miss", "strat_miss",
-                 "idx_oor", "underflow_fallback", "hero_floor")
+                 "idx_oor", "idx_oor_proxied", "underflow_fallback",
+                 "hero_floor")
 
     def __init__(self) -> None:
         self.nodes_conditioned = 0
         self.bucket_miss = 0
         self.strat_miss = 0
         self.idx_oor = 0
+        # Off-vocabulary aggressive actions (an explicit all-in or an added
+        # size the blueprint node has no column for) conditioned on the
+        # node's most aggressive blueprint action instead of being skipped.
+        self.idx_oor_proxied = 0
         self.underflow_fallback = 0
         self.hero_floor = 0  # hands lifted off a pure-0 multiplier (hero-row fix)
 
@@ -97,6 +102,7 @@ class _CondStats:
             "bucket_miss": self.bucket_miss,
             "strat_miss": self.strat_miss,
             "idx_oor": self.idx_oor,
+            "idx_oor_proxied": self.idx_oor_proxied,
             "underflow_fallback": self.underflow_fallback,
             "hero_floor": self.hero_floor,
         }
@@ -265,10 +271,31 @@ def build_conditioned_per_leaf_ranges(
                         if strat is None or len(strat) == 0:
                             stats.strat_miss += 1
                             continue  # blueprint has no opinion -> x1.0
-                        if a_idx < 0 or a_idx >= len(strat):
+                        if a_idx < 0:
                             stats.idx_oor += 1
-                            continue  # action outside the node's support -> x1.0
-                        s = float(strat[a_idx])
+                            continue  # malformed index -> x1.0
+                        if a_idx >= len(strat):
+                            # OFF-VOCABULARY AGGRESSION (2026-09-09): the trainer
+                            # vocab is [0.75] first / [1.0] subsequent plus an
+                            # explicit all-in, so a jam (or an added off-tree
+                            # size) has NO column in the blueprint node.
+                            # Skipping it (x1.0) left the villain's all-in
+                            # leaf range equal to his BET range: on Kh Qh 5h 9s
+                            # ace-high called a 190 jam at 1.00 because it had
+                            # 37% against a betting range. The closest honest
+                            # proxy is the node's most aggressive blueprint
+                            # action (its last column). Only when the node
+                            # has at least two columns (a check/bet or
+                            # fold/call/raise node); a one-column node stays a
+                            # no-op.
+                            if len(strat) >= 2:
+                                s = float(strat[len(strat) - 1])
+                                stats.idx_oor_proxied += 1
+                            else:
+                                stats.idx_oor += 1
+                                continue
+                        else:
+                            s = float(strat[a_idx])
                         ssum = float(sum(strat))
                         # Normalize over the node's own returned support (a guard;
                         # bps strat is already a distribution).

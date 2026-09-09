@@ -155,6 +155,12 @@ ES_EXPORT void es_set_cfr_mode(ESResolver *r, int mode);
  * resolver using es_sampled_oracle_fn(). */
 ES_EXPORT void es_set_vec_mode(ESResolver *r, int mode);
 
+/* Opt in to exact sampled-hand-pair showdown values at betting-closed
+ * depth-limit leaves. The default is OFF, preserving the external leaf-oracle
+ * path. When enabled, immutable runout/strength caches are built before a run's
+ * worker threads start. Set before es_run. */
+ES_EXPORT void es_set_exact_allin_leaves(ESResolver *r, int enabled);
+
 /* Configure scalar traverser-hand sampling for one actual private-hand row.
  * On that player's traverser pass, sample the fixed row with probability
  * `fraction` and use the tree's modeled range otherwise. Other players'
@@ -307,6 +313,19 @@ ES_EXPORT double es_test_showdown_value(
 ES_EXPORT double es_test_showdown_value_vec(
     int np, const int *board5, const int *hand_c0, const int *hand_c1,
     const int *active, const int *bets, int pot, int traverser);
+
+/* TEST-ONLY depth-leaf probes. These drive the production scalar/vector leaf
+ * branches for one caller-supplied sampled hand index per player. */
+/* TEST-ONLY: production terminal payoff (fold / showdown / leaf) at a node,
+ * charging this street's bets plus the earlier-street carry. */
+ES_EXPORT double es_test_terminal_payoff(
+    ESResolver *r, int node_idx, int traverser, const int *sampled);
+ES_EXPORT double es_test_leaf_value(
+    ESResolver *r, int node_idx, int traverser,
+    const int *sampled_hands);
+ES_EXPORT double es_test_leaf_value_vec(
+    ESResolver *r, int node_idx, int traverser,
+    const int *sampled_hands);
 
 /* TEST-ONLY root-pot-layer probes for the additive unequal-stack path.  Drive
  * the production scalar/vector evaluators with pre-existing root eligibility

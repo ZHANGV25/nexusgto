@@ -24,6 +24,17 @@
  * (matches es_solver.py REGRET_FLOOR = -1e12). */
 #define ES_REGRET_FLOOR (-1e12)
 
+/* Immutable exact-showdown cache for one betting-closed depth-limit leaf.
+ * Runouts are board-only candidates; the hot path filters the sampled hole
+ * cards with runout_masks before reading the hand-major strength rows. */
+typedef struct {
+    int num_runouts;
+    uint64_t board_mask;
+    uint64_t *runout_masks;       /* [num_runouts] */
+    size_t hand_base[SS_MAX_PLAYERS];
+    uint32_t *strengths;          /* [(sum num_hands) * num_runouts] */
+} ESExactAllinLeafCache;
+
 /* Full ESResolver state — promoted here (was file-private in es_resolver.c)
  * so es_resolver_reach.c sees the complete type. A struct definition emits
  * no symbol, so this changes no ABI. */
@@ -151,6 +162,24 @@ struct ESResolver {
     int root_pot_total;
     int root_pot_amounts[ES_MAX_ROOT_POT_LAYERS];
     uint32_t root_pot_eligible_masks[ES_MAX_ROOT_POT_LAYERS];
+
+    /* Opt-in exact evaluation for betting-closed depth-limit leaves. calloc
+     * leaves it disabled, preserving the historical oracle path unless the
+     * caller explicitly enables it. Cache entries are indexed by node, because
+     * board/bets/active state belong to the node rather than the table leaf id. */
+    int exact_allin_leaves;
+    int exact_allin_ready;
+    uint8_t *exact_allin_leaf_flags;       /* [num_nodes] */
+    /* CROSS-STREET CONTRIBUTION CARRY (2026-09-09). SSNode.bets holds only
+     * THIS street's bets: the builder resets them to 0 below a chance node and
+     * keeps the closing street's per-player bets on the chance node itself.
+     * node_carry[node*np+p] = chips player p committed on EARLIER streets of
+     * this subgame (sum of chance-node bets on the root path). Every terminal
+     * charges bets + carry, so a turn call is no longer free at a river
+     * showdown (measured: ace-high called a 190-unit jam at 1.00). NULL on a
+     * single-street tree, which keeps that path byte-identical. */
+    int *node_carry;                        /* [num_nodes*np] or NULL */
+    ESExactAllinLeafCache *exact_allin_leaf_cache; /* [num_nodes] */
 };
 
 
@@ -178,6 +207,18 @@ NEXUS_INTERNAL uint64_t es_monotonic_ms(void);
 NEXUS_INTERNAL int es_deadline_expired(const ESResolver *r,
                                        uint64_t start_ms);
 
+/* Build the immutable betting-closed flags and strength caches. This is run
+ * before Hogwild workers start; the forward/test paths may also call it while
+ * single-threaded. */
+NEXUS_INTERNAL int es_prepare_exact_allin_leaves(ESResolver *r);
+
+/* Shared no-stats leaf dispatch used by scalar, vector, forward, and reach
+ * paths. Exact flagged leaves bypass the caller oracle; all other leaves retain
+ * the historical oracle call and RNG behavior. */
+NEXUS_INTERNAL double es_leaf_payoff(
+    ESResolver *r, int node_idx, int traverser,
+    const int *sampled, uint64_t *rng);
+
 /* Regret-matching: positive-regret normalize into a strategy (uniform if all
  * non-positive). Definition in es_resolver.c. */
 void es_regret_match(const double *r, int na, double *out);
@@ -192,5 +233,20 @@ NEXUS_INTERNAL int es_run_reach(ESResolver *r, int64_t iterations, int num_threa
 #ifdef __cplusplus
 }
 #endif
+
+
+/* Chips committed on earlier streets of this subgame (0 on single-street
+ * trees, on a NULL resolver, or for a synthetic node with node_idx < 0). */
+static inline double es_carry(const ESResolver *r, int node_idx, int p) {
+    if (!r || !r->node_carry || node_idx < 0) return 0.0;
+    return (double)r->node_carry[(size_t)node_idx * (size_t)r->np + (size_t)p];
+}
+
+/* The player's total contribution charged at a terminal: this street's bets
+ * plus the carry from earlier streets. */
+static inline double es_my_bet(const ESResolver *r, int node_idx,
+                               const SSNode *nd, int p) {
+    return (double)nd->bets[p] + es_carry(r, node_idx, p);
+}
 
 #endif /* ES_RESOLVER_INTERNAL_H */

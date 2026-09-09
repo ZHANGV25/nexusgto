@@ -407,3 +407,67 @@ def test_folding_villain_drives_weight_toward_zero():
     # Folding hand is ~92x lighter than the continuing hand — the leaf is now
     # valued overwhelmingly against the calling range (the over-bet cure).
     assert fold_w < cont_w / 50.0
+
+
+def test_off_vocabulary_allin_conditions_on_most_aggressive_column():
+    """An explicit all-in (or an added off-tree size) has no column in the
+    blueprint node: the trainer vocab is [0.75] first / [1.0] subsequent. Until
+    2026-09-09 such a step was a x1.0 no-op, so a villain who JAMMED was
+    conditioned only on his earlier BET and the all-in leaf faced his betting
+    range (measured: ace-high called a 190 jam at 1.00 on Kh Qh 5h 9s). The
+    step now conditions on the node's most aggressive column (its last entry)
+    and is counted separately as idx_oor_proxied."""
+    # Facing-a-bet node with [fold, call, raise]; action index 3 = all-in.
+    bp = _FakeBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket={0: [0.10, 0.30, 0.60], 1: [0.50, 0.49, 0.01]},
+    )
+    ranges = _ranges()
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, 3, 1], [0, 1, 0])], player_ranges=ranges,
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=[], blueprint=bp, n_players=2,
+    )
+    jam_w = per_leaf[0][1][0][2]     # hand A: raise column 0.60
+    nojam_w = per_leaf[0][1][1][2]   # hand B: raise column 0.01
+    assert jam_w == pytest.approx(0.60)
+    assert nojam_w == pytest.approx(0.01)
+    # villain: 2 hands x 1 proxied step; hero: 2 hands x 2 in-vocab steps.
+    assert stats["idx_oor_proxied"] == 2
+    assert stats["idx_oor"] == 0
+    assert stats["nodes_conditioned"] == 6
+
+
+def test_off_vocabulary_index_on_one_column_node_stays_no_op():
+    """A one-column node cannot represent aggression at all: keep the historical
+    x1.0 no-op and the idx_oor count so nothing is silently invented."""
+    bp = _FakeBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket={0: [1.0], 1: [1.0]},
+    )
+    ranges = _ranges()
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, 3, 1], [0, 1, 0])], player_ranges=ranges,
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=[], blueprint=bp, n_players=2,
+    )
+    assert per_leaf[0][1][0][2] == pytest.approx(1.0)
+    assert per_leaf[0][1][1][2] == pytest.approx(1.0)
+    # every step (villain's jam and hero's two in-vocab steps) is out of range
+    # on a one-column node: 2 villain + 4 hero no-ops, nothing proxied.
+    assert stats["idx_oor"] == 6
+    assert stats["idx_oor_proxied"] == 0
+
+
+def test_negative_index_still_no_op():
+    bp = _FakeBlueprint(
+        bucket_of_c0={0: 0, 4: 1},
+        strat_by_bucket={0: [0.1, 0.9], 1: [0.9, 0.1]},
+    )
+    per_leaf, stats = build_conditioned_per_leaf_ranges(
+        leaf_infos=[_leaf([1, -1], [0, 1])], player_ranges=_ranges(),
+        board=[0, 1, 2], player_seats=[1, 2],
+        game_action_history=[], blueprint=bp, n_players=2,
+    )
+    assert per_leaf[0][1][0][2] == pytest.approx(1.0)
+    assert stats["idx_oor"] == 2

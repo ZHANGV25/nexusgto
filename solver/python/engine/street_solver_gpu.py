@@ -589,6 +589,41 @@ class StreetSolverGPU:
         self._frozen_arr = frozen
         self._tree.frozen_action = ctypes.cast(frozen, ctypes.POINTER(ctypes.c_int))
 
+    def set_frozen_action_indices(self, pairs):
+        """Freeze hero's earlier decisions on this street by node index.
+
+        ``pairs`` is an iterable of ``(node_index, action_index)``: at each
+        listed decision node the solver must take ``action_index`` with
+        probability one and accumulate no regret there (Pluribus safe
+        re-solving: the re-solve cannot revise what hero already did). The
+        node index comes from the api's replay walk of the recorded street,
+        so no label matching is needed. An empty iterable clears freezing.
+        Fails loud on a non-decision node or an action outside the node's
+        children. Consumed by the C external-sampling resolver through
+        ``SSTreeData.frozen_action`` (-1 = not frozen).
+        """
+        n = int(self._tree.num_nodes)
+        frozen = (ctypes.c_int * n)(*[-1] * n)
+        for node_index, action_index in pairs:
+            node_index = int(node_index)
+            action_index = int(action_index)
+            if node_index < 0 or node_index >= n:
+                raise ValueError(
+                    f"frozen node {node_index} outside the tree ({n} nodes)")
+            node = self._tree.nodes[node_index]
+            if int(node.type) != 0:
+                raise ValueError(
+                    f"frozen node {node_index} is not a decision node "
+                    f"(type={int(node.type)})")
+            if action_index < 0 or action_index >= int(node.num_children):
+                raise ValueError(
+                    f"frozen action {action_index} outside node {node_index}'s "
+                    f"{int(node.num_children)} children")
+            frozen[node_index] = action_index
+        self._frozen_arr = frozen
+        self._tree.frozen_action = ctypes.cast(
+            frozen, ctypes.POINTER(ctypes.c_int))
+
     def solve(self, iterations=200):
         if self.root_stacks_chips is not None:
             raise RuntimeError(

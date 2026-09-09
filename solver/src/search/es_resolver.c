@@ -273,6 +273,201 @@ static inline int es_enumerate_opponent(const ESResolver *r) {
     return (r->opp_mode >= 0) ? r->opp_mode : es_enumerate_opponent_default();
 }
 
+/* Exact betting-closed leaf caches are keyed by NODE rather than leaf_idx:
+ * board, bets, and the active set are node state, while leaf_idx only selects
+ * an eager oracle table cell. Runouts initially exclude the node board only;
+ * the fixed sampled hole cards are filtered on each exact-value call. */
+static void es_clear_exact_allin_cache(ESResolver *r) {
+    if (!r) return;
+    if (r->exact_allin_leaf_cache) {
+        for (int i = 0; i < r->num_nodes; i++) {
+            free(r->exact_allin_leaf_cache[i].runout_masks);
+            free(r->exact_allin_leaf_cache[i].strengths);
+        }
+    }
+    free(r->exact_allin_leaf_cache);
+    free(r->exact_allin_leaf_flags);
+    r->exact_allin_leaf_cache = NULL;
+    r->exact_allin_leaf_flags = NULL;
+    r->exact_allin_ready = 0;
+}
+
+static int es_build_exact_allin_leaf_cache(ESResolver *r, int node_idx) {
+    const SSTreeData *t = r->tree;
+    const SSNode *nd = &t->nodes[node_idx];
+    ESExactAllinLeafCache *cache = &r->exact_allin_leaf_cache[node_idx];
+    int nb = nd->num_board;
+    if (nb < 3 || nb > 5) {
+        es_set_error("exact all-in leaf node %d has num_board=%d (expected 3..5)",
+                     node_idx, nb);
+        return -1;
+    }
+
+    uint64_t board_mask = 0;
+    for (int b = 0; b < nb; b++) {
+        int card = nd->board_cards[b];
+        if (card < 0 || card >= 52 || (board_mask & (1ULL << card))) {
+            es_set_error("exact all-in leaf node %d has invalid board card %d "
+                         "at slot %d", node_idx, card, b);
+            return -1;
+        }
+        board_mask |= 1ULL << card;
+    }
+    cache->board_mask = board_mask;
+
+    int missing = 5 - nb;
+    int available = 52 - nb;
+    int nr = missing == 0 ? 1
+             : (missing == 1 ? available
+                              : available * (available - 1) / 2);
+    cache->num_runouts = nr;
+    cache->runout_masks = (uint64_t *)malloc((size_t)nr * sizeof(uint64_t));
+    size_t runout_card_count = (size_t)nr * (size_t)missing;
+    uint8_t *runout_cards = runout_card_count > 0
+        ? (uint8_t *)malloc(runout_card_count * sizeof(uint8_t)) : NULL;
+    if (!cache->runout_masks || (runout_card_count > 0 && !runout_cards)) {
+        free(runout_cards);
+        es_set_error("OOM exact all-in runouts at node %d (%d runouts)",
+                     node_idx, nr);
+        return -1;
+    }
+
+    int ri = 0;
+    if (missing == 0) {
+        cache->runout_masks[ri++] = 0;
+    } else if (missing == 1) {
+        for (int c = 0; c < 52; c++) {
+            if (board_mask & (1ULL << c)) continue;
+            cache->runout_masks[ri] = 1ULL << c;
+            runout_cards[ri] = (uint8_t)c;
+            ri++;
+        }
+    } else {
+        for (int c0 = 0; c0 < 52; c0++) {
+            if (board_mask & (1ULL << c0)) continue;
+            for (int c1 = c0 + 1; c1 < 52; c1++) {
+                if (board_mask & (1ULL << c1)) continue;
+                cache->runout_masks[ri] = (1ULL << c0) | (1ULL << c1);
+                runout_cards[(size_t)ri * 2] = (uint8_t)c0;
+                runout_cards[(size_t)ri * 2 + 1] = (uint8_t)c1;
+                ri++;
+            }
+        }
+    }
+    if (ri != nr) {
+        free(runout_cards);
+        es_set_error("exact all-in runout count mismatch at node %d (%d != %d)",
+                     node_idx, ri, nr);
+        return -1;
+    }
+
+    size_t total_hands = 0;
+    for (int p = 0; p < r->np; p++) {
+        int nh = t->num_hands[p];
+        if (nh < 0 || nh > SS_MAX_HANDS) {
+            free(runout_cards);
+            es_set_error("exact all-in player %d has num_hands=%d", p, nh);
+            return -1;
+        }
+        cache->hand_base[p] = total_hands;
+        total_hands += (size_t)nh;
+    }
+    if (total_hands > SIZE_MAX / (size_t)nr
+        || total_hands * (size_t)nr > SIZE_MAX / sizeof(uint32_t)) {
+        free(runout_cards);
+        es_set_error("exact all-in strength cache size overflow at node %d",
+                     node_idx);
+        return -1;
+    }
+    size_t strength_count = total_hands * (size_t)nr;
+    cache->strengths = (uint32_t *)calloc(
+        strength_count > 0 ? strength_count : 1, sizeof(uint32_t));
+    if (!cache->strengths) {
+        free(runout_cards);
+        es_set_error("OOM exact all-in strengths at node %d (%zu entries)",
+                     node_idx, strength_count);
+        return -1;
+    }
+
+    for (int p = 0; p < r->np; p++) {
+        for (int h = 0; h < t->num_hands[p]; h++) {
+            int c0 = t->hands[p][h][0];
+            int c1 = t->hands[p][h][1];
+            if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52 || c0 == c1) {
+                free(runout_cards);
+                es_set_error("exact all-in player %d hand %d is invalid (%d,%d)",
+                             p, h, c0, c1);
+                return -1;
+            }
+            uint64_t hand_mask = (1ULL << c0) | (1ULL << c1);
+            if (hand_mask & board_mask) continue;
+            uint32_t *row = cache->strengths
+                + (cache->hand_base[p] + (size_t)h) * (size_t)nr;
+            for (int rix = 0; rix < nr; rix++) {
+                if (cache->runout_masks[rix] & hand_mask) continue;
+                int board[5];
+                for (int b = 0; b < nb; b++) board[b] = nd->board_cards[b];
+                for (int b = 0; b < missing; b++)
+                    board[nb + b] = runout_cards[(size_t)rix * missing + b];
+                int cards[7] = {
+                    board[0], board[1], board[2], board[3], board[4], c0, c1
+                };
+                uint32_t strength = eval7(cards);
+                row[rix] = strength ? strength : 1;
+            }
+        }
+    }
+    free(runout_cards);
+    return 0;
+}
+
+int es_prepare_exact_allin_leaves(ESResolver *r) {
+    if (!r || !r->exact_allin_leaves || r->exact_allin_ready) return 0;
+    es_clear_exact_allin_cache(r);
+
+    r->exact_allin_leaf_flags = (uint8_t *)calloc(
+        (size_t)r->num_nodes, sizeof(uint8_t));
+    r->exact_allin_leaf_cache = (ESExactAllinLeafCache *)calloc(
+        (size_t)r->num_nodes, sizeof(ESExactAllinLeafCache));
+    if (!r->exact_allin_leaf_flags || !r->exact_allin_leaf_cache) {
+        es_set_error("OOM exact all-in leaf metadata (%d nodes)", r->num_nodes);
+        es_clear_exact_allin_cache(r);
+        return -1;
+    }
+
+    int flagged = 0;
+    for (int i = 0; i < r->num_nodes; i++) {
+        const SSNode *nd = &r->tree->nodes[i];
+        if (nd->type != ES_T_LEAF) continue;
+        int active_with_chips = 0;
+        for (int p = 0; p < r->np; p++) {
+            int64_t remaining = (int64_t)r->tree->effective_stack
+                                - (int64_t)nd->bets[p];
+            if (nd->active_players[p] && remaining > 0)
+                active_with_chips++;
+        }
+        if (active_with_chips < 2) {
+            r->exact_allin_leaf_flags[i] = 1;
+            flagged++;
+        }
+    }
+
+    if (flagged > 0) {
+        /* Normally initialized by hand_eval_table.c's loader constructor;
+         * explicit initialization pins the cache-build contract as well. */
+        poker_eval5_table_init();
+        for (int i = 0; i < r->num_nodes; i++) {
+            if (!r->exact_allin_leaf_flags[i]) continue;
+            if (es_build_exact_allin_leaf_cache(r, i) != 0) {
+                es_clear_exact_allin_cache(r);
+                return -1;
+            }
+        }
+    }
+    r->exact_allin_ready = 1;
+    return 0;
+}
+
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
 static int es_build_offsets(ESResolver *r) {
@@ -311,6 +506,39 @@ static int es_build_offsets(ESResolver *r) {
     return 0;
 }
 
+/* Per-node carry of earlier-street contributions (see es_resolver_internal.h).
+ * Single ascending pass: ss_tree_builder allocates every child after its parent
+ * (the same invariant the reach path relies on), so carry(child) = carry(parent)
+ * + parent's closing bets when the parent is a chance node. Fail loud if the
+ * invariant does not hold. NULL (byte-identical path) without chance nodes. */
+static int es_build_node_carry(ESResolver *r) {
+    const SSTreeData *t = r->tree;
+    int n = t->num_nodes;
+    int np = t->num_players;
+    r->node_carry = NULL;
+    if (t->num_chance_nodes <= 0) return 0;
+    int *carry = (int *)calloc((size_t)n * (size_t)np, sizeof(int));
+    if (!carry) { es_set_error("OOM node carry (%d nodes)", n); return -1; }
+    for (int i = 0; i < n; i++) {
+        const SSNode *nd = &t->nodes[i];
+        int is_chance = (nd->type == ES_T_CHANCE);
+        for (int a = 0; a < nd->num_children; a++) {
+            int child = t->children[nd->first_child + a];
+            if (child <= i || child >= n) {
+                free(carry);
+                es_set_error("node carry: child %d is not after parent %d",
+                             child, i);
+                return -1;
+            }
+            for (int p = 0; p < np; p++)
+                carry[(size_t)child * np + p] =
+                    carry[(size_t)i * np + p] + (is_chance ? nd->bets[p] : 0);
+        }
+    }
+    r->node_carry = carry;
+    return 0;
+}
+
 ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
                       void *oracle_ctx, uint64_t seed) {
     g_es_error[0] = '\0';
@@ -335,6 +563,7 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->opp_mode = -1;
     r->reach_mode = 0;     /* OFF until set (validated sampling path is default) */
     if (es_build_offsets(r) != 0) { es_free(r); return NULL; }
+    if (es_build_node_carry(r) != 0) { es_free(r); return NULL; }
     return r;
 }
 
@@ -489,6 +718,10 @@ void es_set_vec_mode(ESResolver *r, int mode) {
     if (r) r->vec_traverser = (mode == 1) ? 1 : 0;
 }
 
+void es_set_exact_allin_leaves(ESResolver *r, int enabled) {
+    if (r) r->exact_allin_leaves = enabled ? 1 : 0;
+}
+
 /* Chance-node handling: 1 = ENUMERATE (correct, zero-variance — average over all
  * dealt cards), 0 = SAMPLE (single card/iter — high variance), -1 = inherit the
  * env default. Set BEFORE es_run. */
@@ -533,6 +766,7 @@ int64_t es_get_visit_count(const ESResolver *r, int node_idx) {
 
 void es_free(ESResolver *r) {
     if (!r) return;
+    if (r) { free(r->node_carry); r->node_carry = NULL; }
     free(r->node_off);
     free(r->node_na);
     free(r->regrets);
@@ -543,6 +777,7 @@ void es_free(ESResolver *r) {
     free(r->rc_strat);
     free(r->rc_sd_strength);
     free(r->rc_sd_done);
+    es_clear_exact_allin_cache(r);
     free(r);
 }
 
@@ -784,9 +1019,10 @@ static void es_sample_opponents(ESResolver *r, uint64_t *rng, int skip,
 
 /* FOLD terminal: the sole remaining active player (node.player) wins the pot.
  * net = (pot - my_bet) if I'm the winner else -my_bet. */
-static inline double es_fold_value(const SSNode *nd, int traverser) {
+static inline double es_fold_value(const ESResolver *r, int node_idx,
+                                   const SSNode *nd, int traverser) {
     int winner = nd->player;          /* street_solve.cu sets winner = node->player */
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
     if (traverser == winner) return (double)nd->pot - my_bet;
     return -my_bet;
 }
@@ -999,14 +1235,104 @@ static double es_root_pot_award(const ESResolver *r, const SSNode *nd,
     return award;
 }
 
+/* Exact expected showdown for one sampled active-hand profile at a flagged
+ * depth-limit leaf. The strength cache removes eval7 from this hot path; each
+ * call only filters runouts, compares cached ranks, and awards the pot. */
+static double es_exact_allin_leaf_value(ESResolver *r, int node_idx,
+                                        int traverser, const int *sampled) {
+    const SSTreeData *t = r->tree;
+    const SSNode *nd = &t->nodes[node_idx];
+    const ESExactAllinLeafCache *cache =
+        &r->exact_allin_leaf_cache[node_idx];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
+    if (!nd->active_players[traverser]) return -my_bet;
+    if (cache->num_runouts <= 0 || !cache->runout_masks || !cache->strengths)
+        return 0.0;
+
+    int selected[SS_MAX_PLAYERS];
+    uint64_t used = cache->board_mask;
+    for (int p = 0; p < r->np; p++) {
+        selected[p] = -1;
+        if (!nd->active_players[p]) continue;
+        int h = sampled[p];
+        if (h < 0 || h >= t->num_hands[p]) return 0.0;
+        int c0 = t->hands[p][h][0];
+        int c1 = t->hands[p][h][1];
+        if (c0 < 0 || c0 >= 52 || c1 < 0 || c1 >= 52 || c0 == c1)
+            return 0.0;
+        uint64_t hand_mask = (1ULL << c0) | (1ULL << c1);
+        /* This catches board collisions, traverser/opponent collisions, and
+         * inter-opponent collisions. The whole sampled world is then neutral. */
+        if (hand_mask & used) return 0.0;
+        used |= hand_mask;
+        selected[p] = h;
+    }
+
+    int single_pot = r->root_pot_count == 0
+                     && es_showdown_is_single_pot(nd, r->np);
+    double payoff_sum = 0.0;
+    int valid_runouts = 0;
+    for (int ri = 0; ri < cache->num_runouts; ri++) {
+        if (cache->runout_masks[ri] & used) continue;
+        uint32_t strength[SS_MAX_PLAYERS];
+        uint32_t best = 0;
+        int valid = 1;
+        for (int p = 0; p < r->np; p++) {
+            if (!nd->active_players[p]) continue;
+            const uint32_t *row = cache->strengths
+                + (cache->hand_base[p] + (size_t)selected[p])
+                  * (size_t)cache->num_runouts;
+            uint32_t s = row[ri];
+            if (s == 0) { valid = 0; break; }
+            strength[p] = s;
+            if (s > best) best = s;
+        }
+        if (!valid) continue;
+
+        double award;
+        if (single_pot) {
+            int nwin = 0;
+            int traverser_wins = 0;
+            for (int p = 0; p < r->np; p++) {
+                if (!nd->active_players[p] || strength[p] != best) continue;
+                nwin++;
+                if (p == traverser) traverser_wins = 1;
+            }
+            award = traverser_wins ? (double)nd->pot / (double)nwin : 0.0;
+        } else if (r->root_pot_count > 0) {
+            award = es_root_pot_award(r, nd, strength, traverser);
+        } else {
+            award = es_layered_award(nd, r->np, strength, traverser);
+        }
+        payoff_sum += award - my_bet;
+        valid_runouts++;
+    }
+    return valid_runouts > 0 ? payoff_sum / (double)valid_runouts : 0.0;
+}
+
+double es_leaf_payoff(ESResolver *r, int node_idx, int traverser,
+                      const int *sampled, uint64_t *rng) {
+    const SSNode *nd = &r->tree->nodes[node_idx];
+    if (r->exact_allin_leaves && r->exact_allin_ready
+        && r->exact_allin_leaf_flags
+        && r->exact_allin_leaf_flags[node_idx]) {
+        return es_exact_allin_leaf_value(r, node_idx, traverser, sampled);
+    }
+    /* The oracle's convention is payoff minus THIS street's bets; charge the
+     * earlier streets' contribution here (zero on single-street trees). */
+    return r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
+                     sampled[traverser], sampled, nd, rng)
+           - es_carry(r, node_idx, traverser);
+}
+
 /* SHOWDOWN terminal (river). Single-pot fast path (bit-exact historical
  * behavior, exact for every node the current builder can emit) + layered
  * side-pot path for uneven this-street all-in contributions (scope above). */
-static double es_showdown_value(ESResolver *r, const SSNode *nd,
+static double es_showdown_value(ESResolver *r, int node_idx, const SSNode *nd,
                                 int traverser, const int *sampled) {
     const SSTreeData *t = r->tree;
     int np = r->np;
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
     if (!nd->active_players[traverser]) return -my_bet;
 
     /* board must be 5 cards at a river showdown. Use the NODE's board, not the
@@ -1069,12 +1395,11 @@ static double es_showdown_value(ESResolver *r, const SSNode *nd,
 
 /* LEAF: lazy betting-leaf value via the caller oracle (one sampled-opponent
  * rollout in the real path; a table lookup in validation). */
-static inline double es_leaf_value(ESResolver *r, const SSNode *nd,
+static inline double es_leaf_value(ESResolver *r, int node_idx,
                                    int traverser, const int *sampled,
                                    ESStats *local, uint64_t *rng) {
     local->leaf_rollouts++;
-    return r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
-                     sampled[traverser], sampled, nd, rng);
+    return es_leaf_payoff(r, node_idx, traverser, sampled, rng);
 }
 
 /* ── Traversal (mirrors es_solver.py _traverse exactly) ──────────────────────
@@ -1094,14 +1419,14 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
 
     if (type == ES_T_FOLD) {
         local->fold_terminals++;
-        return es_fold_value(nd, traverser);
+        return es_fold_value(r, node_idx, nd, traverser);
     }
     if (type == ES_T_SHOWDOWN) {
         local->showdown_terminals++;
-        return es_showdown_value(r, nd, traverser, sampled);
+        return es_showdown_value(r, node_idx, nd, traverser, sampled);
     }
     if (type == ES_T_LEAF) {
-        return es_leaf_value(r, nd, traverser, sampled, local, rng);
+        return es_leaf_value(r, node_idx, traverser, sampled, local, rng);
     }
     /* CHANCE node (OP3 §4 HU flop/turn extension — deal the next street).
      * MCCFR external sampling: descend the ONE child sampled for this CFR
@@ -1147,6 +1472,17 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     local->decision_visits++;
     int acting = nd->player;
     int na = nd->num_children;
+    /* HERO-LINE FREEZING (2026-09-09): a node whose action is fixed by the
+     * api (hero's earlier decision on this street) is walked through its
+     * frozen child with probability one, for the traverser and for an
+     * opponent alike, and accumulates no regret or strategy sum. */
+    {
+        int fa = t->frozen_action ? t->frozen_action[node_idx] : -1;
+        if (fa >= 0 && fa < na) {
+            int child = t->children[nd->first_child + fa];
+            return es_traverse(r, child, traverser, sampled, rng, local, iter);
+        }
+    }
     int hand = sampled[acting];
     if (hand < 0) {
         /* acting player has no assignable hand — pass through child 0 (rare;
@@ -1307,7 +1643,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
          * is the winner (== nd->player), else -my_bet. Broadcast (dead hands get
          * 0 — they don't exist in this world). */
         local->fold_terminals++;
-        double v = es_fold_value(nd, traverser);
+        double v = es_fold_value(r, node_idx, nd, traverser);
         for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : v;
         return;
     }
@@ -1320,7 +1656,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
          * this-street all-ins — see the scope note above es_layered_award. */
         local->showdown_terminals++;
         int np = r->np;
-        double my_bet = (double)nd->bets[traverser];
+        double my_bet = es_my_bet(r, node_idx, nd, traverser);
         if (!nd->active_players[traverser]) {
             for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : -my_bet;
             return;
@@ -1410,9 +1746,8 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
         for (int h = 0; h < nh; h++) {
             if (dead[h]) { out_vals[h] = 0.0; continue; }
             sampled[traverser] = h;
-            local->leaf_rollouts++;
-            out_vals[h] = r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
-                                    h, sampled, nd, rng);
+            out_vals[h] = es_leaf_value(r, node_idx, traverser, sampled,
+                                        local, rng);
         }
         return;
     }
@@ -1462,6 +1797,18 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
     local->decision_visits++;
     int acting = nd->player;
     int na = nd->num_children;
+
+    /* HERO-LINE FREEZING: see es_traverse. The frozen child's per-hand vector
+     * is the node's vector; no per-hand regret or strategy-sum update. */
+    {
+        int fa = t->frozen_action ? t->frozen_action[node_idx] : -1;
+        if (fa >= 0 && fa < na) {
+            int child = t->children[nd->first_child + fa];
+            es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
+                            iter, scratch, scratch_depth, out_vals);
+            return;
+        }
+    }
 
     if (acting != traverser) {
         /* Opponent: sample ONE action from THEIR sampled hand's strategy, then
@@ -1591,6 +1938,8 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
                      r->vec_traverser, r->reach_mode);
         return -1;
     }
+    if (r->exact_allin_leaves && es_prepare_exact_allin_leaves(r) != 0)
+        return -1;
     if (iterations <= 0) return 0;
 
     /* Full-per-hand-reach vector CFR: dedicated deterministic path (no sampling,
@@ -1725,11 +2074,11 @@ static double es_forward_walk_uniform(ESResolver *r, int node_idx, int player,
     const SSNode *nd = &t->nodes[node_idx];
     int type = nd->type;
     if (type == ES_T_LEAF) {
-        return r->oracle(r->oracle_ctx, nd->leaf_idx, player,
-                         sampled[player], sampled, nd, rng);
+        return es_leaf_payoff(r, node_idx, player, sampled, rng);
     }
-    if (type == ES_T_FOLD) return es_fold_value(nd, player);
-    if (type == ES_T_SHOWDOWN) return es_showdown_value(r, nd, player, sampled);
+    if (type == ES_T_FOLD) return es_fold_value(r, node_idx, nd, player);
+    if (type == ES_T_SHOWDOWN)
+        return es_showdown_value(r, node_idx, nd, player, sampled);
     /* DECISION or CHANCE: uniform over children. */
     int na = nd->num_children;
     int a = es_rng_int(rng, na);
@@ -1741,6 +2090,8 @@ int es_forward_ev_uniform(ESResolver *r, int player, int64_t iterations,
                           double *out_mean, double *out_se) {
     if (!r) { es_set_error("resolver is NULL"); return -1; }
     if (player < 0 || player >= r->np) { es_set_error("player %d", player); return -1; }
+    if (r->exact_allin_leaves && es_prepare_exact_allin_leaves(r) != 0)
+        return -1;
     uint64_t rng = r->master_seed ^ (0x2545F4914F6CDD1DULL * (uint64_t)(player + 1));
     int sampled[SS_MAX_PLAYERS];
     double tot = 0.0, tot_sq = 0.0;
@@ -1857,6 +2208,48 @@ void es_reset_stats(ESResolver *r) {
  * scalar path (es_showdown_value) and the vectorized path (the inline showdown
  * block in es_traverse_vec) byte-for-byte as shipped — no reimplementation. */
 
+static int es_test_leaf_args_valid(const ESResolver *r, int node_idx,
+                                   int traverser, const int *sampled_hands) {
+    if (!r || !sampled_hands || node_idx < 0 || node_idx >= r->num_nodes
+        || traverser < 0 || traverser >= r->np
+        || r->tree->nodes[node_idx].type != ES_T_LEAF)
+        return 0;
+    for (int p = 0; p < r->np; p++) {
+        int h = sampled_hands[p];
+        if (h < -1 || h >= r->tree->num_hands[p]) return 0;
+    }
+    return sampled_hands[traverser] >= 0;
+}
+
+ES_EXPORT double es_test_leaf_value(
+    ESResolver *r, int node_idx, int traverser, const int *sampled_hands)
+{
+    if (!es_test_leaf_args_valid(r, node_idx, traverser, sampled_hands))
+        return NAN;
+    if (r->exact_allin_leaves && es_prepare_exact_allin_leaves(r) != 0)
+        return NAN;
+    uint64_t rng = r->master_seed ^ 0x9E3779B97F4A7C15ULL;
+    ESStats local; memset(&local, 0, sizeof(local));
+    return es_leaf_value(r, node_idx, traverser, sampled_hands, &local, &rng);
+}
+
+ES_EXPORT double es_test_leaf_value_vec(
+    ESResolver *r, int node_idx, int traverser, const int *sampled_hands)
+{
+    if (!es_test_leaf_args_valid(r, node_idx, traverser, sampled_hands))
+        return NAN;
+    if (r->exact_allin_leaves && es_prepare_exact_allin_leaves(r) != 0)
+        return NAN;
+    int dead[SS_MAX_HANDS];
+    double out_vals[SS_MAX_HANDS];
+    es_build_dead_mask(r, traverser, sampled_hands, dead);
+    uint64_t rng = r->master_seed ^ 0x9E3779B97F4A7C15ULL;
+    ESStats local; memset(&local, 0, sizeof(local));
+    es_traverse_vec(r, node_idx, traverser, sampled_hands, dead, &rng,
+                    &local, 1, NULL, 0, out_vals);
+    return out_vals[sampled_hands[traverser]];
+}
+
 static void es_test_build_ctx(SSTreeData *td, SSNode *node, ESResolver *tmp,
                               int np, const int *board5,
                               const int *hand_c0, const int *hand_c1,
@@ -1903,7 +2296,7 @@ ES_EXPORT double es_test_showdown_value(
                       active, bets, pot);
     int sampled[SS_MAX_PLAYERS];
     for (int p = 0; p < np; p++) sampled[p] = 0;
-    return es_showdown_value(&tmp, &node, traverser, sampled);
+    return es_showdown_value(&tmp, -1, &node, traverser, sampled);
 }
 
 ES_EXPORT double es_test_showdown_value_vec(
@@ -1993,7 +2386,7 @@ ES_EXPORT double es_test_showdown_value_root_pots(
 
     int sampled[SS_MAX_PLAYERS];
     for (int p = 0; p < np; p++) sampled[p] = 0;
-    return es_showdown_value(&tmp, &node, traverser, sampled);
+    return es_showdown_value(&tmp, -1, &node, traverser, sampled);
 }
 
 ES_EXPORT double es_test_showdown_value_root_pots_vec(
@@ -2021,3 +2414,20 @@ ES_EXPORT double es_test_showdown_value_root_pots_vec(
                     1, NULL, 0, out_vals);
     return out_vals[0];
 }
+
+/* TEST-ONLY: the production terminal payoff at node_idx for `traverser` with
+ * the given sampled hands (fold / showdown / depth-limit leaf), scalar path. */
+ES_EXPORT double es_test_terminal_payoff(ESResolver *r, int node_idx,
+                                         int traverser, const int *sampled) {
+    if (!r || node_idx < 0 || node_idx >= r->tree->num_nodes) return 0.0;
+    const SSNode *nd = &r->tree->nodes[node_idx];
+    if (nd->type == ES_T_FOLD) return es_fold_value(r, node_idx, nd, traverser);
+    if (nd->type == ES_T_SHOWDOWN)
+        return es_showdown_value(r, node_idx, nd, traverser, sampled);
+    if (nd->type == ES_T_LEAF) {
+        uint64_t rng = r->master_seed;
+        return es_leaf_payoff(r, node_idx, traverser, sampled, &rng);
+    }
+    return 0.0;
+}
+
