@@ -94,7 +94,11 @@ def _has_to_call(state: GameState) -> bool:
 
 
 def _grid_k_from_env() -> GridK:
-    """Read the hand-grid dose. Default ALL: every live physical combo.
+    """Read the hand-grid dose. Default ISO (2026-09-09): one row per
+    board-relative suit-isomorphism class, exact for hand strength and about
+    a third of the ALL rows on a turn (1128 -> 367), which is what puts a 2p
+    turn re-solve at 0.7-2.5 s on r7a.2xlarge. ALL keeps every physical
+    combo for measurement.
 
     The historical K=1 grid held ONE representative combo per 169 class,
     chosen clubs-first among unblocked suits, and served the hero's real
@@ -104,7 +108,7 @@ def _grid_k_from_env() -> GridK:
     to a river jam, non-club suited hands raised 100% on a club board).
     K=1 remains selectable for measurement only.
     """
-    raw = os.environ.get("NEXUS_GRID_K", "ALL").strip()
+    raw = os.environ.get("NEXUS_GRID_K", "ISO").strip()
     if raw.upper() in ("ALL", "ISO"):
         # ISO (2026-09-09): one row per board-relative suit-isomorphism
         # class (flush-irrelevant suits pooled); exact for hand strength,
@@ -428,6 +432,33 @@ def hero_exact_row(
         if set(grid[row_idx][:2]) == target:
             return row_idx
     return None
+
+
+# Weight given to the hero's own row when the seeded range for this line
+# holds it at zero (the hero deviated from the blueprint's preflop play, e.g.
+# flat-called KK from the BB). Without it the row is dropped at readout and
+# the decision refuses (live_resolve_not_converged -> blueprint fallback).
+# 1e-6 is far below any real per-row weight (class weight split over the
+# class's live combos, ~0.01-0.3), so the villain's model of hero is
+# unchanged in every practical sense while hero's row is trained and served.
+HERO_ROW_WEIGHT_FLOOR = 1e-6
+
+
+def floor_hero_row(
+    player_ranges: Sequence,
+    hero_player_idx: int,
+    row: int,
+    floor: float = HERO_ROW_WEIGHT_FLOOR,
+) -> Tuple[List[List[Tuple[int, int, float]]], bool]:
+    """Return ``(player_ranges_copy, floored)`` with the hero's row weight
+    raised to ``floor`` when it is below it. Inputs are never mutated; when
+    no floor is needed the copy holds the same row tuples."""
+    new_ranges = [list(rows) for rows in player_ranges]
+    c0, c1, weight = new_ranges[hero_player_idx][row][:3]
+    if float(weight) >= floor:
+        return new_ranges, False
+    new_ranges[hero_player_idx][row] = (int(c0), int(c1), float(floor))
+    return new_ranges, True
 
 
 def hero_grid_rows(

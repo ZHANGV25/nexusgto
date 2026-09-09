@@ -473,6 +473,7 @@ class LiveResolveSource(StrategySource):
         self.last_grid_k: Optional[object] = None
         self.last_grid_rows: Optional[int] = None
         self.last_hero_row_exact: Optional[bool] = None
+        self.last_hero_row_floored: Optional[bool] = None
         # Structured per-call disclosure. None is the flag-OFF contract.
         self.last_belief_carry: Optional[dict] = None
         self.last_offtree_add: Optional[dict] = None
@@ -557,7 +558,9 @@ class LiveResolveSource(StrategySource):
 
     def get_mix(self, state: GameState, hero_cards: HeroCards) -> ActionMix:
         from app.engine.agent.live_resolve_adapter import (
+            HERO_ROW_WEIGHT_FLOOR,
             aggregate_grid_row_strategies,
+            floor_hero_row,
             build_solve_inputs,
             hero_exact_row,
             hero_grid_row,
@@ -780,6 +783,20 @@ class LiveResolveSource(StrategySource):
             ),
         )
         actual_row = exact_row if exact_row is not None else hero_rows[0][0]
+        # HERO-ROW FLOOR (2026-09-09): a hero hand the seeded range holds at
+        # zero for this line would be dropped at readout and refuse; serve it
+        # from a floored row instead (disclosed in provenance).
+        floored_ranges, hero_row_floored = floor_hero_row(
+            inputs["player_ranges"], hero_idx, actual_row,
+        )
+        if hero_row_floored:
+            inputs = dict(inputs, player_ranges=floored_ranges)
+            hero_rows = [
+                (row_idx, HERO_ROW_WEIGHT_FLOOR if row_idx == actual_row
+                 else weight)
+                for row_idx, weight in hero_rows
+            ]
+        self.last_hero_row_floored = bool(hero_row_floored)
         self.last_grid_k = inputs.get("grid_k", 1)
         self.last_grid_rows = len(inputs["player_ranges"][hero_idx])
         self.last_hero_row_exact = exact_row is not None
