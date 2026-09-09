@@ -1030,8 +1030,14 @@ class CpuEsSolver:
         # POKER_SEARCH_DEPTH=full (enable the depth rule) AND POKER_TURN_DEPTH_LIMIT
         # =0 (so the turn root extends to the river instead of depth-limiting), set
         # for THIS build only and restored in finally so they never leak.
+        # DEFAULT ON since 2026-09-09: the 2p turn extends through the river
+        # in-tree (sampled river per iteration, hero line frozen, cross-street
+        # contributions charged at terminals). The depth-limited turn's leaf
+        # table was 3-rollout noise CFR best-responded to (sets folded to a
+        # turn raise at 1.00). NEXUS_ALLOW_CHANCE_SOLVE=0 restores the
+        # depth-limited turn for measurement.
         _allow_chance_turn = os.environ.get(
-            "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
+            "NEXUS_ALLOW_CHANCE_SOLVE", "1")[:1] in ("1", "t", "T", "y", "Y")
         _want_turn_reach = (n_players == 2 and street == "turn"
                             and _allow_chance_turn)
         _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
@@ -1187,11 +1193,14 @@ class CpuEsSolver:
             # validated reach path -> gated to lookup. _chance_is_reach mirrors the
             # use_reach predicate below.
             _has_chance = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
-            _reach_default = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
+            # NEXUS_ES_REACH default OFF since 2026-09-09: full-reach CFR on
+            # the river-extended tree costs ~1.3 s per iteration at 1128 rows
+            # (270 s for 200 iterations); the sampled vec path is the live one.
+            _reach_default = os.environ.get("NEXUS_ES_REACH", "0")[:1] in (
                 "1", "t", "T", "y", "Y")
             _chance_is_reach = (_has_chance and n_players == 2 and _reach_default)
             _allow_chance = os.environ.get(
-                "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
+                "NEXUS_ALLOW_CHANCE_SOLVE", "1")[:1] in ("1", "t", "T", "y", "Y")
             if _has_chance and not _chance_is_reach and not _allow_chance:
                 raise ReplayUnsupported(
                     "live re-solve tree contains an in-tree chance node at a "
@@ -1925,7 +1934,7 @@ class CpuEsSolver:
             # sampling and 3p+ trees have no chance node anyway. Off by default
             # (NEXUS_ES_REACH unset/0 falls back to the prior sampling+enum path so
             # this is a no-op until explicitly enabled for the validated 2p case).
-            _reach = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
+            _reach = os.environ.get("NEXUS_ES_REACH", "0")[:1] in (
                 "1", "t", "T", "y", "Y")
             use_reach = (
                 not _sampled_requested
@@ -1955,7 +1964,7 @@ class CpuEsSolver:
                 # the river-extended turn fits a live budget. Unbiased in
                 # expectation; convergence comes from iterations.
                 _chance_sampled = os.environ.get(
-                    "NEXUS_CHANCE_SAMPLE", "")[:1] in ("1", "t", "T", "y", "Y")
+                    "NEXUS_CHANCE_SAMPLE", "1")[:1] in ("1", "t", "T", "y", "Y")
                 cs.set_chance_mode(0 if _chance_sampled else 1)
                 if (not _sampled_requested and n_players <= 3
                         and hasattr(cs, "set_opp_mode")):

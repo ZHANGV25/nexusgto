@@ -165,12 +165,14 @@ def test_play_table_final_readout_every_n():
         assert cfg.readout == "final", f"{n}p play config must be final"
 
 
-def test_display_table_unchanged_sigma_bar_2p3p():
-    # The /v1 frequency-display contract: 2p/3p stay sigma-bar.
-    assert DEFAULT_LIVE_CONFIG_BY_N[2].readout == "avg"
-    assert DEFAULT_LIVE_CONFIG_BY_N[3].readout == "avg"
-    assert DEFAULT_LIVE_CONFIG_BY_N[2].iterations == 400
-    assert DEFAULT_LIVE_CONFIG_BY_N[3].iterations == 400
+def test_display_table_2p3p_is_vec_final_20k():
+    # 2026-09-09: 2p/3p are vec-Linear-FINAL at 20k (the vec traverser
+    # requires the final readout); the sigma-bar display arm is retired.
+    for n in (2, 3):
+        cfg = DEFAULT_LIVE_CONFIG_BY_N[n]
+        assert cfg.readout == "final"
+        assert cfg.vec_mode is True
+        assert cfg.iterations == 20_000
 
 
 def test_hero_traverser_mixture_and_coverage_defaults(monkeypatch):
@@ -224,7 +226,7 @@ def test_play_rows_differ_only_in_readout_and_note():
 
 
 def test_live_config_for_purpose_routing():
-    assert live_config_for(2).readout == "avg"
+    assert live_config_for(2).readout == "final"
     assert live_config_for(2, purpose="play").readout == "final"
     assert live_config_for(6, purpose="play").readout == "final"
     with pytest.raises(ValueError):
