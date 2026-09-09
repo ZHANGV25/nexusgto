@@ -1030,8 +1030,14 @@ class CpuEsSolver:
         # POKER_SEARCH_DEPTH=full (enable the depth rule) AND POKER_TURN_DEPTH_LIMIT
         # =0 (so the turn root extends to the river instead of depth-limiting), set
         # for THIS build only and restored in finally so they never leak.
+        # DEFAULT ON since 2026-09-09: the 2p turn extends through the river
+        # in-tree (sampled river per iteration, hero line frozen, cross-street
+        # contributions charged at terminals). The depth-limited turn's leaf
+        # table was 3-rollout noise CFR best-responded to (sets folded to a
+        # turn raise at 1.00). NEXUS_ALLOW_CHANCE_SOLVE=0 restores the
+        # depth-limited turn for measurement.
         _allow_chance_turn = os.environ.get(
-            "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
+            "NEXUS_ALLOW_CHANCE_SOLVE", "1")[:1] in ("1", "t", "T", "y", "Y")
         _want_turn_reach = (n_players == 2 and street == "turn"
                             and _allow_chance_turn)
         _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
@@ -1108,6 +1114,47 @@ class CpuEsSolver:
                 )
                 tree.root_pot_amounts = root_amount_values
                 tree.root_pot_eligible_masks = root_mask_values
+            # ── HERO-LINE FREEZING (Pluribus safe re-solving, 2026-09-09) ──
+            # The subgame is rooted at the street start, but the served node
+            # can be several actions deep (facing a jam after a check-raise).
+            # Without freezing, villain's nodes on hero's real line are only
+            # trained when self-play wanders there, so villain still jams too
+            # wide after 100k iterations and hero calls with air. Freezing
+            # hero's OWN earlier decisions on this street (never the served
+            # node) makes every iteration walk the real line. The pairs come
+            # from the same replay walk the readout uses; the C resolver
+            # consumes SSTreeData.frozen_action. NEXUS_FREEZE_HERO_LINE=0
+            # disables it for measurement.
+            _frozen_steps: Tuple[Tuple[int, int], ...] = ()
+            _freeze_hero_line = os.environ.get(
+                "NEXUS_FREEZE_HERO_LINE", "1")[:1] in ("1", "t", "T", "y", "Y")
+            if (_freeze_hero_line and _offtree_replay is not None
+                    and hero_replay is not None
+                    and hero_replay.get("street_actions")
+                    and hasattr(gpu, "set_frozen_action_indices")):
+                try:
+                    _pre_walk = replay_offtree_street_node(
+                        tree,
+                        list(hero_replay["street_actions"]),  # type: ignore[arg-type]
+                        n_players=n_players,
+                        base_bet_sizes=_base_bet_sizes,
+                        base_subsequent_bet_sizes=_base_subsequent_sizes,
+                        bet_sizes=bet_sizes,
+                        subsequent_bet_sizes=subsequent_bet_sizes,
+                        add_explicit_allin=add_explicit_allin,
+                        event_fractions=_event_fractions,
+                        expected_event_amounts=_expected_event_amounts,
+                    )
+                    _frozen_steps = _pre_walk.hero_frozen_steps(
+                        int(hero_replay["player_idx"])  # type: ignore[arg-type]
+                    )
+                except ReplayUnsupported:
+                    # The post-solve walk raises the same error with the
+                    # served-path context; do not duplicate it here.
+                    _frozen_steps = ()
+                if _frozen_steps:
+                    gpu.set_frozen_action_indices(_frozen_steps)
+            _chance_sampled = False
             max_h = gpu._max_hands
 
             # IN-TREE CHANCE NODE GATE (2026-06-14, narrowed 2026-06-15).
@@ -1146,11 +1193,14 @@ class CpuEsSolver:
             # validated reach path -> gated to lookup. _chance_is_reach mirrors the
             # use_reach predicate below.
             _has_chance = int(getattr(gpu._tree, "num_chance_nodes", 0)) > 0
-            _reach_default = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
+            # NEXUS_ES_REACH default OFF since 2026-09-09: full-reach CFR on
+            # the river-extended tree costs ~1.3 s per iteration at 1128 rows
+            # (270 s for 200 iterations); the sampled vec path is the live one.
+            _reach_default = os.environ.get("NEXUS_ES_REACH", "0")[:1] in (
                 "1", "t", "T", "y", "Y")
             _chance_is_reach = (_has_chance and n_players == 2 and _reach_default)
             _allow_chance = os.environ.get(
-                "NEXUS_ALLOW_CHANCE_SOLVE", "")[:1] in ("1", "t", "T", "y", "Y")
+                "NEXUS_ALLOW_CHANCE_SOLVE", "1")[:1] in ("1", "t", "T", "y", "Y")
             if _has_chance and not _chance_is_reach and not _allow_chance:
                 raise ReplayUnsupported(
                     "live re-solve tree contains an in-tree chance node at a "
@@ -1884,7 +1934,7 @@ class CpuEsSolver:
             # sampling and 3p+ trees have no chance node anyway. Off by default
             # (NEXUS_ES_REACH unset/0 falls back to the prior sampling+enum path so
             # this is a no-op until explicitly enabled for the validated 2p case).
-            _reach = os.environ.get("NEXUS_ES_REACH", "1")[:1] in (
+            _reach = os.environ.get("NEXUS_ES_REACH", "0")[:1] in (
                 "1", "t", "T", "y", "Y")
             use_reach = (
                 not _sampled_requested
@@ -1905,7 +1955,17 @@ class CpuEsSolver:
                     readout = "avg"
                 vec_mode = 0
             elif tree_has_chance and hasattr(cs, "set_chance_mode"):
-                cs.set_chance_mode(1)   # enumerate card outcomes (correct)
+                # NEXUS_CHANCE_SAMPLE=1: deal ONE next-street card per
+                # iteration (keyed by iteration and chance node, so every
+                # visit inside one iteration sees the same runout) instead of
+                # enumerating all outcomes. Measured 2026-09-09 on a 2p turn
+                # with the river in-tree: enumerate 75 ms/iteration, sample
+                # 0.16 ms/iteration at 1128 rows; sampling is the only way
+                # the river-extended turn fits a live budget. Unbiased in
+                # expectation; convergence comes from iterations.
+                _chance_sampled = os.environ.get(
+                    "NEXUS_CHANCE_SAMPLE", "1")[:1] in ("1", "t", "T", "y", "Y")
+                cs.set_chance_mode(0 if _chance_sampled else 1)
                 if (not _sampled_requested and n_players <= 3
                         and hasattr(cs, "set_opp_mode")):
                     if readout == "both":
@@ -1919,6 +1979,26 @@ class CpuEsSolver:
                     vec_mode = 1        # force vec for the readout below
             if vec_mode and not _sampled_requested:
                 cs.set_vec_mode(1)
+            # ── EXACT ALL-IN LEAVES (2026-09-09) ──────────────────────────
+            # The eager leaf table indexes by the traverser's hand only, so a
+            # betting-closed (all-in) leaf priced hero's hand against the
+            # villain's whole leaf range and ignored the hand in the walk;
+            # measured: a bare 6-2 flush and ace-high called a 190 jam at
+            # 1.00 at pot odds against a random range. With the resolver's
+            # exact per-pair oracle enabled, such leaves are the exact
+            # expected showdown of the traverser's hand against the sampled
+            # opponent hands over every remaining runout. Depth-limit trees
+            # only (river trees have no leaves); NEXUS_EXACT_ALLIN_LEAVES=0
+            # disables it for measurement. Older resolver builds without the
+            # entry point simply keep the table path.
+            _exact_allin = (
+                not _leaf_sampled and n_leaves > 0
+                and os.environ.get("NEXUS_EXACT_ALLIN_LEAVES", "1")[:1]
+                in ("1", "t", "T", "y", "Y")
+                and hasattr(cs, "set_exact_allin_leaves")
+            )
+            if _exact_allin:
+                cs.set_exact_allin_leaves(True)
             # SMALL-TREE -> SINGLE-THREAD (2026-06-16). Multi-thread Hogwild on a
             # tiny tree is dominated by race noise: the Pluribus-faithful 2p flop
             # is only ~21 nodes / 8 decision nodes, and at num_threads=0 (all
@@ -2562,6 +2642,9 @@ class CpuEsSolver:
                 # reach mode ignores num_threads in C (single-threaded pass)
                 "eff_threads": 1 if use_reach else int(_eff_threads),
                 "use_reach": bool(use_reach),
+                "hero_frozen_steps": int(len(_frozen_steps)),
+                "chance_sampled": bool(_chance_sampled),
+                "exact_allin_leaves": bool(_exact_allin),
                 "num_nodes": int(_nn),
                 "num_leaf_nodes": int(n_leaf_nodes),
                 "num_leaves": int(n_leaves),

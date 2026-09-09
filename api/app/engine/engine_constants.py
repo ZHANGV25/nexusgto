@@ -327,19 +327,36 @@ def _finite_float_env(
 
 
 # Per-player-count defaults. n = players in the street-root re-solve.
-#   n<=3: scalar traverser + sigma-bar readout at a few hundred iterations -
-#         the validated 2p/3p analysis surface (1-4 s). A zero-information
-#         hero row is retried at 10x by the /v1 serving path.
+#   n<=3 (2026-09-09): vec-Linear-FINAL at 20k iterations. The scalar
+#         sampled traverser at K=ALL/ISO row counts refused sparse rows and
+#         left deep nodes untrained (docs LIVE_SESSION_2026-09-09_CONVERGENCE
+#         iteration, so in-range rows never refuse. The 2p turn extends
+#         through the river in-tree with one sampled river per iteration and
+#         hero's earlier street decisions frozen (cpu_es_solver defaults), so
+#         no leaf table is estimated there; the flop keeps depth-limited
+#         leaves with exact per-pair all-in cells. 20k is the measured budget
 #   n>=4: vec-Linear-FINAL at 5M iterations (the Gate-1-validated playing-agent
 #         path); nr=10 for 5p/6p (under-the-bar floor per NR_LADDER).
+LIVE_2P3P_ITERATIONS = 20_000
 DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
     2: LiveSolveConfig(
-        iterations=400, num_rollouts=3, vec_mode=False, readout="avg",
-        note="2p live re-solve ~1-3s (validated scalar/avg analysis surface)",
+        iterations=LIVE_2P3P_ITERATIONS, num_rollouts=3, vec_mode=True,
+        readout="final",
+        note=(
+            "2p live re-solve: vec-Linear-FINAL 20k (2026-09-09); turn "
+            "extends through the river in-tree (sampled river, hero line "
+            "frozen), flop depth-limited with exact all-in leaves; no "
+            "measured exploitability floor for this arm"
+        ),
     ),
     3: LiveSolveConfig(
-        iterations=400, num_rollouts=3, vec_mode=False, readout="avg",
-        note="3p live re-solve ~2-4s (validated scalar/avg analysis surface)",
+        iterations=LIVE_2P3P_ITERATIONS, num_rollouts=3, vec_mode=True,
+        readout="final",
+        note=(
+            "3p live re-solve: vec-Linear-FINAL 20k (2026-09-09), "
+            "depth-limited leaves with exact all-in cells; no measured "
+            "exploitability floor for this arm"
+        ),
     ),
     4: LiveSolveConfig(
         iterations=5_000_000, num_rollouts=3, vec_mode=True, readout="final",
@@ -376,8 +393,9 @@ DEFAULT_LIVE_CONFIG_BY_N: Dict[int, LiveSolveConfig] = {
 # Pluribus PLAYS the FINAL-iteration strategy during search and reserves the
 # weighted average (sigma-bar) for belief updates and analysis
 # (PLURIBUS_EXACT_CONFORMANCE_SPEC_2026-06-26.md §Gap 6). DEFAULT_LIVE_CONFIG
-# above is the /v1 DISPLAY contract — 2p/3p serve sigma-bar frequencies (the
-# validated analysis surface) and MUST stay readout="avg" there. Any consumer
+# above is the /v1 DISPLAY contract. Since 2026-09-09 the 2p/3p rows are
+# vec-Linear-FINAL as well (the vec traverser requires the final readout), so
+# PLAY and DISPLAY coincide at every N; the split is kept for any consumer
 # that ACTS on the mix (the agent match mode; an autonomous agent) must
 # take this table instead: readout="final" at every N. The 4-6p rows are the
 # same objects as DEFAULT (already final); only 2p/3p differ. Floors are

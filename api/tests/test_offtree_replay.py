@@ -584,3 +584,89 @@ def test_non_offtree_single_size_guard_text_remains_present() -> None:
     source = inspect.getsource(CpuEsSolver.solve)
     assert "street replay is validated only for single-size" in source
     assert "if (add_explicit_allin or len(bet_sizes) > 1" in source
+
+
+def _chance_extended_tree() -> SimpleNamespace:
+    # Player 1 bets 0.75 x 500 = 375; player 0 faces it: fold / call. The
+    # call closes the turn on a river-extended tree, so the call child is a
+    # CHANCE node (type 3) whose street bets are reset by the builder.
+    nodes = [
+        _node(idx=0, player=1, bets=(0, 0), children=(1, 2)),
+        _node(idx=1, player=1, bets=(0, 0)),
+        _node(idx=2, player=0, bets=(0, 375), children=(3, 4)),
+        _node(idx=3, player=-1, bets=(0, 375), active=(False, True), ntype=1),
+        _node(idx=4, player=-1, bets=(0, 0), ntype=3),
+    ]
+    return SimpleNamespace(
+        nodes=nodes, num_nodes=len(nodes), starting_pot=500,
+        effective_stack=10000,
+    )
+
+
+def test_structural_call_accepts_chance_child_on_extended_tree() -> None:
+    from app.engine.offtree_replay import _structural_nonraise_children
+
+    tree = _chance_extended_tree()
+    assert _structural_nonraise_children(tree, 2, 2) == (0, 1)
+
+
+def test_replay_walk_records_path_and_hero_frozen_steps() -> None:
+    tree = _chance_extended_tree()
+    walk = replay_offtree_street_node(
+        tree, [1, 1], n_players=2,
+        base_bet_sizes=(0.75,), base_subsequent_bet_sizes=(1.0,),
+        bet_sizes=(0.75,), subsequent_bet_sizes=(1.0,),
+        add_explicit_allin=False, event_fractions={},
+        expected_event_amounts={},
+    )
+    # step 0: player 1 bets (node 0 -> child 1 -> node 2); step 1: player 0
+    # calls (node 2 -> child 1 -> chance node 4).
+    assert walk.path == ((0, 1, 1), (2, 0, 1))
+    assert walk.node_index == 4
+    # Player 0's only decision on the path is node 2; player 1's is node 0.
+    assert walk.hero_frozen_steps(0) == ((2, 1),)
+    assert walk.hero_frozen_steps(1) == ((0, 1),)
+
+
+def test_hero_frozen_steps_never_includes_the_served_node() -> None:
+    tree = _chance_extended_tree()
+    walk = replay_offtree_street_node(
+        tree, [1], n_players=2,
+        base_bet_sizes=(0.75,), base_subsequent_bet_sizes=(1.0,),
+        bet_sizes=(0.75,), subsequent_bet_sizes=(1.0,),
+        add_explicit_allin=False, event_fractions={},
+        expected_event_amounts={},
+    )
+    assert walk.node_index == 2
+    assert walk.path == ((0, 1, 1),)
+    assert walk.hero_frozen_steps(0) == ()
+    assert walk.hero_frozen_steps(1) == ((0, 1),)
+
+
+def test_solve_freezes_hero_line_before_running_cfr() -> None:
+    """Hero's earlier street decisions are frozen from the replay walk BEFORE
+    the CFR runs (Pluribus safe re-solving), gated by NEXUS_FREEZE_HERO_LINE,
+    and reported in the solve stats."""
+    source = inspect.getsource(CpuEsSolver.solve)
+    i_freeze = source.index("gpu.set_frozen_action_indices(_frozen_steps)")
+    i_run = source.index("cs.run(iterations")
+    assert i_freeze < i_run
+    assert "hero_frozen_steps(" in source
+    assert "NEXUS_FREEZE_HERO_LINE" in source
+    assert '"hero_frozen_steps": int(len(_frozen_steps))' in source
+
+
+def test_solve_exposes_chance_sampling_knob() -> None:
+    source = inspect.getsource(CpuEsSolver.solve)
+    assert "NEXUS_CHANCE_SAMPLE" in source
+    assert "cs.set_chance_mode(0 if _chance_sampled else 1)" in source
+
+
+def test_solve_enables_exact_allin_leaves_when_available() -> None:
+    source = inspect.getsource(CpuEsSolver.solve)
+    i_enable = source.index("cs.set_exact_allin_leaves(True)")
+    i_run = source.index("cs.run(iterations")
+    assert i_enable < i_run
+    assert "NEXUS_EXACT_ALLIN_LEAVES" in source
+    assert 'hasattr(cs, "set_exact_allin_leaves")' in source
+    assert '"exact_allin_leaves": bool(_exact_allin)' in source
