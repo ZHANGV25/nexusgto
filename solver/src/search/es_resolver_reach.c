@@ -147,6 +147,15 @@ static void es_reach_regret_match_all(ESResolver *r) {
             for (int a = 0; a < na; a++)
                 r->rc_strat[sbase + (size_t)a * max_h + h] = sigma[a];
         }
+        /* HERO-LINE FREEZING: a frozen node plays its fixed action with
+         * probability one for every hand (reach and CFV follow from it). */
+        int fa = t->frozen_action ? t->frozen_action[i] : -1;
+        if (fa >= 0 && fa < na) {
+            for (int h = 0; h < nh; h++)
+                for (int a = 0; a < na; a++)
+                    r->rc_strat[sbase + (size_t)a * max_h + h] =
+                        (a == fa) ? 1.0 : 0.0;
+        }
     }
 }
 
@@ -228,7 +237,7 @@ static void es_reach_fold_cfv(ESResolver *r, int node_idx, int traverser) {
         + (size_t)opp * r->num_nodes * max_h + (size_t)node_idx * max_h;
     int nh_o = t->num_hands[opp];
 
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
     int winner = nd->player;          /* sole remaining active player wins */
     /* payoff for the traverser hand: (pot - my_bet) if traverser==winner else
      * -my_bet — constant across the traverser's hand. Opponent reach factor:
@@ -261,7 +270,7 @@ static void es_reach_showdown_cfv(ESResolver *r, int node_idx, int traverser) {
     int max_h = r->reach_max_h;
     int nh = t->num_hands[traverser];
     double *cfv = &r->rc_cfv[(size_t)node_idx * max_h];
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
 
     if (!nd->active_players[traverser]) {
         for (int h = 0; h < nh; h++) cfv[h] = -my_bet;
@@ -500,6 +509,17 @@ static void es_reach_cfv_and_update(ESResolver *r, int traverser, int64_t iter) 
         if (nd->player == traverser) {
             int64_t off = r->node_off[i];
             size_t sbase = (size_t)i * SS_MAX_ACTIONS * max_h;
+            {
+                /* HERO-LINE FREEZING: the node's CFV is the frozen child's;
+                 * no regret or strategy-sum update at a frozen node. */
+                int fa = t->frozen_action ? t->frozen_action[i] : -1;
+                if (fa >= 0 && fa < na) {
+                    int child = t->children[nd->first_child + fa];
+                    const double *cv = &cfv[(size_t)child * max_h];
+                    for (int h = 0; h < nh_trav; h++) vnode[h] = cv[h];
+                    continue;
+                }
+            }
             for (int h = 0; h < nh_trav; h++) {
                 const double *srow_h = NULL;  /* indexed per-action below */
                 double node_val = 0.0;

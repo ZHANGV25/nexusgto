@@ -520,6 +520,13 @@ int build_chance_node(
     tb->nodes[cidx].pot = pot;
     set_node_board(&tb->nodes[cidx], board, num_board);
     set_node_active(&tb->nodes[cidx], active, num_players);
+    /* Closing-street contributions (2026-09-09): the next street's bets reset
+     * to 0 below, so the resolver reads the closed street's per-player bets
+     * from the chance node to charge each player's subgame contribution at
+     * river terminals (a turn call must not be free at a river showdown). A
+     * chance node has no betting semantics of its own, so the field is free. */
+    for (int i = 0; i < num_players; i++)
+        tb->nodes[cidx].bets[i] = entry_bets ? entry_bets[i] : 0;
 
     /* Cross-street stack carryover (2026-06-14, HU over-bet fix). On the
      * NEXT street `bets` reset to 0, so the all-in clamp downstream reads

@@ -170,6 +170,15 @@ struct ESResolver {
     int exact_allin_leaves;
     int exact_allin_ready;
     uint8_t *exact_allin_leaf_flags;       /* [num_nodes] */
+    /* CROSS-STREET CONTRIBUTION CARRY (2026-09-09). SSNode.bets holds only
+     * THIS street's bets: the builder resets them to 0 below a chance node and
+     * keeps the closing street's per-player bets on the chance node itself.
+     * node_carry[node*np+p] = chips player p committed on EARLIER streets of
+     * this subgame (sum of chance-node bets on the root path). Every terminal
+     * charges bets + carry, so a turn call is no longer free at a river
+     * showdown (measured: ace-high called a 190-unit jam at 1.00). NULL on a
+     * single-street tree, which keeps that path byte-identical. */
+    int *node_carry;                        /* [num_nodes*np] or NULL */
     ESExactAllinLeafCache *exact_allin_leaf_cache; /* [num_nodes] */
 };
 
@@ -224,5 +233,20 @@ NEXUS_INTERNAL int es_run_reach(ESResolver *r, int64_t iterations, int num_threa
 #ifdef __cplusplus
 }
 #endif
+
+
+/* Chips committed on earlier streets of this subgame (0 on single-street
+ * trees, on a NULL resolver, or for a synthetic node with node_idx < 0). */
+static inline double es_carry(const ESResolver *r, int node_idx, int p) {
+    if (!r || !r->node_carry || node_idx < 0) return 0.0;
+    return (double)r->node_carry[(size_t)node_idx * (size_t)r->np + (size_t)p];
+}
+
+/* The player's total contribution charged at a terminal: this street's bets
+ * plus the carry from earlier streets. */
+static inline double es_my_bet(const ESResolver *r, int node_idx,
+                               const SSNode *nd, int p) {
+    return (double)nd->bets[p] + es_carry(r, node_idx, p);
+}
 
 #endif /* ES_RESOLVER_INTERNAL_H */

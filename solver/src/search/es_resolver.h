@@ -316,6 +316,10 @@ ES_EXPORT double es_test_showdown_value_vec(
 
 /* TEST-ONLY depth-leaf probes. These drive the production scalar/vector leaf
  * branches for one caller-supplied sampled hand index per player. */
+/* TEST-ONLY: production terminal payoff (fold / showdown / leaf) at a node,
+ * charging this street's bets plus the earlier-street carry. */
+ES_EXPORT double es_test_terminal_payoff(
+    ESResolver *r, int node_idx, int traverser, const int *sampled);
 ES_EXPORT double es_test_leaf_value(
     ESResolver *r, int node_idx, int traverser,
     const int *sampled_hands);

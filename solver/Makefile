@@ -147,6 +147,15 @@ $(BUILD_DIR)/test_es_allin_exact: tests/test_es_allin_exact.c \
 test_es_allin_exact: $(BUILD_DIR)/test_es_allin_exact
 	./$(BUILD_DIR)/test_es_allin_exact
 
+# Cross-street contribution carry at every terminal + hero-line freezing
+# (frozen_action) in the scalar, vector and reach paths. Artifact-free.
+$(BUILD_DIR)/test_es_carry_freeze: tests/test_es_carry_freeze.c         $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c         $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h         $(SEARCH_DIR)/es_oracles.c         $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h         $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_es_carry_freeze.c 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c 	    $(SEARCH_DIR)/es_oracles.c $(CORE_DIR)/hand_eval_table.c 	    -o $@ $(LDFLAGS)
+
+.PHONY: test_es_carry_freeze
+test_es_carry_freeze: $(BUILD_DIR)/test_es_carry_freeze
+	./$(BUILD_DIR)/test_es_carry_freeze
+
 # Deterministic ES terminal/table primitives. Kept as a standalone make target
 # because the source is also used directly by validation harnesses.
 $(BUILD_DIR)/test_es_resolver_primitives: tests/test_es_resolver_primitives.c \

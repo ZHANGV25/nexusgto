@@ -506,6 +506,39 @@ static int es_build_offsets(ESResolver *r) {
     return 0;
 }
 
+/* Per-node carry of earlier-street contributions (see es_resolver_internal.h).
+ * Single ascending pass: ss_tree_builder allocates every child after its parent
+ * (the same invariant the reach path relies on), so carry(child) = carry(parent)
+ * + parent's closing bets when the parent is a chance node. Fail loud if the
+ * invariant does not hold. NULL (byte-identical path) without chance nodes. */
+static int es_build_node_carry(ESResolver *r) {
+    const SSTreeData *t = r->tree;
+    int n = t->num_nodes;
+    int np = t->num_players;
+    r->node_carry = NULL;
+    if (t->num_chance_nodes <= 0) return 0;
+    int *carry = (int *)calloc((size_t)n * (size_t)np, sizeof(int));
+    if (!carry) { es_set_error("OOM node carry (%d nodes)", n); return -1; }
+    for (int i = 0; i < n; i++) {
+        const SSNode *nd = &t->nodes[i];
+        int is_chance = (nd->type == ES_T_CHANCE);
+        for (int a = 0; a < nd->num_children; a++) {
+            int child = t->children[nd->first_child + a];
+            if (child <= i || child >= n) {
+                free(carry);
+                es_set_error("node carry: child %d is not after parent %d",
+                             child, i);
+                return -1;
+            }
+            for (int p = 0; p < np; p++)
+                carry[(size_t)child * np + p] =
+                    carry[(size_t)i * np + p] + (is_chance ? nd->bets[p] : 0);
+        }
+    }
+    r->node_carry = carry;
+    return 0;
+}
+
 ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
                       void *oracle_ctx, uint64_t seed) {
     g_es_error[0] = '\0';
@@ -530,6 +563,7 @@ ESResolver *es_create(const SSTreeData *tree, ESLeafOracle leaf_oracle,
     r->opp_mode = -1;
     r->reach_mode = 0;     /* OFF until set (validated sampling path is default) */
     if (es_build_offsets(r) != 0) { es_free(r); return NULL; }
+    if (es_build_node_carry(r) != 0) { es_free(r); return NULL; }
     return r;
 }
 
@@ -732,6 +766,7 @@ int64_t es_get_visit_count(const ESResolver *r, int node_idx) {
 
 void es_free(ESResolver *r) {
     if (!r) return;
+    if (r) { free(r->node_carry); r->node_carry = NULL; }
     free(r->node_off);
     free(r->node_na);
     free(r->regrets);
@@ -984,9 +1019,10 @@ static void es_sample_opponents(ESResolver *r, uint64_t *rng, int skip,
 
 /* FOLD terminal: the sole remaining active player (node.player) wins the pot.
  * net = (pot - my_bet) if I'm the winner else -my_bet. */
-static inline double es_fold_value(const SSNode *nd, int traverser) {
+static inline double es_fold_value(const ESResolver *r, int node_idx,
+                                   const SSNode *nd, int traverser) {
     int winner = nd->player;          /* street_solve.cu sets winner = node->player */
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
     if (traverser == winner) return (double)nd->pot - my_bet;
     return -my_bet;
 }
@@ -1208,7 +1244,7 @@ static double es_exact_allin_leaf_value(ESResolver *r, int node_idx,
     const SSNode *nd = &t->nodes[node_idx];
     const ESExactAllinLeafCache *cache =
         &r->exact_allin_leaf_cache[node_idx];
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
     if (!nd->active_players[traverser]) return -my_bet;
     if (cache->num_runouts <= 0 || !cache->runout_masks || !cache->strengths)
         return 0.0;
@@ -1282,18 +1318,21 @@ double es_leaf_payoff(ESResolver *r, int node_idx, int traverser,
         && r->exact_allin_leaf_flags[node_idx]) {
         return es_exact_allin_leaf_value(r, node_idx, traverser, sampled);
     }
+    /* The oracle's convention is payoff minus THIS street's bets; charge the
+     * earlier streets' contribution here (zero on single-street trees). */
     return r->oracle(r->oracle_ctx, nd->leaf_idx, traverser,
-                     sampled[traverser], sampled, nd, rng);
+                     sampled[traverser], sampled, nd, rng)
+           - es_carry(r, node_idx, traverser);
 }
 
 /* SHOWDOWN terminal (river). Single-pot fast path (bit-exact historical
  * behavior, exact for every node the current builder can emit) + layered
  * side-pot path for uneven this-street all-in contributions (scope above). */
-static double es_showdown_value(ESResolver *r, const SSNode *nd,
+static double es_showdown_value(ESResolver *r, int node_idx, const SSNode *nd,
                                 int traverser, const int *sampled) {
     const SSTreeData *t = r->tree;
     int np = r->np;
-    double my_bet = (double)nd->bets[traverser];
+    double my_bet = es_my_bet(r, node_idx, nd, traverser);
     if (!nd->active_players[traverser]) return -my_bet;
 
     /* board must be 5 cards at a river showdown. Use the NODE's board, not the
@@ -1380,11 +1419,11 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
 
     if (type == ES_T_FOLD) {
         local->fold_terminals++;
-        return es_fold_value(nd, traverser);
+        return es_fold_value(r, node_idx, nd, traverser);
     }
     if (type == ES_T_SHOWDOWN) {
         local->showdown_terminals++;
-        return es_showdown_value(r, nd, traverser, sampled);
+        return es_showdown_value(r, node_idx, nd, traverser, sampled);
     }
     if (type == ES_T_LEAF) {
         return es_leaf_value(r, node_idx, traverser, sampled, local, rng);
@@ -1433,6 +1472,17 @@ static double es_traverse(ESResolver *r, int node_idx, int traverser,
     local->decision_visits++;
     int acting = nd->player;
     int na = nd->num_children;
+    /* HERO-LINE FREEZING (2026-09-09): a node whose action is fixed by the
+     * api (hero's earlier decision on this street) is walked through its
+     * frozen child with probability one, for the traverser and for an
+     * opponent alike, and accumulates no regret or strategy sum. */
+    {
+        int fa = t->frozen_action ? t->frozen_action[node_idx] : -1;
+        if (fa >= 0 && fa < na) {
+            int child = t->children[nd->first_child + fa];
+            return es_traverse(r, child, traverser, sampled, rng, local, iter);
+        }
+    }
     int hand = sampled[acting];
     if (hand < 0) {
         /* acting player has no assignable hand — pass through child 0 (rare;
@@ -1593,7 +1643,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
          * is the winner (== nd->player), else -my_bet. Broadcast (dead hands get
          * 0 — they don't exist in this world). */
         local->fold_terminals++;
-        double v = es_fold_value(nd, traverser);
+        double v = es_fold_value(r, node_idx, nd, traverser);
         for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : v;
         return;
     }
@@ -1606,7 +1656,7 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
          * this-street all-ins — see the scope note above es_layered_award. */
         local->showdown_terminals++;
         int np = r->np;
-        double my_bet = (double)nd->bets[traverser];
+        double my_bet = es_my_bet(r, node_idx, nd, traverser);
         if (!nd->active_players[traverser]) {
             for (int h = 0; h < nh; h++) out_vals[h] = dead[h] ? 0.0 : -my_bet;
             return;
@@ -1747,6 +1797,18 @@ static void es_traverse_vec(ESResolver *r, int node_idx, int traverser,
     local->decision_visits++;
     int acting = nd->player;
     int na = nd->num_children;
+
+    /* HERO-LINE FREEZING: see es_traverse. The frozen child's per-hand vector
+     * is the node's vector; no per-hand regret or strategy-sum update. */
+    {
+        int fa = t->frozen_action ? t->frozen_action[node_idx] : -1;
+        if (fa >= 0 && fa < na) {
+            int child = t->children[nd->first_child + fa];
+            es_traverse_vec(r, child, traverser, opp_sampled, dead, rng, local,
+                            iter, scratch, scratch_depth, out_vals);
+            return;
+        }
+    }
 
     if (acting != traverser) {
         /* Opponent: sample ONE action from THEIR sampled hand's strategy, then
@@ -2014,8 +2076,9 @@ static double es_forward_walk_uniform(ESResolver *r, int node_idx, int player,
     if (type == ES_T_LEAF) {
         return es_leaf_payoff(r, node_idx, player, sampled, rng);
     }
-    if (type == ES_T_FOLD) return es_fold_value(nd, player);
-    if (type == ES_T_SHOWDOWN) return es_showdown_value(r, nd, player, sampled);
+    if (type == ES_T_FOLD) return es_fold_value(r, node_idx, nd, player);
+    if (type == ES_T_SHOWDOWN)
+        return es_showdown_value(r, node_idx, nd, player, sampled);
     /* DECISION or CHANCE: uniform over children. */
     int na = nd->num_children;
     int a = es_rng_int(rng, na);
@@ -2233,7 +2296,7 @@ ES_EXPORT double es_test_showdown_value(
                       active, bets, pot);
     int sampled[SS_MAX_PLAYERS];
     for (int p = 0; p < np; p++) sampled[p] = 0;
-    return es_showdown_value(&tmp, &node, traverser, sampled);
+    return es_showdown_value(&tmp, -1, &node, traverser, sampled);
 }
 
 ES_EXPORT double es_test_showdown_value_vec(
@@ -2323,7 +2386,7 @@ ES_EXPORT double es_test_showdown_value_root_pots(
 
     int sampled[SS_MAX_PLAYERS];
     for (int p = 0; p < np; p++) sampled[p] = 0;
-    return es_showdown_value(&tmp, &node, traverser, sampled);
+    return es_showdown_value(&tmp, -1, &node, traverser, sampled);
 }
 
 ES_EXPORT double es_test_showdown_value_root_pots_vec(
@@ -2351,3 +2414,20 @@ ES_EXPORT double es_test_showdown_value_root_pots_vec(
                     1, NULL, 0, out_vals);
     return out_vals[0];
 }
+
+/* TEST-ONLY: the production terminal payoff at node_idx for `traverser` with
+ * the given sampled hands (fold / showdown / depth-limit leaf), scalar path. */
+ES_EXPORT double es_test_terminal_payoff(ESResolver *r, int node_idx,
+                                         int traverser, const int *sampled) {
+    if (!r || node_idx < 0 || node_idx >= r->tree->num_nodes) return 0.0;
+    const SSNode *nd = &r->tree->nodes[node_idx];
+    if (nd->type == ES_T_FOLD) return es_fold_value(r, node_idx, nd, traverser);
+    if (nd->type == ES_T_SHOWDOWN)
+        return es_showdown_value(r, node_idx, nd, traverser, sampled);
+    if (nd->type == ES_T_LEAF) {
+        uint64_t rng = r->master_seed;
+        return es_leaf_payoff(r, node_idx, traverser, sampled, &rng);
+    }
+    return 0.0;
+}
+
