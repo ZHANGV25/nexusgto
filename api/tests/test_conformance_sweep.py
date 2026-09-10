@@ -232,3 +232,63 @@ def test_live_config_for_purpose_routing():
     assert live_config_for(6, purpose="play").readout == "final"
     with pytest.raises(ValueError):
         live_config_for(2, purpose="agent")
+
+
+@pytest.mark.parametrize("purpose", ["display", "play"])
+@pytest.mark.parametrize("n_players", [2, 3])
+@pytest.mark.parametrize("overrides", [
+    {},
+    {"iterations_override": 20_000},
+    {"num_rollouts_override": 6},
+    {"iterations_override": 20_000, "num_rollouts_override": 6},
+])
+def test_live_config_retains_default_deadline(n_players, purpose, overrides):
+    cfg = live_config_for(n_players, purpose=purpose, **overrides)
+
+    assert cfg.deadline_ms == 3_000
+    assert cfg.iterations == overrides.get("iterations_override", 100_000)
+    assert cfg.num_rollouts == overrides.get("num_rollouts_override", 3)
+
+
+@pytest.mark.parametrize("purpose", ["display", "play"])
+@pytest.mark.parametrize("n_players", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("deadline_ms", [100, 1_500, 60_000])
+def test_live_config_explicit_deadline_wins(n_players, purpose, deadline_ms):
+    cfg = live_config_for(
+        n_players, purpose=purpose, deadline_ms_override=deadline_ms,
+        iterations_override=20_000, num_rollouts_override=6,
+    )
+
+    assert cfg.deadline_ms == deadline_ms
+    assert cfg.iterations == 20_000
+    assert cfg.num_rollouts == 6
+
+
+@pytest.mark.parametrize("purpose", ["display", "play"])
+@pytest.mark.parametrize("n_players", [4, 5, 6])
+def test_live_config_keeps_multiway_deadline_unset(n_players, purpose):
+    assert live_config_for(n_players, purpose=purpose).deadline_ms is None
+    cfg = live_config_for(
+        n_players, purpose=purpose,
+        iterations_override=20_000, num_rollouts_override=6,
+    )
+    assert cfg.deadline_ms is None
+
+
+@pytest.mark.parametrize("purpose", ["display", "play"])
+@pytest.mark.parametrize("n_players", [2, 3])
+@pytest.mark.parametrize(("override", "message"), [
+    ({"deadline_ms_override": -1}, "deadline_ms override"),
+    ({"deadline_ms_override": 0}, "deadline_ms override"),
+    ({"deadline_ms_override": 99}, "deadline_ms override"),
+    ({"deadline_ms_override": 60_001}, "deadline_ms override"),
+    ({"iterations_override": 49}, "iterations override"),
+    ({"iterations_override": 50_000_001}, "iterations override"),
+    ({"num_rollouts_override": 2}, "num_rollouts override"),
+    ({"num_rollouts_override": 31}, "num_rollouts override"),
+])
+def test_live_config_invalid_overrides_still_reject(
+    n_players, purpose, override, message,
+):
+    with pytest.raises(ValueError, match=message):
+        live_config_for(n_players, purpose=purpose, **override)

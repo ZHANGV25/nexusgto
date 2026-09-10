@@ -466,6 +466,8 @@ def live_config_for(
         )
     iterations = base.iterations
     num_rollouts = base.num_rollouts
+    # Omitted client overrides must retain the served 2p/3p CFR budget.
+    deadline_ms = base.deadline_ms
     if iterations_override is not None:
         if not (ITERATIONS_MIN <= iterations_override <= ITERATIONS_MAX):
             raise ValueError(
@@ -486,6 +488,7 @@ def live_config_for(
                 f"deadline_ms override {deadline_ms_override} outside the "
                 f"validated bounds [{DEADLINE_MS_MIN}, {DEADLINE_MS_MAX}]"
             )
+        deadline_ms = deadline_ms_override
     actual_fraction = _finite_float_env(
         HERO_TRAVERSER_ACTUAL_FRACTION_ENV,
         HERO_TRAVERSER_ACTUAL_FRACTION_DEFAULT,
@@ -502,7 +505,7 @@ def live_config_for(
         num_rollouts=num_rollouts,
         vec_mode=base.vec_mode,
         readout=base.readout,
-        deadline_ms=deadline_ms_override,
+        deadline_ms=deadline_ms,
         note=base.note,
         hero_traverser_actual_fraction=actual_fraction,
         hero_row_min_strategy_sum_mass=minimum_mass,
