@@ -783,6 +783,50 @@ class BPSReaderC:
         # See PLAN.md §3 — Phase B fix.
         self._init_ochs_river_auto()
 
+        # RBK1 validates the final OCHS identity. OCHS re-init (and a
+        # PA-EMD flop-cache load) clears a previously loaded table, so
+        # this optional accelerator must be loaded last on both paths.
+        self._load_river_bucket_table_auto(bps_path)
+
+    def _load_river_bucket_table_auto(self, bps_path: str) -> None:
+        """Load an optional river-only RBK1 sidecar after OCHS initialization.
+
+        Missing files and older libraries are silent no-ops. The C loader
+        owns identity/format validation and reports the precise refusal;
+        rejected files leave the existing live bucketizer active.
+        """
+        if not hasattr(self._lib, "bps_load_river_bucket_table"):
+            return
+        blueprint = Path(bps_path)
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        filename = blueprint.name + ".river_buckets.rbk1"
+        candidates = [blueprint.parent / filename, repo_root / filename]
+        for table_path in dict.fromkeys(candidates):
+            try:
+                if not table_path.is_file():
+                    continue
+                count = self.load_river_bucket_table(str(table_path))
+            except (OSError, ValueError) as exc:
+                print(
+                    f"[BPSReaderC] RBK1 skipped at {table_path}: {exc}; "
+                    "using live river bucketing.",
+                    flush=True,
+                )
+                continue
+            if count > 0:
+                print(
+                    f"[BPSReaderC] RBK1 river bucket table loaded from "
+                    f"{table_path} ({count} classes).",
+                    flush=True,
+                )
+                return
+            print(
+                f"[BPSReaderC] RBK1 skipped at {table_path}: C validation "
+                "refused the table (see loader diagnostic); using live "
+                "river bucketing.",
+                flush=True,
+            )
+
     def _load_turn_centroids_auto(self, bps_path: str) -> None:
         """Auto-load TCN1 turn centroids from standard locations.
 
