@@ -271,6 +271,39 @@ def _setup_ctypes(lib: ctypes.CDLL) -> None:
     ]
     lib.bps_load_texture_cache.restype = ctypes.c_int
 
+    # Optional RBK1 offline river bucket table. Keep these bindings guarded so
+    # Python can still open blueprints with an older shared library; callers
+    # receive the same degraded result convention as the optional centroid
+    # loaders below.
+    if hasattr(lib, "bps_load_river_bucket_table"):
+        lib.bps_load_river_bucket_table.argtypes = [
+            ctypes.c_void_p,         # BPSReader*
+            ctypes.c_char_p,         # path
+        ]
+        lib.bps_load_river_bucket_table.restype = ctypes.c_int
+
+    if hasattr(lib, "bps_has_river_bucket_table"):
+        lib.bps_has_river_bucket_table.argtypes = [ctypes.c_void_p]
+        lib.bps_has_river_bucket_table.restype = ctypes.c_int
+
+    # Generator support: the identity is derived from the fully initialized
+    # live OCHS reader, and unrank maps a dense class id back to one canonical
+    # (five-card board, two-card hand) representative.
+    if hasattr(lib, "bps_compute_river_bucket_identity"):
+        lib.bps_compute_river_bucket_identity.argtypes = [
+            ctypes.c_void_p,                         # BPSReader*
+            ctypes.POINTER(ctypes.c_ubyte),          # out_identity[32]
+        ]
+        lib.bps_compute_river_bucket_identity.restype = ctypes.c_int
+
+    if hasattr(lib, "bps_joint_unrank_river"):
+        lib.bps_joint_unrank_river.argtypes = [
+            ctypes.c_int64,          # dense rank
+            c_int_p,                 # out_board[5]
+            c_int_p,                 # out_hand[2]
+        ]
+        lib.bps_joint_unrank_river.restype = ctypes.c_int
+
     lib.bps_hand_to_bucket.argtypes = [
         ctypes.c_void_p,         # BPSReader*
         c_int_p,                 # board (3 ints)
@@ -1059,6 +1092,28 @@ class BPSReaderC:
             self._reader, path.encode("utf-8"), 1 if legacy_mixer else 0
         )
 
+    def load_river_bucket_table(self, path: str) -> int:
+        """Load and validate an RBK1 offline OCHS river bucket table.
+
+        The C loader compares the file identity with this reader's live OCHS
+        configuration. A mismatch leaves the table unloaded, so subsequent
+        river lookups continue through the existing live path.
+
+        Returns the number of canonical classes (123,156,254) on success, or
+        -1 when the symbol is unavailable or the file cannot be validated.
+        """
+        if not hasattr(self._lib, "bps_load_river_bucket_table"):
+            return -1
+        return int(self._lib.bps_load_river_bucket_table(
+            self._reader, path.encode("utf-8")
+        ))
+
+    def has_river_bucket_table(self) -> bool:
+        """Return whether a validated RBK1 river table is currently loaded."""
+        if not hasattr(self._lib, "bps_has_river_bucket_table"):
+            return False
+        return bool(self._lib.bps_has_river_bucket_table(self._reader))
+
     def hand_to_bucket(self, board: List[int], c0: int, c1: int) -> int:
         """Map a hand on a flop board to its bucket index.
 
@@ -1095,9 +1150,10 @@ class BPSReaderC:
     def hand_to_bucket_river(self, board: List[int], c0: int, c1: int) -> int:
         """Map a hand on a 5-card river board to its bucket index.
 
-        Uses deterministic 200-sample EHS percentile bucketing.
-        Matches bps_ev_walk.c training-time bucketing exactly (same
-        RNG seed derivation from cards + board).
+        With production OCHS enabled, a validated offline RBK1 table is the
+        first lookup tier and any missing sentinel falls through to the live
+        exhaustive OCHS computation. When OCHS is explicitly disabled, the
+        legacy EHS-percentile path remains in use and never consults RBK1.
 
         Args:
             board: 5 river cards

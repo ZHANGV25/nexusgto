@@ -84,22 +84,22 @@ $(BUILD_DIR)/solver$(SHLIB_EXT): $(ARCH_DIR)/solver.c $(CORE_DIR)/hand_eval_tabl
 # No OpenMP needed — bucketizer is single-hand at a time.
 bps_reader: $(BUILD_DIR)/bps_reader$(SHLIB_EXT)
 
-$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $(INCS) $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/bps_reader$(SHLIB_EXT): $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $(INCS) $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
 
 # ── BPS EV walk (reader + card_abstraction + OpenMP) ──
 bps_ev_walk: $(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT)
 
-$(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/bps_ev_walk$(SHLIB_EXT): $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
 
 # ── Rollout (C port of python/rollout.py) ──
 # Depth-limited Pluribus-faithful leaf values for real-time solve.
 # Links bps_reader.c (blueprint queries); eval7 is header-only.
 rollout: $(BUILD_DIR)/rollout$(SHLIB_EXT)
 
-$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rollout$(SHLIB_EXT): $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(SEARCH_DIR)/rollout.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_phase_r.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c -o $@ $(LDFLAGS)
 
 # ── CPU external-sampling ES re-solver (HYBRID 5p flop/turn path) ──
 # es_resolver: lightweight (table/joint oracles only) — validation harnesses.
@@ -123,10 +123,10 @@ $(BUILD_DIR)/es_resolver$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -static-libgcc -fopenmp $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/es_vec_sampled_oracle.c $(SEARCH_DIR)/es_vec_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
+$(BUILD_DIR)/es_resolver_real$(SHLIB_EXT): $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_bias_oracle.h $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_sampled_oracle.h $(SEARCH_DIR)/es_vec_sampled_oracle.c $(SEARCH_DIR)/es_vec_sampled_oracle.h $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(SEARCH_DIR)/rollout_bucket_memo.h $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_joint_canon.h $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c $(SEARCH_DIR)/es_resolver.h $(SEARCH_DIR)/es_resolver_internal.h $(SEARCH_DIR)/rollout.h $(SEARCH_DIR)/rollout_internal.h $(SRC_DIR)/cuda/street_solve.cuh | $(BUILD_DIR)
 	$(CC) -O2 -w $(SHLIB_FLAGS) -static-libgcc -fopenmp -D_GNU_SOURCE $(ES_SHIM) $(INCS) \
 	    $(SEARCH_DIR)/es_resolver.c $(SEARCH_DIR)/es_resolver_reach.c $(SEARCH_DIR)/es_oracles.c $(SEARCH_DIR)/es_bias_oracle.c $(SEARCH_DIR)/es_real_oracle.c $(SEARCH_DIR)/es_sampled_oracle.c $(SEARCH_DIR)/es_vec_sampled_oracle.c \
-	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout_bucket_memo.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
 	    $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_phase_r.c \
 	    -o $@ $(LDFLAGS)
 
@@ -379,8 +379,8 @@ test_phase_1_3: $(BUILD_DIR)/test_phase_1_3
 	python3 tests/test_phase_1_3_synthetic.py $(BUILD_DIR)/phase_1_3_synthetic.tbn
 
 # ── BPS EV walk tests ──
-$(BUILD_DIR)/test_bps_ev_walk: tests/test_bps_ev_walk.c $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_bps_ev_walk.c $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS) -static
+$(BUILD_DIR)/test_bps_ev_walk: tests/test_bps_ev_walk.c $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_bps_ev_walk.c $(BP_DIR)/bps_ev_walk.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS) -static
 
 test_ev_walk: $(BUILD_DIR)/test_bps_ev_walk
 	./$(BUILD_DIR)/test_bps_ev_walk
@@ -395,11 +395,33 @@ test_pa_emd: $(BUILD_DIR)/test_pa_emd
 # ── BPS OCHS river bucketer regression test ──
 # Pins the Phase B fix: bps_init_ochs_river + bps_hand_to_bucket_river
 # routing through the OCHS path on representative river fixtures.
-$(BUILD_DIR)/test_bps_ochs_river: tests/test_bps_ochs_river.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCS) tests/test_bps_ochs_river.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_bps_ochs_river: tests/test_bps_ochs_river.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) tests/test_bps_ochs_river.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
 
 test_bps_ochs_river: $(BUILD_DIR)/test_bps_ochs_river
 	./$(BUILD_DIR)/test_bps_ochs_river
+
+# Dense joint river canonicalization/ranking gates.  The default run includes
+# the complete 123,156,254-class enumerator; use the binary's --g1,
+# --enumerator, and --g2 switches to run the phases separately.  G2 is
+# artifact-gated by BPS_RIVER_BUCKET_G2_BLUEPRINT and skips cleanly when unset.
+$(BUILD_DIR)/test_bps_joint_canon: tests/test_bps_joint_canon.c \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+        $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/bps_joint_canon.h \
+        $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c \
+        $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
+        $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) tests/test_bps_joint_canon.c \
+	    $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(BP_DIR)/bps_joint_canon.c \
+	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c \
+	    $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
+	    -o $@ $(LDFLAGS)
+
+.PHONY: test_bps_joint_canon
+test_bps_joint_canon: $(BUILD_DIR)/test_bps_joint_canon
+	./$(BUILD_DIR)/test_bps_joint_canon
 
 # ── Phase R Block A.1: dispatch helper unit tests ──
 # Pure helper (mccfr_phase_r.c) tested in isolation — no card_abstraction
@@ -631,13 +653,13 @@ test_b3_encoding_alignment: $(BUILD_DIR)/test_b3_encoding_alignment
 # all non-blocked (c0,c1) pairs, asserts trainer-stored bucket ==
 # reader-queried bucket on every covered query.
 $(BUILD_DIR)/test_b3_bucket_alignment: tests/test_b3_bucket_alignment.c \
-        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
         $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/card_abstraction.h \
         $(CORE_DIR)/hand_eval.h $(BP_DIR)/mccfr_cont_ev_table.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_b3_bucket_alignment.c \
-	    $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c \
 	    $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c \
 	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS)
@@ -677,13 +699,13 @@ test_phase_r_boundary_bucket: $(BUILD_DIR)/test_phase_r_boundary_bucket
 # never enters the OMP parallel regions.
 $(BUILD_DIR)/test_rollout_cont_ev_boundary: tests/test_rollout_cont_ev_boundary.c \
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
-        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/card_abstraction.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h \
         $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_boundary.c \
-	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
 	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
@@ -699,13 +721,13 @@ test_rollout_cont_ev_boundary: $(BUILD_DIR)/test_rollout_cont_ev_boundary
 # EC2 harness: add to EXTRA_C_TESTS as `test_rollout_cont_ev_bias_action`.
 $(BUILD_DIR)/test_rollout_cont_ev_bias_action: tests/test_rollout_cont_ev_bias_action.c \
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
-        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/card_abstraction.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h \
         $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(BP_DIR)/mccfr_bias_regrets.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_bias_action.c \
-	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
 	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
@@ -730,13 +752,13 @@ test_turn_dispatch: $(BUILD_DIR)/test_turn_dispatch
 # (producer index wrapper) + rollout (consumer index hook) + table.
 $(BUILD_DIR)/test_turn_boundary_key_alignment: tests/test_turn_boundary_key_alignment.c \
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
-        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/card_abstraction.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h \
         $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_turn_boundary_key_alignment.c \
-	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
 	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread
@@ -749,13 +771,13 @@ test_turn_boundary_key_alignment: $(BUILD_DIR)/test_turn_boundary_key_alignment
 # (uniform mean), MISS/EMPTY_BIAS fail-loud, flag orthogonality.
 $(BUILD_DIR)/test_rollout_cont_ev_turn_boundary: tests/test_rollout_cont_ev_turn_boundary.c \
         $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(SEARCH_DIR)/rollout.h \
-        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_reader.h \
+        $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c $(BP_DIR)/bps_reader.h $(BP_DIR)/bps_joint_canon.h \
         $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/card_abstraction.h \
         $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h \
         $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
         $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCS) tests/test_rollout_cont_ev_turn_boundary.c \
-	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c \
+	    $(SEARCH_DIR)/rollout.c $(SEARCH_DIR)/rollout_sampled.c $(BP_DIR)/bps_reader.c $(BP_DIR)/bps_reader_bucketize.c $(BP_DIR)/bps_joint_canon.c \
 	    $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c \
 	    $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c \
 	    -o $@ $(LDFLAGS) -lpthread

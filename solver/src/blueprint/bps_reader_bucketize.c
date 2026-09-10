@@ -14,11 +14,338 @@
 
 #include "bps_reader.h"
 #include "bps_reader_internal.h"
+#include "bps_joint_canon.h"
 #include "card_abstraction.h"
 #include "hand_eval.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* -- RBK1 identity and loader -------------------------------------------- */
+
+#define BPS_RBK1_VERSION 1U
+#define BPS_RBK1_HEADER_BYTES 52U
+#define BPS_RIVER_BUCKET_ALGORITHM_VERSION 1U
+#define BPS_RIVER_BUCKET_MODE_OCHS_EXHAUSTIVE 1U
+#define BPS_RIVER_BUCKET_SENTINEL UINT16_C(0xffff)
+
+/* Small self-contained SHA-256 implementation. Keeping it local avoids an
+ * OpenSSL dependency in every reader/rollout shared library. */
+typedef struct {
+    uint32_t state[8];
+    uint64_t transformed_bits;
+    unsigned char block[64];
+    size_t used;
+} BpsSha256;
+
+static const uint32_t bps_sha256_k[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+    0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+    0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+    0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+    0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+    0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U
+};
+
+static inline uint32_t bps_sha256_rotr(uint32_t x, unsigned n) {
+    return (x >> n) | (x << (32U - n));
+}
+
+static void bps_sha256_transform(BpsSha256 *ctx,
+                                  const unsigned char data[64]) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        size_t j = (size_t)i * 4U;
+        w[i] = ((uint32_t)data[j] << 24)
+             | ((uint32_t)data[j + 1] << 16)
+             | ((uint32_t)data[j + 2] << 8)
+             | (uint32_t)data[j + 3];
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = bps_sha256_rotr(w[i - 15], 7)
+                    ^ bps_sha256_rotr(w[i - 15], 18)
+                    ^ (w[i - 15] >> 3);
+        uint32_t s1 = bps_sha256_rotr(w[i - 2], 17)
+                    ^ bps_sha256_rotr(w[i - 2], 19)
+                    ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = ctx->state[0], b = ctx->state[1];
+    uint32_t c = ctx->state[2], d = ctx->state[3];
+    uint32_t e = ctx->state[4], f = ctx->state[5];
+    uint32_t g = ctx->state[6], h = ctx->state[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = bps_sha256_rotr(e, 6)
+                    ^ bps_sha256_rotr(e, 11)
+                    ^ bps_sha256_rotr(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = h + s1 + ch + bps_sha256_k[i] + w[i];
+        uint32_t s0 = bps_sha256_rotr(a, 2)
+                    ^ bps_sha256_rotr(a, 13)
+                    ^ bps_sha256_rotr(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = s0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    ctx->state[0] += a; ctx->state[1] += b;
+    ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f;
+    ctx->state[6] += g; ctx->state[7] += h;
+}
+
+static void bps_sha256_init(BpsSha256 *ctx) {
+    ctx->state[0] = 0x6a09e667U; ctx->state[1] = 0xbb67ae85U;
+    ctx->state[2] = 0x3c6ef372U; ctx->state[3] = 0xa54ff53aU;
+    ctx->state[4] = 0x510e527fU; ctx->state[5] = 0x9b05688cU;
+    ctx->state[6] = 0x1f83d9abU; ctx->state[7] = 0x5be0cd19U;
+    ctx->transformed_bits = 0;
+    ctx->used = 0;
+}
+
+static void bps_sha256_update(BpsSha256 *ctx, const void *src, size_t len) {
+    const unsigned char *data = (const unsigned char *)src;
+    while (len > 0) {
+        size_t room = sizeof(ctx->block) - ctx->used;
+        size_t take = len < room ? len : room;
+        memcpy(ctx->block + ctx->used, data, take);
+        ctx->used += take;
+        data += take;
+        len -= take;
+        if (ctx->used == sizeof(ctx->block)) {
+            bps_sha256_transform(ctx, ctx->block);
+            ctx->transformed_bits += UINT64_C(512);
+            ctx->used = 0;
+        }
+    }
+}
+
+static void bps_sha256_final(BpsSha256 *ctx, unsigned char out[32]) {
+    uint64_t total_bits = ctx->transformed_bits + (uint64_t)ctx->used * 8U;
+    ctx->block[ctx->used++] = 0x80U;
+    if (ctx->used > 56U) {
+        memset(ctx->block + ctx->used, 0, 64U - ctx->used);
+        bps_sha256_transform(ctx, ctx->block);
+        ctx->used = 0;
+    }
+    memset(ctx->block + ctx->used, 0, 56U - ctx->used);
+    for (int i = 0; i < 8; i++)
+        ctx->block[56 + i] = (unsigned char)(total_bits >> (56 - 8 * i));
+    bps_sha256_transform(ctx, ctx->block);
+
+    for (int i = 0; i < 8; i++) {
+        out[i * 4] = (unsigned char)(ctx->state[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(ctx->state[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(ctx->state[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)ctx->state[i];
+    }
+}
+
+static void bps_sha256_le32(BpsSha256 *ctx, uint32_t value) {
+    unsigned char bytes[4];
+    bytes[0] = (unsigned char)value;
+    bytes[1] = (unsigned char)(value >> 8);
+    bytes[2] = (unsigned char)(value >> 16);
+    bytes[3] = (unsigned char)(value >> 24);
+    bps_sha256_update(ctx, bytes, sizeof(bytes));
+}
+
+static uint32_t bps_read_le32(const unsigned char *p) {
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t bps_read_le64(const unsigned char *p) {
+    return (uint64_t)bps_read_le32(p)
+         | ((uint64_t)bps_read_le32(p + 4) << 32);
+}
+
+static int bps_ochs_river_is_active(const BPSReader *r) {
+    return r != NULL
+        && r->ochs_river_enabled
+        && r->ochs_river_centroids_k > 0
+        && r->ochs_num_clusters > 0
+        && r->ochs_river_centroids != NULL;
+}
+
+static int bps_effective_postflop_buckets(const BPSReader *r) {
+    return r->num_postflop_buckets > 0 ? r->num_postflop_buckets : 200;
+}
+
+static void bps_clear_river_bucket_table(BPSReader *r) {
+    if (!r) return;
+    free(r->river_bucket_table);
+    r->river_bucket_table = NULL;
+    r->river_bucket_table_count = 0;
+}
+
+int bps_compute_river_bucket_identity(const BPSReader *r,
+                                       unsigned char out[32]) {
+    static const unsigned char domain[] = {'R','B','K','1','-','I','D'};
+    if (!out || !bps_ochs_river_is_active(r)) return -1;
+    if (sizeof(float) != 4U) return -1;
+
+    BpsSha256 sha;
+    bps_sha256_init(&sha);
+    bps_sha256_update(&sha, domain, sizeof(domain));
+    bps_sha256_le32(&sha, 3U);  /* street: river */
+    bps_sha256_le32(&sha, BPS_RIVER_BUCKET_ALGORITHM_VERSION);
+    bps_sha256_le32(&sha, BPS_RIVER_BUCKET_MODE_OCHS_EXHAUSTIVE);
+    bps_sha256_le32(&sha, (uint32_t)bps_effective_postflop_buckets(r));
+    bps_sha256_le32(&sha, (uint32_t)r->ochs_num_clusters);
+    bps_sha256_le32(&sha, (uint32_t)r->ochs_river_centroids_k);
+
+    /* Raw centroid object bytes are identity-bearing by design. The Python
+     * generator obtains this digest through this same exported function. */
+    size_t centroid_count = (size_t)r->ochs_river_centroids_k
+                          * (size_t)r->ochs_num_clusters;
+    bps_sha256_update(&sha, r->ochs_river_centroids,
+                      centroid_count * sizeof(float));
+    for (int i = 0; i < 169; i++)
+        bps_sha256_le32(&sha, (uint32_t)(int32_t)r->ochs_cluster_of_169[i]);
+    bps_sha256_final(&sha, out);
+    return 0;
+}
+
+int bps_load_river_bucket_table(BPSReader *r, const char *path) {
+    if (!r) return -1;
+    /* Failed reloads must never leave an older table armed. */
+    bps_clear_river_bucket_table(r);
+    if (!path || !path[0]) return -1;
+    if (!bps_ochs_river_is_active(r)) {
+        fprintf(stderr, "[bps_reader] RBK1 refused: production OCHS river "
+                "path is not initialized\n");
+        return -1;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[bps_reader] Cannot open river bucket table: %s\n", path);
+        return -1;
+    }
+
+    unsigned char header[BPS_RBK1_HEADER_BYTES];
+    if (fread(header, 1, sizeof(header), f) != sizeof(header)) {
+        fprintf(stderr, "[bps_reader] RBK1 truncated header: %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    if (memcmp(header, "RBK1", 4) != 0) {
+        fprintf(stderr, "[bps_reader] Invalid river bucket table magic: %s\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    uint32_t version = bps_read_le32(header + 4);
+    uint32_t num_buckets = bps_read_le32(header + 8);
+    uint64_t num_classes = bps_read_le64(header + 12);
+    int expected_buckets = bps_effective_postflop_buckets(r);
+    if (version != BPS_RBK1_VERSION
+        || num_buckets != (uint32_t)expected_buckets
+        || num_classes != (uint64_t)BPS_JOINT_RIVER_NUM_CLASSES) {
+        fprintf(stderr, "[bps_reader] RBK1 shape mismatch at %s "
+                "(version=%u buckets=%u classes=%llu; expected %u/%d/%llu)\n",
+                path, version, num_buckets, (unsigned long long)num_classes,
+                BPS_RBK1_VERSION, expected_buckets,
+                (unsigned long long)BPS_JOINT_RIVER_NUM_CLASSES);
+        fclose(f);
+        return -1;
+    }
+
+    unsigned char live_identity[32];
+    if (bps_compute_river_bucket_identity(r, live_identity) != 0) {
+        fprintf(stderr, "[bps_reader] RBK1 identity unavailable: %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    if (memcmp(header + 20, live_identity, sizeof(live_identity)) != 0) {
+        fprintf(stderr, "[bps_reader] RBK1 identity mismatch at %s\n"
+                "[bps_reader]   file: ", path);
+        for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", header[20 + i]);
+        fprintf(stderr, "\n[bps_reader]   live: ");
+        for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", live_identity[i]);
+        fprintf(stderr, "\n[bps_reader] Falling through to live OCHS river bucketing\n");
+        fclose(f);
+        return -1;
+    }
+
+    if (num_classes > (uint64_t)(SIZE_MAX / sizeof(uint16_t))) {
+        fclose(f);
+        return -1;
+    }
+    size_t payload_bytes = (size_t)num_classes * sizeof(uint16_t);
+    uint16_t *table = (uint16_t *)malloc(payload_bytes);
+    if (!table) {
+        fprintf(stderr, "[bps_reader] OOM loading RBK1 payload (%zu bytes)\n",
+                payload_bytes);
+        fclose(f);
+        return -1;
+    }
+    if (fread(table, 1, payload_bytes, f) != payload_bytes) {
+        fprintf(stderr, "[bps_reader] RBK1 truncated payload: %s\n", path);
+        free(table);
+        fclose(f);
+        return -1;
+    }
+    int trailing = fgetc(f);
+    if (trailing != EOF || ferror(f)) {
+        fprintf(stderr, "[bps_reader] RBK1 has trailing data or read error: %s\n",
+                path);
+        free(table);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    /* RBK1 payload is little-endian even on a big-endian reader host. */
+    const uint16_t endian_probe = UINT16_C(0x0102);
+    if (*(const unsigned char *)&endian_probe != 0x02U) {
+        unsigned char *raw = (unsigned char *)table;
+        for (uint64_t i = 0; i < num_classes; i++) {
+            uint16_t value = (uint16_t)raw[i * 2]
+                           | (uint16_t)((uint16_t)raw[i * 2 + 1] << 8);
+            table[i] = value;
+        }
+    }
+
+    /* Preserve the bucketizer's return contract even for a corrupt payload. */
+    for (uint64_t i = 0; i < num_classes; i++) {
+        uint16_t value = table[i];
+        if (value != BPS_RIVER_BUCKET_SENTINEL && value >= num_buckets) {
+            fprintf(stderr, "[bps_reader] RBK1 invalid bucket %u at class %llu: %s\n",
+                    (unsigned)value, (unsigned long long)i, path);
+            free(table);
+            return -1;
+        }
+    }
+
+    r->river_bucket_table = table;
+    r->river_bucket_table_count = (int64_t)num_classes;
+    fprintf(stderr, "[bps_reader] Loaded RBK1 river bucket table: %llu classes "
+            "(%.1f MB) from %s\n",
+            (unsigned long long)num_classes,
+            (double)payload_bytes / (1024.0 * 1024.0), path);
+    return (int)num_classes;
+}
+
+int bps_has_river_bucket_table(const BPSReader *r) {
+    return r != NULL
+        && r->river_bucket_table != NULL
+        && r->river_bucket_table_count == (int64_t)BPS_JOINT_RIVER_NUM_CLASSES;
+}
 
 /* ── Turn / river bucketizer ─────────────────────────────────────────── */
 
@@ -296,6 +623,24 @@ int bps_hand_to_bucket_turn(const BPSReader *r,
 int bps_hand_to_bucket_river(const BPSReader *r,
                               const int *board, int c0, int c1) {
     if (!r || !board) return -1;
+
+    /* Offline-table hook: deliberately the first branch after pointer
+     * validation. It is armed only for the production exhaustive OCHS mode;
+     * legacy sampled-EHS behavior is never canonical-table accelerated.
+     * A sentinel or any canonicalization/rank failure is a pure miss and
+     * falls through to the existing live code below without changing it. */
+    if (bps_has_river_bucket_table(r) && bps_ochs_river_is_active(r)) {
+        int hand[2] = {c0, c1};
+        int canon_board[5], canon_hand[2];
+        if (bps_joint_canon_river(board, hand, canon_board, canon_hand) == 0) {
+            int64_t rank = bps_joint_rank_river(canon_board, canon_hand);
+            if (rank >= 0 && rank < r->river_bucket_table_count) {
+                uint16_t value = r->river_bucket_table[rank];
+                if (value != BPS_RIVER_BUCKET_SENTINEL) return (int)value;
+            }
+        }
+    }
+
     int k = r->num_postflop_buckets > 0 ? r->num_postflop_buckets : 200;
 
     /* Hand must not collide with the 5-card river board. */
@@ -371,6 +716,9 @@ int bps_init_ochs_river(BPSReader *r, int num_clusters) {
      * river boards × 300 hands subsample, k-means to postflop_num_buckets
      * (typically 200) centroids in 8-d (or num_clusters-d) space. ~1-2s. */
     if (!r) return -1;
+    /* Centroids and cluster map are identity-bearing. Reinitializing them
+     * invalidates any previously validated offline table before mutation. */
+    bps_clear_river_bucket_table(r);
     if (r->ochs_river_centroids) {
         free(r->ochs_river_centroids);
         r->ochs_river_centroids = NULL;
@@ -542,6 +890,8 @@ int bps_load_pa_emd_flop_cache(BPSReader *r, const char *path) {
     tex_index_rebuild(tc);
 
     r->pa_emd_flop_loaded = 1;
+    /* num_postflop_buckets participates in the RBK1 identity. */
+    bps_clear_river_bucket_table(r);
     r->num_postflop_buckets = n_buckets;
 
     fprintf(stderr, "[bps_reader] Loaded PA-EMD flop cache: %d textures, "

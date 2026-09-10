@@ -281,6 +281,12 @@ int bps_load_strategies(BPSReader *r,
                          int postflop_buckets, int preflop_buckets) {
     if (!r || !data || len < 12) return -1;
 
+    /* Bucket count is part of the RBK1 identity. A reader reconfiguration
+     * cannot retain a table validated against its previous configuration. */
+    free(r->river_bucket_table);
+    r->river_bucket_table = NULL;
+    r->river_bucket_table_count = 0;
+
     /* Store config */
     r->use_legacy_mixer = use_legacy_mixer;
     r->num_postflop_buckets = postflop_buckets;
@@ -1356,6 +1362,9 @@ int bps_load_cache(BPSReader *r, const char *path) {
     fflush(stdout);
 
     /* Store config */
+    free(r->river_bucket_table);
+    r->river_bucket_table = NULL;
+    r->river_bucket_table_count = 0;
     r->use_legacy_mixer = (int)mixer;
     r->num_postflop_buckets = (int)pb;
     r->num_preflop_buckets = (int)ppb;
@@ -1518,6 +1527,9 @@ void bps_reader_free(BPSReader *r) {
         free(r->ochs_river_centroids);
         r->ochs_river_centroids = NULL;
     }
+    free(r->river_bucket_table);
+    r->river_bucket_table = NULL;
+    r->river_bucket_table_count = 0;
     r->ochs_river_centroids_k = 0;
     r->ochs_river_enabled = 0;
     r->ochs_num_clusters = 0;

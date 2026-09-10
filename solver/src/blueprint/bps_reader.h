@@ -178,6 +178,14 @@ typedef struct {
     int      ochs_cluster_of_169[169]; /* 169-class → cluster id map */
     float   *ochs_river_centroids;     /* [k * ochs_num_clusters] flat */
     int      ochs_river_centroids_k;   /* number of populated centroids (≤200) */
+
+    /* Optional RBK1 river bucket table. The payload is indexed by the dense
+     * joint board+hand suit-isomorphism rank from bps_joint_canon.h. It is
+     * valid only for the live exhaustive OCHS configuration whose identity
+     * was checked by bps_load_river_bucket_table(). A 0xffff payload value is
+     * an intentionally ungenerated entry and falls through to live OCHS. */
+    uint16_t *river_bucket_table;       /* [river_bucket_table_count] or NULL */
+    int64_t   river_bucket_table_count; /* exactly 123,156,254 when loaded */
 } BPSReader;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -465,6 +473,44 @@ BPS_EXPORT int bps_hand_to_bucket_river(const BPSReader *r,
  * Returns 0 on success, -1 on alloc/feature failure.
  */
 BPS_EXPORT int bps_init_ochs_river(BPSReader *r, int num_clusters);
+
+/**
+ * Compute the 32-byte identity embedded in an RBK1 river bucket table.
+ *
+ * The SHA-256 input is, in this exact order:
+ *   - seven ASCII bytes "RBK1-ID";
+ *   - little-endian uint32 street=3, algorithm_version=1, mode=1
+ *     (mode 1 is the exhaustive OCHS river feature path);
+ *   - little-endian uint32 effective postflop bucket count,
+ *     OCHS opponent-cluster count, and populated centroid count;
+ *   - the exact live float32 centroid object bytes in row-major order;
+ *   - 169 cluster-map entries, each encoded as little-endian int32.
+ *
+ * Shape fields make the variable centroid byte string unambiguous. Exact
+ * float object bytes are deliberate: a table produced under a different
+ * floating-point result/compiler must not be accepted as identical. The
+ * algorithm version covers both the OCHS feature/centroid interpretation
+ * and the dense-rank convention and must be bumped if either changes.
+ * Returns 0 on success, -1 unless the production OCHS river path is active.
+ */
+BPS_EXPORT int bps_compute_river_bucket_identity(const BPSReader *r,
+                                                   unsigned char out[32]);
+
+/**
+ * Load and validate an RBK1 dense river bucket table.
+ *
+ * RBK1 is little-endian and has a fixed 52-byte header:
+ *   magic[4]="RBK1", int32 version=1, int32 num_buckets,
+ *   int64 num_classes=123156254, identity[32],
+ * followed by uint16[num_classes] in dense-rank order. 0xffff is the
+ * not-generated sentinel. The loader refuses a shape or identity mismatch,
+ * leaves the reader table unloaded, and returns -1 so callers retain the
+ * unchanged live OCHS fallback. On success it returns 123156254.
+ */
+BPS_EXPORT int bps_load_river_bucket_table(BPSReader *r, const char *path);
+
+/** Return 1 only when a validated, full-size RBK1 payload is loaded. */
+BPS_EXPORT int bps_has_river_bucket_table(const BPSReader *r);
 
 /* ── PA-EMD integration ──────────────────────────────────────────── */
 
