@@ -85,6 +85,76 @@ def test_parse_args_accepts_production_ab_with_threads(tmp_path):
     assert args.aivat is True
 
 
+def test_parse_args_rejects_ab_overrides_without_production(tmp_path):
+    with pytest.raises(SystemExit):
+        cli.parse_args(
+            run_match,
+            ["--mode", "aa", "--out", str(tmp_path), "--belief-carry"],
+        )
+
+
+class _Cfg:
+    def __init__(self, n_players, iterations, deadline_ms):
+        self.n_players = n_players
+        self.iterations = iterations
+        self.vec_mode = True
+        self.readout = "final"
+        self.num_rollouts = 3
+        self.deadline_ms = deadline_ms
+        self.hero_traverser_actual_fraction = 0.5
+        self.hero_row_min_strategy_sum_mass = 10.0
+
+
+class _FakeLive:
+    created = []
+
+    def __init__(self, config, **kwargs):
+        self.kwargs = kwargs
+        _FakeLive.created.append(self)
+
+
+def _production(monkeypatch, **kwargs):
+    import app.engine.agent.strategy_source as strategy_source
+
+    _FakeLive.created = []
+    monkeypatch.setattr(strategy_source, "LiveResolveSource", _FakeLive)
+    calls = []
+
+    def live_config_for(n, iterations_override=None, deadline_ms_override=None, purpose="display"):
+        calls.append((n, iterations_override, deadline_ms_override, purpose))
+        return _Cfg(n, iterations_override or 100_000, deadline_ms_override or 3_000)
+
+    strategy, sources = cli._production_strategy(
+        path="bp", lookup=_Lookup(), engine=object(),
+        live_config_for_fn=live_config_for, num_threads=8, **kwargs,
+    )
+    return strategy, sources, calls
+
+
+def test_production_strategy_shares_identical_configs_and_caps_players(monkeypatch):
+    strategy, sources, calls = _production(monkeypatch)
+    assert [c[0] for c in calls] == [2, 3]
+    assert all(c[3] == "play" for c in calls)
+    assert len(sources) == 1 and len(_FakeLive.created) == 1
+    live_by_count = strategy._live_by_count
+    assert live_by_count[2] is live_by_count[3] is sources[0]
+    assert all(isinstance(live_by_count[n], _Lookup) for n in (4, 5, 6))
+    assert _FakeLive.created[0].kwargs["belief_carry"] is None
+    assert _FakeLive.created[0].kwargs["deadline_ms"] == 3_000
+
+
+def test_production_strategy_applies_ab_overrides(monkeypatch):
+    _, _, calls = _production(
+        monkeypatch, iterations_override=1_000_000, deadline_ms_override=10_000,
+        belief_carry=True,
+    )
+    assert calls[0][1:3] == (1_000_000, 10_000)
+    kwargs = _FakeLive.created[0].kwargs
+    assert kwargs["iterations"] == 1_000_000
+    assert kwargs["deadline_ms"] == 10_000
+    assert kwargs["belief_carry"] is True
+
+
 def _namespace(**overrides):
     base = dict(
         seats=6, mode="ab", hero_source="production", field_source="lookup",

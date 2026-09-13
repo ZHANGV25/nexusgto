@@ -330,34 +330,57 @@ def _production_strategy(
     engine: object,
     live_config_for_fn: Any,
     num_threads: int,
+    iterations_override: Optional[int] = None,
+    deadline_ms_override: Optional[int] = None,
+    belief_carry: bool = False,
 ) -> Tuple[object, List[ProductionFallbackSource]]:
+
+    Player counts whose configs are identical share one LiveResolveSource, so
+    a belief-carry session survives a street-root count change within a hand
+    (a three-way flop becoming a heads-up turn). Sources hold no other
+    cross-call state, so sharing is neutral with carry off.
+    """
 
     from app.engine.agent.modes import ModeConfig
     from app.engine.agent.strategy_source import LiveResolveSource
 
     live_by_count: Dict[int, object] = {}
-    sources: List[ProductionFallbackSource] = []
+    by_config: Dict[Tuple[object, ...], ProductionFallbackSource] = {}
     for n_players in range(2, 7):
         if n_players > PRODUCTION_MAX_LIVE_PLAYERS:
             live_by_count[n_players] = lookup
             continue
-        cfg = live_config_for_fn(n_players, purpose="play")
-        live = LiveResolveSource(
-            ModeConfig(mode="LIVE_RESOLVE", blueprint_path=path),
-            cpu_es_solver=engine,
-            iterations=cfg.iterations,
-            vec_mode=cfg.vec_mode,
-            readout=cfg.readout,
-            num_rollouts=cfg.num_rollouts,
-            deadline_ms=cfg.deadline_ms,
-            hero_traverser_actual_fraction=cfg.hero_traverser_actual_fraction,
-            hero_row_min_strategy_sum_mass=cfg.hero_row_min_strategy_sum_mass,
-            num_threads=num_threads,
+        cfg = live_config_for_fn(
+            n_players,
+            iterations_override=iterations_override,
+            deadline_ms_override=deadline_ms_override,
+            purpose="play",
         )
-        source = ProductionFallbackSource(live, lookup)
-        sources.append(source)
+        key = (
+            cfg.iterations, cfg.vec_mode, cfg.readout, cfg.num_rollouts,
+            cfg.deadline_ms, cfg.hero_traverser_actual_fraction,
+            cfg.hero_row_min_strategy_sum_mass,
+        )
+        source = by_config.get(key)
+        if source is None:
+            live = LiveResolveSource(
+                ModeConfig(mode="LIVE_RESOLVE", blueprint_path=path),
+                cpu_es_solver=engine,
+                iterations=cfg.iterations,
+                vec_mode=cfg.vec_mode,
+                readout=cfg.readout,
+                num_rollouts=cfg.num_rollouts,
+                deadline_ms=cfg.deadline_ms,
+                hero_traverser_actual_fraction=cfg.hero_traverser_actual_fraction,
+                hero_row_min_strategy_sum_mass=cfg.hero_row_min_strategy_sum_mass,
+                num_threads=num_threads,
+                # None follows NEXUS_BELIEF_CARRY (unset on the server).
+                belief_carry=True if belief_carry else None,
+            )
+            source = ProductionFallbackSource(live, lookup)
+            by_config[key] = source
         live_by_count[n_players] = source
-    return _LiveByPlayerCountSource(lookup, live_by_count), sources
+    return _LiveByPlayerCountSource(lookup, live_by_count), list(by_config.values())
 
 
 def _positive_finite(raw: str) -> float:
@@ -427,6 +450,24 @@ def parse_args(
         help="native solve threads per decision (0 = all cores, production)",
     )
     ap.add_argument(
+        "--production-deadline-ms",
+        type=_positive_int,
+        default=None,
+        help="A/B override of the production CFR deadline (served: 3000)",
+    )
+    ap.add_argument(
+        "--production-iterations",
+        type=_positive_int,
+        default=None,
+        help="A/B override of the production iteration ceiling (served: 100000)",
+    )
+    ap.add_argument(
+        "--belief-carry",
+        action="store_true",
+        default=False,
+        help="A/B: carry cross-street beliefs in production re-solves (off on the box)",
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -460,6 +501,18 @@ def parse_args(
     args = ap.parse_args(argv)
     if args.aivat and args.hand_log:
         ap.error("--aivat and --hand-log both replace the hand player; pick one")
+    production_overrides = (
+        args.production_deadline_ms is not None
+        or args.production_iterations is not None
+        or args.belief_carry
+    )
+    if production_overrides and "production" not in (
+        args.hero_source, args.field_source
+    ):
+        ap.error(
+            "--production-deadline-ms/--production-iterations/--belief-carry "
+            "need a production source"
+        )
     if args.seats == 2:
         ap.error(
             "--seats 2 is unavailable: the full-hand preflop transition, "
@@ -640,6 +693,9 @@ def build_factories(
                 engine=timed_engine,
                 live_config_for_fn=live_config_for_fn,
                 num_threads=live_threads,
+                iterations_override=getattr(args, "production_iterations", None),
+                deadline_ms_override=getattr(args, "production_deadline_ms", None),
+                belief_carry=bool(getattr(args, "belief_carry", False)),
             )
             strategy_by_role[role] = strategy
             production_sources.extend(sources)
@@ -722,6 +778,11 @@ def build_factories(
             "production_serve_env": effective_leaf_mode_env("production"),
             "production_max_live_players": PRODUCTION_MAX_LIVE_PLAYERS,
             "live_threads": live_threads,
+            "production_ab_overrides": {
+                "deadline_ms": getattr(args, "production_deadline_ms", None),
+                "iterations": getattr(args, "production_iterations", None),
+                "belief_carry": bool(getattr(args, "belief_carry", False)),
+            },
         })
     if has_live_source or args.max_wall_s is not None:
         metadata.update({
