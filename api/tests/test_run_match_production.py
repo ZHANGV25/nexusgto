@@ -57,6 +57,27 @@ def test_fallback_source_acts_on_lookup_after_refusal():
     assert source.fallbacks == {"_Refused": 2}
 
 
+def test_fallback_source_records_replayable_spot():
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(
+        street=2, active=(True, False, True), board=(1, 2, 3, 4, 5),
+        preflop_prefix=(3, 1), postflop_history=(1, 2), seat_of_slot=(0, 3, 5),
+        stacks=(900, 1000, 800), pot=450, to_act_slot=2,
+    )
+    source = cli.ProductionFallbackSource(
+        _Live(_Refused("hero row mass 0.5 < 10")), _Lookup(), (_Refused,)
+    )
+    source.get_mix(state, (40, 41))
+    assert source.spots == ({
+        "error": "_Refused", "message": "hero row mass 0.5 < 10", "street": 2,
+        "n_live": 2, "board": [1, 2, 3, 4, 5], "preflop_prefix": [3, 1],
+        "postflop_history": [1, 2], "seat_of_slot": [0, 3, 5],
+        "stacks": [900, 1000, 800], "pot": 450, "to_act_slot": 2,
+        "hero_cards": [40, 41],
+    },)
+
+
 def test_fallback_source_propagates_unlisted_errors():
     source = cli.ProductionFallbackSource(
         _Live(KeyError("bug")), _Lookup(), (_Refused,)

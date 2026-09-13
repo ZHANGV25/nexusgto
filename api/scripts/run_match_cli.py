@@ -313,6 +313,7 @@ class ProductionFallbackSource:
             else _production_fallback_errors()
         )
         self.fallbacks: Dict[str, int] = {}
+        self.spots: Tuple[Dict[str, object], ...] = ()
 
     def get_mix(self, state: object, hero_cards: object) -> object:
         try:
@@ -320,7 +321,35 @@ class ProductionFallbackSource:
         except self._fallback_errors as exc:
             name = type(exc).__name__
             self.fallbacks = {**self.fallbacks, name: self.fallbacks.get(name, 0) + 1}
+            if len(self.spots) < MAX_RECORDED_FALLBACK_SPOTS:
+                self.spots = self.spots + (_fallback_spot(state, hero_cards, exc),)
             return self._lookup.get_mix(state, hero_cards)
+
+
+MAX_RECORDED_FALLBACK_SPOTS = 2000
+
+
+def _fallback_spot(state: object, hero_cards: object, exc: Exception) -> Dict[str, object]:
+    """A replayable description of one production live-solve fallback."""
+
+    def _tuple(name: str) -> Optional[List[object]]:
+        value = getattr(state, name, None)
+        return list(value) if value is not None else None
+
+    return {
+        "error": type(exc).__name__,
+        "message": str(exc)[:400],
+        "street": getattr(state, "street", None),
+        "n_live": sum(1 for flag in (getattr(state, "active", ()) or ()) if flag),
+        "board": _tuple("board"),
+        "preflop_prefix": _tuple("preflop_prefix"),
+        "postflop_history": _tuple("postflop_history"),
+        "seat_of_slot": _tuple("seat_of_slot"),
+        "stacks": _tuple("stacks"),
+        "pot": getattr(state, "pot", None),
+        "to_act_slot": getattr(state, "to_act_slot", None),
+        "hero_cards": list(hero_cards) if hero_cards is not None else None,
+    }
 
 
 def _production_strategy(
@@ -962,10 +991,20 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
         production_sources = getattr(hero_factory, "_production_sources", ())
         if production_sources:
             fallbacks: Dict[str, int] = {}
+            spots: List[Dict[str, object]] = []
             for source in production_sources:
+                spots.extend(source.spots)
                 for name, count in source.fallbacks.items():
                     fallbacks = {**fallbacks, name: fallbacks.get(name, 0) + count}
-            metadata = {**metadata, "production_live_fallbacks": fallbacks}
+            spots_path = out / "production_fallback_spots.jsonl"
+            with spots_path.open("w", encoding="utf-8", newline="\n") as fh:
+                for spot in spots:
+                    fh.write(json.dumps(spot, sort_keys=True) + "\n")
+            metadata = {
+                **metadata,
+                "production_live_fallbacks": fallbacks,
+                "production_fallback_spots_recorded": len(spots),
+            }
         run = runner.MatchRun(
             groups=run.groups, summary={**run.summary, **metadata}
         )
