@@ -837,15 +837,21 @@ def run_match(
     max_wall_s: Optional[float] = None,
     clock: Optional[Callable[[], float]] = None,
     allin_equity_adjust: bool = False,
+    start_group: int = 0,
 ) -> MatchRun:
     """Run ``deals`` independent groups (six full duplicate arms per group).
 
     ``on_group`` fires after each completed group; the CLI uses it for
-    per-group progress and crash-safe partial persistence.
+    per-group progress and crash-safe partial persistence. ``start_group``
+    skips that many decks first, so a shard reproduces groups
+    ``start_group..start_group+deals-1`` of the same seed exactly (decks and
+    seat-keyed policy seeds both key on the absolute group index).
     """
 
     if deals <= 0:
         raise ValueError("deals must be positive")
+    if start_group < 0:
+        raise ValueError("start_group must be non-negative")
     if master_seed < 0:
         raise ValueError("master_seed must be non-negative")
     if mode not in VALID_MODES:
@@ -861,7 +867,9 @@ def run_match(
     started = monotonic() if max_wall_s is not None else None
     truncated_by_wall_budget = False
     collected: List[DealGroupResult] = []
-    for group_index in range(deals):
+    for _ in range(start_group):
+        deal_from_rng(deal_rng)
+    for group_index in range(start_group, start_group + deals):
         deal = deal_from_rng(deal_rng)
         try:
             group = play_deal_group(

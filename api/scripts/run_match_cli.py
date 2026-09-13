@@ -427,6 +427,12 @@ def parse_args(
     )
     ap.add_argument("--epsilon", type=float, default=0.05)
     ap.add_argument("--master-seed", type=int, default=0)
+    ap.add_argument(
+        "--start-group",
+        type=int,
+        default=0,
+        help="skip this many decks: shard a seed's groups across processes",
+    )
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--blueprint-a", default=None)
     ap.add_argument("--blueprint-b", default=None)
@@ -939,7 +945,9 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 "solve_wall_tracker": tracker,
                 "max_wall_s": args.max_wall_s,
                 "allin_equity_adjust": args.allin_equity_adjust or use_aivat,
+                "start_group": int(getattr(args, "start_group", 0)),
             }
+            metadata = {**metadata, "start_group": match_kwargs["start_group"]}
             if use_aivat:
                 from scripts.match_aivat import ESTIMATOR, play_full_hand_aivat
 
