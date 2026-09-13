@@ -38,16 +38,20 @@ def _estimate(values: Sequence[float]) -> Dict[str, float]:
 
 def load_groups(run_dirs: Sequence[Path]) -> List[dict]:
     groups: List[dict] = []
-    seeds = set()
+    keys = set()
     for run_dir in run_dirs:
         path = run_dir / "deal_groups.jsonl"
         if not path.is_file():
             path = run_dir / "deal_groups.jsonl.partial"
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
-        run_seeds = {row["master_seed"] for row in rows}
-        if run_seeds & seeds:
-            raise ValueError(f"{run_dir} repeats master seeds {sorted(run_seeds & seeds)}")
-        seeds |= run_seeds
+        # Shards of one seed (--start-group) are independent groups; only the
+        # same seed AND group index is a repeat.
+        run_keys = {(row["master_seed"], row.get("group_index")) for row in rows}
+        if run_keys & keys:
+            raise ValueError(
+                f"{run_dir} repeats master seed groups {sorted(run_keys & keys)[:5]}"
+            )
+        keys |= run_keys
         groups.extend(rows)
     return groups
 

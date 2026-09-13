@@ -63,8 +63,20 @@ def test_paired_rejects_missing_pair_and_different_deals(tmp_path):
         pool_mod.paired([tmp_path / "other"], [tmp_path / "base"])
 
 
-def test_pool_rejects_repeated_seeds(tmp_path):
+def test_pool_rejects_repeated_seed_groups(tmp_path):
     _write_run(tmp_path / "a", 7, [1.0, 2.0])
     _write_run(tmp_path / "b", 7, [3.0, 4.0])
-    with pytest.raises(ValueError, match="repeats master seeds"):
+    with pytest.raises(ValueError, match="repeats master seed groups"):
         pool_mod.pool([tmp_path / "a", tmp_path / "b"])
+
+
+def test_pool_accepts_shards_of_one_seed(tmp_path):
+    _write_run(tmp_path / "a", 7, [1.0, 2.0])
+    shard = tmp_path / "b"
+    shard.mkdir()
+    (shard / "deal_groups.jsonl").write_text(
+        json.dumps({"master_seed": 7, "group_index": 2, "hero_net_chips_per_hand": 3.0})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert pool_mod.pool([tmp_path / "a", shard])["raw"]["n_groups"] == 3
