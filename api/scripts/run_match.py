@@ -379,6 +379,51 @@ class ActionChoice:
 
     action_idx: int
     mix: Optional[object] = None
+    # The exact distribution action_idx was drawn from, when a wrapper changes
+    # it away from ``mix`` (AIVAT scoring needs the true sampling law).
+    sampling_probs: Optional[Tuple[float, ...]] = None
+
+
+def sampling_probs_for(result: object, n_legal: int) -> Optional[Tuple[float, ...]]:
+    """Return the normalized distribution a policy sampled ``result`` from.
+
+    Prefers an explicit ``sampling_probs``; otherwise reads ``mix.freqs``.
+    Returns None when the policy exposes neither (pure integer stubs).
+    """
+
+    explicit = getattr(result, "sampling_probs", None)
+    if explicit is not None:
+        probs = [float(p) for p in explicit]
+    else:
+        freqs = getattr(getattr(result, "mix", None), "freqs", None)
+        if freqs is None:
+            return None
+        probs = [0.0] * n_legal
+        for idx, p in freqs.items():
+            if not 0 <= int(idx) < n_legal:
+                raise ValueError(f"mix index {idx} outside n_legal={n_legal}")
+            probs[int(idx)] += float(p)
+    if len(probs) != n_legal:
+        raise ValueError(f"{len(probs)} sampling probabilities for n_legal={n_legal}")
+    total = math.fsum(probs)
+    if any(p < 0.0 or not math.isfinite(p) for p in probs) or not math.isclose(
+        total, 1.0, abs_tol=1e-6
+    ):
+        raise ValueError(f"invalid sampling distribution {probs}")
+    return tuple(p / total for p in probs)
+
+
+def epsilon_sampling_probs(
+    base: Sequence[float], epsilon: float
+) -> Tuple[float, ...]:
+    """EpsilonPolicy's law: keep w.p. 1-eps, else uniform over the others."""
+
+    n_legal = len(base)
+    if n_legal <= 1:
+        return tuple(float(p) for p in base)
+    return tuple(
+        (1.0 - epsilon) * p + epsilon * (1.0 - p) / (n_legal - 1) for p in base
+    )
 
 
 class ObservedPolicy:
@@ -431,11 +476,17 @@ class EpsilonPolicy:
         n_legal = int(n_legal_fn())
         if chosen < 0 or chosen >= n_legal:
             raise ValueError(f"underlying policy returned {chosen}, n_legal={n_legal}")
+        base = sampling_probs_for(underlying, n_legal)
+        probs = (
+            epsilon_sampling_probs(base, self._epsilon) if base is not None else None
+        )
         if n_legal <= 1 or self._rng.random() >= self._epsilon:
-            return ActionChoice(chosen, mix=mix)
+            return ActionChoice(chosen, mix=mix, sampling_probs=probs)
         alternatives = [idx for idx in range(n_legal) if idx != chosen]
         self.perturbations += 1
-        return ActionChoice(int(self._rng.choice(alternatives)), mix=mix)
+        return ActionChoice(
+            int(self._rng.choice(alternatives)), mix=mix, sampling_probs=probs
+        )
 
 
 def _action_index(result: object) -> int:

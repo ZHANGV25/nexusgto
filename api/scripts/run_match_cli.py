@@ -322,12 +322,24 @@ def parse_args(
         ),
     )
     ap.add_argument(
+        "--aivat",
+        action="store_true",
+        default=False,
+        help=(
+            "score adjusted deltas with self-play AIVAT (scripts/match_aivat.py): "
+            "decision and exact turn/river corrections from known policies and "
+            "cards; subsumes --allin-equity-adjust"
+        ),
+    )
+    ap.add_argument(
         "--hand-log",
         action="store_true",
         default=False,
         help="write chronological nexusgto_handlog_v1 events",
     )
     args = ap.parse_args(argv)
+    if args.aivat and args.hand_log:
+        ap.error("--aivat and --hand-log both replace the hand player; pick one")
     if args.seats == 2:
         ap.error(
             "--seats 2 is unavailable: the full-hand preflop transition, "
@@ -642,6 +654,7 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
         ) or getattr(field_factory, "_solve_wall_tracker", None)
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
+        use_aivat = bool(getattr(args, "aivat", False))
         hand_log_emitter = None
         if args.hand_log:
             from scripts.hand_log_emitter import HandLogEmitter
@@ -706,8 +719,13 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 "on_group": group_callback,
                 "solve_wall_tracker": tracker,
                 "max_wall_s": args.max_wall_s,
-                "allin_equity_adjust": args.allin_equity_adjust,
+                "allin_equity_adjust": args.allin_equity_adjust or use_aivat,
             }
+            if use_aivat:
+                from scripts.match_aivat import ESTIMATOR, play_full_hand_aivat
+
+                match_kwargs["hand_player"] = play_full_hand_aivat
+                metadata = {**metadata, "adjusted_estimator": ESTIMATOR}
             if hand_log_emitter is not None:
                 match_kwargs["hand_player"] = hand_log_emitter.hand_player
             run = runner.run_match(**match_kwargs)
