@@ -26,7 +26,20 @@ from typing import (
 )
 
 
-SOURCE_CHOICES = ("lookup", "live_eager", "live_sampled")
+SOURCE_CHOICES = ("lookup", "live_eager", "live_sampled", "production")
+
+# The server's solve-shaping environment (stage-userdata.sh, staged
+# 2026-09-10: API 36a1680 / solver 9f108f1). A "production" source refuses to
+# run without it, so a match can never be labeled production while solving a
+# different arm. Source the uvicorn /proc/<pid>/environ before running.
+PRODUCTION_SERVE_ENV = {
+    "NEXUS_LEAF_VEC_SAMPLED": "1",
+    "NEXUS_HU_LEAF_MIRROR": "1",
+    "NEXUS_OFFTREE_ADD": "1",
+    "NEXUS_MAX_PROJECTED_FILL_BYTES": "7000000",
+}
+# (cdp_ui.SOLVE_MAX_LIVE_PLAYERS) and the API refuses them; the lookup floor acts.
+PRODUCTION_MAX_LIVE_PLAYERS = 3
 
 # These flags select mutually exclusive leaf-value implementations or arm a
 # construct-time continuation table.  Every live solve gets a clean snapshot
@@ -85,10 +98,24 @@ def solve_wall_summaries(
     return summaries
 
 
+def production_env_problems(environ: Mapping[str, str]) -> List[str]:
+    """Differences between ``environ`` and the server's solve environment."""
+
+    problems = []
+    for name, expected in PRODUCTION_SERVE_ENV.items():
+        actual = environ.get(name)
+        if actual != expected:
+            problems.append(f"{name}={actual!r} (server: {expected!r})")
+    for name in _CONTROLLED_LEAF_ENVS:
+        if environ.get(name):
+            problems.append(f"{name}={environ[name]!r} is not set on the server")
+    return problems
+
+
 def resolved_leaf_mode_env(source: str) -> Dict[str, Optional[str]]:
     """Return the leaf-mode environment enforced for one source."""
 
-    if source == "lookup":
+    if source in ("lookup", "production"):
         return {}
     if source not in ("live_eager", "live_sampled"):
         raise ValueError(f"unknown strategy source {source!r}")
@@ -109,6 +136,8 @@ def effective_leaf_mode_env(source: str) -> Dict[str, str]:
 
     if source == "lookup":
         return {}
+    if source == "production":
+        return {name: str(os.environ.get(name)) for name in PRODUCTION_SERVE_ENV}
     if source == "live_sampled":
         return {
             "NEXUS_LEAF_SAMPLED": "1",
@@ -129,7 +158,7 @@ def scoped_leaf_mode(source: str) -> Iterator[None]:
     """Apply one live leaf mode and restore exact prior process state."""
 
     resolved = resolved_leaf_mode_env(source)
-    if source == "lookup":
+    if source in ("lookup", "production"):
         yield
         return
     previous = {name: os.environ.get(name) for name in _CONTROLLED_LEAF_ENVS}
@@ -246,6 +275,91 @@ class _LiveByPlayerCountSource:
         return source.get_mix(state, hero_cards)
 
 
+def _production_fallback_errors() -> Tuple[type, ...]:
+    from app.engine.agent.live_resolve_adapter import (
+        LiveResolveConvergenceError,
+        LiveResolveUnsupported,
+    )
+    from app.engine.cpu_es_solver import (
+        LivePlayerCountExceeded,
+        ProjectedFillMemoryExceeded,
+    )
+
+    return (
+        LiveResolveUnsupported,
+        LiveResolveConvergenceError,
+        LivePlayerCountExceeded,
+        ProjectedFillMemoryExceeded,
+    )
+
+
+class ProductionFallbackSource:
+    """A live re-solve whose refusals act on the lookup floor, as in production.
+
+    The API turns these error classes into a lookup tier or a coded error, and
+    """
+
+    def __init__(
+        self,
+        live: object,
+        lookup: object,
+        fallback_errors: Optional[Tuple[type, ...]] = None,
+    ) -> None:
+        self._live = live
+        self._lookup = lookup
+        self._fallback_errors = (
+            tuple(fallback_errors)
+            if fallback_errors is not None
+            else _production_fallback_errors()
+        )
+        self.fallbacks: Dict[str, int] = {}
+
+    def get_mix(self, state: object, hero_cards: object) -> object:
+        try:
+            return self._live.get_mix(state, hero_cards)
+        except self._fallback_errors as exc:
+            name = type(exc).__name__
+            self.fallbacks = {**self.fallbacks, name: self.fallbacks.get(name, 0) + 1}
+            return self._lookup.get_mix(state, hero_cards)
+
+
+def _production_strategy(
+    *,
+    path: str,
+    lookup: object,
+    engine: object,
+    live_config_for_fn: Any,
+    num_threads: int,
+) -> Tuple[object, List[ProductionFallbackSource]]:
+
+    from app.engine.agent.modes import ModeConfig
+    from app.engine.agent.strategy_source import LiveResolveSource
+
+    live_by_count: Dict[int, object] = {}
+    sources: List[ProductionFallbackSource] = []
+    for n_players in range(2, 7):
+        if n_players > PRODUCTION_MAX_LIVE_PLAYERS:
+            live_by_count[n_players] = lookup
+            continue
+        cfg = live_config_for_fn(n_players, purpose="play")
+        live = LiveResolveSource(
+            ModeConfig(mode="LIVE_RESOLVE", blueprint_path=path),
+            cpu_es_solver=engine,
+            iterations=cfg.iterations,
+            vec_mode=cfg.vec_mode,
+            readout=cfg.readout,
+            num_rollouts=cfg.num_rollouts,
+            deadline_ms=cfg.deadline_ms,
+            hero_traverser_actual_fraction=cfg.hero_traverser_actual_fraction,
+            hero_row_min_strategy_sum_mass=cfg.hero_row_min_strategy_sum_mass,
+            num_threads=num_threads,
+        )
+        source = ProductionFallbackSource(live, lookup)
+        sources.append(source)
+        live_by_count[n_players] = source
+    return _LiveByPlayerCountSource(lookup, live_by_count), sources
+
+
 def _positive_finite(raw: str) -> float:
     try:
         value = float(raw)
@@ -305,6 +419,12 @@ def parse_args(
     )
     ap.add_argument(
         "--live-num-rollouts", type=_positive_int, default=None
+    )
+    ap.add_argument(
+        "--live-threads",
+        type=int,
+        default=0,
+        help="native solve threads per decision (0 = all cores, production)",
     )
     ap.add_argument(
         "--max-wall-s",
@@ -421,6 +541,22 @@ def build_factories(
             "mode 'aa' supports lookup only; use mode 'ab' for live "
             "architecture matches"
         )
+    requested = {args.hero_source, args.field_source}
+    if "production" in requested:
+        if requested & {"live_eager", "live_sampled"}:
+            raise ValueError(
+                "production cannot share a process with live_eager/live_sampled: "
+                "their leaf environments conflict"
+            )
+        problems = production_env_problems(os.environ)
+        if problems:
+            raise ValueError(
+                "production source needs the server environment: "
+                + "; ".join(problems)
+            )
+    live_threads = int(getattr(args, "live_threads", 0))
+    if live_threads < 0:
+        raise ValueError("--live-threads must be >= 0")
     a_path, b_path, metadata = _absolute_blueprint_paths(args)
 
     from app.engine.agent.agent import PokerAgent
@@ -470,12 +606,16 @@ def build_factories(
 
             # Construction-time continuation tables are disabled here too;
             # solve-time role scopes below repeat the guard per decision.
-            with scoped_leaf_mode("live_eager"):
+            # Production constructs under the serve environment as-is.
+            with scoped_leaf_mode(
+                "production" if "production" in requested else "live_eager"
+            ):
                 engine = CpuEsSolver(path)
             engine_by_path[path] = engine
         return engine
 
     strategy_by_role: Dict[str, object] = {}
+    production_sources: List[ProductionFallbackSource] = []
     for role in ("hero", "field"):
         path = role_paths[role]
         source_name = role_sources[role]
@@ -493,6 +633,17 @@ def build_factories(
             source=source_name,
             tracker=tracker,
         )
+        if source_name == "production":
+            strategy, sources = _production_strategy(
+                path=path,
+                lookup=lookup,
+                engine=timed_engine,
+                live_config_for_fn=live_config_for_fn,
+                num_threads=live_threads,
+            )
+            strategy_by_role[role] = strategy
+            production_sources.extend(sources)
+            continue
         live_by_count: Dict[int, object] = {}
         for n_players in range(2, 7):
             config_kwargs = {
@@ -565,6 +716,13 @@ def build_factories(
     if tracker is not None:
         setattr(hero_factory, "_solve_wall_tracker", tracker)
         setattr(field_factory, "_solve_wall_tracker", tracker)
+    if production_sources:
+        setattr(hero_factory, "_production_sources", tuple(production_sources))
+        metadata.update({
+            "production_serve_env": effective_leaf_mode_env("production"),
+            "production_max_live_players": PRODUCTION_MAX_LIVE_PLAYERS,
+            "live_threads": live_threads,
+        })
     if has_live_source or args.max_wall_s is not None:
         metadata.update({
             "seats": int(args.seats),
@@ -732,6 +890,13 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
         finally:
             if progress["fh"] is not None:
                 progress["fh"].close()
+        production_sources = getattr(hero_factory, "_production_sources", ())
+        if production_sources:
+            fallbacks: Dict[str, int] = {}
+            for source in production_sources:
+                for name, count in source.fallbacks.items():
+                    fallbacks = {**fallbacks, name: fallbacks.get(name, 0) + count}
+            metadata = {**metadata, "production_live_fallbacks": fallbacks}
         run = runner.MatchRun(
             groups=run.groups, summary={**run.summary, **metadata}
         )
