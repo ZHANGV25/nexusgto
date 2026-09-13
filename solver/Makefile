@@ -30,7 +30,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve street_solve_joint street_solve_cpu subgame_preflop
+.PHONY: all clean bench dll test test_phase_1_3 test_ev_walk blueprint bps_reader bps_ev_walk rollout street_solve street_solve_joint street_solve_cpu subgame_preflop hand_eval_batch
 
 all: blueprint
 
@@ -43,6 +43,12 @@ blueprint: $(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT)
 
 $(BUILD_DIR)/mccfr_blueprint$(SHLIB_EXT): $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c $(BP_DIR)/mccfr_blueprint.h $(BP_DIR)/mccfr_bias_regrets.h $(BP_DIR)/mccfr_cont_ev_table.h $(CORE_DIR)/card_abstraction.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHLIB_FLAGS) -fopenmp $(INCS) $(BP_DIR)/mccfr_blueprint.c $(BP_DIR)/mccfr_blueprint_io.c $(CORE_DIR)/card_abstraction.c $(CORE_DIR)/card_abstraction_river_nd.c $(CORE_DIR)/card_abstraction_ochs.c $(CORE_DIR)/hand_eval_table.c $(BP_DIR)/mccfr_phase_r.c $(BP_DIR)/mccfr_cont_ev_table.c $(BP_DIR)/mccfr_bias_regrets.c -o $@ $(LDFLAGS)
+
+# ── Batch 7-card evaluator (ctypes; api offline match AIVAT scoring) ──
+hand_eval_batch: $(BUILD_DIR)/hand_eval_batch$(SHLIB_EXT)
+
+$(BUILD_DIR)/hand_eval_batch$(SHLIB_EXT): $(CORE_DIR)/hand_eval_batch.c $(CORE_DIR)/hand_eval_table.c $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHLIB_FLAGS) $(INCS) $(CORE_DIR)/hand_eval_batch.c $(CORE_DIR)/hand_eval_table.c -o $@ $(LDFLAGS)
 
 # ── Street solver v2 (GPU re-solve support library) ──
 $(BUILD_DIR)/solver_v2$(SHLIB_EXT): $(ARCH_DIR)/solver_v2.c $(CORE_DIR)/hand_eval_table.c $(ARCH_DIR)/solver_v2.h $(CORE_DIR)/hand_eval.h | $(BUILD_DIR)
