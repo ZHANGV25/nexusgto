@@ -92,6 +92,21 @@ def test_fallback_source_gates_streets_to_lookup_without_solving():
     assert source.gated == 1
 
 
+def test_fallback_source_counts_belief_carry_engagement():
+    live = _Live()
+    source = cli.ProductionFallbackSource(live, _Lookup(), (_Refused,))
+    source.get_mix(None, (0, 1))
+    assert source.belief_carry == {}  # flag-off contract: no summary
+    live.last_belief_carry = {"applied": True, "dropped": False, "folded_streets": [{}]}
+    source.get_mix(None, (0, 1))
+    live.last_belief_carry = {"applied": False, "dropped": True, "folded_streets": [],
+                              "drop_reason": "belief_carry: dropped (x)"}
+    live.error = _Refused("no")
+    source.get_mix(None, (0, 1))
+    assert source.belief_carry == {"solves": 2, "applied": 1, "folded": 1, "dropped": 1}
+    assert source.belief_drop_reasons == {"belief_carry: dropped (x)": 1}
+
+
 def test_parse_args_production_live_streets(tmp_path):
     base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
     args = cli.parse_args(

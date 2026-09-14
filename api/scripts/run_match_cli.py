@@ -319,6 +319,9 @@ class ProductionFallbackSource:
         self.fallbacks: Dict[str, int] = {}
         self.spots: Tuple[Dict[str, object], ...] = ()
         self.gated = 0
+        # Belief-carry engagement read from LiveResolveSource.last_belief_carry.
+        self.belief_carry: Dict[str, int] = {}
+        self.belief_drop_reasons: Dict[str, int] = {}
 
     def get_mix(self, state: object, hero_cards: object) -> object:
         if (
@@ -335,10 +338,35 @@ class ProductionFallbackSource:
             if len(self.spots) < MAX_RECORDED_FALLBACK_SPOTS:
                 self.spots = self.spots + (_fallback_spot(state, hero_cards, exc),)
             return self._lookup.get_mix(state, hero_cards)
+        finally:
+            self._record_belief_carry()
+
+    def _record_belief_carry(self) -> None:
+        summary = getattr(self._live, "last_belief_carry", None)
+        if not isinstance(summary, dict):
+            return
+        events = ["solves"]
+        events.extend(key for key in ("applied", "dropped") if summary.get(key))
+        if summary.get("folded_streets"):
+            events.append("folded")
+        self.belief_carry = _sum_counts([self.belief_carry, {key: 1 for key in events}])
+        reason = summary.get("drop_reason")
+        if reason:
+            self.belief_drop_reasons = _sum_counts(
+                [self.belief_drop_reasons, {str(reason)[:160]: 1}]
+            )
 
 
 MAX_RECORDED_FALLBACK_SPOTS = 2000
 PRODUCTION_STREETS = {"flop": 1, "turn": 2, "river": 3}
+
+
+def _sum_counts(counts: Sequence[Mapping[str, int]]) -> Dict[str, int]:
+    total: Dict[str, int] = {}
+    for mapping in counts:
+        for name, count in mapping.items():
+            total = {**total, name: total.get(name, 0) + int(count)}
+    return total
 
 
 def _street_set(raw: str) -> FrozenSet[int]:
@@ -1047,6 +1075,15 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 "production_live_fallbacks": fallbacks,
                 "production_fallback_spots_recorded": len(spots),
                 "production_street_gated": sum(s.gated for s in production_sources),
+                "production_belief_carry": _sum_counts(
+                    [s.belief_carry for s in production_sources]
+                ),
+                "production_belief_drop_reasons": dict(sorted(
+                    _sum_counts(
+                        [s.belief_drop_reasons for s in production_sources]
+                    ).items(),
+                    key=lambda item: -item[1],
+                )[:10]),
             }
         run = runner.MatchRun(
             groups=run.groups, summary={**run.summary, **metadata}
