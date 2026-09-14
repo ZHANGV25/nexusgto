@@ -78,6 +78,34 @@ def test_fallback_source_records_replayable_spot():
     },)
 
 
+def test_fallback_source_gates_streets_to_lookup_without_solving():
+    from types import SimpleNamespace
+
+    live = _Live(_Refused("must not solve"))
+    source = cli.ProductionFallbackSource(
+        live, _Lookup(), (_Refused,), live_streets=frozenset({3})
+    )
+    assert source.get_mix(SimpleNamespace(street=1), (0, 1)) == "lookup"
+    assert source.gated == 1 and source.fallbacks == {}
+    live.error = None
+    assert source.get_mix(SimpleNamespace(street=3), (0, 1)) == "live"
+    assert source.gated == 1
+
+
+def test_parse_args_production_live_streets(tmp_path):
+    base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
+    args = cli.parse_args(
+        run_match,
+        base + ["--hero-source", "production", "--production-live-streets", "turn, river"],
+    )
+    assert args.production_live_streets == frozenset({2, 3})
+    assert cli.street_names(args.production_live_streets) == ["turn", "river"]
+    for bad in (["--hero-source", "production", "--production-live-streets", "preflop"],
+                ["--production-live-streets", "flop"]):
+        with pytest.raises(SystemExit):
+            cli.parse_args(run_match, base + bad)
+
+
 def test_fallback_source_propagates_unlisted_errors():
     source = cli.ProductionFallbackSource(
         _Live(KeyError("bug")), _Lookup(), (_Refused,)
@@ -174,6 +202,11 @@ def test_production_strategy_applies_ab_overrides(monkeypatch):
     assert kwargs["iterations"] == 1_000_000
     assert kwargs["deadline_ms"] == 10_000
     assert kwargs["belief_carry"] is True
+
+
+def test_production_strategy_passes_live_streets(monkeypatch):
+    _, sources, _ = _production(monkeypatch, live_streets=frozenset({1}))
+    assert sources[0]._live_streets == frozenset({1})
 
 
 def _namespace(**overrides):

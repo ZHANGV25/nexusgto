@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import (
     Any,
     Dict,
+    FrozenSet,
     Iterator,
     List,
     Mapping,
@@ -304,6 +305,7 @@ class ProductionFallbackSource:
         live: object,
         lookup: object,
         fallback_errors: Optional[Tuple[type, ...]] = None,
+        live_streets: Optional[FrozenSet[int]] = None,
     ) -> None:
         self._live = live
         self._lookup = lookup
@@ -312,10 +314,19 @@ class ProductionFallbackSource:
             if fallback_errors is not None
             else _production_fallback_errors()
         )
+        # A/B: streets outside this set act on the lookup floor without a solve.
+        self._live_streets = live_streets
         self.fallbacks: Dict[str, int] = {}
         self.spots: Tuple[Dict[str, object], ...] = ()
+        self.gated = 0
 
     def get_mix(self, state: object, hero_cards: object) -> object:
+        if (
+            self._live_streets is not None
+            and int(getattr(state, "street", -1)) not in self._live_streets
+        ):
+            self.gated = self.gated + 1
+            return self._lookup.get_mix(state, hero_cards)
         try:
             return self._live.get_mix(state, hero_cards)
         except self._fallback_errors as exc:
@@ -327,6 +338,24 @@ class ProductionFallbackSource:
 
 
 MAX_RECORDED_FALLBACK_SPOTS = 2000
+PRODUCTION_STREETS = {"flop": 1, "turn": 2, "river": 3}
+
+
+def _street_set(raw: str) -> FrozenSet[int]:
+    names = [name.strip() for name in raw.split(",") if name.strip()]
+    unknown = [name for name in names if name not in PRODUCTION_STREETS]
+    if not names or unknown:
+        raise argparse.ArgumentTypeError(
+            f"expected comma-separated streets from {sorted(PRODUCTION_STREETS)}, "
+            f"got {raw!r}"
+        )
+    return frozenset(PRODUCTION_STREETS[name] for name in names)
+
+
+def street_names(streets: Optional[FrozenSet[int]]) -> Optional[List[str]]:
+    if streets is None:
+        return None
+    return [name for name, index in PRODUCTION_STREETS.items() if index in streets]
 
 
 def _fallback_spot(state: object, hero_cards: object, exc: Exception) -> Dict[str, object]:
@@ -362,6 +391,7 @@ def _production_strategy(
     iterations_override: Optional[int] = None,
     deadline_ms_override: Optional[int] = None,
     belief_carry: bool = False,
+    live_streets: Optional[FrozenSet[int]] = None,
 ) -> Tuple[object, List[ProductionFallbackSource]]:
 
     Player counts whose configs are identical share one LiveResolveSource, so
@@ -406,7 +436,7 @@ def _production_strategy(
                 # None follows NEXUS_BELIEF_CARRY (unset on the server).
                 belief_carry=True if belief_carry else None,
             )
-            source = ProductionFallbackSource(live, lookup)
+            source = ProductionFallbackSource(live, lookup, live_streets=live_streets)
             by_config[key] = source
         live_by_count[n_players] = source
     return _LiveByPlayerCountSource(lookup, live_by_count), list(by_config.values())
@@ -503,6 +533,13 @@ def parse_args(
         help="A/B: carry cross-street beliefs in production re-solves (off on the box)",
     )
     ap.add_argument(
+        "--production-live-streets",
+        type=_street_set,
+        default=None,
+        help="A/B: re-solve only these streets (comma list of flop,turn,river); "
+        "the rest act on lookup (served: all three)",
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -540,13 +577,14 @@ def parse_args(
         args.production_deadline_ms is not None
         or args.production_iterations is not None
         or args.belief_carry
+        or args.production_live_streets is not None
     )
     if production_overrides and "production" not in (
         args.hero_source, args.field_source
     ):
         ap.error(
-            "--production-deadline-ms/--production-iterations/--belief-carry "
-            "need a production source"
+            "--production-deadline-ms/--production-iterations/--belief-carry/"
+            "--production-live-streets need a production source"
         )
     if args.seats == 2:
         ap.error(
@@ -731,6 +769,7 @@ def build_factories(
                 iterations_override=getattr(args, "production_iterations", None),
                 deadline_ms_override=getattr(args, "production_deadline_ms", None),
                 belief_carry=bool(getattr(args, "belief_carry", False)),
+                live_streets=getattr(args, "production_live_streets", None),
             )
             strategy_by_role[role] = strategy
             production_sources.extend(sources)
@@ -817,6 +856,9 @@ def build_factories(
                 "deadline_ms": getattr(args, "production_deadline_ms", None),
                 "iterations": getattr(args, "production_iterations", None),
                 "belief_carry": bool(getattr(args, "belief_carry", False)),
+                "live_streets": street_names(
+                    getattr(args, "production_live_streets", None)
+                ),
             },
         })
     if has_live_source or args.max_wall_s is not None:
@@ -1004,6 +1046,7 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 **metadata,
                 "production_live_fallbacks": fallbacks,
                 "production_fallback_spots_recorded": len(spots),
+                "production_street_gated": sum(s.gated for s in production_sources),
             }
         run = runner.MatchRun(
             groups=run.groups, summary={**run.summary, **metadata}
