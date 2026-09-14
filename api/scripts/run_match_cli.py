@@ -394,6 +394,44 @@ def street_names(streets: Optional[FrozenSet[int]]) -> Optional[List[str]]:
     return [name for name, index in PRODUCTION_STREETS.items() if index in streets]
 
 
+# A/B: leaf-model flags a production arm may change after the serve environment
+# check passes. An empty value unsets the flag.
+PRODUCTION_ENV_OVERRIDABLE = (
+    "NEXUS_LEAF_VEC_SAMPLED",
+    "NEXUS_LEAF_ROLLOUT",
+    "NEXUS_LEAF_CACHE_K",
+    "NEXUS_LEAF_RANGE_CONDITIONING",
+    "NEXUS_VEC_SAMPLED_HERO_BIAS",
+    "NEXUS_VEC_SAMPLED_EPS",
+    "NEXUS_VEC_SAMPLED_RUNOUT",
+    "NEXUS_VEC_SAMPLED_NR",
+)
+
+
+def _env_override(raw: str) -> Tuple[str, str]:
+    name, sep, value = raw.partition("=")
+    if not sep or name not in PRODUCTION_ENV_OVERRIDABLE:
+        raise argparse.ArgumentTypeError(
+            f"expected NAME=VALUE with NAME in {list(PRODUCTION_ENV_OVERRIDABLE)}, got {raw!r}"
+        )
+    return name, value
+
+
+def apply_env_overrides(
+    pairs: Sequence[Tuple[str, str]], environ: Any
+) -> Dict[str, Optional[str]]:
+    """Set (or unset, for an empty value) each flag; return what was applied."""
+    applied: Dict[str, Optional[str]] = {}
+    for name, value in pairs:
+        if value == "":
+            environ.pop(name, None)
+            applied = {**applied, name: None}
+        else:
+            environ[name] = value
+            applied = {**applied, name: value}
+    return applied
+
+
 def _fallback_spot(state: object, hero_cards: object, exc: Exception) -> Dict[str, object]:
     """A replayable description of one production live-solve fallback."""
 
@@ -606,6 +644,14 @@ def parse_args(
         "record both mixes (mix_compare.jsonl + summary; scripts/mix_compare.py)",
     )
     ap.add_argument(
+        "--production-env",
+        type=_env_override,
+        action="append",
+        default=None,
+        help="A/B: NAME=VALUE leaf-model flag applied after the serve environment "
+        "check (repeatable; empty VALUE unsets)",
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -648,14 +694,15 @@ def parse_args(
         or args.production_live_streets is not None
         or args.capture_river_brgap is not None
         or args.record_mix_compare
+        or args.production_env is not None
     )
     if production_overrides and "production" not in (
         args.hero_source, args.field_source
     ):
         ap.error(
             "--production-deadline-ms/--production-iterations/--belief-carry/"
-            "--production-live-streets/--capture-river-brgap/--record-mix-compare "
-            "need a production source"
+            "--production-live-streets/--capture-river-brgap/--record-mix-compare/"
+            "--production-env need a production source"
         )
     if args.seats == 2:
         ap.error(
@@ -751,6 +798,7 @@ def build_factories(
                 "production source needs the server environment: "
                 + "; ".join(problems)
             )
+        apply_env_overrides(getattr(args, "production_env", None) or (), os.environ)
     live_threads = int(getattr(args, "live_threads", 0))
     if live_threads < 0:
         raise ValueError("--live-threads must be >= 0")
@@ -957,6 +1005,10 @@ def build_factories(
                 "live_streets": street_names(
                     getattr(args, "production_live_streets", None)
                 ),
+                "env": {
+                    name: (value or None)
+                    for name, value in (getattr(args, "production_env", None) or ())
+                },
             },
         })
     if mix_compare is not None:

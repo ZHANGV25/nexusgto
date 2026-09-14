@@ -107,6 +107,31 @@ def test_fallback_source_counts_belief_carry_engagement():
     assert source.belief_drop_reasons == {"belief_carry: dropped (x)": 1}
 
 
+def test_parse_args_production_env_overrides(tmp_path):
+    base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
+    args = cli.parse_args(
+        run_match,
+        base + ["--hero-source", "production",
+                "--production-env", "NEXUS_LEAF_VEC_SAMPLED=",
+                "--production-env", "NEXUS_VEC_SAMPLED_EPS=0.3"],
+    )
+    assert args.production_env == [("NEXUS_LEAF_VEC_SAMPLED", ""), ("NEXUS_VEC_SAMPLED_EPS", "0.3")]
+    for bad in (["--hero-source", "production", "--production-env", "AUTH_ENABLED=false"],
+                ["--hero-source", "production", "--production-env", "NEXUS_LEAF_ROLLOUT"],
+                ["--production-env", "NEXUS_LEAF_ROLLOUT=1"]):
+        with pytest.raises(SystemExit):
+            cli.parse_args(run_match, base + bad)
+
+
+def test_apply_env_overrides_sets_and_unsets():
+    environ = {"NEXUS_LEAF_VEC_SAMPLED": "1", "KEEP": "x"}
+    applied = cli.apply_env_overrides(
+        [("NEXUS_LEAF_VEC_SAMPLED", ""), ("NEXUS_LEAF_ROLLOUT", "1")], environ
+    )
+    assert environ == {"KEEP": "x", "NEXUS_LEAF_ROLLOUT": "1"}
+    assert applied == {"NEXUS_LEAF_VEC_SAMPLED": None, "NEXUS_LEAF_ROLLOUT": "1"}
+
+
 def test_parse_args_river_capture_requires_production(tmp_path):
     base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
     args = cli.parse_args(
