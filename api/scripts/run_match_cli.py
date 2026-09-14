@@ -581,6 +581,13 @@ def parse_args(
         help="maximum river spots captured per process",
     )
     ap.add_argument(
+        "--field-style",
+        choices=("station", "maniac", "nit"),
+        default=None,
+        help="mode ab: field seats play the blueprint with this style's leaks "
+        "(scripts/field_styles.py)",
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -612,6 +619,8 @@ def parse_args(
         help="write chronological nexusgto_handlog_v1 events",
     )
     args = ap.parse_args(argv)
+    if args.field_style is not None and args.mode != "ab":
+        ap.error("--field-style needs --mode ab (the field differs from the hero)")
     if args.aivat and args.hand_log:
         ap.error("--aivat and --hand-log both replace the hand player; pick one")
     production_overrides = (
@@ -874,6 +883,16 @@ def build_factories(
         strategy_by_role[role] = _LiveByPlayerCountSource(
             lookup, live_by_count
         )
+
+    field_style = getattr(args, "field_style", None)
+    if field_style:
+        from scripts.field_styles import StyleSource
+
+        styled = StyleSource(strategy_by_role["field"], field_style)
+        strategy_by_role["field"] = styled
+        metadata.update({
+            "field_style": {"name": field_style, "params": styled.style.as_dict()},
+        })
 
     def make_factory(role: str) -> Any:
         path = role_paths[role]
