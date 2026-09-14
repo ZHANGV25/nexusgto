@@ -358,6 +358,20 @@ def _vec_sampled_hero_bias_fixed() -> bool:
     return raw[:1] in ("1", "t", "T", "y", "Y")
 
 
+_VEC_SAMPLED_OPP_HAND_MODES = {"traversal": 0, "root": 1}
+
+
+def _vec_sampled_opp_hand_mode() -> int:
+    """Research A/B: opponent hands at a vec-sampled leaf. traversal (default)
+    = the traversal's sampled hand; root = drawn per traverser hand from the
+    opponent's root range, as the eager table does."""
+    raw = (os.environ.get("NEXUS_VEC_SAMPLED_OPP_HAND") or "traversal").lower()
+    if raw not in _VEC_SAMPLED_OPP_HAND_MODES:
+        raise ValueError(
+            f"NEXUS_VEC_SAMPLED_OPP_HAND must be traversal or root, got {raw!r}")
+    return _VEC_SAMPLED_OPP_HAND_MODES[raw]
+
+
 def _leaf_bias_cfr_mode() -> str:
     """Parse the table-backed continuation-bias CFR mode."""
     raw = os.environ.get("NEXUS_LEAF_BIAS_CFR") or "off"
@@ -855,6 +869,7 @@ class CpuEsSolver:
                 "num_rollouts": _vec_sampled_num_rollouts(),
                 "opp_bias_mode": _vec_sampled_opp_bias_mode(),
                 "hero_bias_fixed": _vec_sampled_hero_bias_fixed(),
+                "opp_hand_mode": _vec_sampled_opp_hand_mode(),
             }
         if _sampled_requested:
             vec_mode = 0
@@ -2023,6 +2038,7 @@ class CpuEsSolver:
                     explore_eps=float(_vec_sampled_cfg["explore_eps"]),
                     opp_bias_mode=int(_vec_sampled_cfg["opp_bias_mode"]),
                     hero_bias_fixed=bool(_vec_sampled_cfg["hero_bias_fixed"]),
+                    opp_hand_mode=int(_vec_sampled_cfg["opp_hand_mode"]),
                     seed=master_seed,
                 )
             elif _leaf_rollout:
@@ -2377,6 +2393,7 @@ class CpuEsSolver:
                         "num_rollouts": int(_vec_sampled_cfg["num_rollouts"]),
                         "opp_bias_mode": int(_vec_sampled_cfg["opp_bias_mode"]),
                         "hero_bias_fixed": bool(_vec_sampled_cfg["hero_bias_fixed"]),
+                        "opp_hand_mode": int(_vec_sampled_cfg["opp_hand_mode"]),
                     }
                     logger.info(
                         "CpuEsSolver vec-sampled-leaf: %dp %s hero_bias=%d "

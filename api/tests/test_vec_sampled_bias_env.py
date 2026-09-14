@@ -36,6 +36,32 @@ def test_hero_bias_fixed_parses_flag(monkeypatch, raw, expected):
     assert solver._vec_sampled_hero_bias_fixed() is expected
 
 
+@pytest.mark.parametrize("raw,expected", [
+    (None, 0), ("", 0), ("traversal", 0), ("ROOT", 1),
+])
+def test_opp_hand_mode_parses_names(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("NEXUS_VEC_SAMPLED_OPP_HAND", raising=False)
+    else:
+        monkeypatch.setenv("NEXUS_VEC_SAMPLED_OPP_HAND", raw)
+    assert solver._vec_sampled_opp_hand_mode() == expected
+
+
+def test_opp_hand_mode_rejects_unknown(monkeypatch):
+    monkeypatch.setenv("NEXUS_VEC_SAMPLED_OPP_HAND", "uniform")
+    with pytest.raises(ValueError, match="traversal or root"):
+        solver._vec_sampled_opp_hand_mode()
+
+
+def test_opp_hand_flag_is_production_overridable(tmp_path):
+    args = cli.parse_args(run_match, [
+        "--mode", "ab", "--out", str(tmp_path), "--hero-source", "production",
+        "--field-source", "lookup",
+        "--production-env", "NEXUS_VEC_SAMPLED_OPP_HAND=root",
+    ])
+    assert args.production_env == [("NEXUS_VEC_SAMPLED_OPP_HAND", "root")]
+
+
 def test_bias_mode_flags_are_production_overridable(tmp_path):
     args = cli.parse_args(run_match, [
         "--mode", "ab", "--out", str(tmp_path), "--hero-source", "production",
