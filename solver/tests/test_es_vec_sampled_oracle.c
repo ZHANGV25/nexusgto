@@ -363,6 +363,69 @@ static void test_sample_mode(const SSTreeData *t) {
     es_free_vec_sampled_oracle(ctx);
 }
 
+static void test_bias_modes(const SSTreeData *t) {
+    printf("[test] bias modes: opponent unbiased / uniform, fixed hero\n");
+    CHECK(es_vec_sampled_oracle_set_bias_modes(NULL, 0, 0) == -1,
+          "NULL context accepted");
+    void *ctx = make_ctx(t, ES_VS_HERO_BIAS_ENUMERATE, ES_VS_RUNOUT_SHARED, 1, 0.05);
+    CHECK(ctx != NULL, "context allocated");
+    if (!ctx) return;
+    CHECK(es_vec_sampled_oracle_set_bias_modes(ctx, 3, 0) == -1,
+          "opponent mode 3 accepted");
+    CHECK(es_vec_sampled_oracle_set_bias_modes(ctx, 0, 2) == -1,
+          "hero_bias_fixed 2 accepted");
+    ESLeafOracleVec fn = es_vec_sampled_oracle_vec_fn();
+    int dead[NH] = {0};
+    double out[NH];
+    uint64_t rng = UINT64_C(0x0f0f0f0f12345678);
+
+    /* UNBIASED: every opponent realization is the unbiased continuation. */
+    CHECK(es_vec_sampled_oracle_set_bias_modes(ctx, ES_VS_OPP_BIAS_UNBIASED, 0) == 0,
+          "set UNBIASED");
+    int biased = 0;
+    for (int visit = 0; visit < 32; visit++) {
+        int opp[2] = {-1, visit % NH};
+        reset_stub(STUB_RECORD);
+        fn(ctx, 0, 0, opp, &t->nodes[0], &rng, NH, dead, out);
+        for (int i = 0; i < g_stub_calls; i++)
+            if (g_calls[i].bias[1] != 0) biased++;
+    }
+    CHECK(biased == 0, "UNBIASED: %d rollouts saw a biased opponent", biased);
+
+    /* UNIFORM: all four opponent biases appear across visits. */
+    CHECK(es_vec_sampled_oracle_set_bias_modes(ctx, ES_VS_OPP_BIAS_UNIFORM, 0) == 0,
+          "set UNIFORM");
+    int seen[4] = {0, 0, 0, 0};
+    for (int visit = 0; visit < 64; visit++) {
+        int opp[2] = {-1, visit % NH};
+        reset_stub(STUB_RECORD);
+        fn(ctx, 0, 0, opp, &t->nodes[0], &rng, NH, dead, out);
+        if (g_stub_calls > 0 && g_calls[0].bias[1] >= 0 && g_calls[0].bias[1] < 4)
+            seen[g_calls[0].bias[1]] = 1;
+    }
+    CHECK(seen[0] && seen[1] && seen[2] && seen[3],
+          "UNIFORM: opponent biases seen %d%d%d%d", seen[0], seen[1], seen[2], seen[3]);
+
+    /* HERO FIXED: one rollout per live hand at bias 0; the stub pays only
+     * bias 3, so a learning hero would drift to 1.0 and a fixed hero stays 0. */
+    CHECK(es_vec_sampled_oracle_set_bias_modes(ctx, ES_VS_OPP_BIAS_REGRET, 1) == 0,
+          "set hero fixed");
+    int opp[2] = {-1, 1};
+    reset_stub(STUB_HERO_BIAS3);
+    for (int visit = 0; visit < 3; visit++) {
+        fn(ctx, 0, 0, opp, &t->nodes[0], &rng, NH, dead, out);
+        for (int h = 0; h < NH; h++)
+            CHECK_CLOSE(out[h], 0.0, 1e-9, "hero fixed visit %d hand %d", visit, h);
+    }
+    CHECK(g_stub_calls == 3 * NH, "hero fixed: %d rollouts for %d hand visits",
+          g_stub_calls, 3 * NH);
+    for (int i = 0; i < g_stub_calls; i++)
+        CHECK(g_calls[i].bias[0] == 0, "hero fixed call %d used bias %d", i,
+              g_calls[i].bias[0]);
+    CHECK(g_stub_bad == 0, "stub inputs");
+    es_free_vec_sampled_oracle(ctx);
+}
+
 /* Two-node tree: root decision (p0: 2 actions) -> leaf 0 / leaf 1. */
 typedef struct {
     SSTreeData tree;
@@ -522,6 +585,7 @@ int main(void) {
     test_per_visit_rng_budget(&tree);
     test_enumerate_regret(&tree);
     test_sample_mode(&tree);
+    test_bias_modes(&tree);
     test_resolver_hook();
 
     if (g_fail == 0) {

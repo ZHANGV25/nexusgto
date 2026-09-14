@@ -37,6 +37,15 @@ extern "C" {
 #define ES_VS_RUNOUT_FRESH  0
 #define ES_VS_RUNOUT_SHARED 1
 
+/* Opponent continuation-bias handling per visit (research A/B). REGRET keeps
+ * the Pluribus leaf game: each opponent's bias is regret-matched from its
+ * persistent row. UNIFORM draws each opponent's bias uniformly per visit.
+ * UNBIASED fixes every opponent on the unbiased blueprint continuation
+ * (bias profile 0). */
+#define ES_VS_OPP_BIAS_REGRET   0
+#define ES_VS_OPP_BIAS_UNIFORM  1
+#define ES_VS_OPP_BIAS_UNBIASED 2
+
 /* Build a context. The tree and blueprint are borrowed and must outlive the
  * context; all flat per-leaf arrays are copied (same layouts and meaning as
  * es_make_sampled_oracle). explore_eps in [0, 0.5] is only used by SAMPLE
@@ -46,6 +55,14 @@ ES_EXPORT void *es_make_vec_sampled_oracle(
     int num_rollouts, int hero_bias_mode, int runout_mode, double explore_eps,
     int n_leaves, int max_h, const int *pot, const int *bets, const int *active,
     const int *hist_flat, const int *hist_len, const int *player_seats);
+
+/* Research A/B: set the opponent-bias mode (ES_VS_OPP_BIAS_*) and whether the
+ * traverser plays the unbiased continuation with no bias regret update
+ * (hero_bias_fixed = 1, which bypasses hero_bias_mode). Call before solving.
+ * A new context starts at (ES_VS_OPP_BIAS_REGRET, 0), the served behavior.
+ * Returns 0, or -1 on a NULL context or an invalid mode. */
+ES_EXPORT int es_vec_sampled_oracle_set_bias_modes(
+    void *ctx, int opp_bias_mode, int hero_bias_fixed);
 
 /* The vector entry (register with es_set_vec_leaf_oracle). */
 ES_EXPORT ESLeafOracleVec es_vec_sampled_oracle_vec_fn(void);

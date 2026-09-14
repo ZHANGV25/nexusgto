@@ -51,6 +51,8 @@ typedef struct {
     int hero_bias_mode;
     int runout_mode;
     float explore_eps;
+    int opp_bias_mode;     /* ES_VS_OPP_BIAS_*; 0 (REGRET) after calloc */
+    int hero_bias_fixed;   /* 1: traverser plays bias 0, no regret update */
 
     int n_leaves;
     int max_h;
@@ -189,11 +191,18 @@ static int esvs_visit_setup(ESVecSampledCtx *c, int leaf_idx, int traverser,
         /* Opponent continuation bias: one regret-matched sample per visit,
          * held fixed for every traverser hand valued in this visit. */
         if (v->active[p]) {
-            float strategy[ESVS_NB];
-            esvs_regret_match(esvs_regret_row(c, leaf_idx, p, hand),
-                              strategy);
-            v->bias_profile[p] =
-                esvs_sample_from(strategy, esvs_rng_double(rng));
+            if (c->opp_bias_mode == ES_VS_OPP_BIAS_UNBIASED) {
+                v->bias_profile[p] = 0;
+            } else if (c->opp_bias_mode == ES_VS_OPP_BIAS_UNIFORM) {
+                v->bias_profile[p] =
+                    (int32_t)(esvs_rng_next(rng) % (uint64_t)ESVS_NB);
+            } else {
+                float strategy[ESVS_NB];
+                esvs_regret_match(esvs_regret_row(c, leaf_idx, p, hand),
+                                  strategy);
+                v->bias_profile[p] =
+                    esvs_sample_from(strategy, esvs_rng_double(rng));
+            }
         }
     }
     v->pinned_len = 0;
@@ -262,6 +271,15 @@ static double esvs_eval_hand(ESVecSampledCtx *c, ESVSVisit *v, int hand) {
     v->c0[trav] = t->hands[trav][hand][0];
     v->c1[trav] = t->hands[trav][hand][1];
     v->has_sample[trav] = 1;
+
+    if (c->hero_bias_fixed) {
+        /* Research A/B: the unbiased continuation, no bias regret update. */
+        v->bias_profile[trav] = 0;
+        float fixed_value = 0.0f;
+        uint64_t fixed_stream = esvs_hand_stream(v->visit_seed, hand, 0x1234ULL);
+        if (esvs_batch(c, v, fixed_stream, &fixed_value) != 0) return 0.0;
+        return (double)fixed_value;
+    }
 
     float *row = esvs_regret_row(c, v->leaf_idx, trav, hand);
     float sigma[ESVS_NB];
@@ -457,6 +475,21 @@ ES_EXPORT void *es_make_vec_sampled_oracle(
         rollout_bucket_memo_reset(bp_void, flop3);
     }
     return c;
+}
+
+ES_EXPORT int es_vec_sampled_oracle_set_bias_modes(
+    void *ctx, int opp_bias_mode, int hero_bias_fixed
+) {
+    ESVecSampledCtx *c = (ESVecSampledCtx *)ctx;
+    if (!c
+        || (opp_bias_mode != ES_VS_OPP_BIAS_REGRET
+            && opp_bias_mode != ES_VS_OPP_BIAS_UNIFORM
+            && opp_bias_mode != ES_VS_OPP_BIAS_UNBIASED)
+        || (hero_bias_fixed != 0 && hero_bias_fixed != 1))
+        return -1;
+    c->opp_bias_mode = opp_bias_mode;
+    c->hero_bias_fixed = hero_bias_fixed;
+    return 0;
 }
 
 ES_EXPORT void es_vec_sampled_oracle_stats(

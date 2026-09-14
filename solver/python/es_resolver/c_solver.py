@@ -623,6 +623,8 @@ class CSolver:
                                 player_seats, num_rollouts: int = 1,
                                 hero_bias_mode: int = 0, runout_mode: int = 1,
                                 explore_eps: float = 0.05,
+                                opp_bias_mode: int = 0,
+                                hero_bias_fixed: bool = False,
                                 seed: int = 0) -> "CSolver":
         """Vec-coherent per-visit sampled blueprint-rollout oracle.
 
@@ -651,6 +653,9 @@ class CSolver:
             raise ValueError("runout_mode must be 0 (fresh) or 1 (shared)")
         if not (0.0 <= float(explore_eps) <= 0.5):
             raise ValueError("explore_eps must be in [0, 0.5]")
+        if opp_bias_mode not in (0, 1, 2):
+            raise ValueError(
+                "opp_bias_mode must be 0 (regret), 1 (uniform) or 2 (unbiased)")
         ka = [np.ascontiguousarray(a, dtype=np.int32)
               for a in (pot, bets, active, hist_flat, hist_len, player_seats)]
         ctx = _lib.es_make_vec_sampled_oracle(
@@ -668,6 +673,21 @@ class CSolver:
             raise RuntimeError(
                 "es_make_vec_sampled_oracle returned NULL "
                 "(invalid arguments or OOM)")
+        if opp_bias_mode != 0 or hero_bias_fixed:
+            # Research A/B; the default modes never touch this entry point.
+            setter = getattr(_lib, "es_vec_sampled_oracle_set_bias_modes", None)
+            if setter is None:
+                _lib.es_free_vec_sampled_oracle(ctx)
+                raise RuntimeError(
+                    "es_vec_sampled_oracle_set_bias_modes not in this DLL; "
+                    "rebuild es_resolver_real")
+            setter.restype = ctypes.c_int
+            setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            if setter(ctx, int(opp_bias_mode), 1 if hero_bias_fixed else 0) != 0:
+                _lib.es_free_vec_sampled_oracle(ctx)
+                raise RuntimeError(
+                    "es_vec_sampled_oracle_set_bias_modes rejected "
+                    f"opp_bias_mode={opp_bias_mode} hero_bias_fixed={hero_bias_fixed}")
         scalar_fn = _lib.es_vec_sampled_oracle_scalar_fn()
         try:
             solver = cls(tree, scalar_fn, ctx, seed=seed, _keepalive=None)
