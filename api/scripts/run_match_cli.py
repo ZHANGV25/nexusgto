@@ -306,6 +306,7 @@ class ProductionFallbackSource:
         lookup: object,
         fallback_errors: Optional[Tuple[type, ...]] = None,
         live_streets: Optional[FrozenSet[int]] = None,
+        mix_compare: Optional[Any] = None,
     ) -> None:
         self._live = live
         self._lookup = lookup
@@ -322,6 +323,8 @@ class ProductionFallbackSource:
         # Belief-carry engagement read from LiveResolveSource.last_belief_carry.
         self.belief_carry: Dict[str, int] = {}
         self.belief_drop_reasons: Dict[str, int] = {}
+        # Research: served mix vs blueprint mix at decisions live search served.
+        self._mix_compare = mix_compare
 
     def get_mix(self, state: object, hero_cards: object) -> object:
         if (
@@ -331,7 +334,7 @@ class ProductionFallbackSource:
             self.gated = self.gated + 1
             return self._lookup.get_mix(state, hero_cards)
         try:
-            return self._live.get_mix(state, hero_cards)
+            mix = self._live.get_mix(state, hero_cards)
         except self._fallback_errors as exc:
             name = type(exc).__name__
             self.fallbacks = {**self.fallbacks, name: self.fallbacks.get(name, 0) + 1}
@@ -340,6 +343,11 @@ class ProductionFallbackSource:
             return self._lookup.get_mix(state, hero_cards)
         finally:
             self._record_belief_carry()
+        if self._mix_compare is not None:
+            self._mix_compare.add(
+                state, hero_cards, mix, self._lookup.get_mix(state, hero_cards)
+            )
+        return mix
 
     def _record_belief_carry(self) -> None:
         summary = getattr(self._live, "last_belief_carry", None)
@@ -420,6 +428,7 @@ def _production_strategy(
     deadline_ms_override: Optional[int] = None,
     belief_carry: bool = False,
     live_streets: Optional[FrozenSet[int]] = None,
+    mix_compare: Optional[Any] = None,
 ) -> Tuple[object, List[ProductionFallbackSource]]:
 
     Player counts whose configs are identical share one LiveResolveSource, so
@@ -464,7 +473,9 @@ def _production_strategy(
                 # None follows NEXUS_BELIEF_CARRY (unset on the server).
                 belief_carry=True if belief_carry else None,
             )
-            source = ProductionFallbackSource(live, lookup, live_streets=live_streets)
+            source = ProductionFallbackSource(
+                live, lookup, live_streets=live_streets, mix_compare=mix_compare
+            )
             by_config[key] = source
         live_by_count[n_players] = source
     return _LiveByPlayerCountSource(lookup, live_by_count), list(by_config.values())
@@ -588,6 +599,13 @@ def parse_args(
         "(scripts/field_styles.py)",
     )
     ap.add_argument(
+        "--record-mix-compare",
+        action="store_true",
+        default=False,
+        help="research: at every served live decision also query the blueprint and "
+        "record both mixes (mix_compare.jsonl + summary; scripts/mix_compare.py)",
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -629,13 +647,15 @@ def parse_args(
         or args.belief_carry
         or args.production_live_streets is not None
         or args.capture_river_brgap is not None
+        or args.record_mix_compare
     )
     if production_overrides and "production" not in (
         args.hero_source, args.field_source
     ):
         ap.error(
             "--production-deadline-ms/--production-iterations/--belief-carry/"
-            "--production-live-streets/--capture-river-brgap need a production source"
+            "--production-live-streets/--capture-river-brgap/--record-mix-compare "
+            "need a production source"
         )
     if args.seats == 2:
         ap.error(
@@ -794,6 +814,11 @@ def build_factories(
     strategy_by_role: Dict[str, object] = {}
     production_sources: List[ProductionFallbackSource] = []
     river_captures: List[object] = []
+    mix_compare = None
+    if getattr(args, "record_mix_compare", False):
+        from scripts.mix_compare import MixComparison
+
+        mix_compare = MixComparison()
     for role in ("hero", "field"):
         path = role_paths[role]
         source_name = role_sources[role]
@@ -822,6 +847,7 @@ def build_factories(
                 deadline_ms_override=getattr(args, "production_deadline_ms", None),
                 belief_carry=bool(getattr(args, "belief_carry", False)),
                 live_streets=getattr(args, "production_live_streets", None),
+                mix_compare=mix_compare if role == "hero" else None,
             )
             capture_dir = getattr(args, "capture_river_brgap", None)
             if capture_dir and role == "hero":
@@ -933,6 +959,8 @@ def build_factories(
                 ),
             },
         })
+    if mix_compare is not None:
+        setattr(hero_factory, "_mix_compare", mix_compare)
     if river_captures:
         setattr(hero_factory, "_river_captures", tuple(river_captures))
         metadata.update({
@@ -1145,6 +1173,10 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 "river_brgap_captured": sum(c.captured for c in river_captures),
                 "river_brgap_skipped": _sum_counts([c.skipped for c in river_captures]),
             }
+        mix_compare = getattr(hero_factory, "_mix_compare", None)
+        if mix_compare is not None:
+            mix_compare.write_rows(out / "mix_compare.jsonl")
+            metadata = {**metadata, "mix_compare": mix_compare.summary()}
         run = runner.MatchRun(
             groups=run.groups, summary={**run.summary, **metadata}
         )
