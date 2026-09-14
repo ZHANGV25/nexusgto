@@ -53,6 +53,7 @@ typedef struct {
     float explore_eps;
     int opp_bias_mode;     /* ES_VS_OPP_BIAS_*; 0 (REGRET) after calloc */
     int hero_bias_fixed;   /* 1: traverser plays bias 0, no regret update */
+    int opp_hand_mode;     /* ES_VS_OPP_HAND_*; 0 (TRAVERSAL) after calloc */
 
     int n_leaves;
     int max_h;
@@ -260,6 +261,47 @@ static int esvs_batch(ESVecSampledCtx *c, ESVSVisit *v, uint64_t stream,
     return 0;
 }
 
+/* Research A/B (ES_VS_OPP_HAND_ROOT_RANGE): give every live opponent a hand
+ * drawn from its root range weights, excluding the board, the traverser's
+ * hand and earlier draws, from a per-hand stream (as the real oracle's
+ * all-hands rollout samples opponents). Returns -1 if an opponent has no
+ * compatible weighted hand. */
+static int esvs_draw_root_opponents(ESVecSampledCtx *c, ESVSVisit *v, int hand) {
+    const SSTreeData *t = c->tree;
+    int trav = v->traverser;
+    uint64_t used = (1ULL << v->c0[trav]) | (1ULL << v->c1[trav]);
+    for (int b = 0; b < t->num_board; b++) used |= 1ULL << t->board[b];
+    uint64_t stream = esvs_hand_stream(v->visit_seed, hand, 0x9ABCULL);
+    for (int p = 0; p < c->np; p++) {
+        if (p == trav || !v->active[p]) continue;
+        double total = 0.0;
+        for (int h = 0; h < t->num_hands[p]; h++) {
+            int a = t->hands[p][h][0], b = t->hands[p][h][1];
+            if (t->weights[p][h] > 0.0f && !((used >> a) & 1ULL)
+                && !((used >> b) & 1ULL))
+                total += (double)t->weights[p][h];
+        }
+        if (!(total > 0.0)) return -1;
+        double target = esvs_rng_double(&stream) * total;
+        double acc = 0.0;
+        int pick = -1;
+        for (int h = 0; h < t->num_hands[p]; h++) {
+            int a = t->hands[p][h][0], b = t->hands[p][h][1];
+            if (!(t->weights[p][h] > 0.0f) || ((used >> a) & 1ULL)
+                || ((used >> b) & 1ULL))
+                continue;
+            pick = h;
+            acc += (double)t->weights[p][h];
+            if (target < acc) break;
+        }
+        v->c0[p] = t->hands[p][pick][0];
+        v->c1[p] = t->hands[p][pick][1];
+        v->has_sample[p] = 1;
+        used |= (1ULL << v->c0[p]) | (1ULL << v->c1[p]);
+    }
+    return 0;
+}
+
 /* Value one live traverser hand in the visit's world and update its bias
  * regret row. Returns the mixture (ENUMERATE) or its unbiased estimate
  * (SAMPLE); 0.0 with an error count on a rollout failure. */
@@ -271,6 +313,12 @@ static double esvs_eval_hand(ESVecSampledCtx *c, ESVSVisit *v, int hand) {
     v->c0[trav] = t->hands[trav][hand][0];
     v->c1[trav] = t->hands[trav][hand][1];
     v->has_sample[trav] = 1;
+
+    if (c->opp_hand_mode == ES_VS_OPP_HAND_ROOT_RANGE
+        && esvs_draw_root_opponents(c, v, hand) != 0) {
+        atomic_fetch_add_explicit(&c->oracle_errors, 1, memory_order_relaxed);
+        return 0.0;
+    }
 
     if (c->hero_bias_fixed) {
         /* Research A/B: the unbiased continuation, no bias regret update. */
@@ -489,6 +537,15 @@ ES_EXPORT int es_vec_sampled_oracle_set_bias_modes(
         return -1;
     c->opp_bias_mode = opp_bias_mode;
     c->hero_bias_fixed = hero_bias_fixed;
+    return 0;
+}
+
+ES_EXPORT int es_vec_sampled_oracle_set_opp_hand_mode(void *ctx, int opp_hand_mode) {
+    ESVecSampledCtx *c = (ESVecSampledCtx *)ctx;
+    if (!c || (opp_hand_mode != ES_VS_OPP_HAND_TRAVERSAL
+               && opp_hand_mode != ES_VS_OPP_HAND_ROOT_RANGE))
+        return -1;
+    c->opp_hand_mode = opp_hand_mode;
     return 0;
 }
 

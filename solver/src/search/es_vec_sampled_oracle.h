@@ -46,6 +46,14 @@ extern "C" {
 #define ES_VS_OPP_BIAS_UNIFORM  1
 #define ES_VS_OPP_BIAS_UNBIASED 2
 
+/* Opponent hands at a leaf visit (research A/B). TRAVERSAL values leaves
+ * against each opponent's hand sampled by the traversal (served). ROOT_RANGE
+ * draws every live opponent's hand per traverser hand from its root range
+ * weights, excluding the board and the traverser's cards, as the eager table
+ * and the real oracle do. */
+#define ES_VS_OPP_HAND_TRAVERSAL  0
+#define ES_VS_OPP_HAND_ROOT_RANGE 1
+
 /* Build a context. The tree and blueprint are borrowed and must outlive the
  * context; all flat per-leaf arrays are copied (same layouts and meaning as
  * es_make_sampled_oracle). explore_eps in [0, 0.5] is only used by SAMPLE
@@ -63,6 +71,10 @@ ES_EXPORT void *es_make_vec_sampled_oracle(
  * Returns 0, or -1 on a NULL context or an invalid mode. */
 ES_EXPORT int es_vec_sampled_oracle_set_bias_modes(
     void *ctx, int opp_bias_mode, int hero_bias_fixed);
+
+/* Research A/B: set ES_VS_OPP_HAND_*. A new context starts at TRAVERSAL.
+ * Returns 0, or -1 on a NULL context or an invalid mode. */
+ES_EXPORT int es_vec_sampled_oracle_set_opp_hand_mode(void *ctx, int opp_hand_mode);
 
 /* The vector entry (register with es_set_vec_leaf_oracle). */
 ES_EXPORT ESLeafOracleVec es_vec_sampled_oracle_vec_fn(void);

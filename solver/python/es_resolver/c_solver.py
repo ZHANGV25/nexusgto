@@ -625,6 +625,7 @@ class CSolver:
                                 explore_eps: float = 0.05,
                                 opp_bias_mode: int = 0,
                                 hero_bias_fixed: bool = False,
+                                opp_hand_mode: int = 0,
                                 seed: int = 0) -> "CSolver":
         """Vec-coherent per-visit sampled blueprint-rollout oracle.
 
@@ -656,6 +657,9 @@ class CSolver:
         if opp_bias_mode not in (0, 1, 2):
             raise ValueError(
                 "opp_bias_mode must be 0 (regret), 1 (uniform) or 2 (unbiased)")
+        if opp_hand_mode not in (0, 1):
+            raise ValueError(
+                "opp_hand_mode must be 0 (traversal) or 1 (root range)")
         ka = [np.ascontiguousarray(a, dtype=np.int32)
               for a in (pot, bets, active, hist_flat, hist_len, player_seats)]
         ctx = _lib.es_make_vec_sampled_oracle(
@@ -688,6 +692,22 @@ class CSolver:
                 raise RuntimeError(
                     "es_vec_sampled_oracle_set_bias_modes rejected "
                     f"opp_bias_mode={opp_bias_mode} hero_bias_fixed={hero_bias_fixed}")
+        if opp_hand_mode != 0:
+            # Research A/B; the default mode never touches this entry point.
+            hand_setter = getattr(
+                _lib, "es_vec_sampled_oracle_set_opp_hand_mode", None)
+            if hand_setter is None:
+                _lib.es_free_vec_sampled_oracle(ctx)
+                raise RuntimeError(
+                    "es_vec_sampled_oracle_set_opp_hand_mode not in this DLL; "
+                    "rebuild es_resolver_real")
+            hand_setter.restype = ctypes.c_int
+            hand_setter.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hand_setter(ctx, int(opp_hand_mode)) != 0:
+                _lib.es_free_vec_sampled_oracle(ctx)
+                raise RuntimeError(
+                    "es_vec_sampled_oracle_set_opp_hand_mode rejected "
+                    f"opp_hand_mode={opp_hand_mode}")
         scalar_fn = _lib.es_vec_sampled_oracle_scalar_fn()
         try:
             solver = cls(tree, scalar_fn, ctx, seed=seed, _keepalive=None)

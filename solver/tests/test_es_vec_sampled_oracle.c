@@ -48,6 +48,7 @@ typedef struct {
     int32_t pinned_len;
     int32_t hero_c0, hero_c1;
     int32_t hero_player;
+    int32_t opp_c0, opp_c1, opp_has;
     uint64_t rng_in;
 } StubCall;
 
@@ -92,6 +93,12 @@ int rollout_simulate_one_ex(
         c->hero_c0 = sampled_hands_c0[hero_player];
         c->hero_c1 = sampled_hands_c1[hero_player];
         c->hero_player = hero_player;
+        if (num_players == 2) {
+            int opp_slot = 1 - hero_player;
+            c->opp_c0 = sampled_hands_c0[opp_slot];
+            c->opp_c1 = sampled_hands_c1[opp_slot];
+            c->opp_has = has_sample[opp_slot];
+        }
         c->rng_in = *rng;
     }
     g_stub_calls++;
@@ -426,6 +433,60 @@ static void test_bias_modes(const SSTreeData *t) {
     es_free_vec_sampled_oracle(ctx);
 }
 
+static int opp_hand_index(const SSTreeData *t, const StubCall *call) {
+    for (int h = 0; h < NH; h++)
+        if (call->opp_c0 == t->hands[1][h][0] && call->opp_c1 == t->hands[1][h][1])
+            return h;
+    return -1;
+}
+
+static void test_root_range_opponents(const SSTreeData *t) {
+    printf("[test] ROOT_RANGE: opponent leaf hands drawn per hand from the range\n");
+    CHECK(es_vec_sampled_oracle_set_opp_hand_mode(NULL, 1) == -1,
+          "NULL context accepted");
+    /* FRESH runout: a pinned card may legitimately equal a drawn hand. */
+    void *ctx = make_ctx(t, ES_VS_HERO_BIAS_SAMPLE, ES_VS_RUNOUT_FRESH, 1, 0.05);
+    CHECK(ctx != NULL, "context allocated");
+    if (!ctx) return;
+    CHECK(es_vec_sampled_oracle_set_opp_hand_mode(ctx, 2) == -1, "mode 2 accepted");
+    ESLeafOracleVec fn = es_vec_sampled_oracle_vec_fn();
+    int dead[NH] = {0};
+    double out[NH];
+    uint64_t rng = UINT64_C(0x2468ace013579bdf);
+    int opp[2] = {-1, 2};
+
+    /* TRAVERSAL (default): every hand is valued against opponent hand 2. */
+    reset_stub(STUB_RECORD);
+    fn(ctx, 0, 0, opp, &t->nodes[0], &rng, NH, dead, out);
+    for (int i = 0; i < g_stub_calls; i++)
+        CHECK(opp_hand_index(t, &g_calls[i]) == 2,
+              "TRAVERSAL call %d used opponent hand %d", i,
+              opp_hand_index(t, &g_calls[i]));
+
+    CHECK(es_vec_sampled_oracle_set_opp_hand_mode(ctx, ES_VS_OPP_HAND_ROOT_RANGE) == 0,
+          "set ROOT_RANGE");
+    int seen[NH] = {0};
+    int distinct = 0;
+    for (int visit = 0; visit < 8; visit++) {
+        reset_stub(STUB_RECORD);
+        fn(ctx, 0, 0, opp, &t->nodes[0], &rng, NH, dead, out);
+        CHECK(g_stub_calls == NH, "ROOT_RANGE visit %d: %d rollouts", visit, g_stub_calls);
+        for (int i = 0; i < g_stub_calls; i++) {
+            const StubCall *call = &g_calls[i];
+            int idx = opp_hand_index(t, call);
+            CHECK(idx >= 0 && call->opp_has, "visit %d call %d opponent hand not in range",
+                  visit, i);
+            CHECK(call->opp_c0 != call->hero_c0 && call->opp_c0 != call->hero_c1
+                  && call->opp_c1 != call->hero_c0 && call->opp_c1 != call->hero_c1,
+                  "visit %d call %d opponent collides with hero", visit, i);
+            if (idx >= 0 && !seen[idx]) { seen[idx] = 1; distinct++; }
+        }
+    }
+    CHECK(distinct >= 4, "ROOT_RANGE drew only %d distinct opponent hands", distinct);
+    CHECK(g_stub_bad == 0, "stub inputs");
+    es_free_vec_sampled_oracle(ctx);
+}
+
 /* Two-node tree: root decision (p0: 2 actions) -> leaf 0 / leaf 1. */
 typedef struct {
     SSTreeData tree;
@@ -586,6 +647,7 @@ int main(void) {
     test_enumerate_regret(&tree);
     test_sample_mode(&tree);
     test_bias_modes(&tree);
+    test_root_range_opponents(&tree);
     test_resolver_hook();
 
     if (g_fail == 0) {
