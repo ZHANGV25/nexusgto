@@ -336,6 +336,28 @@ def _vec_sampled_num_rollouts() -> int:
     return nr
 
 
+_VEC_SAMPLED_OPP_BIAS_MODES = {"regret": 0, "uniform": 1, "unbiased": 2}
+
+
+def _vec_sampled_opp_bias_mode() -> int:
+    """Research A/B: opponents' continuation biases at a vec-sampled leaf
+    visit. regret (default, the Pluribus leaf game) = 0, uniform = 1,
+    unbiased blueprint continuation only = 2."""
+    raw = (os.environ.get("NEXUS_VEC_SAMPLED_OPP_BIAS") or "regret").lower()
+    if raw not in _VEC_SAMPLED_OPP_BIAS_MODES:
+        raise ValueError(
+            "NEXUS_VEC_SAMPLED_OPP_BIAS must be regret, uniform or unbiased, "
+            f"got {raw!r}")
+    return _VEC_SAMPLED_OPP_BIAS_MODES[raw]
+
+
+def _vec_sampled_hero_bias_fixed() -> bool:
+    """Research A/B: the traverser plays the unbiased continuation at a
+    vec-sampled leaf with no bias regret update. Default off."""
+    raw = os.environ.get("NEXUS_VEC_SAMPLED_HERO_FIXED") or "0"
+    return raw[:1] in ("1", "t", "T", "y", "Y")
+
+
 def _leaf_bias_cfr_mode() -> str:
     """Parse the table-backed continuation-bias CFR mode."""
     raw = os.environ.get("NEXUS_LEAF_BIAS_CFR") or "off"
@@ -831,6 +853,8 @@ class CpuEsSolver:
                 "runout_mode": _vec_sampled_runout_mode(),
                 "explore_eps": _vec_sampled_explore_eps(),
                 "num_rollouts": _vec_sampled_num_rollouts(),
+                "opp_bias_mode": _vec_sampled_opp_bias_mode(),
+                "hero_bias_fixed": _vec_sampled_hero_bias_fixed(),
             }
         if _sampled_requested:
             vec_mode = 0
@@ -1997,6 +2021,8 @@ class CpuEsSolver:
                     hero_bias_mode=int(_vec_sampled_cfg["hero_bias_mode"]),
                     runout_mode=int(_vec_sampled_cfg["runout_mode"]),
                     explore_eps=float(_vec_sampled_cfg["explore_eps"]),
+                    opp_bias_mode=int(_vec_sampled_cfg["opp_bias_mode"]),
+                    hero_bias_fixed=bool(_vec_sampled_cfg["hero_bias_fixed"]),
                     seed=master_seed,
                 )
             elif _leaf_rollout:
@@ -2349,6 +2375,8 @@ class CpuEsSolver:
                         "runout_mode": int(_vec_sampled_cfg["runout_mode"]),
                         "explore_eps": float(_vec_sampled_cfg["explore_eps"]),
                         "num_rollouts": int(_vec_sampled_cfg["num_rollouts"]),
+                        "opp_bias_mode": int(_vec_sampled_cfg["opp_bias_mode"]),
+                        "hero_bias_fixed": bool(_vec_sampled_cfg["hero_bias_fixed"]),
                     }
                     logger.info(
                         "CpuEsSolver vec-sampled-leaf: %dp %s hero_bias=%d "
