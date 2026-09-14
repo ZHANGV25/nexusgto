@@ -107,6 +107,18 @@ def test_fallback_source_counts_belief_carry_engagement():
     assert source.belief_drop_reasons == {"belief_carry: dropped (x)": 1}
 
 
+def test_parse_args_river_capture_requires_production(tmp_path):
+    base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
+    args = cli.parse_args(
+        run_match,
+        base + ["--hero-source", "production", "--capture-river-brgap", str(tmp_path / "rv"),
+                "--capture-limit", "40"],
+    )
+    assert args.capture_river_brgap == str(tmp_path / "rv") and args.capture_limit == 40
+    with pytest.raises(SystemExit):
+        cli.parse_args(run_match, base + ["--capture-river-brgap", str(tmp_path / "rv")])
+
+
 def test_parse_args_production_live_streets(tmp_path):
     base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
     args = cli.parse_args(

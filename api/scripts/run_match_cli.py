@@ -568,6 +568,19 @@ def parse_args(
         "the rest act on lookup (served: all three)",
     )
     ap.add_argument(
+        "--capture-river-brgap",
+        default=None,
+        help="research: pickle heads-up river street-root solves with the "
+        "blueprint projected onto the same tree into this directory "
+        "(scripts/river_brgap_score.py); sets NEXUS_BR_GAP_EXPOSE=1",
+    )
+    ap.add_argument(
+        "--capture-limit",
+        type=_positive_int,
+        default=500,
+        help="maximum river spots captured per process",
+    )
+    ap.add_argument(
         "--max-wall-s",
         type=_positive_finite,
         default=None,
@@ -606,13 +619,14 @@ def parse_args(
         or args.production_iterations is not None
         or args.belief_carry
         or args.production_live_streets is not None
+        or args.capture_river_brgap is not None
     )
     if production_overrides and "production" not in (
         args.hero_source, args.field_source
     ):
         ap.error(
             "--production-deadline-ms/--production-iterations/--belief-carry/"
-            "--production-live-streets need a production source"
+            "--production-live-streets/--capture-river-brgap need a production source"
         )
     if args.seats == 2:
         ap.error(
@@ -770,6 +784,7 @@ def build_factories(
 
     strategy_by_role: Dict[str, object] = {}
     production_sources: List[ProductionFallbackSource] = []
+    river_captures: List[object] = []
     for role in ("hero", "field"):
         path = role_paths[role]
         source_name = role_sources[role]
@@ -799,6 +814,16 @@ def build_factories(
                 belief_carry=bool(getattr(args, "belief_carry", False)),
                 live_streets=getattr(args, "production_live_streets", None),
             )
+            capture_dir = getattr(args, "capture_river_brgap", None)
+            if capture_dir and role == "hero":
+                from scripts.river_brgap_capture import RiverCaptureSource
+
+                os.environ["NEXUS_BR_GAP_EXPOSE"] = "1"
+                strategy = RiverCaptureSource(
+                    strategy, lookup, timed_engine, capture_dir,
+                    int(getattr(args, "capture_limit", 500)),
+                )
+                river_captures.append(strategy)
             strategy_by_role[role] = strategy
             production_sources.extend(sources)
             continue
@@ -887,6 +912,15 @@ def build_factories(
                 "live_streets": street_names(
                     getattr(args, "production_live_streets", None)
                 ),
+            },
+        })
+    if river_captures:
+        setattr(hero_factory, "_river_captures", tuple(river_captures))
+        metadata.update({
+            "river_brgap_capture": {
+                "dir": str(args.capture_river_brgap),
+                "limit": int(args.capture_limit),
+                "nexus_br_gap_expose": os.environ.get("NEXUS_BR_GAP_EXPOSE"),
             },
         })
     if has_live_source or args.max_wall_s is not None:
@@ -1084,6 +1118,13 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                     ).items(),
                     key=lambda item: -item[1],
                 )[:10]),
+            }
+        river_captures = getattr(hero_factory, "_river_captures", ())
+        if river_captures:
+            metadata = {
+                **metadata,
+                "river_brgap_captured": sum(c.captured for c in river_captures),
+                "river_brgap_skipped": _sum_counts([c.skipped for c in river_captures]),
             }
         run = runner.MatchRun(
             groups=run.groups, summary={**run.summary, **metadata}
