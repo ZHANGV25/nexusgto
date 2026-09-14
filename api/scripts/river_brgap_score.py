@@ -189,6 +189,9 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--json", default=None, help="write per-spot rows and the summary here")
     args = ap.parse_args(argv)
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
     from scripts.match_aivat import evaluate_7card_batch
 
     rows = [score_record(record, evaluate_7card_batch) for record in load_records(args.dirs)]
