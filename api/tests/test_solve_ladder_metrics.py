@@ -51,6 +51,7 @@ def test_mix_distance_over_label_union():
 def test_cost_helpers():
     assert m.ms_per_kiter(3.0, 60_000) == pytest.approx(50.0)
     assert m.ms_per_kiter(3.0, 0) is None
+    assert m.ms_per_kiter(None, 10) is None
     assert m.iterations_in(3000.0, 50.0) == pytest.approx(60_000)
     assert m.iterations_in(3000.0, None) is None
 
@@ -64,40 +65,47 @@ def test_plateau_rung_requires_every_larger_rung_to_stay_inside():
     assert m.plateau_rung([], floor) is None
 
 
-def _row(spot, rung, iterations, run, solve_s, tv, mix_tv=None, gap=None, street="flop", n=2):
+def _row(spot, rung, iterations, run, solve_s, pair_tv, tv, mix_tv=None, gap=None, gap_avg=None,
+         street="flop", n=2):
     return {
         "spot": spot, "rung": rung, "street": street, "n_players": n,
-        "iterations": iterations, "iterations_run": run, "solve_s": solve_s,
-        "construct_s": 0.1, "mean_tv": tv, "root_tv": tv, "hero_mix_tv": mix_tv,
-        "river_brgap_pct_pot": gap,
+        "iterations": iterations, "iterations_run": run, "iterations_run_b": run,
+        "solve_s": solve_s, "solve_s_b": solve_s, "construct_s": 0.1,
+        "pair_mean_tv": pair_tv, "pair_root_tv": pair_tv, "pair_hero_mix_tv": pair_tv,
+        "mean_tv": tv, "root_tv": tv, "hero_mix_tv": mix_tv,
+        "river_brgap_pct_pot": gap, "river_brgap_avg_pct_pot": gap_avg,
     }
 
 
-def test_aggregate_cell_derives_floor_cost_and_plateau():
+def test_aggregate_cell_uses_the_top_rung_pair_as_floor():
     rows = []
     for spot in ("s1", "s2"):
-        rows.append(_row(spot, "ref_a", 1_000_000, 1_000_000, 50.0, None))
-        rows.append(_row(spot, "ref_b", 1_000_000, 1_000_000, 50.0, 0.01, 0.01))
-        rows.append(_row(spot, "production", 100_000, 60_000, 3.0, 0.05, 0.05))
-        rows.append(_row(spot, "it_10000", 10_000, 10_000, 0.5, 0.10, 0.1))
-        rows.append(_row(spot, "it_50000", 50_000, 50_000, 2.5, 0.014, 0.02))
-        rows.append(_row(spot, "it_250000", 250_000, 250_000, 12.5, 0.011, 0.012))
+        rows.append(_row(spot, "it_100000", 100_000, 100_000, 5.0, 0.01, None))
+        rows.append(_row(spot, "production", 100_000, 60_000, 3.0, 0.02, 0.05, 0.05))
+        rows.append(_row(spot, "it_1000", 1_000, 1_000, 0.05, 0.30, 0.10, 0.1))
+        rows.append(_row(spot, "it_5000", 5_000, 5_000, 0.25, 0.05, 0.014, 0.02))
+        rows.append(_row(spot, "it_25000", 25_000, 25_000, 1.25, 0.015, 0.011, 0.012))
+        rows.append(_row(spot, "avg_5000", 5_000, 5_000, 0.3, None, 0.02, None, 12.0, 6.0, street="flop"))
     cell = m.aggregate_cell(rows)
     assert cell["spots"] == 2
+    assert cell["top_rung"] == "it_100000"
     assert cell["noise_floor"]["mean_tv"] == pytest.approx(0.01)
     assert cell["ms_per_kiter"] == pytest.approx(50.0)
     assert cell["iterations_in_3s"] == pytest.approx(60_000)
-    assert cell["plateau_iterations"] == 50_000
-    assert cell["seconds_to_plateau"] == pytest.approx(2.5)
+    assert cell["plateau_iterations"] == 5_000
+    assert cell["seconds_to_plateau"] == pytest.approx(0.25)
     assert cell["rungs"]["production"]["iterations_run"] == pytest.approx(60_000)
-    assert cell["rungs"]["it_50000"]["mean_tv_se"] == pytest.approx(0.0)
+    assert cell["rungs"]["it_5000"]["mean_tv_se"] == pytest.approx(0.0)
+    assert cell["rungs"]["avg_5000"]["river_brgap_avg_pct_pot"] == pytest.approx(6.0)
+    assert cell["rungs"]["it_100000"]["mean_tv"] is None
 
 
 def test_aggregate_groups_by_street_and_players():
     rows = [
-        _row("a", "it_10000", 10_000, 10_000, 1.0, 0.1, street="flop", n=2),
-        _row("b", "it_10000", 10_000, 10_000, 4.0, 0.1, street="turn", n=3),
+        _row("a", "it_10000", 10_000, 10_000, 1.0, 0.1, None, street="flop", n=2),
+        _row("b", "it_10000", 10_000, 10_000, 4.0, 0.1, None, street="turn", n=3),
     ]
     cells = m.aggregate(rows)
     assert set(cells) == {"flop_2p", "turn_3p"}
     assert cells["turn_3p"]["ms_per_kiter"] == pytest.approx(400.0)
+    assert cells["turn_3p"]["plateau_iterations"] is None

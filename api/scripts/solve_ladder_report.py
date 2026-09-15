@@ -34,10 +34,14 @@ def load_rows(dirs: Sequence[str]) -> List[Dict[str, Any]]:
     return rows
 
 
+SKIP_RUNGS = ("done", "warmup")
+
+
 def split_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, List[Mapping[str, Any]]]:
     """Solved rows versus failures (refusals and errors), markers dropped."""
-    solved = [r for r in rows if r.get("rung") != "done" and r.get("outcome") == "solved"]
-    failed = [r for r in rows if r.get("rung") != "done" and r.get("outcome") != "solved"]
+    kept = [r for r in rows if r.get("rung") not in SKIP_RUNGS]
+    solved = [r for r in kept if r.get("outcome") == "solved" and r.get("outcome_b", "solved") == "solved"]
+    failed = [r for r in kept if r not in solved]
     return {"solved": solved, "failed": failed}
 
 
@@ -48,13 +52,15 @@ def _fmt(value: Optional[float], digits: int = 3) -> str:
 
 
 def _rung_order(label: str) -> tuple:
-    if label == "ref_a":
-        return (3, 0)
-    if label == "ref_b":
-        return (2, 0)
     if label == "production":
         return (0, 0)
-    return (1, int(label.split("_")[1]) if label.startswith("it_") else 0)
+    prefix, _, number = label.partition("_")
+    group = {"it": 1, "avg": 2}.get(prefix, 3)
+    return (group, int(number) if number.isdigit() else 0)
+
+
+def _pm(info: Mapping[str, Any], field: str, digits: int = 3) -> str:
+    return f"{_fmt(info.get(field), digits)} +/- {_fmt(info.get(f'{field}_se'), digits)}"
 
 
 def render(cells: Mapping[str, Any], failed: Sequence[Mapping[str, Any]]) -> str:
@@ -62,27 +68,30 @@ def render(cells: Mapping[str, Any], failed: Sequence[Mapping[str, Any]]) -> str
     for key, cell in cells.items():
         lines.append(f"## {key}: {cell['spots']} spots")
         lines.append(
-            f"cost {_fmt(cell['ms_per_kiter'], 1)} ms per 1k iterations; "
+            f"cost {_fmt(cell['ms_per_kiter'], 2)} ms per 1k iterations; "
             f"3 s buys {_fmt(cell['iterations_in_3s'], 0)} iterations; "
             f"plateau {cell['plateau_iterations']} iterations "
-            f"({_fmt(cell['seconds_to_plateau'], 1)} s)"
+            f"({_fmt(cell['seconds_to_plateau'], 1)} s) against the {cell['top_rung']} floor"
         )
         floor = cell["noise_floor"]
         lines.append(
-            f"noise floor (ref B vs ref A): mean TV {_fmt(floor['mean_tv'])}, "
+            f"noise floor (seed pair at {cell['top_rung']}): mean TV {_fmt(floor['mean_tv'])}, "
             f"root TV {_fmt(floor['root_tv'])}, hero mix TV {_fmt(floor['hero_mix_tv'])}"
         )
         lines.append("")
-        lines.append("| rung | spots | iterations run | solve s | ms/1k it | mean TV vs ref | hero mix TV | river BR-gap % pot |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append(
+            "| rung | spots | iterations run | solve s | ms/1k it | pair TV | TV vs top | "
+            "hero mix pair TV | hero mix TV vs top | river BR-gap % pot | BR-gap avg readout |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for label in sorted(cell["rungs"], key=_rung_order):
             info = cell["rungs"][label]
             lines.append(
                 f"| {label} | {info['spots']} | {_fmt(info['iterations_run'], 0)} | "
-                f"{_fmt(info['solve_s'], 2)} | {_fmt(info['ms_per_kiter'], 1)} | "
-                f"{_fmt(info['mean_tv'])} +/- {_fmt(info['mean_tv_se'])} | "
-                f"{_fmt(info['hero_mix_tv'])} +/- {_fmt(info['hero_mix_tv_se'])} | "
-                f"{_fmt(info['river_brgap_pct_pot'], 1)} |"
+                f"{_fmt(info['solve_s'], 2)} | {_fmt(info['ms_per_kiter'], 2)} | "
+                f"{_pm(info, 'pair_mean_tv')} | {_pm(info, 'mean_tv')} | "
+                f"{_pm(info, 'pair_hero_mix_tv')} | {_pm(info, 'hero_mix_tv')} | "
+                f"{_pm(info, 'river_brgap_pct_pot', 1)} | {_pm(info, 'river_brgap_avg_pct_pot', 1)} |"
             )
         lines.append("")
     if failed:

@@ -1,12 +1,13 @@
 """Pure convergence and timing metrics for the solve-iteration ladder.
 
-A ladder solves one captured spot at rising iteration budgets and compares
-each rung's strategy with a high-budget reference solve of the same spot.
-The strategy of a solve is ``sigma``: ``{decision_node: rows}`` where
-``rows[hand_row, action]`` is that player's action probability, in the tree
-snapshot's node order and hand order (``scripts/river_brgap_capture.plain_tree``).
-Two reference solves with different seeds give the noise floor: the distance
-a converged solve keeps from itself under sampled leaves and Hogwild threads.
+A ladder solves one captured spot at rising iteration budgets, twice per rung
+with two seeds. The strategy of a solve is ``sigma``: ``{decision_node: rows}``
+where ``rows[hand_row, action]`` is that player's action probability, in the
+tree snapshot's node order and hand order (``scripts/river_brgap_capture.plain_tree``).
+Two distances are reported per rung: seed A versus seed B at the same budget
+(self-consistency: the noise floor of a sampled-leaf, Hogwild solve at that
+budget) and seed A versus the top rung's seed A (convergence toward the
+largest budget).
 """
 from __future__ import annotations
 
@@ -16,6 +17,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import numpy as np
 
 T_DECISION = 0
+PAIR_FIELDS = ("pair_mean_tv", "pair_root_tv", "pair_hero_mix_tv")
+TOP_FIELDS = ("mean_tv", "root_tv", "hero_mix_tv")
+MIN_COST_ITERATIONS = 1_000
 
 
 def _weighted_rows(tree: Mapping[str, Any], player: int) -> np.ndarray:
@@ -76,9 +80,9 @@ def mix_distance(mix_a: Mapping[str, float], mix_b: Mapping[str, float]) -> floa
     return 0.5 * sum(abs(float(mix_a.get(k, 0.0)) - float(mix_b.get(k, 0.0))) for k in labels)
 
 
-def ms_per_kiter(solve_s: float, iterations_run: int) -> Optional[float]:
+def ms_per_kiter(solve_s: Optional[float], iterations_run: Optional[int]) -> Optional[float]:
     """Milliseconds of solve wall per thousand iterations."""
-    if iterations_run <= 0:
+    if solve_s is None or iterations_run is None or iterations_run <= 0:
         return None
     return 1000.0 * float(solve_s) / (float(iterations_run) / 1000.0)
 
@@ -95,7 +99,7 @@ def plateau_rung(
     floor: float,
     tolerance: float = 1.5,
 ) -> Optional[int]:
-    """Smallest iteration count whose distance to the reference is within
+    """Smallest iteration count whose distance to the top rung is within
     ``tolerance`` times the noise floor, provided every larger rung stays
     there too (a single lucky rung does not count as converged).
 
@@ -116,68 +120,98 @@ def plateau_rung(
     return result
 
 
-def _mean(values: Sequence[float]) -> Optional[float]:
-    clean = [float(v) for v in values if v is not None and not math.isnan(float(v))]
+def _clean(values: Sequence[Any]) -> List[float]:
+    return [float(v) for v in values if v is not None and not math.isnan(float(v))]
+
+
+def _mean(values: Sequence[Any]) -> Optional[float]:
+    clean = _clean(values)
     return float(np.mean(clean)) if clean else None
 
 
-def _se(values: Sequence[float]) -> Optional[float]:
-    clean = [float(v) for v in values if v is not None and not math.isnan(float(v))]
+def _se(values: Sequence[Any]) -> Optional[float]:
+    clean = _clean(values)
     if len(clean) < 2:
         return None
     return float(np.std(clean, ddof=1) / math.sqrt(len(clean)))
 
 
+def _rung_costs(rows: Sequence[Mapping[str, Any]]) -> List[float]:
+    costs: List[float] = []
+    for row in rows:
+        for solve_key, iter_key in (("solve_s", "iterations_run"), ("solve_s_b", "iterations_run_b")):
+            run = row.get(iter_key)
+            if run is not None and int(run) >= MIN_COST_ITERATIONS:
+                cost = ms_per_kiter(row.get(solve_key), run)
+                if cost is not None:
+                    costs.append(cost)
+    return costs
+
+
+def summarize_rung(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "spots": len(rows),
+        "iterations": _mean([r.get("iterations") for r in rows]),
+        "iterations_run": _mean([r.get("iterations_run") for r in rows]),
+        "solve_s": _mean([r.get("solve_s") for r in rows]),
+        "construct_s": _mean([r.get("construct_s") for r in rows]),
+        "ms_per_kiter": _mean(_rung_costs(rows)),
+        "river_brgap_pct_pot": _mean([r.get("river_brgap_pct_pot") for r in rows]),
+        "river_brgap_pct_pot_se": _se([r.get("river_brgap_pct_pot") for r in rows]),
+        "river_brgap_avg_pct_pot": _mean([r.get("river_brgap_avg_pct_pot") for r in rows]),
+        "river_brgap_avg_pct_pot_se": _se([r.get("river_brgap_avg_pct_pot") for r in rows]),
+    }
+    for field in PAIR_FIELDS + TOP_FIELDS:
+        summary = {
+            **summary,
+            field: _mean([r.get(field) for r in rows]),
+            f"{field}_se": _se([r.get(field) for r in rows]),
+        }
+    return summary
+
+
+def top_label(rungs: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
+    """The ladder rung with the largest requested iteration count."""
+    candidates = [
+        (info["iterations"], label)
+        for label, info in rungs.items()
+        if label.startswith("it_") and info.get("iterations") is not None
+    ]
+    return max(candidates)[1] if candidates else None
+
+
 def aggregate_cell(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """Summarize ladder rows of one (street, n_players) cell.
 
-    Rows carry ``rung`` (a label), ``iterations`` (requested), ``iterations_run``,
-    ``solve_s``, ``construct_s``, ``mean_tv``, ``root_tv``, ``hero_mix_tv`` and
-    optionally ``river_brgap_pct_pot`` and ``spot``. Reference-B rows carry the
-    noise floor in the same distance fields (measured against reference A).
+    Rows carry ``rung`` (``it_N``, ``production`` or ``avg_N``), requested
+    ``iterations``, per-seed ``iterations_run``/``solve_s`` (``_b`` for seed B),
+    the pair distances (``pair_mean_tv``, ``pair_root_tv``,
+    ``pair_hero_mix_tv``), the distances to the top rung (``mean_tv``,
+    ``root_tv``, ``hero_mix_tv``) and optional river best-response gaps.
     """
     by_rung: Dict[str, List[Mapping[str, Any]]] = {}
     for row in rows:
         by_rung.setdefault(str(row["rung"]), []).append(row)
-    floor_rows = by_rung.get("ref_b", [])
+    rungs = {label: summarize_rung(group) for label, group in by_rung.items()}
+    top = top_label(rungs)
     floor = {
-        "mean_tv": _mean([r.get("mean_tv") for r in floor_rows]),
-        "root_tv": _mean([r.get("root_tv") for r in floor_rows]),
-        "hero_mix_tv": _mean([r.get("hero_mix_tv") for r in floor_rows]),
+        field: (rungs[top][f"pair_{field}"] if top is not None else None)
+        for field in TOP_FIELDS
     }
-    rungs: Dict[str, Any] = {}
-    for label, group in by_rung.items():
-        costs = [ms_per_kiter(r["solve_s"], r["iterations_run"]) for r in group]
-        rungs[label] = {
-            "spots": len(group),
-            "iterations": _mean([r.get("iterations") for r in group]),
-            "iterations_run": _mean([r.get("iterations_run") for r in group]),
-            "solve_s": _mean([r.get("solve_s") for r in group]),
-            "construct_s": _mean([r.get("construct_s") for r in group]),
-            "ms_per_kiter": _mean(costs),
-            "mean_tv": _mean([r.get("mean_tv") for r in group]),
-            "mean_tv_se": _se([r.get("mean_tv") for r in group]),
-            "root_tv": _mean([r.get("root_tv") for r in group]),
-            "hero_mix_tv": _mean([r.get("hero_mix_tv") for r in group]),
-            "hero_mix_tv_se": _se([r.get("hero_mix_tv") for r in group]),
-            "river_brgap_pct_pot": _mean([r.get("river_brgap_pct_pot") for r in group]),
-        }
     ladder = [
         (info["iterations"], info["mean_tv"])
         for label, info in rungs.items()
-        if label.startswith("it_") and info["iterations"] is not None
+        if label.startswith("it_") and label != top and info["iterations"] is not None
     ]
     plateau = (
         plateau_rung(ladder, floor["mean_tv"]) if floor["mean_tv"] is not None else None
     )
-    cost_rows = [
-        ms_per_kiter(r["solve_s"], r["iterations_run"])
-        for r in rows
-        if str(r["rung"]).startswith("it_") and r.get("iterations_run", 0) >= 10_000
-    ]
-    cost = _mean(cost_rows)
+    # Median: the first solves of a process can still be paying page faults.
+    costs = _rung_costs([r for r in rows if str(r["rung"]).startswith("it_")])
+    cost = float(np.median(costs)) if costs else None
     return {
         "spots": len({r.get("spot") for r in rows}),
+        "top_rung": top,
         "noise_floor": floor,
         "rungs": rungs,
         "plateau_iterations": plateau,
