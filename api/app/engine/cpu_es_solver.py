@@ -372,6 +372,48 @@ def _vec_sampled_opp_hand_mode() -> int:
     return _VEC_SAMPLED_OPP_HAND_MODES[raw]
 
 
+_RIVER_AVG_READOUT_ENV = "NEXUS_RIVER_AVG_READOUT"
+_RIVER_AVG_ITERATIONS_ENV = "NEXUS_RIVER_AVG_ITERATIONS"
+_RIVER_AVG_ITERATIONS_DEFAULT = 5_000_000
+_STREET_BY_BOARD_LEN = {3: "flop", 4: "turn", 5: "river"}
+
+
+def _river_avg_readout_enabled() -> bool:
+    """Research A/B (2026-09-15, SCOREBOARD_RESULTS section 30.3): serve the
+    AVERAGE strategy of a scalar external-sampling solve on heads-up rivers
+    instead of the vectorized traverser's final iterate. The final iterate was
+    15-22% of pot exploitable at every budget; the average of a 2 s scalar
+    solve was 1.4%. A river tree has no depth-limited leaves, so the vec-sampled
+    leaf oracle is not involved. The served deadline stays; the iteration
+    ceiling is raised (NEXUS_RIVER_AVG_ITERATIONS) because scalar iterations
+    update one hand each. DEFAULT OFF."""
+    return os.environ.get(_RIVER_AVG_READOUT_ENV, "")[:1] in ("1", "t", "T", "y", "Y")
+
+
+def _river_avg_iterations() -> int:
+    raw = os.environ.get(_RIVER_AVG_ITERATIONS_ENV, "").strip()
+    if not raw:
+        return _RIVER_AVG_ITERATIONS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{_RIVER_AVG_ITERATIONS_ENV}={raw!r} is not an integer"
+        ) from None
+    if value < 1:
+        raise ValueError(f"{_RIVER_AVG_ITERATIONS_ENV} must be >= 1, got {value}")
+    return value
+
+
+def river_avg_applies(street: str, n_players: int) -> bool:
+    """True when the river average-readout A/B governs this solve."""
+    return (
+        _river_avg_readout_enabled()
+        and street == "river"
+        and int(n_players) == 2
+    )
+
+
 def _leaf_bias_cfr_mode() -> str:
     """Parse the table-backed continuation-bias CFR mode."""
     raw = os.environ.get("NEXUS_LEAF_BIAS_CFR") or "off"
@@ -839,11 +881,22 @@ class CpuEsSolver:
                 "seed-unstable at 3+ players (Gate-1, VECTOR_TRAVERSER_DESIGN.md)"
             )
 
+        # RIVER AVERAGE READOUT (research A/B, default off): a heads-up river
+        # solve runs the scalar traverser and serves its average strategy
+        # under the same deadline with a raised ceiling. No leaves exist on
+        # the river, so the vec-sampled oracle requirement does not apply.
+        _river_avg = river_avg_applies(
+            _STREET_BY_BOARD_LEN.get(len(board_strs), ""), len(player_ranges)
+        )
+        if _river_avg:
+            vec_mode = 0
+            readout = "avg"
+            iterations = max(int(iterations), _river_avg_iterations())
         # Sampled leaves are scalar-only. Apply their precedence before the
         # normal vec/readout validation so a caller requesting vec + avg is
         # accepted and run as scalar without changing the requested readout.
         _sampled_requested = _leaf_sampled_enabled()
-        _vec_sampled_requested = _leaf_vec_sampled_enabled()
+        _vec_sampled_requested = _leaf_vec_sampled_enabled() and not _river_avg
         _rollout_requested = _leaf_rollout_enabled()
         # MEASUREMENT ONLY: a multi-seed A/B needs distinct master seeds per
         # run; the serving callers never set this.
@@ -2910,6 +2963,7 @@ class CpuEsSolver:
                 ),
                 "vec_mode": int(vec_mode),
                 "readout": readout,
+                "river_avg_readout": bool(_river_avg),
                 "num_threads": int(num_threads),
                 # reach mode ignores num_threads in C (single-threaded pass)
                 "eff_threads": 1 if use_reach else int(_eff_threads),
