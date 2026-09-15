@@ -470,21 +470,29 @@ def _production_strategy(
     belief_carry: bool = False,
     live_streets: Optional[FrozenSet[int]] = None,
     mix_compare: Optional[Any] = None,
+    max_live_players: int = PRODUCTION_MAX_LIVE_PLAYERS,
 ) -> Tuple[object, List[ProductionFallbackSource]]:
 
     Player counts whose configs are identical share one LiveResolveSource, so
     a belief-carry session survives a street-root count change within a hand
     (a three-way flop becoming a heads-up turn). Sources hold no other
     cross-call state, so sharing is neutral with carry off.
+
+    ``max_live_players`` above the served cap is a research A/B: the engine's
+    own cap (NEXUS_MAX_LIVE_RESOLVE_PLAYERS) must be raised alongside it.
     """
 
     from app.engine.agent.modes import ModeConfig
     from app.engine.agent.strategy_source import LiveResolveSource
 
+    if not (2 <= int(max_live_players) <= 6):
+        raise ValueError(
+            f"max_live_players must be within [2, 6], got {max_live_players}"
+        )
     live_by_count: Dict[int, object] = {}
     by_config: Dict[Tuple[object, ...], ProductionFallbackSource] = {}
     for n_players in range(2, 7):
-        if n_players > PRODUCTION_MAX_LIVE_PLAYERS:
+        if n_players > int(max_live_players):
             live_by_count[n_players] = lookup
             continue
         cfg = live_config_for_fn(
@@ -630,7 +638,34 @@ def parse_args(
         "--capture-limit",
         type=_positive_int,
         default=500,
-        help="maximum river spots captured per process",
+        help="maximum spots captured per process (river BR-gap or solve requests)",
+    )
+    ap.add_argument(
+        "--capture-solve-requests",
+        default=None,
+        help="research: pickle the exact solve inputs of every hero production "
+        "re-solve (any street or player count) into this directory "
+        "(scripts/solve_ladder_bench.py replays them at other budgets)",
+    )
+    ap.add_argument(
+        "--capture-only",
+        action="store_true",
+        default=False,
+        help="with --capture-solve-requests: record each request and refuse the "
+        "solve so the lookup floor acts (a fast spot generator, not a result)",
+    )
+    ap.add_argument(
+        "--capture-min-players",
+        type=int,
+        default=2,
+        help="with --capture-solve-requests: record only street-entry player "
+        "counts at or above this",
+    )
+    ap.add_argument(
+        "--production-max-live-players",
+        type=int,
+        default=None,
+        "street roots re-solve too; sets NEXUS_MAX_LIVE_RESOLVE_PLAYERS",
     )
     ap.add_argument(
         "--field-style",
@@ -696,6 +731,8 @@ def parse_args(
         or args.belief_carry
         or args.production_live_streets is not None
         or args.capture_river_brgap is not None
+        or args.capture_solve_requests is not None
+        or args.production_max_live_players is not None
         or args.record_mix_compare
         or args.production_env is not None
     )
@@ -704,9 +741,20 @@ def parse_args(
     ):
         ap.error(
             "--production-deadline-ms/--production-iterations/--belief-carry/"
-            "--production-live-streets/--capture-river-brgap/--record-mix-compare/"
+            "--production-live-streets/--capture-river-brgap/--capture-solve-requests/"
+            "--production-max-live-players/--record-mix-compare/"
             "--production-env need a production source"
         )
+    if (args.capture_only or args.capture_min_players != 2) and (
+        args.capture_solve_requests is None
+    ):
+        ap.error("--capture-only/--capture-min-players need --capture-solve-requests")
+    if not (2 <= args.capture_min_players <= 6):
+        ap.error("--capture-min-players must be within [2, 6]")
+    if args.production_max_live_players is not None and not (
+        2 <= args.production_max_live_players <= 6
+    ):
+        ap.error("--production-max-live-players must be within [2, 6]")
     if args.seats == 2:
         ap.error(
             "--seats 2 is unavailable: the full-hand preflop transition, "
@@ -802,6 +850,13 @@ def build_factories(
                 + "; ".join(problems)
             )
         apply_env_overrides(getattr(args, "production_env", None) or (), os.environ)
+    max_live_players = int(
+        getattr(args, "production_max_live_players", None)
+        or PRODUCTION_MAX_LIVE_PLAYERS
+    )
+    if max_live_players != PRODUCTION_MAX_LIVE_PLAYERS:
+        # The engine refuses above its own cap; raise both for the A/B.
+        os.environ["NEXUS_MAX_LIVE_RESOLVE_PLAYERS"] = str(max_live_players)
     live_threads = int(getattr(args, "live_threads", 0))
     if live_threads < 0:
         raise ValueError("--live-threads must be >= 0")
@@ -865,6 +920,7 @@ def build_factories(
     strategy_by_role: Dict[str, object] = {}
     production_sources: List[ProductionFallbackSource] = []
     river_captures: List[object] = []
+    request_recorders: List[object] = []
     mix_compare = None
     if getattr(args, "record_mix_compare", False):
         from scripts.mix_compare import MixComparison
@@ -888,10 +944,22 @@ def build_factories(
             tracker=tracker,
         )
         if source_name == "production":
+            production_engine: object = timed_engine
+            request_dir = getattr(args, "capture_solve_requests", None)
+            if request_dir and role == "hero":
+                from scripts.solve_request_capture import SolveRequestRecorder
+
+                production_engine = SolveRequestRecorder(
+                    timed_engine, request_dir,
+                    limit=int(getattr(args, "capture_limit", 500)),
+                    capture_only=bool(getattr(args, "capture_only", False)),
+                    min_players=int(getattr(args, "capture_min_players", 2)),
+                )
+                request_recorders.append(production_engine)
             strategy, sources = _production_strategy(
                 path=path,
                 lookup=lookup,
-                engine=timed_engine,
+                engine=production_engine,
                 live_config_for_fn=live_config_for_fn,
                 num_threads=live_threads,
                 iterations_override=getattr(args, "production_iterations", None),
@@ -899,6 +967,7 @@ def build_factories(
                 belief_carry=bool(getattr(args, "belief_carry", False)),
                 live_streets=getattr(args, "production_live_streets", None),
                 mix_compare=mix_compare if role == "hero" else None,
+                max_live_players=max_live_players,
             )
             capture_dir = getattr(args, "capture_river_brgap", None)
             if capture_dir and role == "hero":
@@ -906,7 +975,7 @@ def build_factories(
 
                 os.environ["NEXUS_BR_GAP_EXPOSE"] = "1"
                 strategy = RiverCaptureSource(
-                    strategy, lookup, timed_engine, capture_dir,
+                    strategy, lookup, production_engine, capture_dir,
                     int(getattr(args, "capture_limit", 500)),
                 )
                 river_captures.append(strategy)
@@ -999,7 +1068,7 @@ def build_factories(
         setattr(hero_factory, "_production_sources", tuple(production_sources))
         metadata.update({
             "production_serve_env": effective_leaf_mode_env("production"),
-            "production_max_live_players": PRODUCTION_MAX_LIVE_PLAYERS,
+            "production_max_live_players": max_live_players,
             "live_threads": live_threads,
             "production_ab_overrides": {
                 "deadline_ms": getattr(args, "production_deadline_ms", None),
@@ -1023,6 +1092,16 @@ def build_factories(
                 "dir": str(args.capture_river_brgap),
                 "limit": int(args.capture_limit),
                 "nexus_br_gap_expose": os.environ.get("NEXUS_BR_GAP_EXPOSE"),
+            },
+        })
+    if request_recorders:
+        setattr(hero_factory, "_request_recorders", tuple(request_recorders))
+        metadata.update({
+            "solve_request_capture": {
+                "dir": str(args.capture_solve_requests),
+                "limit": int(args.capture_limit),
+                "capture_only": bool(getattr(args, "capture_only", False)),
+                "min_players": int(getattr(args, "capture_min_players", 2)),
             },
         })
     if has_live_source or args.max_wall_s is not None:
@@ -1227,6 +1306,15 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 **metadata,
                 "river_brgap_captured": sum(c.captured for c in river_captures),
                 "river_brgap_skipped": _sum_counts([c.skipped for c in river_captures]),
+            }
+        request_recorders = getattr(hero_factory, "_request_recorders", ())
+        if request_recorders:
+            metadata = {
+                **metadata,
+                "solve_requests_captured": sum(r.captured for r in request_recorders),
+                "solve_requests_skipped": _sum_counts(
+                    [r.skipped for r in request_recorders]
+                ),
             }
         mix_compare = getattr(hero_factory, "_mix_compare", None)
         if mix_compare is not None:

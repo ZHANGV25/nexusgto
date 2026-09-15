@@ -144,6 +144,37 @@ def test_parse_args_river_capture_requires_production(tmp_path):
         cli.parse_args(run_match, base + ["--capture-river-brgap", str(tmp_path / "rv")])
 
 
+def test_parse_args_solve_request_capture_and_player_cap(tmp_path):
+    base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
+    args = cli.parse_args(
+        run_match,
+        base + ["--hero-source", "production", "--capture-solve-requests", str(tmp_path / "rq"),
+                "--capture-only", "--capture-min-players", "4",
+                "--production-max-live-players", "6"],
+    )
+    assert args.capture_solve_requests == str(tmp_path / "rq")
+    assert args.capture_only and args.capture_min_players == 4
+    assert args.production_max_live_players == 6
+    for bad in (
+        ["--capture-solve-requests", str(tmp_path / "rq")],
+        ["--hero-source", "production", "--capture-only"],
+        ["--hero-source", "production", "--capture-min-players", "3"],
+        ["--hero-source", "production", "--production-max-live-players", "7"],
+        ["--production-max-live-players", "4"],
+    ):
+        with pytest.raises(SystemExit):
+            cli.parse_args(run_match, base + bad)
+
+
+def test_production_strategy_raised_player_cap_builds_multiway_sources(monkeypatch):
+    strategy, sources, calls = _production(monkeypatch, max_live_players=6)
+    assert [c[0] for c in calls] == [2, 3, 4, 5, 6]
+    live_by_count = strategy._live_by_count
+    assert all(not isinstance(live_by_count[n], _Lookup) for n in (2, 3, 4, 5, 6))
+    with pytest.raises(ValueError):
+        _production(monkeypatch, max_live_players=7)
+
+
 def test_parse_args_production_live_streets(tmp_path):
     base = ["--mode", "ab", "--out", str(tmp_path), "--field-source", "lookup"]
     args = cli.parse_args(
