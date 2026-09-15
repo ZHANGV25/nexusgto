@@ -136,6 +136,37 @@ def _se(values: Sequence[Any]) -> Optional[float]:
     return float(np.std(clean, ddof=1) / math.sqrt(len(clean)))
 
 
+def cost_fit(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[float]]:
+    """Least-squares ``solve_s = fixed_s + marginal_s * iterations`` over both seeds.
+
+    Every solve pays a fixed cost (thread start, per-solve memo warm-up) that
+    dominates small budgets, so the marginal cost is the slope, not the ratio.
+    Returns the fixed overhead in seconds, the marginal ms per 1k iterations,
+    and the iterations a 3,000 ms budget buys after the overhead.
+    """
+    xs: List[float] = []
+    ys: List[float] = []
+    for row in rows:
+        for solve_key, iter_key in (("solve_s", "iterations_run"), ("solve_s_b", "iterations_run_b")):
+            run, solve_s = row.get(iter_key), row.get(solve_key)
+            if run is not None and solve_s is not None and int(run) > 0:
+                xs.append(float(run))
+                ys.append(float(solve_s))
+    empty = {"fixed_s": None, "marginal_ms_per_kiter": None, "iterations_in_3s": None, "points": len(xs)}
+    if len(xs) < 3 or len(set(xs)) < 2:
+        return empty
+    slope, intercept = np.polyfit(np.asarray(xs), np.asarray(ys), 1)
+    if slope <= 0.0:
+        return empty
+    budget = 3.0 - max(float(intercept), 0.0)
+    return {
+        "fixed_s": float(intercept),
+        "marginal_ms_per_kiter": float(slope) * 1e6,
+        "iterations_in_3s": float(budget / slope) if budget > 0.0 else 0.0,
+        "points": len(xs),
+    }
+
+
 def _rung_costs(rows: Sequence[Mapping[str, Any]]) -> List[float]:
     costs: List[float] = []
     for row in rows:
@@ -155,6 +186,8 @@ def summarize_rung(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "iterations_run": _mean([r.get("iterations_run") for r in rows]),
         "solve_s": _mean([r.get("solve_s") for r in rows]),
         "construct_s": _mean([r.get("construct_s") for r in rows]),
+        "num_nodes": _mean([r.get("num_nodes") for r in rows]),
+        "num_leaf_nodes": _mean([r.get("num_leaf_nodes") for r in rows]),
         "ms_per_kiter": _mean(_rung_costs(rows)),
         "river_brgap_pct_pot": _mean([r.get("river_brgap_pct_pot") for r in rows]),
         "river_brgap_pct_pot_se": _se([r.get("river_brgap_pct_pot") for r in rows]),
@@ -206,9 +239,12 @@ def aggregate_cell(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     plateau = (
         plateau_rung(ladder, floor["mean_tv"]) if floor["mean_tv"] is not None else None
     )
+    ladder_rows = [r for r in rows if str(r["rung"]).startswith("it_")]
     # Median: the first solves of a process can still be paying page faults.
-    costs = _rung_costs([r for r in rows if str(r["rung"]).startswith("it_")])
+    costs = _rung_costs(ladder_rows)
     cost = float(np.median(costs)) if costs else None
+    fit = cost_fit(ladder_rows)
+    marginal = fit["marginal_ms_per_kiter"]
     return {
         "spots": len({r.get("spot") for r in rows}),
         "top_rung": top,
@@ -217,9 +253,10 @@ def aggregate_cell(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "plateau_iterations": plateau,
         "ms_per_kiter": cost,
         "iterations_in_3s": iterations_in(3000.0, cost),
+        "cost_fit": fit,
         "seconds_to_plateau": (
-            (plateau / 1000.0) * cost / 1000.0
-            if plateau is not None and cost is not None
+            float(fit["fixed_s"]) + (plateau / 1000.0) * marginal / 1000.0
+            if plateau is not None and marginal is not None
             else None
         ),
     }

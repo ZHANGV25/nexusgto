@@ -100,6 +100,20 @@ def test_aggregate_cell_uses_the_top_rung_pair_as_floor():
     assert cell["rungs"]["it_100000"]["mean_tv"] is None
 
 
+def test_cost_fit_separates_fixed_and_marginal_cost():
+    rows = [
+        {"iterations_run": 1_000, "solve_s": 1.1, "iterations_run_b": 1_000, "solve_s_b": 1.1},
+        {"iterations_run": 10_000, "solve_s": 2.0, "iterations_run_b": 10_000, "solve_s_b": 2.0},
+        {"iterations_run": 100_000, "solve_s": 11.0, "iterations_run_b": 100_000, "solve_s_b": 11.0},
+    ]
+    fit = m.cost_fit(rows)
+    assert fit["fixed_s"] == pytest.approx(1.0)
+    assert fit["marginal_ms_per_kiter"] == pytest.approx(100.0)
+    assert fit["iterations_in_3s"] == pytest.approx(20_000)
+    assert fit["points"] == 6
+    assert m.cost_fit(rows[:1])["fixed_s"] is None
+
+
 def test_aggregate_groups_by_street_and_players():
     rows = [
         _row("a", "it_10000", 10_000, 10_000, 1.0, 0.1, None, street="flop", n=2),

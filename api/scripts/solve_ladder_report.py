@@ -67,9 +67,12 @@ def render(cells: Mapping[str, Any], failed: Sequence[Mapping[str, Any]]) -> str
     lines: List[str] = []
     for key, cell in cells.items():
         lines.append(f"## {key}: {cell['spots']} spots")
+        fit = cell.get("cost_fit") or {}
         lines.append(
-            f"cost {_fmt(cell['ms_per_kiter'], 2)} ms per 1k iterations; "
-            f"3 s buys {_fmt(cell['iterations_in_3s'], 0)} iterations; "
+            f"cost fit: {_fmt(fit.get('fixed_s'), 2)} s fixed + "
+            f"{_fmt(fit.get('marginal_ms_per_kiter'), 2)} ms per 1k iterations "
+            f"({fit.get('points')} solves); 3 s buys {_fmt(fit.get('iterations_in_3s'), 0)} iterations; "
+            f"median cost {_fmt(cell['ms_per_kiter'], 2)} ms per 1k; "
             f"plateau {cell['plateau_iterations']} iterations "
             f"({_fmt(cell['seconds_to_plateau'], 1)} s) against the {cell['top_rung']} floor"
         )
@@ -79,17 +82,24 @@ def render(cells: Mapping[str, Any], failed: Sequence[Mapping[str, Any]]) -> str
             f"root TV {_fmt(floor['root_tv'])}, hero mix TV {_fmt(floor['hero_mix_tv'])}"
         )
         lines.append("")
+        top = cell["rungs"].get(cell["top_rung"], {}) if cell["top_rung"] else {}
         lines.append(
-            "| rung | spots | iterations run | solve s | ms/1k it | pair TV | TV vs top | "
-            "hero mix pair TV | hero mix TV vs top | river BR-gap % pot | BR-gap avg readout |"
+            f"tree: {_fmt(top.get('num_nodes'), 0)} nodes, {_fmt(top.get('num_leaf_nodes'), 0)} leaves (mean)"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("")
+        lines.append(
+            "| rung | spots | iterations run | solve s | ms/1k it | pair TV all nodes | pair TV root | "
+            "TV vs top all nodes | TV vs top root | hero mix pair TV | hero mix TV vs top | "
+            "river BR-gap % pot | BR-gap avg readout |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for label in sorted(cell["rungs"], key=_rung_order):
             info = cell["rungs"][label]
             lines.append(
                 f"| {label} | {info['spots']} | {_fmt(info['iterations_run'], 0)} | "
                 f"{_fmt(info['solve_s'], 2)} | {_fmt(info['ms_per_kiter'], 2)} | "
-                f"{_pm(info, 'pair_mean_tv')} | {_pm(info, 'mean_tv')} | "
+                f"{_pm(info, 'pair_mean_tv')} | {_pm(info, 'pair_root_tv')} | "
+                f"{_pm(info, 'mean_tv')} | {_pm(info, 'root_tv')} | "
                 f"{_pm(info, 'pair_hero_mix_tv')} | {_pm(info, 'hero_mix_tv')} | "
                 f"{_pm(info, 'river_brgap_pct_pot', 1)} | {_pm(info, 'river_brgap_avg_pct_pot', 1)} |"
             )
