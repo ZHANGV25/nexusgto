@@ -94,6 +94,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="heads-up river spots: add a scalar solve with both readouts at each --avg-rungs budget",
     )
     ap.add_argument("--avg-rungs", type=_parse_ints, default=DEFAULT_AVG_RUNGS)
+    ap.add_argument(
+        "--top-deadline-s", type=float, default=120.0,
+        help="skip a hand whose top rung cannot finish inside this wall (0 = no cap)",
+    )
     ap.add_argument("--threads", type=int, default=8, help="solve threads (production box: 8)")
     ap.add_argument("--limit", type=int, default=None, help="spots per (street, players) cell")
     ap.add_argument(
@@ -370,11 +374,26 @@ class LadderRunner:
         self, record: Mapping[str, Any], rungs: Sequence[int], reference: int,
         production_rung: bool, emit: Callable[[Dict[str, Any]], None],
         river_avg_arm: bool = False, avg_rungs: Sequence[int] = DEFAULT_AVG_RUNGS,
+        top_deadline_ms: Optional[int] = None,
     ) -> None:
-        top = self._pair(record, f"it_{int(reference)}", int(reference), None, False, None, emit)
+        """``top_deadline_ms`` bounds the top rung's solves; a hand whose top rung
+        cannot finish inside it is recorded as slow and its ladder is skipped,
+        so one pathological hand cannot stall a queue."""
         spot = record.get("path", str(record.get("index")))
+        top_rows: List[Dict[str, Any]] = []
+        top = self._pair(
+            record, f"it_{int(reference)}", int(reference), top_deadline_ms, False, None,
+            lambda row: (top_rows.append(row), emit(row)),
+        )
         if top is None:
             emit({"spot": spot, "rung": "done", "reference_failed": True})
+            return
+        if top_deadline_ms is not None and top_rows and (
+            (top_rows[0].get("iterations_run") or 0) < int(reference)
+            or (top_rows[0].get("iterations_run_b") or 0) < int(reference)
+        ):
+            emit({"spot": spot, "rung": "done", "slow": True,
+                  "top_iterations_run": top_rows[0].get("iterations_run")})
             return
         if production_rung:
             self._pair(record, "production", PRODUCTION_ITERATIONS, PRODUCTION_DEADLINE_MS, True, top, emit)
@@ -461,6 +480,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 runner.run_spot(
                     record, args.rungs, args.reference, not args.no_production_rung, emit,
                     river_avg_arm=bool(args.river_avg_arm), avg_rungs=args.avg_rungs,
+                    top_deadline_ms=(
+                        int(args.top_deadline_s * 1000) if args.top_deadline_s > 0 else None
+                    ),
                 )
             except Exception as exc:  # one bad spot must not end the ladder
                 print(f"[ladder] spot failed: {type(exc).__name__}: {exc}", flush=True)
