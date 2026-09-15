@@ -34,6 +34,29 @@ def load_rows(dirs: Sequence[str]) -> List[Dict[str, Any]]:
     return rows
 
 
+def fill_solve_keys(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Rows written before keys existed get theirs from the spot record on disk."""
+    import pickle
+
+    from scripts.solve_ladder_bench import solve_key
+
+    cache: Dict[str, Optional[str]] = {}
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if row.get("solve_key") or not row.get("spot"):
+            out.append(dict(row))
+            continue
+        spot = str(row["spot"])
+        if spot not in cache:
+            try:
+                with open(spot, "rb") as fh:
+                    cache[spot] = solve_key(pickle.load(fh))
+            except (OSError, pickle.UnpicklingError, KeyError):
+                cache[spot] = None
+        out.append({**row, "solve_key": cache[spot]})
+    return out
+
+
 SKIP_RUNGS = ("done", "warmup")
 
 
@@ -66,7 +89,7 @@ def _pm(info: Mapping[str, Any], field: str, digits: int = 3) -> str:
 def render(cells: Mapping[str, Any], failed: Sequence[Mapping[str, Any]]) -> str:
     lines: List[str] = []
     for key, cell in cells.items():
-        lines.append(f"## {key}: {cell['spots']} spots")
+        lines.append(f"## {key}: {cell['spots']} hands")
         fit = cell.get("cost_fit") or {}
         lines.append(
             f"cost fit: {_fmt(fit.get('fixed_s'), 2)} s fixed + "
@@ -121,7 +144,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
-    parts = split_rows(load_rows(args.dirs))
+    parts = split_rows(fill_solve_keys(load_rows(args.dirs)))
     if not parts["solved"]:
         print("no solved ladder rows found")
         return 1

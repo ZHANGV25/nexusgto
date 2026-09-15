@@ -28,6 +28,7 @@ spots. scripts/solve_ladder_report.py aggregates the rows.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -95,6 +96,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--avg-rungs", type=_parse_ints, default=DEFAULT_AVG_RUNGS)
     ap.add_argument("--threads", type=int, default=8, help="solve threads (production box: 8)")
     ap.add_argument("--limit", type=int, default=None, help="spots per (street, players) cell")
+    ap.add_argument(
+        "--all-arms", action="store_true", default=False,
+        help="keep every seat arm of a hand (default: one record per distinct solve problem)",
+    )
     ap.add_argument("--streets", default="flop,turn,river")
     ap.add_argument("--players", type=_parse_ints, default=(2, 3, 4, 5, 6))
     ap.add_argument("--seed-a", type=int, default=0xE5, help="production master seed")
@@ -109,23 +114,46 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def solve_key(record: Mapping[str, Any]) -> str:
+    """Identity of the hand behind a spot: the match replays each deal in six
+    seat arms and, with every seat on the blueprint, the six arms are the same
+    hand with the hero label moved (each arm records the hero at its own
+    decision node of the same street-root solve). The board and player count
+    identify the independent unit."""
+    k = record["kwargs"]
+    blob = json.dumps(
+        [k.get("board_ints"), len(k.get("player_ranges") or ())], default=list,
+    )
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
 def select_spots(
     records: Sequence[Mapping[str, Any]],
     streets: Sequence[str],
     players: Sequence[int],
     limit: Optional[int],
+    distinct: bool = True,
 ) -> List[Mapping[str, Any]]:
-    """Filter by street and player count; cap each cell at ``limit`` spots."""
+    """Filter by street and player count; cap each cell at ``limit`` spots.
+
+    With ``distinct`` (default) only the first record of each solve problem is
+    kept, so a cell's spots are different hands rather than seat arms of one.
+    """
     counts: Dict[Tuple[str, int], int] = {}
+    seen: set = set()
     chosen: List[Mapping[str, Any]] = []
     for record in records:
         key = (str(record["street"]), int(record["n_players"]))
         if key[0] not in streets or key[1] not in players:
             continue
+        identity = solve_key(record)
+        if distinct and identity in seen:
+            continue
         if limit is not None and counts.get(key, 0) >= limit:
             continue
+        seen.add(identity)
         counts = {**counts, key: counts.get(key, 0) + 1}
-        chosen.append(record)
+        chosen.append({**record, "solve_key": identity})
     return chosen
 
 
@@ -198,6 +226,7 @@ class LadderRunner:
     ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Any]:
         row: Dict[str, Any] = {
             "spot": record.get("path", str(record.get("index"))),
+            "solve_key": record.get("solve_key"),
             "street": record["street"],
             "n_players": int(record["n_players"]),
             "rung": label,
@@ -255,11 +284,14 @@ class LadderRunner:
     def _distance(a: Optional[Mapping[str, Any]], b: Optional[Mapping[str, Any]], prefix: str) -> Dict[str, Any]:
         if a is None or b is None:
             return {}
-        distance = sigma_distance(a["sigma"], b["sigma"], b["tree"])
         mix_tv = (
             mix_distance(a["mix"], b["mix"])
             if a["mix"] is not None and b["mix"] is not None else None
         )
+        try:
+            distance = sigma_distance(a["sigma"], b["sigma"], b["tree"])
+        except ValueError as exc:  # readout rows and snapshot hands can disagree
+            return {f"{prefix}hero_mix_tv": mix_tv, f"{prefix}distance_error": str(exc)[:200]}
         return {
             f"{prefix}mean_tv": distance["mean_tv"],
             f"{prefix}root_tv": distance["root_tv"],
@@ -378,7 +410,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     ladder_path = out_dir / "ladder.jsonl"
     streets = [part.strip() for part in args.streets.split(",") if part.strip()]
-    spots = select_spots(load_requests(args.dirs), streets, args.players, args.limit)
+    spots = select_spots(
+        load_requests(args.dirs), streets, args.players, args.limit, distinct=not args.all_arms,
+    )
     done = finished_spots(ladder_path)
     pending = [record for record in spots if record["path"] not in done]
     print(f"[ladder] {len(spots)} spots selected, {len(pending)} pending", flush=True)
@@ -423,10 +457,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             runner.warmup(pending[0], emit)
         for index, record in enumerate(pending, 1):
             print(f"[ladder] spot {index}/{len(pending)}: {record['path']}", flush=True)
-            runner.run_spot(
-                record, args.rungs, args.reference, not args.no_production_rung, emit,
-                river_avg_arm=bool(args.river_avg_arm), avg_rungs=args.avg_rungs,
-            )
+            try:
+                runner.run_spot(
+                    record, args.rungs, args.reference, not args.no_production_rung, emit,
+                    river_avg_arm=bool(args.river_avg_arm), avg_rungs=args.avg_rungs,
+                )
+            except Exception as exc:  # one bad spot must not end the ladder
+                print(f"[ladder] spot failed: {type(exc).__name__}: {exc}", flush=True)
+                emit({"spot": record["path"], "rung": "done", "spot_error": f"{type(exc).__name__}: {exc}"[:300]})
     print("[ladder] finished", flush=True)
     return 0
 

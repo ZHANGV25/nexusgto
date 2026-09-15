@@ -213,6 +213,38 @@ def top_label(rungs: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
     return max(candidates)[1] if candidates else None
 
 
+_NUMERIC_MEAN_FIELDS = (
+    "iterations", "iterations_run", "iterations_run_b", "solve_s", "solve_s_b",
+    "construct_s", "num_nodes", "num_leaf_nodes", "river_brgap_pct_pot",
+    "river_brgap_avg_pct_pot",
+) + PAIR_FIELDS + TOP_FIELDS
+
+
+def collapse_duplicates(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Average rows that share a hand (``solve_key``) and rung into one row.
+
+    Rows without a key are kept as they are. Non-numeric fields come from the
+    first row of the group.
+    """
+    groups: Dict[tuple, List[Mapping[str, Any]]] = {}
+    order: List[tuple] = []
+    for index, row in enumerate(rows):
+        key = (row.get("solve_key") or f"row{index}", str(row.get("rung")))
+        if key not in groups:
+            order.append(key)
+        groups.setdefault(key, []).append(row)
+    out: List[Dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        merged: Dict[str, Any] = {**group[0], "spot": group[0].get("solve_key") or group[0].get("spot")}
+        if len(group) > 1:
+            for field in _NUMERIC_MEAN_FIELDS:
+                merged[field] = _mean([r.get(field) for r in group])
+            merged["arms"] = len(group)
+        out.append(merged)
+    return out
+
+
 def aggregate_cell(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """Summarize ladder rows of one (street, n_players) cell.
 
@@ -220,8 +252,10 @@ def aggregate_cell(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     ``iterations``, per-seed ``iterations_run``/``solve_s`` (``_b`` for seed B),
     the pair distances (``pair_mean_tv``, ``pair_root_tv``,
     ``pair_hero_mix_tv``), the distances to the top rung (``mean_tv``,
-    ``root_tv``, ``hero_mix_tv``) and optional river best-response gaps.
+    ``root_tv``, ``hero_mix_tv``) and optional river best-response gaps. Rows
+    of one hand's seat arms are averaged first so the spread is across hands.
     """
+    rows = collapse_duplicates(rows)
     by_rung: Dict[str, List[Mapping[str, Any]]] = {}
     for row in rows:
         by_rung.setdefault(str(row["rung"]), []).append(row)

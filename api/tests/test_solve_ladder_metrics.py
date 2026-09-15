@@ -114,6 +114,22 @@ def test_cost_fit_separates_fixed_and_marginal_cost():
     assert m.cost_fit(rows[:1])["fixed_s"] is None
 
 
+def test_collapse_duplicates_averages_seat_arms_of_one_hand():
+    rows = [
+        {**_row("a1", "it_10000", 10_000, 10_000, 1.0, 0.1, 0.2), "solve_key": "hand-a"},
+        {**_row("a2", "it_10000", 10_000, 10_000, 3.0, 0.3, 0.4), "solve_key": "hand-a"},
+        {**_row("b1", "it_10000", 10_000, 10_000, 2.0, 0.2, 0.3), "solve_key": "hand-b"},
+        _row("c", "it_10000", 10_000, 10_000, 2.0, 0.2, 0.3),
+    ]
+    merged = m.collapse_duplicates(rows)
+    assert [r["spot"] for r in merged] == ["hand-a", "hand-b", "c"]
+    assert merged[0]["solve_s"] == pytest.approx(2.0)
+    assert merged[0]["pair_mean_tv"] == pytest.approx(0.2)
+    assert merged[0]["arms"] == 2 and "arms" not in merged[1]
+    cell = m.aggregate_cell(rows)
+    assert cell["spots"] == 3
+
+
 def test_aggregate_groups_by_street_and_players():
     rows = [
         _row("a", "it_10000", 10_000, 10_000, 1.0, 0.1, None, street="flop", n=2),
