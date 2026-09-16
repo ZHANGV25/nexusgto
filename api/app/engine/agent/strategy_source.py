@@ -457,6 +457,10 @@ class LiveResolveSource(StrategySource):
         # per-job /v1 source pays stash extraction but dies before consuming it.
         self._belief_carry_override = belief_carry
         self._belief_session = None
+        # NEXUS_RANGE_POSTFLOP_CONDITIONING: blueprint lookup over the loaded
+        # reader (built once) and the last solve's conditioning stats.
+        self._conditioning_lookup_cache = None
+        self.last_range_conditioning = None
         # Same per-call override contract as belief carry. None follows the
         # environment; explicit True/False is used by in-process A/B harnesses.
         self._offtree_add_override = offtree_add
@@ -533,6 +537,42 @@ class LiveResolveSource(StrategySource):
         if bp is not None and hasattr(bp, "get_strategy"):
             return bp.get_strategy
         return None
+
+    def _conditioning_lookup(self, engine) -> "LookupSource":
+        if self._conditioning_lookup_cache is None:
+            reader = getattr(engine, "_blueprint", None)
+            self._conditioning_lookup_cache = LookupSource(
+                ModeConfig(
+                    mode="LOOKUP",
+                    blueprint_path=self._config.blueprint_path,
+                    uniform_on_miss=True,
+                ),
+                reader=reader,
+            )
+        return self._conditioning_lookup_cache
+
+    def _condition_inputs(self, state: GameState, inputs: Dict[str, object], engine):
+        """Apply postflop range conditioning to the solve inputs (research)."""
+        from app.engine.agent import postflop_conditioning
+
+        try:
+            decisions = postflop_conditioning.earlier_street_decisions(state)
+            ranges, stats = postflop_conditioning.condition_player_ranges(
+                decisions, inputs["player_ranges"], inputs["entry_slots"],
+                self._conditioning_lookup(engine).get_mix,
+            )
+        except Exception:
+            logger.warning(
+                "LiveResolveSource: postflop range conditioning FAILED for "
+                "history %s; solving with unconditioned ranges",
+                list(state.postflop_history), exc_info=True,
+            )
+            self.last_range_conditioning = {"error": True}
+            return inputs
+        self.last_range_conditioning = stats
+        if stats.get("players_conditioned"):
+            self.last_range_seeding = f"{self.last_range_seeding}+postflop_conditioning"
+        return dict(inputs, player_ranges=ranges)
 
     def _seat_range_dicts(self, state: GameState, engine):
         """Per-slot in-distribution range weight dicts, or None (→ uniform)."""
@@ -680,6 +720,16 @@ class LiveResolveSource(StrategySource):
 
         inputs = build_solve_inputs(state, range_weight_dicts=range_dicts)
         #   raises LiveResolveUnsupported on terminal / river / mid-street re-entry.
+
+        # Research A/B (2026-09-16, SCOREBOARD_RESULTS section 32): condition
+        # every entry player's range on the earlier-street actions its seat
+        # took, read from the blueprint. Default off; failures fall back to
+        # the unconditioned ranges and are disclosed on the source.
+        from app.engine.agent import postflop_conditioning
+
+        self.last_range_conditioning = None
+        if postflop_conditioning.enabled():
+            inputs = self._condition_inputs(state, inputs, engine)
 
         unequal_solve_kwargs = {}
         if "root_stacks_bb" in inputs:

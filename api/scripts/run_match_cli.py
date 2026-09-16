@@ -322,6 +322,8 @@ class ProductionFallbackSource:
         self.gated = 0
         # Belief-carry engagement read from LiveResolveSource.last_belief_carry.
         self.belief_carry: Dict[str, int] = {}
+        # Postflop range conditioning read from LiveResolveSource.last_range_conditioning.
+        self.range_conditioning: Dict[str, int] = {}
         self.belief_drop_reasons: Dict[str, int] = {}
         # Research: served mix vs blueprint mix at decisions live search served.
         self._mix_compare = mix_compare
@@ -343,11 +345,27 @@ class ProductionFallbackSource:
             return self._lookup.get_mix(state, hero_cards)
         finally:
             self._record_belief_carry()
+            self._record_range_conditioning()
         if self._mix_compare is not None:
             self._mix_compare.add(
                 state, hero_cards, mix, self._lookup.get_mix(state, hero_cards)
             )
         return mix
+
+    def _record_range_conditioning(self) -> None:
+        stats = getattr(self._live, "last_range_conditioning", None)
+        if not isinstance(stats, dict):
+            return
+        events = {"solves": 1}
+        if stats.get("error"):
+            events["errors"] = 1
+        if stats.get("decisions"):
+            events["with_earlier_streets"] = 1
+        events["players_conditioned"] = int(stats.get("players_conditioned", 0))
+        events["players_zero_mass"] = int(stats.get("players_zero_mass", 0))
+        events["lookups"] = int(stats.get("lookups", 0))
+        events["uniform_rows"] = int(stats.get("uniform_rows", 0))
+        self.range_conditioning = _sum_counts([self.range_conditioning, events])
 
     def _record_belief_carry(self) -> None:
         summary = getattr(self._live, "last_belief_carry", None)
@@ -410,6 +428,7 @@ PRODUCTION_ENV_OVERRIDABLE = (
     "NEXUS_VEC_SAMPLED_OPP_HAND",
     "NEXUS_RIVER_AVG_READOUT",
     "NEXUS_RIVER_AVG_ITERATIONS",
+    "NEXUS_RANGE_POSTFLOP_CONDITIONING",
 )
 
 
@@ -1294,6 +1313,9 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                 "production_street_gated": sum(s.gated for s in production_sources),
                 "production_belief_carry": _sum_counts(
                     [s.belief_carry for s in production_sources]
+                ),
+                "production_range_conditioning": _sum_counts(
+                    [s.range_conditioning for s in production_sources]
                 ),
                 "production_belief_drop_reasons": dict(sorted(
                     _sum_counts(
