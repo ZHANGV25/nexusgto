@@ -139,6 +139,13 @@ def _hu_leaf_mirror_enabled() -> bool:
     )
 
 
+COMBO_PRIOR_ENV = "NEXUS_RANGE_COMBO_PRIOR"
+
+
+def _combo_prior_enabled() -> bool:
+    return os.environ.get(COMBO_PRIOR_ENV, "")[:1] in ("1", "t", "T", "y", "Y")
+
+
 def build_solve_inputs(
     state: GameState,
     range_weight_dicts: Optional[List[Dict[str, float]]] = None,
@@ -346,6 +353,17 @@ def build_solve_inputs(
         )
         player_ranges.append([(r[0], r[1], r[2]) for r in grid])
         player_range_metadata.append(metadata)
+    # NEXUS_RANGE_COMBO_PRIOR (research, SCOREBOARD_RESULTS section 34): the
+    # grid conserves each hand CLASS's weight, so per physical combo a pair
+    # (6 combos) carries twice and a suited hand (4) three times the mass of
+    # an offsuit hand (12). Scaling every row by its class's live combo count
+    # restores the deal prior: each combo carries its class's seeded weight.
+    combo_prior = _combo_prior_enabled()
+    if combo_prior:
+        player_ranges = [
+            [(c0, c1, w * float(meta[2])) for (c0, c1, w), meta in zip(rows, row_metadata)]
+            for rows, row_metadata in zip(player_ranges, player_range_metadata)
+        ]
 
     # Chips -> big blinds (CpuEsSolver scales bb by 100 internally).
     pot_bb = float(pot_entry) / BIG_BLIND
@@ -378,6 +396,7 @@ def build_solve_inputs(
         "street_actions": street_actions,
         "n_legal": state.num_legal_actions(),
         "has_to_call": _has_to_call(state),
+        "combo_prior": combo_prior,
     }
     result.update(unequal_stack_inputs)
     return result

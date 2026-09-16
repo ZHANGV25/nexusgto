@@ -461,6 +461,10 @@ class LiveResolveSource(StrategySource):
         # reader (built once) and the last solve's conditioning stats.
         self._conditioning_lookup_cache = None
         self.last_range_conditioning = None
+        # Research hook (section 34): per-combo weights (1326) a driver sets
+        # before a solve to replace the hero's seeded range with its own reach.
+        self.hero_range_override = None
+        self.last_hero_range_override = None
         # Same per-call override contract as belief carry. None follows the
         # environment; explicit True/False is used by in-process A/B harnesses.
         self._offtree_add_override = offtree_add
@@ -572,6 +576,28 @@ class LiveResolveSource(StrategySource):
         self.last_range_conditioning = stats
         if stats.get("players_conditioned"):
             self.last_range_seeding = f"{self.last_range_seeding}+postflop_conditioning"
+        return dict(inputs, player_ranges=ranges)
+
+    def _override_hero_range(self, inputs: Dict[str, object]) -> Dict[str, object]:
+        """Replace the hero's rows with the driver-supplied per-combo reach."""
+        from app.engine.agent.hero_range_override import apply_hero_range
+
+        try:
+            ranges, stats = apply_hero_range(
+                inputs["player_ranges"], inputs["hero_player_idx"],
+                inputs["board_ints"], self.hero_range_override,
+            )
+        except Exception:
+            logger.warning(
+                "LiveResolveSource: hero range override FAILED; solving with "
+                "the seeded hero range", exc_info=True,
+            )
+            self.last_hero_range_override = {"error": True, "applied": False}
+            return inputs
+        self.last_hero_range_override = stats
+        if not stats.get("applied"):
+            return inputs
+        self.last_range_seeding = f"{self.last_range_seeding}+hero_own_reach"
         return dict(inputs, player_ranges=ranges)
 
     def _seat_range_dicts(self, state: GameState, engine):
@@ -730,6 +756,9 @@ class LiveResolveSource(StrategySource):
         self.last_range_conditioning = None
         if postflop_conditioning.enabled():
             inputs = self._condition_inputs(state, inputs, engine)
+        self.last_hero_range_override = None
+        if self.hero_range_override is not None:
+            inputs = self._override_hero_range(inputs)
 
         unequal_solve_kwargs = {}
         if "root_stacks_bb" in inputs:
