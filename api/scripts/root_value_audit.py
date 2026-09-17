@@ -277,11 +277,22 @@ def audit_spot(spot: Dict[str, Any], hero_cards: Tuple[int, int], policy: Any, l
     true_hero = true_reach(spot["decisions"], hero_seat, lookup)
     true_opp = true_reach(spot["decisions"], opp_seat, lookup)
     equities = row_equities(tree, hero_slot, assumed_opp, board, rng, evaluate, equity_runouts)
-    believed = root_action_values(tree, table, sigma, hero_slot) if table is not None else None
+    believed = None
+    believed_error = None
+    if table is not None:
+        try:
+            believed = root_action_values(tree, table, sigma, hero_slot)
+        except ValueError as exc:
+            # Turn trees carry chance and showdown nodes the single-street walk
+            # does not value; the strategy comparison below still applies.
+            believed_error = str(exc)
+    if any(np.asarray(sig).shape[0] != len(tree.player_hands[tree.nodes[ni].player]) for ni, sig in sigma.items()):
+        raise ValueError("solver readout has fewer rows than the hand list")
     result: Dict[str, Any] = {
         "street": int(root.street), "hero_seat": int(hero_seat), "pot": pot, "n_actions": n_actions,
         "preflop_prefix": list(root.preflop_prefix), "postflop_history": list(root.postflop_history),
         "board": board, "hero_rows": int(tree.num_hands[hero_slot]), "table_source": objs.get("table_source"),
+        "believed_error": believed_error,
         "solve": {"iterations": policy.stats.get("solves"), "wall_s": policy.stats.get("solve_wall_s")},
     }
     for label, hero_w, opp_w in (("assumed", assumed_hero, assumed_opp), ("true", true_hero, true_opp)):
