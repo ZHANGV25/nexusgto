@@ -148,6 +148,40 @@ def test_play_hand_against_a_station_is_consistent():
     assert any(d["actor"] == "exploiter" for d in record["decisions"])
 
 
+def _fake_stash(state, n_rows_in_sigma=None, n_actions=2):
+    from types import SimpleNamespace
+
+    from app.services.suit_isomorphism import group_by_canonical
+    from scripts.lbr_core import COMBOS, live_mask
+
+    live = [COMBOS[int(i)] for i in np.nonzero(live_mask(NUT_BOARD))[0]]
+    hands = [(canon[0], canon[1], float(len(members))) for canon, members in group_by_canonical(live, NUT_BOARD)]
+    nodes = [
+        SimpleNamespace(type=0, player=0, children=(1, 2), pot=1000, bets=(0, 0), active=(True, True)),
+        SimpleNamespace(type=2, player=0, children=(), pot=1000, bets=(0, 0), active=(True, True)),
+        SimpleNamespace(type=2, player=0, children=(), pot=1000, bets=(0, 0), active=(True, True)),
+    ]
+    tree = SimpleNamespace(num_players=2, board=tuple(NUT_BOARD), starting_pot=1000, player_hands=[hands, hands], nodes=nodes)
+    rows = len(hands) if n_rows_in_sigma is None else n_rows_in_sigma
+    sigma = np.tile(np.array([[0.25, 0.75]])[:, :n_actions], (rows, 1))
+    return {"tree": tree, "sigma": {0: sigma}}, hands
+
+
+def test_stash_table_maps_every_live_combo_and_guards_row_mismatches():
+    from scripts.lbr_policies import stash_table
+
+    state = river_state()
+    objs, hands = _fake_stash(state)
+    table, reason = stash_table(state, objs)
+    assert reason == "stash" and table.shape == (core.N_COMBOS, 2)
+    live = core.live_mask(NUT_BOARD)
+    assert np.allclose(table[live], [0.25, 0.75]) and np.all(table[~live] == 0.0)
+    short, _ = _fake_stash(state, n_rows_in_sigma=len(hands) - 1)
+    assert stash_table(state, short) == (None, "row_mismatch")
+    wide, _ = _fake_stash(state, n_actions=1)
+    assert stash_table(state, wide) == (None, "n_actions")
+
+
 def test_expected_equals_realized_when_the_range_is_the_actual_hand():
     deal = game.Deal(hole_cards=(AIR_HAND, NUT_HAND, (30, 31), (32, 33), (34, 35), (36, 37)), board=tuple(NUT_BOARD))
     state = river_state()

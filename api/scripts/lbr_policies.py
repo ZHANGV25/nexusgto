@@ -84,7 +84,12 @@ def stash_table(state: Any, objs: Any) -> Tuple[Optional[np.ndarray], str]:
     if sigma.shape[1] != n_legal:
         return None, "n_actions"
     board = list(tree["board"])
-    rows = {(int(c0), int(c1)): i for i, (c0, c1, _w) in enumerate(tree["player_hands"][hero])}
+    hands = tree["player_hands"][hero]
+    if sigma.shape[0] != len(hands):
+        # The solver's readout occasionally drops a row (343 sigma rows for
+        # 344 hands); the node then falls back to the lookup table.
+        return None, "row_mismatch"
+    rows = {(int(c0), int(c1)): i for i, (c0, c1, _w) in enumerate(hands)}
     table = np.zeros((N_COMBOS, n_legal), dtype=np.float64)
     missing = 0
     for index in np.nonzero(live_mask(board))[0]:
