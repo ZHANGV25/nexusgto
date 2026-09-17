@@ -36,6 +36,37 @@ from scripts.root_value_audit import BUCKETS, blueprint_play_to_root, bucket_of,
 PROFILES = ("search_vs_search", "search_vs_blueprint", "blueprint_vs_blueprint", "blueprint_vs_search")
 
 
+def project_blueprint(tree: Any, root: Any, lookup: Any) -> Dict[int, np.ndarray]:
+    """Blueprint strategy per decision node and hand row of a flop or turn tree.
+
+    Unlike river_brgap_capture.project_blueprint_sigma, street-end leaves map
+    to non-terminal states (the next street) and are simply not expanded.
+    """
+    from scripts.river_brgap_capture import _row_mix
+
+    sigma: Dict[int, np.ndarray] = {}
+    pending = [(0, root)]
+    while pending:
+        node_idx, state = pending.pop()
+        node = tree.nodes[node_idx]
+        if node.type != 0:
+            continue
+        if state.terminal or state.to_act_slot is None:
+            raise ValueError(f"decision node {node_idx} reached a terminal state")
+        n_legal = int(state.num_legal_actions())
+        if n_legal != len(node.children):
+            raise ValueError(f"node {node_idx} has {len(node.children)} children, state has {n_legal}")
+        hands = tree.player_hands[node.player]
+        rows = np.full((len(hands), n_legal), 1.0 / n_legal)
+        for row, (c0, c1, weight) in enumerate(hands):
+            if weight <= 0.0:
+                continue
+            rows[row], _missed = _row_mix(lookup, state, (int(c0), int(c1)), n_legal)
+        sigma[node_idx] = rows
+        pending.extend((child, state.advance(action)) for action, child in enumerate(node.children))
+    return sigma
+
+
 def mixed_profile(tree: Any, hero: int, hero_sigma: Dict[int, np.ndarray], opp_sigma: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
     """Decision nodes owned by the hero from ``hero_sigma``, the rest from ``opp_sigma``."""
     profile: Dict[int, np.ndarray] = {}
@@ -60,7 +91,6 @@ def strategy_value(tree: Any, table: np.ndarray, profile: Dict[int, np.ndarray],
 
 def audit_spot(spot: Dict[str, Any], hero_cards: Any, policy: Any, lookup: Any, evaluate: Any,
                rng: np.random.Generator, equity_runouts: int) -> Dict[str, Any]:
-    from scripts.river_brgap_capture import plain_tree, project_blueprint_sigma
     from scripts.root_value_audit import assumed_reach
 
     root = spot["state"]
@@ -72,7 +102,8 @@ def audit_spot(spot: Dict[str, Any], hero_cards: Any, policy: Any, lookup: Any, 
         raise RuntimeError("no fresh eager leaf table for the root")
     tree, table = objs["tree"], objs["table"]
     search_sigma = {int(k): np.asarray(v, dtype=np.float64) for k, v in objs["sigma"].items()}
-    blueprint_sigma, projection = project_blueprint_sigma(plain_tree(tree), root, lookup)
+    blueprint_sigma = project_blueprint(tree, root, lookup)
+    projection = {"nodes": len(blueprint_sigma)}
     profiles = {
         "search_vs_search": mixed_profile(tree, hero, search_sigma, search_sigma),
         "search_vs_blueprint": mixed_profile(tree, hero, search_sigma, blueprint_sigma),

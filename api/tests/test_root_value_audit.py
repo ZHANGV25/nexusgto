@@ -95,6 +95,34 @@ def test_mixed_profile_values_the_root_strategy_under_each_opponent_model():
     assert opp.strategy_value(tree, table, opp.mixed_profile(tree, 0, blueprint, blueprint), 0) == pytest.approx([500.0, 500.0])
 
 
+def test_project_blueprint_covers_flop_decision_nodes_and_skips_leaves():
+    from es_resolver.es_solver import T_DECISION, T_FOLD, T_LEAF
+    from scripts import opponent_model_check as opp
+
+    hands = [(card("A", "c"), card("A", "d"), 1.0), (card("7", "c"), card("2", "d"), 0.0)]
+    nodes = [
+        SimpleNamespace(type=T_DECISION, player=0, children=(1, 2)),
+        SimpleNamespace(type=T_LEAF, player=-1, children=()),
+        SimpleNamespace(type=T_DECISION, player=1, children=(3, 4, 5)),
+        SimpleNamespace(type=T_FOLD, player=0, children=()),
+        SimpleNamespace(type=T_LEAF, player=-1, children=()),
+        SimpleNamespace(type=T_LEAF, player=-1, children=()),  # the raise line is cut at a leaf for this test
+    ]
+    tree = SimpleNamespace(nodes=nodes, player_hands=[hands, hands])
+
+    class _Lookup:
+        def get_mix(self, state, cards):
+            from scripts.lbr_game import action_kinds
+
+            kinds = action_kinds(state)
+            return _Mix({kinds.index("call"): 0.7, len(kinds) - 1: 0.3})
+
+    sigma = opp.project_blueprint(tree, flop_root(), _Lookup())
+    assert set(sigma) == {0, 2}
+    assert sigma[0][0] == pytest.approx([0.7, 0.3]) and sigma[0][1] == pytest.approx([0.5, 0.5])  # zero-weight row stays uniform
+    assert sigma[2][0] == pytest.approx([0.0, 0.7, 0.3])  # facing a bet: fold, call, raise
+
+
 def test_rollout_accounting_check_through_and_bet_lines():
     root = flop_root()
     cards = [(card("5", "s"), card("6", "s")), (card("A", "c"), card("A", "d"))]  # SB straight flush beats BB aces
