@@ -70,6 +70,31 @@ def test_root_action_values_reads_leaves_and_folds():
     assert values[:, 1] == pytest.approx([0.75 * 1000.0 + 0.25 * 1500.0, 0.75 * 1000.0 + 0.25 * -400.0])
 
 
+def test_mixed_profile_values_the_root_strategy_under_each_opponent_model():
+    from es_resolver.es_solver import T_DECISION, T_FOLD, T_LEAF
+    from scripts import opponent_model_check as opp
+
+    hero = [(card("A", "c"), card("A", "d"), 1.0), (card("7", "c"), card("2", "d"), 1.0)]
+    villain = [(card("Q", "c"), card("Q", "d"), 1.0), (card("8", "c"), card("6", "d"), 1.0)]
+    nodes = [
+        SimpleNamespace(type=T_DECISION, player=0, children=(1, 2), pot=1000, bets=(0, 0), leaf_idx=-1),
+        SimpleNamespace(type=T_LEAF, player=-1, children=(), pot=1000, bets=(0, 0), leaf_idx=0),
+        SimpleNamespace(type=T_DECISION, player=1, children=(3, 4), pot=1750, bets=(750, 0), leaf_idx=-1),
+        SimpleNamespace(type=T_FOLD, player=0, children=(), pot=1750, bets=(750, 0), leaf_idx=-1),
+        SimpleNamespace(type=T_LEAF, player=-1, children=(), pot=2500, bets=(750, 750), leaf_idx=1),
+    ]
+    tree = SimpleNamespace(num_players=2, num_hands=[2, 2], player_hands=[hero, villain], nodes=nodes)
+    table = np.zeros((2, 2, 2))
+    table[0, 0], table[1, 0] = [500.0, 500.0], [1000.0, -750.0]
+    search = {0: np.array([[0.0, 1.0], [0.0, 1.0]]), 2: np.array([[0.0, 1.0], [0.0, 1.0]])}   # hero always bets, villain always calls
+    blueprint = {0: np.array([[1.0, 0.0], [1.0, 0.0]]), 2: np.array([[1.0, 0.0], [1.0, 0.0]])}  # hero checks, villain folds
+    profile = opp.mixed_profile(tree, 0, search, blueprint)
+    assert set(profile) == {0, 2} and np.all(profile[0] == search[0]) and np.all(profile[2] == blueprint[2])
+    assert opp.strategy_value(tree, table, opp.mixed_profile(tree, 0, search, search), 0) == pytest.approx([1000.0, -750.0])
+    assert opp.strategy_value(tree, table, profile, 0) == pytest.approx([1000.0, 1000.0])  # bets into a villain who folds
+    assert opp.strategy_value(tree, table, opp.mixed_profile(tree, 0, blueprint, blueprint), 0) == pytest.approx([500.0, 500.0])
+
+
 def test_rollout_accounting_check_through_and_bet_lines():
     root = flop_root()
     cards = [(card("5", "s"), card("6", "s")), (card("A", "c"), card("A", "d"))]  # SB straight flush beats BB aces
