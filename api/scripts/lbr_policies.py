@@ -156,7 +156,9 @@ class SearchPolicy:
         self._bump("solves")
         self._record_own_range()
         objs = getattr(self._engine, "_last_br_gap_objs", None)
-        table, reason = (None, "no_fresh_solve") if objs is None or objs is before else stash_table(state, objs)
+        fresh = objs is not None and objs is not before
+        self.last_objs = objs if fresh else None
+        table, reason = stash_table(state, objs) if fresh else (None, "no_fresh_solve")
         if table is None:
             table = lookup_table(self._lookup, state)
             self._bump("lookup_tables")
