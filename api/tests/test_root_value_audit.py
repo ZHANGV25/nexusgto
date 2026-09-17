@@ -93,6 +93,42 @@ def test_assumed_reach_spreads_rows_over_isomorphic_members():
     assert len(mapping) == int(core.live_mask(BOARD[:3]).sum())
 
 
+def test_leaf_states_follow_every_line_to_the_street_end():
+    from es_resolver.es_solver import T_DECISION, T_FOLD, T_LEAF
+    from scripts import leaf_value_check as leaf
+
+    def node(kind, player, children, leaf_idx=-1):
+        return SimpleNamespace(type=kind, player=player, children=children, leaf_idx=leaf_idx)
+
+    nodes = [
+        node(T_DECISION, 0, (1, 2)),          # hero: check -> 1, bet -> 2
+        node(T_DECISION, 1, (3, 4)),          # opp after check: check -> leaf, bet -> hero
+        node(T_DECISION, 1, (7, 8)),          # opp after bet: fold, call -> leaf
+        node(T_LEAF, -1, (), 0),
+        node(T_DECISION, 0, (5, 6)),          # hero facing bet: fold, call -> leaf
+        node(T_FOLD, 1, ()),
+        node(T_LEAF, -1, (), 1),
+        node(T_FOLD, 0, ()),
+        node(T_LEAF, -1, (), 2),
+    ]
+    tree = SimpleNamespace(nodes=nodes)
+    root = flop_root()
+    leaves = leaf.leaf_states(tree, root)
+    by_line = {entry["line"]: entry for entry in leaves}
+    assert set(by_line) == {"cc", "cbc", "bc"}
+    assert int(by_line["cc"]["state"].street) == 2 and by_line["cc"]["state"].pot == root.pot
+    assert by_line["bc"]["state"].pot == root.pot + 2 * 750 and by_line["bc"]["leaf_idx"] == 2
+    assert [player for _s, player, _a in by_line["cbc"]["decisions"]] == [0, 1, 0]
+
+    class _Lookup:
+        def get_mix(self, state, cards):
+            return _Mix({0: 0.5, 1: 0.5})
+
+    weights = leaf.conditioned_opponent(np.ones(core.N_COMBOS), by_line["cbc"]["decisions"], 1, _Lookup())
+    live = core.live_mask(BOARD[:3])
+    assert np.allclose(weights[live], 0.5) and np.all(weights[~live] == 0.0)  # one opponent decision, board-blocked combos dropped
+
+
 def test_true_reach_multiplies_action_probabilities():
     class _Lookup:
         def get_mix(self, state, cards):

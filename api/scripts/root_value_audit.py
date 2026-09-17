@@ -167,11 +167,9 @@ def root_action_values(tree: Any, table: np.ndarray, sigma: Dict[int, np.ndarray
 # -- true values (blueprint rollouts) ------------------------------------------
 
 
-def rollout(root: Any, action: int, hero_slot: int, cards_by_slot: Sequence[Tuple[int, int]], lookup: Any,
-            rng: np.random.Generator, evaluate: Any) -> float:
-    """Hero's net chips from the root when it takes ``action`` and both then play the blueprint."""
-    state = root.advance(int(action))
-    root_stack = int(root.stacks[hero_slot])
+def play_out(state: Any, hero_slot: int, cards_by_slot: Sequence[Tuple[int, int]], lookup: Any,
+             rng: np.random.Generator, evaluate: Any) -> Tuple[float, int]:
+    """Both players play the blueprint from ``state``; returns (hero award, hero final stack)."""
     while True:
         state = advance_forced(state, frozenset())
         if state.terminal:
@@ -187,7 +185,14 @@ def rollout(root: Any, action: int, hero_slot: int, cards_by_slot: Sequence[Tupl
         rows = np.array([list(state.board) + list(cards_by_slot[hero_slot]), list(state.board) + list(cards_by_slot[opp_slot])], dtype=np.int32)
         strength = evaluate(rows)
         award = float(state.pot) if strength[0] > strength[1] else 0.5 * float(state.pot) if strength[0] == strength[1] else 0.0
-    return award - (root_stack - int(state.stacks[hero_slot]))
+    return award, int(state.stacks[hero_slot])
+
+
+def rollout(root: Any, action: int, hero_slot: int, cards_by_slot: Sequence[Tuple[int, int]], lookup: Any,
+            rng: np.random.Generator, evaluate: Any) -> float:
+    """Hero's net chips from the root when it takes ``action`` and both then play the blueprint."""
+    award, final_stack = play_out(root.advance(int(action)), hero_slot, cards_by_slot, lookup, rng, evaluate)
+    return award - (int(root.stacks[hero_slot]) - final_stack)
 
 
 def sample_pair(rng: np.random.Generator, hero_w: np.ndarray, opp_w: np.ndarray, board: Sequence[int]) -> Optional[Tuple[int, int]]:
