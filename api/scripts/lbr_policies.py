@@ -197,6 +197,7 @@ def build_policy(
     name: str, blueprint_path: str, rng: np.random.Generator, *,
     live_threads: int = 8, env_overrides: Sequence[Tuple[str, str]] = (),
     hero_range: str = "blueprint",
+    iterations_override: Optional[int] = None, deadline_ms_override: Optional[int] = None,
 ) -> Any:
     from app.engine.agent.modes import ModeConfig
     from app.engine.agent.strategy_source import LookupSource
@@ -222,5 +223,6 @@ def build_policy(
     strategy, sources = _production_strategy(
         path=blueprint_path, lookup=lookup, engine=engine, live_config_for_fn=live_config_for,
         num_threads=int(live_threads),
+        iterations_override=iterations_override, deadline_ms_override=deadline_ms_override,
     )
     return SearchPolicy(strategy, engine, lookup, rng, sources, hero_range=hero_range)

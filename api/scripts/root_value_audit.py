@@ -258,6 +258,15 @@ def _pct(values: np.ndarray, pot: float) -> float:
     return 100.0 * float(values.mean()) / pot if values.size else float("nan")
 
 
+SOLVE_STAT_KEYS = ("iterations_run", "solve_s", "num_nodes", "flop_chance", "master_seed")
+
+
+def last_solve_stats(policy: Any) -> Dict[str, Any]:
+    """The engine's stats for the solve that produced the policy's last table."""
+    stats = getattr(getattr(policy, "_engine", None), "_last_solve_stats", None) or {}
+    return {key: stats.get(key) for key in SOLVE_STAT_KEYS if key in stats}
+
+
 def audit_spot(spot: Dict[str, Any], hero_cards: Tuple[int, int], policy: Any, lookup: Any, evaluate: Any,
                rng: np.random.Generator, samples: int, equity_runouts: int) -> Dict[str, Any]:
     root = spot["state"]
@@ -294,6 +303,11 @@ def audit_spot(spot: Dict[str, Any], hero_cards: Tuple[int, int], policy: Any, l
         "board": board, "hero_rows": int(tree.num_hands[hero_slot]), "table_source": objs.get("table_source"),
         "believed_error": believed_error,
         "solve": {"iterations": policy.stats.get("solves"), "wall_s": policy.stats.get("solve_wall_s")},
+        "solve_stats": last_solve_stats(policy),
+        "_tables": {
+            "search": np.asarray(search_table, dtype=np.float32), "blueprint": np.asarray(blueprint_table, dtype=np.float32),
+            "true_hero": np.asarray(true_hero, dtype=np.float32),
+        },
     }
     for label, hero_w, opp_w in (("assumed", assumed_hero, assumed_opp), ("true", true_hero, true_opp)):
         hands, values = rollout_values(root, hero_slot, hero_w, opp_w, n_actions, samples, lookup, rng, evaluate)
@@ -374,6 +388,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--blueprint", default=None)
     ap.add_argument("--live-threads", type=int, default=8)
     ap.add_argument("--production-env", action="append", default=[])
+    ap.add_argument("--deadline-ms", type=int, default=None, help="solve deadline override (research ladder)")
+    ap.add_argument("--iterations", type=int, default=None, help="iteration ceiling override (research ladder)")
+    ap.add_argument("--save-tables", action="store_true", help="write each spot's root tables to tables.npz")
+    ap.add_argument("--max-consecutive-failures", type=int, default=25, help="abort instead of looping on a broken configuration")
     args = ap.parse_args(argv)
     blueprint = args.blueprint or os.environ.get("AGENT_BLUEPRINT_PATH")
     if not blueprint:
@@ -385,13 +403,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from scripts.match_aivat import evaluate_7card_batch
 
     policy = build_policy("production", blueprint, np.random.default_rng(args.seed + 1), live_threads=args.live_threads,
-                          env_overrides=_env_pairs(args.production_env))
+                          env_overrides=_env_pairs(args.production_env),
+                          iterations_override=args.iterations, deadline_ms_override=args.deadline_ms)
     lookup = policy._lookup
     rng = np.random.default_rng(args.seed)
     street = STREET_INDEX[args.street]
     (out_dir / "config.json").write_text(json.dumps({**vars(args), "blueprint": blueprint}, indent=2), encoding="utf-8")
     rows: List[Dict[str, Any]] = []
+    tables: Dict[str, np.ndarray] = {}
     dealt = 0
+    failures_in_a_row = 0
     started = time.perf_counter()
     with (out_dir / "spots.jsonl").open("w", encoding="utf-8") as fh:
         while len(rows) < int(args.spots):
@@ -406,8 +427,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 row = audit_spot(spot, deal.hole_cards[hero_seat], policy, lookup, evaluate_7card_batch, rng, int(args.samples), int(args.equity_runouts))
             except Exception as exc:
                 print(f"[audit] spot failed: {type(exc).__name__}: {exc}", flush=True)
+                failures_in_a_row += 1
+                if failures_in_a_row >= int(args.max_consecutive_failures):
+                    raise SystemExit(f"[audit] {failures_in_a_row} consecutive spot failures; aborting") from exc
                 continue
-            row["deal"] = dealt
+            failures_in_a_row = 0
+            spot_tables = row.get("_tables", {})
+            row = {**{k: v for k, v in row.items() if k != "_tables"}, "deal": dealt}
+            if args.save_tables:
+                tables = {**tables, **{f"{name}_{len(rows)}": arr for name, arr in spot_tables.items()}}
             rows.append(row)
             fh.write(json.dumps(row, default=float) + "\n")
             fh.flush()
@@ -420,10 +448,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             if len(rows) % 10 == 0:
                 (out_dir / "summary.json").write_text(json.dumps(summarize(rows), indent=2, default=float), encoding="utf-8")
+                if tables:
+                    np.savez_compressed(out_dir / "tables.npz", **tables)
     summary = summarize(rows)
     summary["dealt"] = dealt
     summary["wall_s"] = time.perf_counter() - started
     summary["policy_stats"] = dict(policy.stats)
+    if tables:
+        np.savez_compressed(out_dir / "tables.npz", **tables)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
     print(json.dumps(summary, indent=1, default=float))
     return 0
