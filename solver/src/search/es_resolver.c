@@ -2001,7 +2001,12 @@ int es_run(ESResolver *r, int64_t iterations, int num_threads) {
      * iteration and between traverser passes; other paths keep the 4096
      * stride. Without a deadline none of this is consulted. */
     int fine_deadline = (r->vec_oracle != NULL) && (r->deadline_ms > 0);
-    int64_t deadline_mask = fine_deadline ? 0LL : 4095LL;
+    /* Chance-extended trees (2026-09-17): an iteration walks a flop layer
+     * plus sampled turn and river subtrees, so the 4096 stride could overshoot
+     * a 3 s budget by seconds; check every 256 iterations instead. */
+    int chance_deadline = (r->deadline_ms > 0) && r->tree
+                          && r->tree->num_chance_nodes > 0;
+    int64_t deadline_mask = fine_deadline ? 0LL : (chance_deadline ? 255LL : 4095LL);
 
     if (nthreads == 1) {
         /* Deterministic single-thread path (the validated reference). */

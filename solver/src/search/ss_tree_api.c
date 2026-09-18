@@ -97,6 +97,17 @@ static int ss_build_tree_impl(
         const char *tdl = getenv("POKER_TURN_DEPTH_LIMIT");
         tb.turn_depth_limit = (tdl && (tdl[0] == '0' || tdl[0] == 'n' || tdl[0] == 'N'))
                               ? 0 : 1;
+        /* Sampled-card chance subsets (2026-09-17): a flop-root extension
+         * deals POKER_CHANCE_TURN_CARDS turn cards and, per turn card,
+         * POKER_CHANCE_RIVER_CARDS river cards (0/unset = every card), drawn
+         * from POKER_CHANCE_SUBSET_SEED. Keeps the in-tree flop solve's
+         * regret storage near a turn tree's instead of 873k nodes. */
+        const char *ctc = getenv("POKER_CHANCE_TURN_CARDS");
+        const char *crc = getenv("POKER_CHANCE_RIVER_CARDS");
+        const char *css = getenv("POKER_CHANCE_SUBSET_SEED");
+        tb.chance_turn_cards = ctc ? atoi(ctc) : 0;
+        tb.chance_river_cards = crc ? atoi(crc) : 0;
+        if (css) tb.chance_subset_seed = strtoull(css, NULL, 10);
     }
     if (unequal_stack_mode)
         tb.depth_rule_enabled |= STB_MODE_UNEQUAL_STACK;

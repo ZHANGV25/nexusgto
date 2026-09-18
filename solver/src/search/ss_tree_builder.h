@@ -80,6 +80,21 @@ typedef struct SSTreeBuilder {
     int *chance_card_per_child;
     int  chance_card_per_child_len;
     int  chance_card_per_child_cap;
+    /* Sampled-card chance subsets (2026-09-17, in-tree flop solve). When a
+     * FLOP root extends through chance nodes, every turn chance node deals
+     * only `chance_turn_cards` cards (0 = all 49) drawn once per build, and
+     * every river chance node under turn card t deals the same
+     * `chance_river_cards` cards (0 = all 48) drawn once per t. Betting lines
+     * are therefore compared on identical futures, and the resolver's
+     * per-iteration child sampling stays uniform over the subset. Turn-root
+     * trees are never subset (their river extension is unchanged). */
+    int chance_turn_cards;
+    int chance_river_cards;
+    unsigned long long chance_subset_seed;
+    int turn_subset[52];
+    int turn_subset_len;        /* -1 until drawn */
+    int river_subset[52][52];   /* indexed by turn card */
+    int river_subset_len[52];   /* -1 until drawn */
 } SSTreeBuilder;
 
 #define STB_MODE_DEPTH_RULE      0x1

@@ -35,6 +35,71 @@ void stb_init(SSTreeBuilder *tb) {
     tb->chance_card_per_child = NULL;
     tb->chance_card_per_child_len = 0;
     tb->chance_card_per_child_cap = 0;
+    tb->chance_turn_cards = 0;
+    tb->chance_river_cards = 0;
+    tb->chance_subset_seed = 0x5EED5EED5EEDULL;
+    tb->turn_subset_len = -1;
+    for (int t = 0; t < 52; t++) tb->river_subset_len[t] = -1;
+}
+
+/* splitmix64 (the same generator the resolver's chance sampler uses). */
+static unsigned long long stb_splitmix64(unsigned long long *state) {
+    unsigned long long z = (*state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/* Draw `k` distinct cards from `pool` (partial Fisher-Yates), ascending. */
+static int stb_draw_subset(const int *pool, int pool_len, int k,
+                           unsigned long long seed, int *out) {
+    int scratch[52];
+    if (k > pool_len) k = pool_len;
+    for (int i = 0; i < pool_len; i++) scratch[i] = pool[i];
+    unsigned long long state = seed;
+    for (int i = 0; i < k; i++) {
+        int j = i + (int)(stb_splitmix64(&state) % (unsigned long long)(pool_len - i));
+        int tmp = scratch[i]; scratch[i] = scratch[j]; scratch[j] = tmp;
+    }
+    for (int i = 0; i < k; i++) out[i] = scratch[i];
+    for (int i = 1; i < k; i++) {          /* insertion sort, ascending */
+        int v = out[i], j = i - 1;
+        while (j >= 0 && out[j] > v) { out[j + 1] = out[j]; j--; }
+        out[j + 1] = v;
+    }
+    return k;
+}
+
+/* The cards a chance node deals: the whole pool, or (flop-root trees under
+ * the subset config) the shared turn subset / the river subset for this
+ * turn card. Returns the count written to `deal`. */
+static int stb_chance_deal(SSTreeBuilder *tb, const int *board, int num_board,
+                           const int *pool, int pool_len, int *deal) {
+    int want = 0;
+    if (tb->root_street == 3) {
+        if (num_board == 3) want = tb->chance_turn_cards;
+        else if (num_board == 4) want = tb->chance_river_cards;
+    }
+    if (want <= 0 || want >= pool_len) {
+        for (int i = 0; i < pool_len; i++) deal[i] = pool[i];
+        return pool_len;
+    }
+    if (num_board == 3) {
+        if (tb->turn_subset_len < 0)
+            tb->turn_subset_len = stb_draw_subset(
+                pool, pool_len, want, tb->chance_subset_seed ^ 0xF10FF10FULL,
+                tb->turn_subset);
+        for (int i = 0; i < tb->turn_subset_len; i++) deal[i] = tb->turn_subset[i];
+        return tb->turn_subset_len;
+    }
+    int t = board[3];
+    if (tb->river_subset_len[t] < 0)
+        tb->river_subset_len[t] = stb_draw_subset(
+            pool, pool_len, want,
+            tb->chance_subset_seed ^ (0x51E4ULL * (unsigned long long)(t + 1)),
+            tb->river_subset[t]);
+    for (int i = 0; i < tb->river_subset_len[t]; i++) deal[i] = tb->river_subset[t][i];
+    return tb->river_subset_len[t];
 }
 
 static int stb_depth_rule_enabled(const SSTreeBuilder *tb) {
@@ -565,8 +630,14 @@ int build_chance_node(
     int temp_cards[64];
     int nc = 0;
 
-    for (int c = 0; c < 52 && nc < 52; c++) {
-        if (on_board[c]) continue;
+    int pool[52];
+    int pool_len = 0;
+    for (int c = 0; c < 52; c++) if (!on_board[c]) pool[pool_len++] = c;
+    int deal[52];
+    int deal_len = stb_chance_deal(tb, board, num_board, pool, pool_len, deal);
+
+    for (int di = 0; di < deal_len && nc < 52; di++) {
+        int c = deal[di];
 
         int new_board[5];
         for (int i = 0; i < num_board; i++) new_board[i] = board[i];
