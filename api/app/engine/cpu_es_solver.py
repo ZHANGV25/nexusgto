@@ -1287,8 +1287,41 @@ class CpuEsSolver:
             "NEXUS_ALLOW_CHANCE_SOLVE", "1")[:1] in ("1", "t", "T", "y", "Y")
         _want_turn_reach = (n_players == 2 and street == "turn"
                             and _allow_chance_turn)
-        _depth_prev = os.environ.get("POKER_SEARCH_DEPTH")
-        _tdl_prev = os.environ.get("POKER_TURN_DEPTH_LIMIT")
+        # IN-TREE FLOP SOLVE (2026-09-17, SCOREBOARD_RESULTS section 35 /
+        # docs/FLOP_INTREE_PLAN.md). Opt-in: NEXUS_FLOP_CHANCE_SOLVE=1 extends a
+        # heads-up FLOP root through the turn and river in-tree over a sampled
+        # subset of K turn cards and M river cards per turn card (the tree
+        # builder's POKER_CHANCE_* subsets, seeded per solve), so the flop has
+        # no leaf table to best-respond to. Default off: production keeps the
+        # depth-limited flop until the audits say otherwise.
+        _want_flop_chance = (
+            n_players == 2 and street == "flop"
+            and os.environ.get("NEXUS_FLOP_CHANCE_SOLVE", "")[:1]
+            in ("1", "t", "T", "y", "Y")
+        )
+        _window_env: Dict[str, str] = {}
+        self._last_flop_chance = None
+        if _want_turn_reach:
+            _window_env = {"POKER_SEARCH_DEPTH": "full",
+                           "POKER_TURN_DEPTH_LIMIT": "0"}
+        elif _want_flop_chance:
+            _subset_seed = os.environ.get("NEXUS_FLOP_CHANCE_SUBSET_SEED")
+            _window_env = {
+                "POKER_SEARCH_DEPTH": "full",
+                "POKER_FLOP_DEPTH_LIMIT": "0",
+                "POKER_CHANCE_TURN_CARDS":
+                    os.environ.get("NEXUS_FLOP_CHANCE_TURN_CARDS", "8"),
+                "POKER_CHANCE_RIVER_CARDS":
+                    os.environ.get("NEXUS_FLOP_CHANCE_RIVER_CARDS", "6"),
+                "POKER_CHANCE_SUBSET_SEED":
+                    _subset_seed if _subset_seed else str(int(master_seed)),
+            }
+            self._last_flop_chance = {
+                "turn_cards": int(_window_env["POKER_CHANCE_TURN_CARDS"]),
+                "river_cards": int(_window_env["POKER_CHANCE_RIVER_CARDS"]),
+                "subset_seed": int(_window_env["POKER_CHANCE_SUBSET_SEED"]),
+            }
+        _window_prev = {name: os.environ.get(name) for name in _window_env}
         _depth_set = False
         # CONCURRENCY GUARD (2026-06-18): os.environ is process-global and solves
         # run in asyncio.to_thread worker threads. Hold _ENV_MUTATION_LOCK across
@@ -1296,11 +1329,11 @@ class CpuEsSolver:
         # observe a half-set env (or have its restore race ours). Taken ONLY on
         # this opt-in path; the default path (the overwhelming majority of solves)
         # never sets env, never acquires, never serializes. Released in finally.
-        if _want_turn_reach and _depth_prev is None and _tdl_prev is None:
+        if _window_env and all(prev is None for prev in _window_prev.values()):
             _ENV_MUTATION_LOCK.acquire()
             try:
-                os.environ["POKER_SEARCH_DEPTH"] = "full"
-                os.environ["POKER_TURN_DEPTH_LIMIT"] = "0"
+                for name, value in _window_env.items():
+                    os.environ[name] = value
                 _depth_set = True
             except BaseException:
                 _ENV_MUTATION_LOCK.release()
@@ -1332,14 +1365,11 @@ class CpuEsSolver:
             # lock so the next opt-in solve sees the restored env.
             if _depth_set:
                 try:
-                    if _depth_prev is None:
-                        os.environ.pop("POKER_SEARCH_DEPTH", None)
-                    else:
-                        os.environ["POKER_SEARCH_DEPTH"] = _depth_prev
-                    if _tdl_prev is None:
-                        os.environ.pop("POKER_TURN_DEPTH_LIMIT", None)
-                    else:
-                        os.environ["POKER_TURN_DEPTH_LIMIT"] = _tdl_prev
+                    for name, prev in _window_prev.items():
+                        if prev is None:
+                            os.environ.pop(name, None)
+                        else:
+                            os.environ[name] = prev
                 finally:
                     _ENV_MUTATION_LOCK.release()
         try:
@@ -2970,6 +3000,7 @@ class CpuEsSolver:
                 "use_reach": bool(use_reach),
                 "hero_frozen_steps": int(len(_frozen_steps)),
                 "chance_sampled": bool(_chance_sampled),
+                "flop_chance": self._last_flop_chance,
                 "exact_allin_leaves": bool(_exact_allin),
                 "num_nodes": int(_nn),
                 "num_leaf_nodes": int(n_leaf_nodes),
