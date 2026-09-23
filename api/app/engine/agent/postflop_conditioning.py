@@ -91,10 +91,13 @@ def row_members(rows: Sequence[Row], board: Optional[Sequence[int]]) -> List[Lis
     from app.services.suit_isomorphism import canonical_combo, group_by_canonical
 
     board_list = [int(card) for card in board]
-    if any(canonical_combo(int(c0), int(c1), board_list) != (min(int(c0), int(c1)), max(int(c0), int(c1)))
-           for c0, c1, _w in rows):
-        return own
     blocked = set(board_list)
+    # canonical_combo raised on (0, 1) and the whole conditioning fell back); such a row
+    # stands for itself and is not evidence about the grid's form.
+    live_rows = [(int(c0), int(c1)) for c0, c1, _w in rows
+                 if int(c0) not in blocked and int(c1) not in blocked]
+    if any(canonical_combo(c0, c1, board_list) != (min(c0, c1), max(c0, c1)) for c0, c1 in live_rows):
+        return own
     live = [(a, b) for a in range(52) for b in range(a + 1, 52) if a not in blocked and b not in blocked]
     groups = dict(group_by_canonical(live, board_list))
     return [list(groups.get((int(c0), int(c1)), [(int(c0), int(c1))])) for c0, c1, _w in rows]

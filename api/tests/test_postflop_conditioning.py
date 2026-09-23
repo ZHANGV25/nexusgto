@@ -131,3 +131,13 @@ def test_conditioning_averages_the_members_of_a_pooled_row():
     assert stats["lookups"] == len(members)
     legacy, _ = pc.condition_player_ranges([(0, "flop", 1)], ranges, [0], get_mix)
     assert legacy[0][0][2] in (0.0, 2.0)  # the representative-only form is all-or-nothing
+
+
+def test_row_members_tolerates_a_board_colliding_row():
+    # A zero-weight row holding a board card (2c2d on a board with the 2c) must not
+    # abort the grouping: it stands for itself and the live rows still pool.
+    canonical, members = _pooled_group(RAINBOW_RIVER)
+    rows = [(canonical[0], canonical[1], 1.0), (0, 1, 0.0)]  # card 0 (2c) is on RAINBOW_RIVER
+    out = pc.row_members(rows, RAINBOW_RIVER)
+    assert sorted(out[0]) == sorted(members)
+    assert out[1] == [(0, 1)]
