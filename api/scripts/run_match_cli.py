@@ -655,6 +655,13 @@ def parse_args(
         "the rest act on lookup (served: all three)",
     )
     ap.add_argument(
+        "--hero-own-reach",
+        action="store_true",
+        help="research (EVERY_STREET_PLAN B1): solve with the hero's range tracked from the "
+        "strategies it actually played (search tables at live solves, blueprint elsewhere) "
+        "instead of the blueprint stand-in; needs --hero-source production",
+    )
+    ap.add_argument(
         "--capture-river-brgap",
         default=None,
         help="research: pickle heads-up river street-root solves with the "
@@ -763,6 +770,8 @@ def parse_args(
         or args.record_mix_compare
         or args.production_env is not None
     )
+    if args.hero_own_reach and args.hero_source != "production":
+        ap.error("--hero-own-reach needs --hero-source production")
     if production_overrides and "production" not in (
         args.hero_source, args.field_source
     ):
@@ -953,6 +962,7 @@ def build_factories(
         from scripts.mix_compare import MixComparison
 
         mix_compare = MixComparison()
+    hero_production: Optional[Dict[str, Any]] = None
     for role in ("hero", "field"):
         path = role_paths[role]
         source_name = role_sources[role]
@@ -1008,6 +1018,8 @@ def build_factories(
                 river_captures.append(strategy)
             strategy_by_role[role] = strategy
             production_sources.extend(sources)
+            if role == "hero":
+                hero_production = {"lookup": lookup, "engine": production_engine, "sources": tuple(sources)}
             continue
         live_by_count: Dict[int, object] = {}
         for n_players in range(2, 7):
@@ -1067,6 +1079,16 @@ def build_factories(
             "field_style": {"name": field_style, "params": styled.style.as_dict()},
         })
 
+    own_reach_stats = None
+    if bool(getattr(args, "hero_own_reach", False)):
+        from scripts.own_reach import OwnReachStats
+
+        if hero_production is None:
+            raise RuntimeError("--hero-own-reach needs the hero's production source")
+        # The solver exposes the served strategy for every combo (the BR-gap stash).
+        os.environ["NEXUS_BR_GAP_EXPOSE"] = "1"
+        own_reach_stats = OwnReachStats()
+
     def make_factory(role: str) -> Any:
         path = role_paths[role]
         source_name = role_sources[role]
@@ -1074,7 +1096,7 @@ def build_factories(
         mode = "LOOKUP" if source_name == "lookup" else "LIVE_RESOLVE"
 
         def factory(seed: int) -> object:
-            return PokerAgent(
+            agent = PokerAgent(
                 source=strategy,
                 config=ModeConfig(
                     mode=mode,
@@ -1083,11 +1105,22 @@ def build_factories(
                     uniform_on_miss=True,
                 ),
             )
+            if role == "hero" and own_reach_stats is not None:
+                from scripts.own_reach import OwnReachPolicy
+
+                return OwnReachPolicy(
+                    agent, hero_production["lookup"], hero_production["engine"],
+                    hero_production["sources"], own_reach_stats,
+                )
+            return agent
 
         return factory
 
     hero_factory = make_factory("hero")
     field_factory = make_factory("field")
+    if own_reach_stats is not None:
+        setattr(hero_factory, "_own_reach_stats", own_reach_stats)
+        metadata.update({"hero_own_reach": True})
     if tracker is not None:
         setattr(hero_factory, "_solve_wall_tracker", tracker)
         setattr(field_factory, "_solve_wall_tracker", tracker)
@@ -1346,6 +1379,9 @@ def main(runner: Any, argv: Optional[Sequence[str]] = None) -> int:
                     [r.skipped for r in request_recorders]
                 ),
             }
+        own_reach = getattr(hero_factory, "_own_reach_stats", None)
+        if own_reach is not None:
+            metadata = {**metadata, "hero_own_reach_stats": own_reach.as_dict()}
         mix_compare = getattr(hero_factory, "_mix_compare", None)
         if mix_compare is not None:
             mix_compare.write_rows(out / "mix_compare.jsonl")
