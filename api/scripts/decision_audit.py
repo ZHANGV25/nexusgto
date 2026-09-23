@@ -295,14 +295,18 @@ def cmd_score(args: argparse.Namespace) -> int:
                 continue
             per_arm = {}
             table_meta: Dict[str, Any] = {}
+            missing = [arm for arm, _directory in arms if str(spot["spot_id"]) not in tables[arm]]
             for arm, _directory in arms:
-                if str(spot["spot_id"]) not in tables[arm]:
-                    raise RuntimeError(f"missing {arm} table for {spot['spot_id']}")
-                per_arm[arm], table_meta[arm] = tables[arm][str(spot["spot_id"])]
+                if arm not in missing:
+                    per_arm[arm], table_meta[arm] = tables[arm][str(spot["spot_id"])]
+            if not per_arm:
+                print(f"[score] skip spot={spot['spot_id']}: no arm has a table", flush=True)
+                continue
             t0 = time.perf_counter()
             row = score_tables_for_spot(
                 spot, per_arm, lookup, evaluate_7card_batch, rng, int(args.samples)
             )
+            row["missing_arms"] = missing
             row["table_sources"] = {
                 arm: {
                     "table_source": meta.get("table_source"),
