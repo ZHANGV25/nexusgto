@@ -568,6 +568,7 @@ class LiveResolveSource(StrategySource):
             ranges, stats = postflop_conditioning.condition_player_ranges(
                 decisions, inputs["player_ranges"], inputs["entry_slots"],
                 self._conditioning_lookup(engine).get_mix,
+                board=inputs["board_ints"],
             )
         except Exception:
             logger.warning(

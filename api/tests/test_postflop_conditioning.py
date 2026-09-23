@@ -84,3 +84,50 @@ def test_fallback_source_aggregates_conditioning_stats():
         "solves": 1, "with_earlier_streets": 1, "players_conditioned": 2,
         "players_zero_mass": 0, "lookups": 300, "uniform_rows": 4,
     }
+
+
+def _pooled_group(board):
+    """A canonical row on ``board`` that pools several physical combos, and its members."""
+    from app.services.suit_isomorphism import group_by_canonical
+
+    blocked = set(board)
+    live = [(a, b) for a in range(52) for b in range(a + 1, 52) if a not in blocked and b not in blocked]
+    for canonical, members in group_by_canonical(live, board):
+        if len(members) >= 3:
+            return canonical, members
+    raise AssertionError("board pools no suits")
+
+
+RAINBOW_RIVER = [0, 5, 10, 15, 20]  # at most two cards of any suit: no flush, suits pooled
+
+
+def test_row_members_lists_the_pooled_combos_of_an_iso_row():
+    canonical, members = _pooled_group(RAINBOW_RIVER)
+    rows = [(canonical[0], canonical[1], 1.0)]
+    assert sorted(pc.row_members(rows, RAINBOW_RIVER)[0]) == sorted(members)
+    assert pc.row_members(rows, None) == [[canonical]]
+
+
+def test_row_members_does_not_pool_a_grid_of_physical_combos():
+    canonical, members = _pooled_group(RAINBOW_RIVER)
+    other = next(m for m in members if m != canonical)
+    rows = [(canonical[0], canonical[1], 1.0), (other[0], other[1], 1.0)]  # ALL grid: non-canonical row present
+    assert pc.row_members(rows, RAINBOW_RIVER) == [[canonical], [other]]
+
+
+def test_conditioning_averages_the_members_of_a_pooled_row():
+    # A flop decision where only ONE suit variant of the pooled row bets (a flush draw that
+    # bricked by the river): the row keeps 1/len(members) of its weight, not 0 or 1.
+    canonical, members = _pooled_group(RAINBOW_RIVER)
+    drawer = members[-1]
+
+    def get_mix(_state, cards):
+        bet = 1.0 if tuple(cards) == tuple(drawer) else 0.0
+        return _Mix({0: 1.0 - bet, 1: bet})
+
+    ranges = [[(canonical[0], canonical[1], 2.0)]]
+    out, stats = pc.condition_player_ranges([(0, "flop", 1)], ranges, [0], get_mix, board=RAINBOW_RIVER)
+    assert out[0][0][2] == pytest.approx(2.0 / len(members))
+    assert stats["lookups"] == len(members)
+    legacy, _ = pc.condition_player_ranges([(0, "flop", 1)], ranges, [0], get_mix)
+    assert legacy[0][0][2] in (0.0, 2.0)  # the representative-only form is all-or-nothing

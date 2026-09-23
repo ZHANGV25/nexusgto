@@ -15,7 +15,7 @@ tree replays them itself. DEFAULT OFF.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 ENV = "NEXUS_RANGE_POSTFLOP_CONDITIONING"
 Decision = Tuple[int, Any, int]  # (compact slot, state before the action, action index)
@@ -71,15 +71,46 @@ def earlier_street_decisions(state: Any) -> List[Decision]:
     return decisions
 
 
+def row_members(rows: Sequence[Row], board: Optional[Sequence[int]]) -> List[List[Tuple[int, int]]]:
+    """The physical combos each grid row stands for on ``board``.
+
+    The ISO grid pools suits that cannot make a flush on the CURRENT board, but
+    those suits could be flush-relevant on an earlier street (a two-tone flop
+    that bricks): AhKh and AsKs share a river row while their flop strategies
+    differ. Conditioning must therefore weight a row by the mean of its
+    members' action probabilities, not by one representative's (2026-09-23
+    decision audit: the representative form left total-variation 0.1-0.5
+    between the conditioned and the true ranges). Without a board, or for a
+    row whose canonical form is not in the grouping, the row stands for itself.
+    A grid holding any non-canonical row (the measurement-only ALL grid, one
+    row per physical combo) is not pooled, so every row stands for itself.
+    """
+    own = [[(int(c0), int(c1))] for c0, c1, _w in rows]
+    if board is None:
+        return own
+    from app.services.suit_isomorphism import canonical_combo, group_by_canonical
+
+    board_list = [int(card) for card in board]
+    if any(canonical_combo(int(c0), int(c1), board_list) != (min(int(c0), int(c1)), max(int(c0), int(c1)))
+           for c0, c1, _w in rows):
+        return own
+    blocked = set(board_list)
+    live = [(a, b) for a in range(52) for b in range(a + 1, 52) if a not in blocked and b not in blocked]
+    groups = dict(group_by_canonical(live, board_list))
+    return [list(groups.get((int(c0), int(c1)), [(int(c0), int(c1))])) for c0, c1, _w in rows]
+
+
 def condition_player_ranges(
     decisions: Sequence[Decision],
     player_ranges: Sequence[Sequence[Row]],
     entry_slots: Sequence[int],
     get_mix: Callable[[Any, Tuple[int, int]], Any],
+    board: Optional[Sequence[int]] = None,
 ) -> Tuple[List[List[Row]], Dict[str, Any]]:
     """Multiply each player's row weights by the blueprint's probability of the
-    earlier-street actions its seat took. A player whose conditioned range has
-    no mass keeps its unconditioned range (disclosed in the stats)."""
+    earlier-street actions its seat took, averaged over the combos each row
+    stands for on ``board`` (see ``row_members``). A player whose conditioned
+    range has no mass keeps its unconditioned range (disclosed in the stats)."""
     stats: Dict[str, Any] = {
         "decisions": len(decisions), "lookups": 0, "uniform_rows": 0,
         "players_conditioned": 0, "players_zero_mass": 0, "mass_kept": [],
@@ -91,15 +122,24 @@ def condition_player_ranges(
         if not mine:
             out.append([(int(c0), int(c1), float(w)) for c0, c1, w in rows])
             continue
-        factors = [1.0] * len(rows)
-        for _slot, before, action in mine:
-            for index, (c0, c1, weight) in enumerate(rows):
-                if float(weight) <= 0.0 or factors[index] == 0.0:
-                    continue
-                mix = get_mix(before, (int(c0), int(c1)))
-                stats["lookups"] += 1
-                stats["uniform_rows"] += int(bool(getattr(mix, "is_uniform_fallback", False)))
-                factors[index] *= float(mix.freqs.get(int(action), 0.0))
+        members = row_members(rows, board)
+        factors = []
+        for index, (_c0, _c1, weight) in enumerate(rows):
+            if float(weight) <= 0.0:
+                factors.append(0.0)
+                continue
+            member_factors = []
+            for combo in members[index]:
+                factor = 1.0
+                for _slot, before, action in mine:
+                    mix = get_mix(before, combo)
+                    stats["lookups"] += 1
+                    stats["uniform_rows"] += int(bool(getattr(mix, "is_uniform_fallback", False)))
+                    factor *= float(mix.freqs.get(int(action), 0.0))
+                    if factor == 0.0:
+                        break
+                member_factors.append(factor)
+            factors.append(sum(member_factors) / len(member_factors))
         conditioned = [(int(c0), int(c1), float(w) * factors[i]) for i, (c0, c1, w) in enumerate(rows)]
         before_mass = sum(float(w) for _c0, _c1, w in rows)
         after_mass = sum(w for _c0, _c1, w in conditioned)
