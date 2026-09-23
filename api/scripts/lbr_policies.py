@@ -122,6 +122,7 @@ class SearchPolicy:
             "served_row_max_diff": 0.0, "lookup_tables": 0, "hero_range": hero_range,
             "own_range_applied": 0, "own_range_skipped": 0,
         }
+        self.last_table_source_reason: Optional[str] = None
 
     def set_own_range(self, combo_weights: np.ndarray) -> None:
         """Hand the driver's tracked reach to every live source (own-reach mode)."""
@@ -131,6 +132,18 @@ class SearchPolicy:
             live = getattr(source, "_live", None)
             if live is not None:
                 live.hero_range_override = np.asarray(combo_weights, dtype=np.float64)
+
+    def set_range_overrides(self, range_overrides: Optional[Dict[object, np.ndarray]]) -> None:
+        """Hand per-full-seat combo ranges to every live source."""
+        prepared = (
+            None if range_overrides is None else
+            {seat: np.asarray(weights, dtype=np.float64)
+             for seat, weights in range_overrides.items()}
+        )
+        for source in self._sources:
+            live = getattr(source, "_live", None)
+            if live is not None:
+                live.range_overrides = prepared
 
     def _record_own_range(self) -> None:
         for source in self._sources:
@@ -169,6 +182,7 @@ class SearchPolicy:
             diff = max(abs(float(mix.freqs.get(i, 0.0)) - float(row[i])) for i in range(row.shape[0]))
             self.stats = {**self.stats, "served_row_max_diff": max(self.stats["served_row_max_diff"], diff)}
         self._count_source(reason)
+        self.last_table_source_reason = reason
         return mix, table
 
     def table(self, state: Any, cards: Tuple[int, int]) -> np.ndarray:

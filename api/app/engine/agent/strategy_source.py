@@ -465,6 +465,10 @@ class LiveResolveSource(StrategySource):
         # before a solve to replace the hero's seeded range with its own reach.
         self.hero_range_override = None
         self.last_hero_range_override = None
+        # Phase A audit hook: per-full-seat 1326-combo reach overrides. Applied
+        # after all normal seeding/conditioning and after hero_range_override.
+        self.range_overrides = None
+        self.last_range_overrides = None
         # Same per-call override contract as belief carry. None follows the
         # environment; explicit True/False is used by in-process A/B harnesses.
         self._offtree_add_override = offtree_add
@@ -598,6 +602,28 @@ class LiveResolveSource(StrategySource):
         if not stats.get("applied"):
             return inputs
         self.last_range_seeding = f"{self.last_range_seeding}+hero_own_reach"
+        return dict(inputs, player_ranges=ranges)
+
+    def _override_ranges(self, inputs: Dict[str, object]) -> Dict[str, object]:
+        """Replace any configured full-seat ranges with per-combo reach."""
+        from app.engine.agent.hero_range_override import apply_range_overrides
+
+        try:
+            ranges, stats = apply_range_overrides(
+                inputs["player_ranges"], inputs["positions_sorted"],
+                inputs["board_ints"], self.range_overrides,
+            )
+        except Exception:
+            logger.warning(
+                "LiveResolveSource: range overrides FAILED; solving with "
+                "the seeded ranges", exc_info=True,
+            )
+            self.last_range_overrides = {"error": True, "applied": False}
+            return inputs
+        self.last_range_overrides = stats
+        if not stats.get("applied"):
+            return inputs
+        self.last_range_seeding = f"{self.last_range_seeding}+range_override"
         return dict(inputs, player_ranges=ranges)
 
     def _seat_range_dicts(self, state: GameState, engine):
@@ -759,6 +785,9 @@ class LiveResolveSource(StrategySource):
         self.last_hero_range_override = None
         if self.hero_range_override is not None:
             inputs = self._override_hero_range(inputs)
+        self.last_range_overrides = None
+        if self.range_overrides is not None:
+            inputs = self._override_ranges(inputs)
 
         unequal_solve_kwargs = {}
         if "root_stacks_bb" in inputs:
