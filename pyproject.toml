@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexusgto"
+version = "1.0.0"
+description = "Six-max no-limit hold'em: blueprint trainer, search and evaluation tools"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+# The native libraries are built by `make` into solver/build and loaded with
+# ctypes from there, so install in editable mode (pip install -e .).
+[tool.setuptools]
+package-dir = {"app" = "api/app", "scripts" = "api/scripts", "engine" = "solver/python/engine", "es_resolver" = "solver/python/es_resolver"}
+packages = ["app", "app.engine", "app.engine.agent", "app.services", "scripts", "engine", "es_resolver"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "solver/tests", "api/tests"]

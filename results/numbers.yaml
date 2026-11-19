@@ -1,0 +1,965 @@
+# Published NexusGTO numbers, each tied to the data that produced it.
+#
+# `python results/reproduce.py` recomputes every row marked `reproducible: true`
+# from the result files listed in MANIFEST.sha256 and checks it against the
+# value here, at the precision the value is written with.
+#
+# Conventions
+#   value, se    the estimate and its standard error (bb/100 unless `unit` says
+#                otherwise; 100 chips = 1 big blind, 100bb stacks, no rake)
+#   ci95         mean +/- 1.96 SE
+#   deals        independent units behind the estimate. A deal is one set of
+#                cards played in all six seat rotations (match rows) or in both
+#                heads-up seats (LBR rows)
+#   metric       adjusted = AIVAT-adjusted (the published default); raw = without
+#   seeds        master-seed range used; omitted = every seed in the file
+#   data/sha256  the files the row is computed from, and their SHA-256
+#   published    the wording used in prose, when it is a rounding of `value`
+#   corrected_value, corrected_se, corrected_ci95
+#                what the data gives, when a published figure is off; the
+#                published figure stays in value/se/ci95, reproduce.py checks
+#                against the corrected one and prints both. `note` says why
+#   reason       for `reproducible: false`: why the number cannot be recomputed
+#
+# Arms (search configurations; results/README.md maps them to their flags):
+#   blueprint                      the 8.05B blueprint, no search
+#   first_config                   the first search configuration (13 Sep)
+#   flop_only                      search on the flop only, the decision rule's comparator
+#   flop_only_combo_prior          flop-only search with the combo prior, matched to the run below
+#   all_streets_own_range          search on every street with own-range tracking (headline)
+#   all_streets                    the same without own-range tracking
+#   all_streets_serving_candidate  a later candidate without own-range tracking
+#   blueprint_rerun                the blueprint again, seeds 9101-9104 of the nit and
+#                                  maniac fields, rerun on 18 Nov 2026 with this release's
+#                                  code because the original files were lost
+#
+# baseline     for paired rows: the arm subtracted; a list means several arms that
+#              together cover the seeds, each deal taken from exactly one of them
+#
+# Fields (the five opponents): blueprint = five copies of the blueprint;
+# nit and maniac = scripted deviations from it.
+
+rows:
+
+# ── Every-street results, blueprint field, 14,250 deals ─────────────────────
+
+  - id: all_streets_own_range_vs_blueprint
+    fact: "Every-street search with own-range tracking vs the blueprint field"
+    reproducible: true
+    compute: pooled
+    arm: all_streets_own_range
+    field: blueprint
+    metric: adjusted
+    value: 5.73
+    se: 1.53
+    ci95: [2.74, 8.72]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_own_range.blueprint.deal_groups.jsonl.gz]
+    sha256: [4634ac4a869da1303f8c62bfa506351982121d92ba782cf29039bfaff9e14b59]
+
+  - id: all_streets_own_range_vs_blueprint_raw
+    fact: "The headline without AIVAT"
+    reproducible: true
+    compute: pooled
+    arm: all_streets_own_range
+    field: blueprint
+    metric: raw
+    value: 5.14
+    se: 2.15
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_own_range.blueprint.deal_groups.jsonl.gz]
+    sha256: [4634ac4a869da1303f8c62bfa506351982121d92ba782cf29039bfaff9e14b59]
+
+  - id: all_streets_vs_blueprint
+    fact: "Every-street search without own-range tracking (added during the run; same deals and seeds)"
+    reproducible: true
+    compute: pooled
+    arm: all_streets
+    field: blueprint
+    metric: adjusted
+    value: 8.61
+    se: 1.72
+    ci95: [5.24, 11.98]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets.blueprint.deal_groups.jsonl.gz]
+    sha256: [aa0724c59f41892d5ec14f8046c8184acaff44f399f5d2f2b57cf0f482a62a62]
+
+  - id: flop_only_combo_prior_vs_blueprint
+    fact: "Matched flop-only comparator (with the combo prior)"
+    reproducible: true
+    compute: pooled
+    arm: flop_only_combo_prior
+    field: blueprint
+    metric: adjusted
+    value: 2.49
+    se: 1.37
+    deals: 14250
+    unit: bb/100
+    data: [match.flop_only_combo_prior.blueprint.deal_groups.jsonl.gz]
+    sha256: [3c66d34da8cb4e9dcc551a4da4fd958c0aa7b6c4bd1d43cf1f7812dcc4e51f98]
+
+  - id: flop_only_vs_blueprint
+    fact: "Flop-only search vs the blueprint field (the decision rule's comparator)"
+    reproducible: true
+    compute: pooled
+    arm: flop_only
+    field: blueprint
+    metric: adjusted
+    value: 4.11
+    se: 1.37
+    ci95: [1.42, 6.80]
+    deals: 14250
+    unit: bb/100
+    data: [match.flop_only.blueprint.deal_groups.jsonl.gz]
+    sha256: [a2ab0f1ab9697f0a004038c51aaeaa035010ca00b719f93d1c031866272759ed]
+
+  - id: own_range_minus_flop_only_combo_prior
+    fact: "Every-street (own range) minus matched flop-only, paired on deals"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: flop_only_combo_prior
+    field: blueprint
+    metric: adjusted
+    value: 3.24
+    se: 1.64
+    ci95: [0.04, 6.45]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_own_range.blueprint.deal_groups.jsonl.gz, match.flop_only_combo_prior.blueprint.deal_groups.jsonl.gz]
+    sha256: [4634ac4a869da1303f8c62bfa506351982121d92ba782cf29039bfaff9e14b59, 3c66d34da8cb4e9dcc551a4da4fd958c0aa7b6c4bd1d43cf1f7812dcc4e51f98]
+
+  - id: own_range_minus_flop_only
+    fact: "Every-street (own range) minus flop-only, the rule's comparator (lower bound misses the -1.5 margin by 0.11)"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: flop_only
+    field: blueprint
+    metric: adjusted
+    value: 1.62
+    se: 1.65
+    ci95: [-1.61, 4.86]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_own_range.blueprint.deal_groups.jsonl.gz, match.flop_only.blueprint.deal_groups.jsonl.gz]
+    sha256: [4634ac4a869da1303f8c62bfa506351982121d92ba782cf29039bfaff9e14b59, a2ab0f1ab9697f0a004038c51aaeaa035010ca00b719f93d1c031866272759ed]
+
+  - id: all_streets_minus_flop_only_combo_prior
+    fact: "Every-street without own-range tracking minus matched flop-only"
+    reproducible: true
+    compute: paired
+    arm: all_streets
+    baseline: flop_only_combo_prior
+    field: blueprint
+    metric: adjusted
+    value: 6.12
+    se: 1.77
+    ci95: [2.65, 9.59]
+    corrected_ci95: [2.65, 9.58]
+    note: "The exact upper bound is 9.58495 (6.119527 + 1.96 x 1.768073), the same from the original and the repacked files; 9.59 most likely came from rounding the mean and SE before adding (6.12 + 1.96 x 1.77 = 9.589)."
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets.blueprint.deal_groups.jsonl.gz, match.flop_only_combo_prior.blueprint.deal_groups.jsonl.gz]
+    sha256: [aa0724c59f41892d5ec14f8046c8184acaff44f399f5d2f2b57cf0f482a62a62, 3c66d34da8cb4e9dcc551a4da4fd958c0aa7b6c4bd1d43cf1f7812dcc4e51f98]
+
+  - id: all_streets_minus_flop_only
+    fact: "Every-street without own-range tracking minus flop-only (meets the rule's outright clause)"
+    reproducible: true
+    compute: paired
+    arm: all_streets
+    baseline: flop_only
+    field: blueprint
+    metric: adjusted
+    value: 4.50
+    se: 1.79
+    ci95: [0.99, 8.01]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets.blueprint.deal_groups.jsonl.gz, match.flop_only.blueprint.deal_groups.jsonl.gz]
+    sha256: [aa0724c59f41892d5ec14f8046c8184acaff44f399f5d2f2b57cf0f482a62a62, a2ab0f1ab9697f0a004038c51aaeaa035010ca00b719f93d1c031866272759ed]
+
+  - id: own_range_minus_all_streets
+    fact: "Cost of own-range tracking in chips (not significant)"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: all_streets
+    field: blueprint
+    metric: adjusted
+    value: -2.88
+    se: 1.62
+    ci95: [-6.05, 0.30]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_own_range.blueprint.deal_groups.jsonl.gz, match.all_streets.blueprint.deal_groups.jsonl.gz]
+    sha256: [4634ac4a869da1303f8c62bfa506351982121d92ba782cf29039bfaff9e14b59, aa0724c59f41892d5ec14f8046c8184acaff44f399f5d2f2b57cf0f482a62a62]
+
+  - id: own_range_minus_first_config
+    fact: "Every-street (own range) minus the first configuration, paired"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: first_config
+    field: blueprint
+    metric: adjusted
+    seeds: "9101-9108"
+    value: 5.17
+    se: 2.77
+    ci95: [-0.26, 10.60]
+    deals: 6000
+    unit: bb/100
+    data: [match.all_streets_own_range.blueprint.deal_groups.jsonl.gz, match.first_config.blueprint.deal_groups.jsonl.gz]
+    sha256: [4634ac4a869da1303f8c62bfa506351982121d92ba782cf29039bfaff9e14b59, 83ee96cbe0dd52e6f8e46632bf5a62d1bfd24df6af353e33307fca012a582f3e]
+
+  - id: all_streets_minus_first_config
+    fact: "Every-street without own-range tracking minus the first configuration, paired"
+    reproducible: true
+    compute: paired
+    arm: all_streets
+    baseline: first_config
+    field: blueprint
+    metric: adjusted
+    seeds: "9101-9108"
+    value: 6.70
+    se: 3.13
+    ci95: [0.57, 12.83]
+    deals: 6000
+    unit: bb/100
+    data: [match.all_streets.blueprint.deal_groups.jsonl.gz, match.first_config.blueprint.deal_groups.jsonl.gz]
+    sha256: [aa0724c59f41892d5ec14f8046c8184acaff44f399f5d2f2b57cf0f482a62a62, 83ee96cbe0dd52e6f8e46632bf5a62d1bfd24df6af353e33307fca012a582f3e]
+
+  - id: serving_candidate_vs_blueprint
+    fact: "Later candidate without own-range tracking (listed in the all-arms table only; LBR never measured)"
+    reproducible: true
+    compute: pooled
+    arm: all_streets_serving_candidate
+    field: blueprint
+    metric: adjusted
+    value: 6.31
+    se: 1.67
+    ci95: [3.04, 9.59]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_serving_candidate.blueprint.deal_groups.jsonl.gz]
+    sha256: [6c3ad3d410a1b4332e80208f95c95e2404ef4925211c2e192f82314a2b285a0b]
+
+  - id: noise_floor
+    fact: "Noise floor: two nearly identical configurations (both without own-range tracking) on the same deals"
+    reproducible: true
+    compute: paired
+    arm: all_streets_serving_candidate
+    baseline: all_streets
+    field: blueprint
+    metric: adjusted
+    value: -2.30
+    se: 1.37
+    ci95: [-4.98, 0.39]
+    deals: 14250
+    unit: bb/100
+    data: [match.all_streets_serving_candidate.blueprint.deal_groups.jsonl.gz, match.all_streets.blueprint.deal_groups.jsonl.gz]
+    sha256: [6c3ad3d410a1b4332e80208f95c95e2404ef4925211c2e192f82314a2b285a0b, aa0724c59f41892d5ec14f8046c8184acaff44f399f5d2f2b57cf0f482a62a62]
+
+# ── Deviating fields, 6,000 deals ────────────────────────────────────────────
+
+  - id: own_range_minus_flop_only_nit
+    fact: "Nit field: every-street (own range) minus flop-only (met the rule's second clause)"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: flop_only
+    field: nit
+    metric: adjusted
+    value: 2.54
+    se: 1.13
+    ci95: [0.32, 4.76]
+    deals: 6000
+    unit: bb/100
+    data: [match.all_streets_own_range.nit.deal_groups.jsonl.gz, match.flop_only.nit.deal_groups.jsonl.gz]
+    sha256: [a6d36d1e603ddc4b75e689f2bb3e91e2ef2301d2d1eb7a7cc8bec1b2da54fc42, 202a19bd908f3aba002046cf8abd605fc637270d81c9dc9de61c55b3b1a252b6]
+
+  - id: own_range_minus_flop_only_maniac
+    fact: "Maniac field: every-street (own range) minus flop-only"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: flop_only
+    field: maniac
+    metric: adjusted
+    value: 1.3
+    se: 3.9
+    deals: 6000
+    unit: bb/100
+    data: [match.all_streets_own_range.maniac.deal_groups.jsonl.gz, match.flop_only.maniac.deal_groups.jsonl.gz]
+    sha256: [f6bde8685d76ca181ef79f9044f4cc2c9213bbf9f1b91e5a13426ce9aba7b325, 4ffb89e7007a62547b0429f4960895b9cbd9150dba1216580d91193957631345]
+
+  - id: own_range_vs_blueprint_nit
+    fact: "Nit field: every-street (own range) vs the blueprint playing the same seat"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: [blueprint, blueprint_rerun]
+    field: nit
+    metric: adjusted
+    value: 2.53
+    se: 1.09
+    ci95: [0.39, 4.68]
+    deals: 6000
+    unit: bb/100
+    note: "The blueprint's own runs of seeds 9101-9104 in this field were lost with the cloud storage deleted on 5 Oct 2026. They were rerun on 18 Nov 2026 with this release's code (blueprint_rerun; lookup only, so no search randomness): the rerun of the surviving seeds 9105-9108 matched the original files deal by deal, and the pooled figures for 9101-9104 match the figures recorded for the lost runs (+32.26 ± 2.11 nit). The paired result equals the published one."
+    data: [match.all_streets_own_range.nit.deal_groups.jsonl.gz, match.blueprint.nit.deal_groups.jsonl.gz, match.blueprint_rerun.nit.deal_groups.jsonl.gz]
+    sha256: [a6d36d1e603ddc4b75e689f2bb3e91e2ef2301d2d1eb7a7cc8bec1b2da54fc42, 16d025837b22e2bfceadc162adbf857e2ec8f396897992d271ab1727b68bd98e, 5f1185b3ae255e6dcd5dca5c8576ed5f780b404d4e97a16c3c2d68c45eb27d4b]
+
+  - id: own_range_vs_blueprint_maniac
+    fact: "Maniac field: every-street (own range) vs the blueprint playing the same seat"
+    reproducible: true
+    compute: paired
+    arm: all_streets_own_range
+    baseline: [blueprint, blueprint_rerun]
+    field: maniac
+    metric: adjusted
+    value: 19.9
+    se: 5.4
+    deals: 6000
+    unit: bb/100
+    note: "The blueprint's own runs of seeds 9101-9104 in this field were lost with the cloud storage deleted on 5 Oct 2026. They were rerun on 18 Nov 2026 with this release's code (blueprint_rerun; lookup only, so no search randomness): the rerun of the surviving seeds 9105-9108 matched the original files deal by deal, and the pooled figures for 9101-9104 match the figures recorded for the lost runs (+58.53 ± 10.24 maniac). The paired result equals the published one."
+    data: [match.all_streets_own_range.maniac.deal_groups.jsonl.gz, match.blueprint.maniac.deal_groups.jsonl.gz, match.blueprint_rerun.maniac.deal_groups.jsonl.gz]
+    sha256: [f6bde8685d76ca181ef79f9044f4cc2c9213bbf9f1b91e5a13426ce9aba7b325, 3869c7f126f644dfa5275aac1e9d8e81a1cefd5c91d4b95bdcaf51ed34ce6f5a, 8af3273fd029dcccfa792bfcd1e7c4d7127488dc145d5e14871b1df2aede3a1d]
+
+# ── First search configuration (13 Sep) ─────────────────────────────────────
+
+  - id: first_config_vs_blueprint
+    fact: "First search configuration vs the blueprint field (defective range inputs)"
+    reproducible: true
+    compute: pooled
+    arm: first_config
+    field: blueprint
+    metric: adjusted
+    seeds: "9101-9104"
+    value: -3.74
+    se: 3.22
+    ci95: [-10.06, 2.58]
+    deals: 3000
+    unit: bb/100
+    data: [match.first_config.blueprint.deal_groups.jsonl.gz]
+    sha256: [83ee96cbe0dd52e6f8e46632bf5a62d1bfd24df6af353e33307fca012a582f3e]
+
+  - id: first_config_vs_blueprint_raw
+    fact: "First search configuration without AIVAT"
+    reproducible: true
+    compute: pooled
+    arm: first_config
+    field: blueprint
+    metric: raw
+    seeds: "9101-9104"
+    value: -6.89
+    se: 4.02
+    deals: 3000
+    unit: bb/100
+    data: [match.first_config.blueprint.deal_groups.jsonl.gz]
+    sha256: [83ee96cbe0dd52e6f8e46632bf5a62d1bfd24df6af353e33307fca012a582f3e]
+
+  - id: first_config_solves
+    fact: "First configuration: number of searches"
+    reproducible: true
+    compute: solves
+    arm: first_config
+    field: blueprint
+    seeds: "9101-9104"
+    stat: solves
+    value: 8877
+    unit: solves
+    data: [match.first_config.blueprint.summaries.jsonl.gz]
+    sha256: [0af59296e97de7135c3070230b8358ffbede2b7ff98ed4b73d6064ea15247ec7]
+
+  - id: first_config_solve_mean
+    fact: "First configuration: mean search time"
+    reproducible: true
+    compute: solves
+    arm: first_config
+    field: blueprint
+    seeds: "9101-9104"
+    stat: mean_s
+    value: 2.65
+    unit: s
+    data: [match.first_config.blueprint.summaries.jsonl.gz]
+    sha256: [0af59296e97de7135c3070230b8358ffbede2b7ff98ed4b73d6064ea15247ec7]
+
+  - id: first_config_solve_p95
+    fact: "First configuration: p95 search time (median over jobs)"
+    reproducible: true
+    compute: solves
+    arm: first_config
+    field: blueprint
+    seeds: "9101-9104"
+    stat: p95_s_median_over_jobs
+    value: 3.33
+    unit: s
+    data: [match.first_config.blueprint.summaries.jsonl.gz]
+    sha256: [0af59296e97de7135c3070230b8358ffbede2b7ff98ed4b73d6064ea15247ec7]
+
+  - id: first_config_solve_max
+    fact: "First configuration: slowest search"
+    reproducible: true
+    compute: solves
+    arm: first_config
+    field: blueprint
+    seeds: "9101-9104"
+    stat: max_s
+    value: 11.2
+    unit: s
+    data: [match.first_config.blueprint.summaries.jsonl.gz]
+    sha256: [0af59296e97de7135c3070230b8358ffbede2b7ff98ed4b73d6064ea15247ec7]
+
+  - id: first_config_fallback_pct
+    fact: "First configuration: searches that fell back to the blueprint"
+    reproducible: true
+    compute: solves
+    arm: first_config
+    field: blueprint
+    seeds: "9101-9104"
+    stat: fallback_pct
+    value: 1.2
+    unit: "%"
+    data: [match.first_config.blueprint.summaries.jsonl.gz]
+    sha256: [0af59296e97de7135c3070230b8358ffbede2b7ff98ed4b73d6064ea15247ec7]
+
+  - id: ten_second_budget
+    fact: "First configuration: a 10 s budget minus 3 s, paired"
+    reproducible: false
+    value: -2.28
+    se: 2.63
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: first_config_vs_blueprint_nit
+    fact: "First configuration in the nit field, relative to the blueprint"
+    reproducible: false
+    value: -7.31
+    se: 1.78
+    ci95: [-10.79, -3.82]
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: passive_search
+    fact: "Nit field, unopened heads-up flops: the search bet 4.1% vs the blueprint's 46.8% (7,951 decisions)"
+    reproducible: false
+    value: 4.1
+    unit: "% bets"
+    reason: "The decision logs were lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: believed_vs_true_values
+    fact: "Heads-up flop root, 150 spots: correlation of believed and true bet-minus-check values"
+    reproducible: false
+    value: 0.06
+    unit: r
+    reason: "The per-spot values were lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: river_true_range_resolve
+    fact: "599 heads-up river spots: a re-solve given the opponent's true range vs the blueprint"
+    reproducible: false
+    value: 2.74
+    se: 0.33
+    unit: "% of pot"
+    reason: "The per-spot results were lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: earlier_all_streets_run_1
+    fact: "Earlier every-street run with defective ranges"
+    reproducible: false
+    value: -4.5
+    se: 3.9
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: earlier_all_streets_run_2
+    fact: "Earlier every-street run with defective ranges (turn and river only)"
+    reproducible: false
+    value: -4.0
+    se: 3.1
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: earlier_all_streets_run_3
+    fact: "Earlier every-street run with defective ranges"
+    reproducible: false
+    value: -7.1
+    se: 3.8
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+# ── Search statistics (every-street with own-range tracking, blueprint field) ─
+
+  - id: own_range_solves
+    fact: "Number of searches"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: solves
+    value: 38451
+    unit: solves
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_solve_p50
+    fact: "Median search time (median over the 19 jobs)"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: p50_s_median_over_jobs
+    value: 3.01
+    unit: s
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_solve_p95
+    fact: "p95 search time (median over the 19 jobs)"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: p95_s_median_over_jobs
+    value: 3.47
+    unit: s
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_solve_max
+    fact: "Slowest search"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: max_s
+    value: 12.1
+    unit: s
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_overrides
+    fact: "Own-range overrides applied"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: own_range_overrides
+    value: 38953
+    unit: overrides
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_unapplied
+    fact: "Own-range overrides left unapplied"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: own_range_unapplied
+    value: 0
+    unit: overrides
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_fallbacks
+    fact: "Searches that fell back to the blueprint"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: fallbacks
+    value: 907
+    unit: fallbacks
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: own_range_fallback_pct
+    fact: "Fallback rate"
+    reproducible: true
+    compute: solves
+    arm: all_streets_own_range
+    field: blueprint
+    stat: fallback_pct
+    value: 2.36
+    unit: "%"
+    data: [match.all_streets_own_range.blueprint.summaries.jsonl.gz]
+    sha256: [bede2e2c9ac56c261e553aaa953c254676bb128c8d414f5a8c45eb4102a8e708]
+
+  - id: fallbacks_all_in_forced_check
+    fact: "Fallbacks with every stack at 0 (only the forced check is legal)"
+    reproducible: true
+    compute: fallback_causes
+    arm: all_streets_own_range
+    field: blueprint
+    cause: all_in_forced_check
+    value: 417
+    unit: fallbacks
+    data: [match.all_streets_own_range.blueprint.fallback_spots.jsonl.gz]
+    sha256: [75e34be69ad80781a9ca9f52b1a5d331bb3827d5ff6de6f6a79ff3abeb1e3936]
+
+  - id: fallbacks_uniform_real_spots
+    fact: "Fallbacks on an exactly uniform strategy in a real spot"
+    reproducible: true
+    compute: fallback_causes
+    arm: all_streets_own_range
+    field: blueprint
+    cause: uniform_strategy_other
+    value: 120
+    published: "about 120"
+    unit: fallbacks
+    data: [match.all_streets_own_range.blueprint.fallback_spots.jsonl.gz]
+    sha256: [75e34be69ad80781a9ca9f52b1a5d331bb3827d5ff6de6f6a79ff3abeb1e3936]
+
+  - id: fallbacks_second_raise
+    fact: "Fallbacks where the legal set holds a raise the solved tree lacks (multiway, facing a second raise)"
+    reproducible: true
+    compute: fallback_causes
+    arm: all_streets_own_range
+    field: blueprint
+    cause: tree_lacks_legal_raise
+    value: 310
+    corrected_value: 311
+    note: "The data has 311 such spots (263 flop, 48 turn), so the published causes summed to 906 of 907."
+    unit: fallbacks
+    data: [match.all_streets_own_range.blueprint.fallback_spots.jsonl.gz]
+    sha256: [75e34be69ad80781a9ca9f52b1a5d331bb3827d5ff6de6f6a79ff3abeb1e3936]
+
+  - id: fallbacks_past_raise_cap
+    fact: "Fallbacks on histories already past the two-raise cap"
+    reproducible: true
+    compute: fallback_causes
+    arm: all_streets_own_range
+    field: blueprint
+    cause: past_raise_cap
+    value: 52
+    unit: fallbacks
+    data: [match.all_streets_own_range.blueprint.fallback_spots.jsonl.gz]
+    sha256: [75e34be69ad80781a9ca9f52b1a5d331bb3827d5ff6de6f6a79ff3abeb1e3936]
+
+  - id: fallbacks_low_mass
+    fact: "Fallbacks on strategy rows with too little mass"
+    reproducible: true
+    compute: fallback_causes
+    arm: all_streets_own_range
+    field: blueprint
+    cause: low_mass
+    value: 7
+    unit: fallbacks
+    data: [match.all_streets_own_range.blueprint.fallback_spots.jsonl.gz]
+    sha256: [75e34be69ad80781a9ca9f52b1a5d331bb3827d5ff6de6f6a79ff3abeb1e3936]
+
+# ── Exploitability: local best response, heads-up slice ─────────────────────
+# bb/100 won by the exploiter (lower bounds inside the abstraction). A deal is
+# played twice with the seats swapped; the two results are averaged per deal.
+
+  - id: lbr_all_streets_own_range
+    fact: "LBR vs every-street with own-range tracking (range-expected)"
+    reproducible: true
+    compute: lbr
+    arm: all_streets_own_range
+    metric: expected
+    value: 9.2
+    se: 18.6
+    deals: 2000
+    unit: bb/100
+    data: [lbr.all_streets_own_range.hands.jsonl.gz]
+    sha256: [1007ff9d644ab2271e3a26319a5cf492d77624775a5950f9fb90c3524215114f]
+
+  - id: lbr_all_streets_own_range_realized
+    fact: "LBR vs every-street with own-range tracking (realized)"
+    reproducible: true
+    compute: lbr
+    arm: all_streets_own_range
+    metric: realized
+    value: 31.7
+    se: 24.1
+    deals: 2000
+    unit: bb/100
+    data: [lbr.all_streets_own_range.hands.jsonl.gz]
+    sha256: [1007ff9d644ab2271e3a26319a5cf492d77624775a5950f9fb90c3524215114f]
+
+  - id: lbr_all_streets
+    fact: "LBR vs every-street without own-range tracking (range-expected)"
+    reproducible: true
+    compute: lbr
+    arm: all_streets
+    metric: expected
+    value: 64.4
+    se: 17.6
+    deals: 2000
+    unit: bb/100
+    data: [lbr.all_streets.hands.jsonl.gz]
+    sha256: [96762a5d68ed5791f736875ab54f9a9d7b18f0f5153d8e3e314dbfc95af08259]
+
+  - id: lbr_gap
+    fact: "LBR gap: without minus with own-range tracking, paired on deal"
+    reproducible: true
+    compute: lbr_paired
+    arm: all_streets
+    baseline: all_streets_own_range
+    metric: expected
+    pairing: deal
+    value: 55.2
+    se: 21.3
+    ci95: [13.5, 96.9]
+    corrected_se: 21.8
+    corrected_ci95: [12.4, 98.0]
+    note: "21.3 paired the 4,000 seat arms as if independent (row lbr_gap_seat_paired); with the deal as the unit, as in the other LBR rows, the SE is 21.8. Quote about 55 +/- 22."
+    deals: 2000
+    unit: bb/100
+    data: [lbr.all_streets.hands.jsonl.gz, lbr.all_streets_own_range.hands.jsonl.gz]
+    sha256: [96762a5d68ed5791f736875ab54f9a9d7b18f0f5153d8e3e314dbfc95af08259, 1007ff9d644ab2271e3a26319a5cf492d77624775a5950f9fb90c3524215114f]
+
+  - id: lbr_gap_seat_paired
+    fact: "Where the published 21.3 came from: the same gap paired per seat arm (4,000 hands, the two seats of a deal treated as independent)"
+    reproducible: true
+    compute: lbr_paired
+    arm: all_streets
+    baseline: all_streets_own_range
+    metric: expected
+    pairing: seat
+    value: 55.2
+    se: 21.3
+    ci95: [13.5, 96.9]
+    unit: bb/100
+    data: [lbr.all_streets.hands.jsonl.gz, lbr.all_streets_own_range.hands.jsonl.gz]
+    sha256: [96762a5d68ed5791f736875ab54f9a9d7b18f0f5153d8e3e314dbfc95af08259, 1007ff9d644ab2271e3a26319a5cf492d77624775a5950f9fb90c3524215114f]
+
+  - id: lbr_blueprint
+    fact: "LBR vs the blueprint (seed 1, different deals from the search arms)"
+    reproducible: false
+    value: 91.8
+    se: 15.9
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data for seed 1 was not kept; the 4 Oct rerun on the search arms' seats and deals (lbr_blueprint_same_deals) replaces it."
+
+  - id: lbr_blueprint_same_deals
+    fact: "LBR vs the blueprint, rerun 4 Oct on the same deals as the search arms (not in the 3 Oct fact sheet)"
+    reproducible: true
+    compute: lbr
+    arm: blueprint
+    metric: expected
+    value: 114.8
+    se: 21.1
+    ci95: [73.5, 156.0]
+    corrected_se: 21.0
+    note: "The SE is 21.0465; the rerun's summary printed 21.05 and the scoreboard rounded that again to 21.1."
+    deals: 2000
+    unit: bb/100
+    data: [lbr.blueprint.hands.jsonl.gz]
+    sha256: [baedc02b1f40eed9a45aa0dfa167bc55c24ad93bea05f237436b62bdc20c6a66]
+
+  - id: lbr_blueprint_minus_own_range
+    fact: "LBR take: blueprint minus every-street with own-range tracking, paired on deal"
+    reproducible: true
+    compute: lbr_paired
+    arm: blueprint
+    baseline: all_streets_own_range
+    metric: expected
+    value: 105.6
+    se: 24.2
+    ci95: [58.1, 153.1]
+    deals: 2000
+    unit: bb/100
+    data: [lbr.blueprint.hands.jsonl.gz, lbr.all_streets_own_range.hands.jsonl.gz]
+    sha256: [baedc02b1f40eed9a45aa0dfa167bc55c24ad93bea05f237436b62bdc20c6a66, 1007ff9d644ab2271e3a26319a5cf492d77624775a5950f9fb90c3524215114f]
+
+  - id: lbr_blueprint_minus_all_streets
+    fact: "LBR take: blueprint minus every-street without own-range tracking, paired on deal"
+    reproducible: true
+    compute: lbr_paired
+    arm: blueprint
+    baseline: all_streets
+    metric: expected
+    value: 50.4
+    se: 24.9
+    ci95: [1.6, 99.2]
+    deals: 2000
+    unit: bb/100
+    data: [lbr.blueprint.hands.jsonl.gz, lbr.all_streets.hands.jsonl.gz]
+    sha256: [baedc02b1f40eed9a45aa0dfa167bc55c24ad93bea05f237436b62bdc20c6a66, 96762a5d68ed5791f736875ab54f9a9d7b18f0f5153d8e3e314dbfc95af08259]
+
+  - id: lbr_flop_only
+    fact: "LBR vs flop-only search"
+    reproducible: false
+    value: 85.9
+    se: 21.4
+    deals: 2000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+# ── Decision audit: 1,200 turn/river spots from 40,000 self-play deals ───────
+# Each spot is solved by seven configurations and scored against the
+# blueprint's mix with true ranges. Cell-weighted to bb/100; first order.
+
+  - id: audit_deals
+    fact: "Decision audit: blueprint self-play deals sampled from"
+    reproducible: true
+    compute: audit_meta
+    stat: deals
+    value: 40000
+    unit: deals
+    data: [decision_audit.meta.json.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa]
+
+  - id: audit_eligible
+    fact: "Decision audit: eligible turn/river decisions with 2 or 3 players"
+    reproducible: true
+    compute: audit_meta
+    stat: eligible
+    value: 50300
+    unit: decisions
+    data: [decision_audit.meta.json.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa]
+
+  - id: audit_sampled
+    fact: "Decision audit: spots sampled (100 in each of 12 cells)"
+    reproducible: true
+    compute: audit_meta
+    stat: sampled
+    value: 1200
+    unit: spots
+    data: [decision_audit.meta.json.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa]
+
+  - id: audit_true_ranges
+    fact: "Turn/river search with true ranges vs the blueprint's play"
+    reproducible: true
+    compute: audit
+    arm: true_ranges
+    value: 3.51
+    se: 2.00
+    unit: bb/100
+    data: [decision_audit.meta.json.gz, decision_audit.scores.jsonl.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa, ac3218cc85df1fae245606a8ce51d35207fcde5b7165f6218b67007bdd15ce76]
+
+  - id: audit_true_ranges_final_iterate
+    fact: "The same, reading out the final iterate"
+    reproducible: true
+    compute: audit
+    arm: true_ranges_final_iterate
+    value: 4.05
+    se: 2.02
+    unit: bb/100
+    data: [decision_audit.meta.json.gz, decision_audit.scores.jsonl.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa, ac3218cc85df1fae245606a8ce51d35207fcde5b7165f6218b67007bdd15ce76]
+
+  - id: audit_true_ranges_minus_root
+    fact: "Correct ranges vs the old range inputs, paired on spots"
+    reproducible: true
+    compute: audit
+    arm: true_ranges
+    baseline: root_range_leaves
+    value: 4.65
+    se: 1.48
+    unit: bb/100
+    data: [decision_audit.meta.json.gz, decision_audit.scores.jsonl.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa, ac3218cc85df1fae245606a8ce51d35207fcde5b7165f6218b67007bdd15ce76]
+
+  - id: audit_combo_prior_minus_root
+    fact: "The combo prior alone, paired on spots"
+    reproducible: true
+    compute: audit
+    arm: plus_combo_prior
+    baseline: root_range_leaves
+    value: 3.55
+    se: 1.13
+    unit: bb/100
+    data: [decision_audit.meta.json.gz, decision_audit.scores.jsonl.gz]
+    sha256: [939c834b6d4c447c3380c24c9528cd55ee9deaad8846751500fd40920c4fa4aa, ac3218cc85df1fae245606a8ce51d35207fcde5b7165f6218b67007bdd15ce76]
+
+  - id: iterations_hu_turn
+    fact: "Median CFR iterations in the 3 s budget: heads-up turn (root-range arm)"
+    reproducible: true
+    compute: audit_iterations
+    arm: root_range_leaves
+    street: turn
+    players: 2
+    value: 100000
+    published: "98k to 100k (the ceiling)"
+    unit: iterations
+    data: [decision_audit.solve_logs.jsonl.gz]
+    sha256: [f9b6f268ea471249701a0a8073e2b16a55c1a3724ee74e4f523fdc05275c4cc8]
+
+  - id: iterations_hu_river
+    fact: "Median CFR iterations in the 3 s budget: heads-up river (root-range arm)"
+    reproducible: true
+    compute: audit_iterations
+    arm: root_range_leaves
+    street: river
+    players: 2
+    value: 98304
+    published: "98k to 100k (the ceiling)"
+    unit: iterations
+    data: [decision_audit.solve_logs.jsonl.gz]
+    sha256: [f9b6f268ea471249701a0a8073e2b16a55c1a3724ee74e4f523fdc05275c4cc8]
+
+  - id: iterations_3p_river
+    fact: "Median CFR iterations in the 3 s budget: three-player river (root-range arm)"
+    reproducible: true
+    compute: audit_iterations
+    arm: root_range_leaves
+    street: river
+    players: 3
+    value: 73728
+    published: "about 70k"
+    unit: iterations
+    data: [decision_audit.solve_logs.jsonl.gz]
+    sha256: [f9b6f268ea471249701a0a8073e2b16a55c1a3724ee74e4f523fdc05275c4cc8]
+
+  - id: iterations_3p_turn
+    fact: "Median CFR iterations in the 3 s budget: three-player turn (root-range arm)"
+    reproducible: true
+    compute: audit_iterations
+    arm: root_range_leaves
+    street: turn
+    players: 3
+    value: 13332
+    published: "about 13k"
+    unit: iterations
+    data: [decision_audit.solve_logs.jsonl.gz]
+    sha256: [f9b6f268ea471249701a0a8073e2b16a55c1a3724ee74e4f523fdc05275c4cc8]
+
+# ── Evaluation-harness checks ────────────────────────────────────────────────
+
+  - id: aivat_validation
+    fact: "AIVAT validation, 5% random deviator: AIVAT -7.58 +/- 1.26 vs raw -6.89 +/- 1.80; per-deal SD 2.545 to 1.775 bb"
+    reproducible: false
+    value: -7.58
+    se: 1.26
+    deals: 20000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: self_test_small_deviation
+    fact: "Self-test: a blueprint playing a random action 5% of the time (raw)"
+    reproducible: false
+    value: 0.46
+    se: 3.58
+    deals: 3000
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: self_test_large_deviation
+    fact: "Self-test: the same at 20%"
+    reproducible: false
+    value: -41.2
+    se: 8.2
+    unit: bb/100
+    reason: "Per-deal data was lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."
+
+  - id: blueprint_coverage
+    fact: "Blueprint self-play: share of 106,422 lookups that hit trained rows (2,000 deals)"
+    reproducible: false
+    value: 99.70
+    unit: "%"
+    reason: "The self-play lookup logs were lost with the cloud storage deleted on 5 Oct 2026; only the summary table survives."

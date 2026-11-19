@@ -1,0 +1,710 @@
+"""Anchor tests for LiveResolveSource (the LIVE_RESOLVE mode).
+
+LIVE_RESOLVE is the search: a per-decision CPU re-solve. On a
+known 2p flop spot AND a 3p turn spot (plus the turn, river and 6p spots
+below), the resolved strategy must be:
+  - non-degenerate (a real mix or a justified pure action, not empty/garbage),
+  - legal-length (len(mix) == GameState.num_legal_actions()),
+  - mapped back to the agent's action-index vocab (Check/Bet 75% -> indices).
+and the per-decision latency is MEASURED (expected seconds, NOT sub-second).
+
+The engine is CpuEsSolver (the search library's postflop CPU external-sampling
+solver, GPU-free). It builds blueprint-grounded leaf values (on these spots the
+2p-flop table is 99.9% nonzero and the 3p-turn table 98.6%, with no coverage
+substitutions). The river is solved with exact showdown terminals (side pots
+included) and no leaf table.
+
+These tests load a ~12GB blueprint through es_resolver_real (session-scoped,
+once) and SKIP cleanly if it's absent, like the LOOKUP oracle tests.
+"""
+
+from __future__ import annotations
+
+import time
+
+import numpy as np
+import pytest
+
+from app.engine.agent.game_state import new_postflop_state
+from app.engine.agent.modes import ModeConfig
+
+
+def _ci(card: str) -> int:
+    ranks = "AKQJT98765432"
+    so = ("c", "d", "h", "s")
+    return (12 - ranks.index(card[0].upper())) * 4 + so.index(card[1].lower())
+
+
+# ── Session-scoped CpuEsSolver (the heavy 12GB load happens ONCE) ─────────
+
+
+@pytest.fixture(scope="session")
+def cpu_es_engine(blueprint_path):
+    """Construct the CpuEsSolver once for the whole test session.
+
+    Skips if the engine can't be built (no es_resolver_real.dll / blueprint).
+    """
+    try:
+        from app.engine.cpu_es_solver import CpuEsSolver
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"CpuEsSolver not importable: {e}")
+    try:
+        engine = CpuEsSolver(blueprint_path)
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"CpuEsSolver construct failed (no GPU-free ES?): {e}")
+    if not engine.ready:  # pragma: no cover
+        pytest.skip("CpuEsSolver not ready")
+    return engine
+
+
+@pytest.fixture(scope="session")
+def live_source(cpu_es_engine, blueprint_path):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    cfg = ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0)
+    # A low iteration count keeps the anchors fast; they check for a real,
+    # legal mix, not for converged quality.
+    return LiveResolveSource(cfg, cpu_es_solver=cpu_es_engine, iterations=200)
+
+
+# ── ANCHOR: 2p flop ──────────────────────────────────────────────────────
+
+
+def _is_uniform(freqs, n_legal, eps=0.02):
+    """True if the mix is within eps of uniform-over-legal (the placeholder a
+    near-zero-weight / unresolved row collapses to). The anchor must REJECT this
+    so the test distinguishes a real solve from a no-op."""
+    u = 1.0 / n_legal
+    return all(abs(freqs.get(i, 0.0) - u) <= eps for i in range(n_legal))
+
+
+def test_live_resolve_2p_flop_solves_live(live_source):
+    """2p flop (UTG raise, BB call -> flop) SOLVES LIVE, Pluribus-style.
+
+    In the Pluribus paper (Science 2019) a FLOP subgame terminates at a
+    continuation-strategy LEAF at the turn boundary (no in-tree chance node), for
+    ALL player counts. The search library depth-limits the 2p flop by default
+    (POKER_FLOP_DEPTH_LIMIT=1) -> a ~21-node cont-strat-leaf betting tree (sub-ms),
+    IDENTICAL in shape to the 3p+ flop path, with no chance node and no gate.
+    Extending the 2p flop THROUGH an in-tree chance node instead (full turn+river
+    runout, 873k nodes) makes a 20-90 min solve, which is not interactive.
+
+    Assert the real-solve quality (a degenerate/uniform mix would FAIL): a
+    legal-length, non-fallback, sums-to-1 mix that is NOT uniform-over-legal."""
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )  # pot/stacks derived canonically (2p: 600 / 9725 each)
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # flop root, no bet faced: [check, bet]
+
+    t0 = time.time()
+    mix = live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False           # a REAL solve, not the miss fallback
+    assert not _is_uniform(mix.freqs, n_legal)        # not the uniform placeholder
+    assert dt < 30.0                                   # depth-limited flop is sub-second
+    print(f"\n2p-flop live-resolve (Pluribus-faithful): dt={dt:.3f}s mix={mix.freqs}")
+
+
+def test_live_resolve_2p_flop_qjs_checks_with_conditioning(cpu_es_engine, blueprint_path):
+    """2p flop QJs (Qh Jh) on Ah Ks Td (UTG raise / BB call, BB to act): with
+    opponent-range CONDITIONING (default ON) the marginal gutshot+overcards
+    hand CHECKS, matching the blueprint's confident check 0.957.
+
+    REGRESSION GUARD for the over-bet: an un-conditioned cont-strat leaf values
+    QJs's bet vs the FULL preflop range -> bet ~0.99. Conditioning values it vs
+    the bet-CALLING subset -> check ~0.97-0.99 (measured A/B: check OFF=0.002
+    vs ON=0.878@400 / 0.986@800). At 400 iters the conditioned solve is solidly
+    check-heavy; assert check is the majority action so a regression that
+    reintroduces the over-bet (check < 0.05) FAILS here, which structural-only
+    anchors would not catch."""
+    from app.engine.agent.strategy_source import LiveResolveSource
+    # 400 iters: past the uniform warm-up (check is ~0.5 at 50 and 150 iters).
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=400,
+    )
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Ah"), _ci("Ks"), _ci("Td")],
+    )
+    assert st.num_legal_actions() == 2  # [check, bet]
+    mix = src.get_mix(st, hero_cards=(_ci("Qh"), _ci("Jh")))
+    check = mix.freqs.get(0, 0.0)
+    assert mix.is_uniform_fallback is False
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert check > 0.5, (
+        f"2p-flop QJs should CHECK with conditioning (blueprint 0.957), got "
+        f"check={check:.3f} mix={mix.freqs} — the over-bet may have regressed"
+    )
+    print(f"\n2p-flop QJs conditioned (400it): check={check:.3f} mix={mix.freqs}")
+
+
+# ── 2p turn: Pluribus-depth-limited cont-strat-leaf, LIVE by default ─────────
+
+
+def _turn_state():
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h")],
+    )
+    for idx in [0, 0]:  # flop check-through to the turn root: BB chk, UTG chk
+        st = st.advance(idx)
+    assert st.street == 2 and st.num_legal_actions() == 2  # turn root, no bet
+    return st
+
+
+def test_live_resolve_2p_turn_solves_live_depth_limited(cpu_es_engine, blueprint_path, monkeypatch):
+    """2p turn solves LIVE by default via the Pluribus turn depth-limit:
+    the turn terminates at a cont-strat LEAF at the river boundary
+    (POKER_TURN_DEPTH_LIMIT=1, the C default) and is solved live + range-
+    conditioned, exactly like the flop — sub-second, NO chance node, no opt-in.
+    Assert a real, legal-length, non-fallback, non-degenerate mix that is FAST
+    (the multi-second reach-CFR river extension would blow the latency bound)."""
+    from app.engine.agent.strategy_source import LiveResolveSource
+    monkeypatch.delenv("NEXUS_ALLOW_CHANCE_SOLVE", raising=False)
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=400,
+    )
+    st = _turn_state()
+    n_legal = st.num_legal_actions()
+    t0 = time.time()
+    mix = src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False     # a REAL solve, not lookup fallback
+    assert not _is_uniform(mix.freqs, n_legal)  # not the uniform placeholder
+    assert dt < 10.0                            # depth-limited turn is fast (vs reach)
+    print(f"\n2p-turn depth-limited live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+
+
+def test_live_resolve_2p_turn_reach_optin_solves_live(cpu_es_engine, blueprint_path, monkeypatch):
+    """2p turn with NEXUS_ALLOW_CHANCE_SOLVE=1 (the research opt-in) solves the
+    FULL river extension via reach-CFR: the engine sets POKER_SEARCH_DEPTH=full +
+    POKER_TURN_DEPTH_LIMIT=0 so the in-tree chance node is built. Assert a real,
+    legal-length, non-fallback mix (quality is a separate concern — the probe
+    showed it needs more iters than interactive to fully polarize)."""
+    from app.engine.agent.strategy_source import LiveResolveSource
+    monkeypatch.setenv("NEXUS_ALLOW_CHANCE_SOLVE", "1")
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=200,
+    )
+    st = _turn_state()
+    n_legal = st.num_legal_actions()
+    t0 = time.time()
+    mix = src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False    # a REAL reach solve, not lookup
+    assert dt < 60.0                            # reach river extension is slower
+    print(f"\n2p-turn reach-CFR opt-in live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+
+
+# ── ANCHOR: 3p turn ──────────────────────────────────────────────────────
+
+
+def test_live_resolve_3p_turn_anchor(cpu_es_engine, blueprint_path):
+    """3p turn (UTG raise, BTN call, BB call -> flop checks through -> turn):
+    hero=BB resolves a legal-length, real (non-fallback) mix (STRUCTURAL anchor;
+    there is no 3p EV claim, since a 2p-only EV check has no side pots). Hero =
+    99 (in BB's flat-call range).
+
+    NOTE on 3p variance: the CPU-ES solve is multi-thread Hogwild, so at low
+    iters the 3p-turn solve for a near-mixed hand has real run-to-run variance (a
+    hand can land ~0.98/0.02 one run and ~0.55/0.45 another). So the test does
+    NOT assert strict non-uniformity here (a flaky claim for a genuinely
+    close-to-mixed 3p spot); the structural facts (runs GPU-free, legal-length,
+    NOT the uniform-on-miss fallback, sums to 1, measured latency) are the 3p
+    headline. Strict non-uniformity is asserted on the lower-variance 2p anchor.
+    The higher iteration count reduces (does not eliminate) the variance."""
+    from app.engine.agent.strategy_source import LiveResolveSource
+    src = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0),
+        cpu_es_solver=cpu_es_engine, iterations=600,
+    )
+    # The board must carry the TURN card: with a 3-card board the anchor
+    # would silently solve a FLOP (the wrong-street case the board-length
+    # guard rejects).
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h")],
+    )
+    # Walk the flop check-through to the turn root: BB chk, UTG chk, BTN chk.
+    for idx in [0, 0, 0]:
+        st = st.advance(idx)
+    assert st.street == 2  # turn root
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # turn root, no bet faced
+
+    t0 = time.time()
+    mix = src.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert len(mix.freqs) >= 1
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False  # a REAL solve, not the miss fallback
+    assert dt < 120.0
+    print(f"\n3p-turn live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+
+
+# ── Check-through: hero NOT first-to-act extracts the RIGHT (no-bet) node ─
+
+
+def test_live_resolve_check_through_2p_flop_solves_live(live_source):
+    """A 2p flop check-through node (BB checks -> UTG to act, no bet faced)
+    SOLVES LIVE (the Pluribus depth-limit, see
+    test_live_resolve_2p_flop_solves_live). This also exercises the node
+    extraction at a non-first-to-act flop node (UTG to act after BB's check):
+    the engine must resolve the correct no-bet-faced node, not a faced-bet
+    branch. Assert a real, legal-length, non-fallback mix."""
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d")],
+    )
+    st = st.advance(0)  # BB checks -> UTG (the raiser) to act, no bet faced
+    assert st.to_act_slot == 1 and st.facing_bet is False
+    n_legal = st.num_legal_actions()
+
+    mix = live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n2p-flop check-through live-resolve: mix={mix.freqs}")
+
+
+# ── RIVER: exact showdown terminals, no leaf table ────────────────────────
+
+
+def test_live_resolve_3p_river_serves_mix(live_source):
+    """3p RIVER solves live: the river tree
+    terminates in showdown/fold terminals settled natively by the C ES
+    (es_showdown_value, side-pot validated incl. the nh>1 vec gate), and
+    CpuEsSolver bypasses the leaf-table construct fail-loud. The mix must be
+    a legal-shape REAL solve (structural anchor, like the 3p turn anchor)."""
+    st = new_postflop_state(
+        seats=["BB", "UTG", "BTN"], preflop_prefix=[2, 0, 0, 1, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h"), _ci("3c")],
+    )
+    # Walk flop check-through -> turn, turn check-through -> river root.
+    for idx in [0, 0, 0, 0, 0, 0]:
+        st = st.advance(idx)
+    assert st.street == 3  # river root
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # river root, no bet faced
+
+    t0 = time.time()
+    mix = live_source.get_mix(st, hero_cards=(_ci("9h"), _ci("9c")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert len(mix.freqs) >= 1
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False  # a REAL solve, not the miss fallback
+    # River skips the leaf-table construct -> should be FASTER than flop/turn.
+    assert dt < 120.0
+    print(f"\n3p-river live-resolve: dt={dt:.2f}s mix={mix.freqs}")
+
+
+def test_live_resolve_2p_river_faced_bet_replay(live_source):
+    """2p river FACED BET: BB bets the river, UTG faces it — the street
+    replay walks the bet inside the solved RIVER tree to UTG's 3-action
+    {fold, call, raise} node. Proves hero_replay works on the new street."""
+    st = new_postflop_state(
+        seats=["BB", "UTG"], preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Qs"), _ci("Js"), _ci("2d"), _ci("7h"), _ci("3c")],
+    )
+    # flop check-check -> turn check-check -> river: BB bets (idx 1).
+    for idx in [0, 0, 0, 0, 1]:
+        st = st.advance(idx)
+    assert st.street == 3
+    assert st.to_act_slot == 1  # UTG
+    assert st.facing_bet is True
+    n_legal = st.num_legal_actions()
+    assert n_legal == 3  # [fold, call, raise]
+
+    mix = live_source.get_mix(st, hero_cards=(_ci("Ah"), _ci("Qh")))
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n2p-river faced-bet live-resolve: mix={mix.freqs}")
+
+
+# -- 6p vec-Linear-FINAL: the multiway re-solve path ------------------------
+#
+# These exercise the 6p path end-to-end through the live loop surface:
+# GameState -> build_solve_inputs (street-entry reconstruction + street
+# replay actions) -> CpuEsSolver.solve(vec_mode=1, readout="final",
+# hero_replay) -> label->index mix. vec-Linear-FINAL is the validated multiway
+# configuration. Iteration counts here are SMALL:
+# these validate the PATH (correct node, legal mix), not solve quality.
+
+
+@pytest.fixture(scope="session")
+def live_source_6p(cpu_es_engine, blueprint_path):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    cfg = ModeConfig(mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0)
+    return LiveResolveSource(
+        cfg, cpu_es_solver=cpu_es_engine, iterations=2000,
+        vec_mode=True, readout="final", num_threads=2,
+    )
+
+
+def _state_6p_flop():
+    # 6p single-open line: UTG opens 0.7x, everyone (incl. blinds) flat-calls.
+    # Canonical chips derived (single open + calls). Flop order is SB-first.
+    return new_postflop_state(
+        seats=["SB", "BB", "UTG", "MP", "CO", "BTN"],
+        preflop_prefix=[2, 1, 1, 1, 1, 1],
+        board=[_ci("Ah"), _ci("Kh"), _ci("2c")],
+    )
+
+
+def test_live_resolve_6p_checkline_vec_final(live_source_6p, monkeypatch):
+    """6p flop, checked to CO (4 checks replayed): the hero's node is reached
+    by street replay; the mix is over the no-bet vocab and is a REAL solve."""
+    # The default configuration refuses live re-solves with 4+ players
+    # (NEXUS_MAX_LIVE_RESOLVE_PLAYERS, default 3); this test measures the
+    # multiway path, so it raises the cap.
+    monkeypatch.setenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", "6")
+    st = _state_6p_flop()
+    for idx in [0, 0, 0, 0]:  # SB, BB, UTG, MP check
+        st = st.advance(idx)
+    assert st.to_act_slot == 4  # CO
+    assert st.facing_bet is False
+    n_legal = st.num_legal_actions()
+    assert n_legal == 2  # [check, bet 0.75]
+
+    t0 = time.time()
+    mix = live_source_6p.get_mix(st, hero_cards=(_ci("Qh"), _ci("Jh")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n6p check-line vec-final: dt={dt:.1f}s mix={mix.freqs}")
+
+
+def test_live_resolve_6p_faced_bet_vec_final(live_source_6p, monkeypatch):
+    """6p flop FACED BET: SB/BB check, UTG bets, MP folds, CO calls, BTN to
+    act facing the bet. The replay walks check/check/bet/fold/call inside the
+    solved tree to BTN's faced-bet node -- the mix must be over the 3-action
+    {fold, call, raise} vocab."""
+    # The default configuration refuses live re-solves with 4+ players
+    # (NEXUS_MAX_LIVE_RESOLVE_PLAYERS, default 3); this test measures the
+    # multiway path, so it raises the cap.
+    monkeypatch.setenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", "6")
+    st = _state_6p_flop()
+    for idx in [0, 0, 1, 0, 1]:  # SB chk, BB chk, UTG bet, MP fold, CO call
+        st = st.advance(idx)
+    assert st.to_act_slot == 5  # BTN
+    assert st.facing_bet is True
+    n_legal = st.num_legal_actions()
+    assert n_legal == 3  # [fold, call, raise]
+
+    t0 = time.time()
+    mix = live_source_6p.get_mix(st, hero_cards=(_ci("Ad"), _ci("Kd")))
+    dt = time.time() - t0
+
+    assert set(mix.freqs.keys()) <= set(range(n_legal))
+    assert abs(sum(mix.freqs.values()) - 1.0) < 1e-9
+    assert mix.is_uniform_fallback is False
+    print(f"\n6p faced-bet vec-final: dt={dt:.1f}s mix={mix.freqs}")
+
+
+# ── Off-tree add-action + replay (real C tree, full blueprint only) ───────
+
+
+def _offtree_base_state():
+    return new_postflop_state(
+        seats=["SB", "BB", "UTG", "MP"],
+        preflop_prefix=[1, 1, 0, 0, 1, 0],
+        board=[_ci("Ah"), _ci("8s"), _ci("3c")],
+    )
+
+
+def _offtree_hu_state():
+    return new_postflop_state(
+        seats=["BB", "UTG"],
+        preflop_prefix=[2, 0, 0, 0, 0, 1],
+        board=[_ci("Ah"), _ci("8s"), _ci("3c")],
+    )
+
+
+def _offtree_fraction_for_increment(state, increment):
+    slot = int(state.to_act_slot)
+    pot = int(state.pot)
+    to_call = max(0, int(state.current_bet) - int(state.street_bets[slot]))
+    if to_call == 0:
+        return (float(increment) + 0.5) / float(pot)
+    return (
+        float(increment - to_call) + 0.5
+    ) / float(pot + to_call)
+
+
+def _offtree_faithful_increment(state, target_fraction):
+    slot = int(state.to_act_slot)
+    pot = int(state.pot)
+    to_call = max(0, int(state.current_bet) - int(state.street_bets[slot]))
+    stack = int(state.stacks[slot])
+    denominator = pot if to_call == 0 else pot + to_call
+    base = int(float(target_fraction) * denominator) + to_call
+    canonical = state._surviving_raise_amounts(slot)
+    for offset in sorted(range(-32, 33), key=lambda value: (abs(value), value)):
+        amount = base + offset
+        if amount <= to_call or amount >= stack:
+            continue
+        fraction = _offtree_fraction_for_increment(state, amount)
+        rebuilt = (
+            int(fraction * pot)
+            if to_call == 0
+            else to_call + int(fraction * (pot + to_call))
+        )
+        if rebuilt != amount:
+            continue
+        if any(abs(amount - existing) <= 1 for existing in canonical):
+            continue
+        return amount
+    raise AssertionError("could not construct an exact-chip off-tree raise")
+
+
+def test_offtree_real_projection_discloses_unmergeable_added_mass():
+    from app.engine.cpu_es_solver import CpuEsSolver
+    from app.engine.offtree_replay import AddedChild, NodeProjection
+
+    # A commitment-pruned hero node has only fold/call base children, while
+    # the global extension still exposes one richer-tree raise column.
+    projection = NodeProjection(
+        base_child_indices=(0, 1),
+        base_raise_targets=(),
+        added_children=(AddedChild(child_index=2, fraction=1.4),),
+        base_action_labels=("Fold", "Call"),
+    )
+    sigma = np.asarray(
+        [[0.2, 0.3, 0.5], [0.0, 0.0, 0.0]], dtype=np.float64,
+    )
+
+    projected, merged, dropped, reasons = (
+        CpuEsSolver.__new__(CpuEsSolver)._project_offtree_strategy(
+            sigma, projection
+        )
+    )
+
+    assert projected[0].tolist() == pytest.approx([0.4, 0.6])
+    assert projected[1].tolist() == pytest.approx([0.0, 0.0])
+    assert merged == {0: 0.0, 1: 0.0}
+    assert dropped == {0: 0.5}
+    assert reasons == {0: "no_base_raise_child"}
+
+
+def test_offtree_flag_on_zero_event_uses_one_base_solve(monkeypatch):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    import app.engine.agent.live_resolve_adapter as adapter
+
+    class _CaptureEngine:
+        def __init__(self):
+            self.calls = []
+
+        def solve(self, **kwargs):
+            self.calls.append(kwargs)
+            return {0: {0: {"Check": 0.25, "Bet 75%": 0.75}}}
+
+    state = _offtree_base_state()
+    engine = _CaptureEngine()
+    inputs = {
+        "board_strs": ["Ah", "8s", "3c"],
+        "board_ints": list(state.board),
+        "player_ranges": [[(0, 1, 1.0)]] * state.n_slots,
+        "positions_sorted": list(state.seat_of_slot),
+        "player_seats": list(range(state.n_slots)),
+        "entry_slots": list(range(state.n_slots)),
+        "hero_player_idx": 0,
+        "pot_bb": float(state.pot) / 100.0,
+        "stack_bb": float(max(state.stacks)) / 100.0,
+        "game_action_indices": list(state.preflop_prefix),
+        "street_actions": [],
+        "n_legal": state.num_legal_actions(),
+        "has_to_call": False,
+    }
+    monkeypatch.setattr(
+        adapter, "build_solve_inputs", lambda *_args, **_kwargs: inputs,
+    )
+    monkeypatch.setattr(adapter, "hero_grid_row", lambda *_args: 0)
+    monkeypatch.setattr(
+        adapter, "hero_grid_rows", lambda *_args, **_kwargs: [(0, 1.0)],
+    )
+    source = LiveResolveSource(
+        ModeConfig(mode="LIVE_RESOLVE"),
+        cpu_es_solver=engine,
+        seed_ranges=False,
+        belief_carry=False,
+        offtree_add=True,
+    )
+
+    mix = source.get_mix(state, (_ci("Ad"), _ci("Js")))
+
+    assert len(engine.calls) == 1
+    call = engine.calls[0]
+    assert call["bet_sizes"] == [0.75]
+    assert call["subsequent_bet_sizes"] == [1.0]
+    assert "offtree" not in call["hero_replay"]
+    assert mix.freqs == {0: 0.25, 1: 0.75}
+    assert source.last_offtree_add == {
+        "enabled": True,
+        "events": [],
+        "added_first": [],
+        "added_subsequent": [],
+        "skipped": [],
+        "replayed_through_added": False,
+        "hero_merged_mass": 0.0,
+        "dropped": False,
+        "drop_reason": None,
+    }
+
+
+def test_offtree_flag_on_zero_event_is_bit_identical(
+    cpu_es_engine, blueprint_path, monkeypatch,
+):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    # The default configuration refuses live re-solves with 4+ players
+    # (NEXUS_MAX_LIVE_RESOLVE_PLAYERS, default 3); this test measures the
+    # multiway path, so it raises the cap.
+    monkeypatch.setenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", "6")
+
+    config = ModeConfig(
+        mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0,
+    )
+    state = _offtree_base_state()
+    cards = (_ci("Ad"), _ci("Js"))
+    off = LiveResolveSource(
+        config, cpu_es_solver=cpu_es_engine, iterations=200,
+        num_threads=1, offtree_add=False,
+    )
+    on = LiveResolveSource(
+        config, cpu_es_solver=cpu_es_engine, iterations=200,
+        num_threads=1, offtree_add=True,
+    )
+
+    off_mix = off.get_mix(state, cards)
+    on_mix = on.get_mix(state, cards)
+
+    assert on_mix.freqs == off_mix.freqs
+    assert on_mix.is_uniform_fallback is off_mix.is_uniform_fallback
+    assert off.last_offtree_add is None
+    assert on.last_offtree_add == {
+        "enabled": True,
+        "events": [],
+        "added_first": [],
+        "added_subsequent": [],
+        "skipped": [],
+        "replayed_through_added": False,
+        "hero_merged_mass": 0.0,
+        "dropped": False,
+        "drop_reason": None,
+    }
+
+
+def test_offtree_extended_solve_replays_exact_chips_and_keeps_base_arity(
+    cpu_es_engine, blueprint_path, monkeypatch,
+):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    # The default configuration refuses live re-solves with 4+ players
+    # (NEXUS_MAX_LIVE_RESOLVE_PLAYERS, default 3); this test measures the
+    # multiway path, so it raises the cap.
+    monkeypatch.setenv("NEXUS_MAX_LIVE_RESOLVE_PLAYERS", "6")
+
+    state = _offtree_base_state().advance(0).advance(0)
+    amount = _offtree_faithful_increment(state, 1.4)
+    expected_fraction = _offtree_fraction_for_increment(state, amount)
+    observed = state.advance_observed("raise", amount=amount)
+    state = observed.state
+    event_step = len(state.street_history) - 1
+    source = LiveResolveSource(
+        ModeConfig(
+            mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0,
+        ),
+        cpu_es_solver=cpu_es_engine,
+        iterations=200,
+        # Belief carry (belief_carry.py) is not in this release; the test is
+        # about the off-tree extension, so it runs without it.
+        belief_carry=False,
+        offtree_add=True,
+    )
+
+    mix = source.get_mix(state, (_ci("Ad"), _ci("Js")))
+    disclosure = source.last_offtree_add
+    stats = cpu_es_engine._last_solve_stats
+
+    assert disclosure is not None
+    assert disclosure["added_first"] == pytest.approx(
+        [expected_fraction], rel=0.0, abs=1e-12,
+    )
+    assert disclosure["events"][0]["stack_before"] == (
+        state.street_offtree_raises[0][4]
+    )
+    assert disclosure["events"][0]["fraction"] == pytest.approx(
+        expected_fraction, rel=0.0, abs=1e-12,
+    )
+    assert disclosure["replayed_through_added"] is True
+    assert disclosure["dropped"] is False
+    assert stats["offtree_replayed_through"] is True
+    assert stats["offtree_added_child_chips"][event_step] == amount
+    assert set(mix.freqs) == set(range(state.num_legal_actions()))
+    assert len(mix.freqs) == state.num_legal_actions()
+    assert mix.is_uniform_fallback is False
+
+
+def test_offtree_hu_subsequent_raise_replays_live_without_cap_fallback(
+    cpu_es_engine, blueprint_path,
+):
+    from app.engine.agent.strategy_source import LiveResolveSource
+    from app.engine.engine_constants import live_config_for
+
+    state = _offtree_hu_state().advance(1)  # BB's canonical 0.75-pot bet.
+    amount = _offtree_faithful_increment(state, 1.6)
+    expected_fraction = _offtree_fraction_for_increment(state, amount)
+    state = state.advance_observed("raise", amount=amount).state
+    event_step = len(state.street_history) - 1
+    config = live_config_for(2)
+    source = LiveResolveSource(
+        ModeConfig(
+            mode="LIVE_RESOLVE", blueprint_path=blueprint_path, seed=0,
+        ),
+        cpu_es_solver=cpu_es_engine,
+        iterations=config.iterations,
+        num_rollouts=config.num_rollouts,
+        vec_mode=config.vec_mode,
+        readout=config.readout,
+        num_threads=1,
+        belief_carry=False,
+        offtree_add=True,
+    )
+
+    mix = source.get_mix(state, (_ci("Ad"), _ci("Js")))
+    disclosure = source.last_offtree_add
+    stats = cpu_es_engine._last_solve_stats
+
+    assert disclosure is not None
+    assert disclosure["added_first"] == []
+    assert disclosure["added_subsequent"] == pytest.approx(
+        [expected_fraction], rel=0.0, abs=1e-12,
+    )
+    assert disclosure["events"][0]["stack_before"] == (
+        state.street_offtree_raises[0][4]
+    )
+    assert disclosure["events"][0]["fraction"] == pytest.approx(
+        expected_fraction, rel=0.0, abs=1e-12,
+    )
+    assert disclosure["replayed_through_added"] is True
+    assert disclosure["dropped"] is False
+    assert stats["offtree_added_child_chips"][event_step] == amount
+    assert set(mix.freqs) == set(range(state.num_legal_actions()))
+    assert len(mix.freqs) == state.num_legal_actions() == 3
+    assert mix.is_uniform_fallback is False

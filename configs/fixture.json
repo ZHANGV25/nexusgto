@@ -1,0 +1,31 @@
+{
+  "description": "Tiny blueprint for tests. Same game and trainer settings as the published 8.05B blueprint, trained for 1,000 iterations on 1 thread with a small hash table.",
+  "trainer": "solver/precompute/blueprint_worker_unified.py",
+  "build_dir": "solver/build",
+  "iterations": 1000,
+  "num_threads": 1,
+  "hash_size": 2000003,
+  "env": {
+    "OMP_NUM_THREADS": "1",
+    "BPS_RIVER_OCHS": "1",
+    "BPS_RIVER_OCHS_CLUSTERS": "8",
+    "BPS_NO_EXPLICIT_ALLIN": "1"
+  },
+  "args": ["--depth-limit-cont-strats", "--cont-strat-prob", "0.5"],
+  "abstraction_dir": "data/abstraction",
+  "abstraction_files": ["texture_cache.bin", "turn_centroids.bin"],
+  "trainer_cache_files": {
+    "ochs_clusters.bin": "3efecd1d91bc2bdf98c123d34ac3bc4975c41876f1879452a362db5cbe21e1c8",
+    "river_centroids.bin": "88ac92a3eeb74a2e091a7f28fddf84ebc3748d82050118caa47331e15bd94eab"
+  },
+  "expected_config_hash": "bc8ac10598e08ee856bcbcd663c8ea4fe028d92e5daf7a3f7e7baca5e4ab953c",
+  "manifest_overrides": {"time_seconds": 0, "time_hours": 0.0, "subsequent_bet_sizes": [1.0]},
+  "output": "tests/fixtures/fixture.bps",
+  "expected_sha256": "b0614f61654e23dabecdd14c3055bc6dcaefc6f446f5bf0f0fe75a4984283530",
+  "notes": [
+    "The river OCHS settings go through the environment because the trainer's config hash reads BPS_RIVER_OCHS and BPS_RIVER_OCHS_CLUSTERS, not the --river-ochs flags. With them set, the fixture's config_hash equals the 8.05B manifest's.",
+    "The trainer looks for texture_cache.bin, turn_centroids.bin, ochs_clusters.bin and river_centroids.bin in $BP_CACHE_DIR, then its working directory, and writes the ones it computes to $BP_CACHE_DIR. make_fixture.py sets BP_CACHE_DIR to a fresh working directory holding only the two shipped files, so the trainer computes ochs_clusters.bin and river_centroids.bin itself; trainer_cache_files records their expected hashes.",
+    "make_fixture.py changes the manifest in two ways and leaves every other byte as the trainer wrote it. time_seconds and time_hours are wall-clock readings, so it sets them to 0. The final export does not stamp subsequent_bet_sizes, which LookupSource needs; the per-chunk snapshot export that made the 8.05B stamps [1.0], the size the C trainer always uses, so make_fixture.py adds the same value.",
+    "expected_sha256 holds for gcc 13.3 on x86-64 Linux. Another compiler or libm can change the float rounding and so the bytes; tests/test_fixture.py then still checks the structure."
+  ]
+}

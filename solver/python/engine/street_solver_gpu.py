@@ -1,0 +1,919 @@
+"""Python wrapper for the N-player CUDA single-street solver.
+
+Wraps street_solve.dll for Pluribus-style depth-limited GPU solving.
+Supports 2-6 players in a single betting round.
+
+Usage (2-player, backward compatible):
+    solver = StreetSolverGPU(
+        board=["Qs", "As", "2d"],
+        oop_range=[(0, 1, 1.0), ...],
+        ip_range=[(2, 3, 1.0), ...],
+        pot_bb=6.5, stack_bb=97.5,
+    )
+    solver.solve(iterations=200)
+    strategy = solver.get_strategy(player=0, hand_idx=5)
+
+Usage (N-player):
+    solver = StreetSolverGPU(
+        board=["Qs", "As", "2d", "7h", "4c"],
+        player_ranges=[oop_hands, mp_hands, ip_hands],  # 3 players
+        pot_bb=16.0, stack_bb=92.0,
+    )
+"""
+
+import ctypes
+import os
+import platform
+import sys
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+# Constants matching solver/src/search/tree.h
+SS_MAX_PLAYERS = 6
+SS_MAX_HANDS = 1400
+SS_MAX_ACTIONS = 8
+SS_MAX_BOARD = 5
+SCALE = 100
+
+from engine.cards import card_to_int, int_to_card, parse_range_string
+
+# ── DLL loading ──────────────────────────────────────────────────────────
+
+# Filename → CDLL handle. Keyed by lib_filename (not abspath) so callers can
+# load a sibling .so (e.g. "street_solve_joint.so" for the JOINT cont-strat
+# diagnostic) alongside the default without re-loading either.
+_LIB_CACHE: Dict[str, ctypes.CDLL] = {}
+
+
+def _default_lib_filename() -> str:
+    # The CPU tree-builder build (make street_solve_cpu). It exports the tree
+    # API; ss_solve_gpu is a stub that aborts (the CUDA solver is not shipped).
+    return "street_solve_cpu.dll" if platform.system() == "Windows" else "street_solve_cpu.so"
+
+
+def _get_lib(lib_filename: Optional[str] = None):
+    if lib_filename is None:
+        lib_filename = _default_lib_filename()
+    cached = _LIB_CACHE.get(lib_filename)
+    if cached is not None:
+        return cached
+    # LOAD-BEARING DEPTH: this file is python/engine/street_solver_gpu.py, so go up
+    # 3 levels (engine -> python -> repo root) to reach build/. If the final
+    # path ends in python/build the depth is WRONG.
+    solver_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    lib_path = os.path.join(solver_dir, "build", lib_filename)
+    if not os.path.exists(lib_path):
+        raise FileNotFoundError(f"street_solve library not found at {lib_path}")
+    lib = ctypes.CDLL(lib_path)
+    lib.ss_build_tree.restype = ctypes.c_int
+    # ss_build_tree2 is the per-level bet_sizes API. Older
+    # libstreet_solve.so builds don't export
+    # ss_build_tree2; tolerate that here so this binding loads
+    # against either build, and let the caller surface the missing
+    # symbol only when subsequent_bet_sizes is actually passed.
+    if hasattr(lib, "ss_build_tree2"):
+        lib.ss_build_tree2.restype = ctypes.c_int
+    if hasattr(lib, "ss_build_tree_stacks"):
+        lib.ss_build_tree_stacks.restype = ctypes.c_int
+        lib.ss_build_tree_stacks.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+    lib.ss_solve_gpu.restype = ctypes.c_int
+    lib.ss_free_tree.restype = None
+    lib.ss_free_output.restype = None
+    _LIB_CACHE[lib_filename] = lib
+    return lib
+
+# ── ctypes structure mirrors (must match solver/src/search/tree.h exactly) ──
+
+class SSNode(ctypes.Structure):
+    # Multi-street fields: chance_card_per_child_offset + chance_node_idx at
+    # the tail. Unused (=0) for non-SS_NODE_CHANCE nodes, so single-street
+    # default behavior is unchanged. Field order must match tree.h exactly.
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("player", ctypes.c_int),
+        ("num_children", ctypes.c_int),
+        ("first_child", ctypes.c_int),
+        ("pot", ctypes.c_int),
+        ("bets", ctypes.c_int * SS_MAX_PLAYERS),
+        ("board_cards", ctypes.c_int * 5),
+        ("num_board", ctypes.c_int),
+        ("leaf_idx", ctypes.c_int),
+        ("fold_player", ctypes.c_int),
+        ("num_players", ctypes.c_int),
+        ("active_players", ctypes.c_int * SS_MAX_PLAYERS),
+        ("chance_card_per_child_offset", ctypes.c_int),
+        ("chance_node_idx", ctypes.c_int),
+    ]
+
+class SSTreeData(ctypes.Structure):
+    # Multi-street fields sit at the tail after `frozen_action`.
+    # Zero / NULL under single-street mode so the legacy path is unchanged.
+    # Field order must match tree.h exactly.
+    _fields_ = [
+        ("nodes", ctypes.POINTER(SSNode)),
+        ("children", ctypes.POINTER(ctypes.c_int)),
+        ("num_nodes", ctypes.c_int),
+        ("num_children_total", ctypes.c_int),
+        ("num_players_field", ctypes.c_int),  # renamed to avoid conflict
+        ("hands", ((ctypes.c_int * 2) * SS_MAX_HANDS) * SS_MAX_PLAYERS),
+        ("weights", (ctypes.c_float * SS_MAX_HANDS) * SS_MAX_PLAYERS),
+        ("num_hands", ctypes.c_int * SS_MAX_PLAYERS),
+        ("board", ctypes.c_int * SS_MAX_BOARD),
+        ("num_board", ctypes.c_int),
+        ("leaf_values", ctypes.POINTER(ctypes.c_float)),
+        ("num_leaves", ctypes.c_int),
+        ("level_order", ctypes.POINTER(ctypes.c_int)),
+        ("node_depth", ctypes.POINTER(ctypes.c_int)),
+        ("max_depth", ctypes.c_int),
+        ("decision_node_indices", ctypes.POINTER(ctypes.c_int)),
+        ("num_decision_nodes", ctypes.c_int),
+        ("showdown_node_indices", ctypes.POINTER(ctypes.c_int)),
+        ("num_showdown_nodes", ctypes.c_int),
+        ("leaf_node_indices", ctypes.POINTER(ctypes.c_int)),
+        ("num_leaf_nodes", ctypes.c_int),
+        ("fold_node_indices", ctypes.POINTER(ctypes.c_int)),
+        ("num_fold_nodes", ctypes.c_int),
+        ("starting_pot", ctypes.c_int),
+        ("effective_stack", ctypes.c_int),
+        ("is_river", ctypes.c_int),
+        ("frozen_action", ctypes.POINTER(ctypes.c_int)),
+        # Multi-street tail: all zero/NULL under POKER_SEARCH_DEPTH=single.
+        ("subgame_root_street", ctypes.c_int),
+        ("chance_node_indices", ctypes.POINTER(ctypes.c_int)),
+        ("num_chance_nodes", ctypes.c_int),
+        ("chance_card_per_child", ctypes.POINTER(ctypes.c_int)),
+        ("chance_card_per_child_total", ctypes.c_int),
+        ("sampled_child_per_chance", ctypes.POINTER(ctypes.c_int)),
+        ("future_round_regret_remap", ctypes.POINTER(ctypes.c_int)),
+        ("num_abstract_future_infosets", ctypes.c_int),
+        ("subgame_root_flop", ctypes.c_int * 3),
+    ]
+
+class SSOutput(ctypes.Structure):
+    # Field order must match tree.h SSOutput exactly.
+    _fields_ = [
+        ("root_strategy", ctypes.POINTER(ctypes.c_float)),
+        ("root_num_actions", ctypes.c_int),
+        ("root_player", ctypes.c_int),
+        ("root_ev", ctypes.POINTER(ctypes.c_float)),
+        # sigma-bar at all decision nodes — belief-update path.
+        ("avg_strategies", ctypes.POINTER(ctypes.c_float)),
+        ("avg_strategy_node_ids", ctypes.POINTER(ctypes.c_int)),
+        ("num_avg_nodes", ctypes.c_int),
+        # Final-iteration strategy at all decision nodes — play-decision
+        # path (Pluribus §4). Parallel shape to avg_strategies.
+        ("final_strategies", ctypes.POINTER(ctypes.c_float)),
+        ("final_strategy_node_ids", ctypes.POINTER(ctypes.c_int)),
+        ("num_final_nodes", ctypes.c_int),
+        ("num_players_out", ctypes.c_int),
+        ("max_hands", ctypes.c_int),
+    ]
+
+# ── Action label helpers ─────────────────────────────────────────────────
+
+def _build_labels_at_node(tree_data, node_idx, root_stacks_chips=None):
+    """Build action labels for a decision node."""
+    node = tree_data.nodes[node_idx]
+    labels = []
+    pot = node.pot
+    acting = node.player
+    acting_bet = node.bets[acting] if acting >= 0 else 0
+    # Remaining stack for the acting player. effective_stack on SSTreeData
+    # is the per-player starting stack (solver/src/search/ss_tree_builder.c's
+    # build_street_tree_n keeps `stack` constant down the tree), so chips
+    # left to bet = effective_stack - already-committed.
+    eff_stack = (tree_data.effective_stack
+                 if root_stacks_chips is None
+                 else root_stacks_chips[acting])
+    acting_remaining = eff_stack - acting_bet if acting >= 0 else eff_stack
+
+    # Max bet among all players
+    mx = 0
+    for p in range(SS_MAX_PLAYERS):
+        if (root_stacks_chips is None or node.active_players[p]) \
+                and node.bets[p] > mx:
+            mx = node.bets[p]
+    to_call = mx - acting_bet if acting >= 0 else 0
+
+    for i in range(node.num_children):
+        child_idx = tree_data.children[node.first_child + i]
+        child = tree_data.nodes[child_idx]
+
+        # The builder's non-raise slots are structural: facing a bet they are
+        # [fold, call], otherwise slot 0 is check.  Use those slots only for the
+        # additive path so a short all-in call that leads to another player's
+        # decision remains "Call", never the trailing all-in raise action.
+        if root_stacks_chips is not None:
+            if to_call > 0 and i == 0:
+                labels.append("Fold")
+                continue
+            if to_call > 0 and i == 1:
+                labels.append("Call")
+                continue
+            if to_call == 0 and i == 0:
+                labels.append("Check")
+                continue
+
+            child_bet = child.bets[acting] if acting >= 0 else 0
+            bet_amount = child_bet - acting_bet
+            if bet_amount >= acting_remaining and acting_remaining > 0:
+                labels.append("All-in")
+            elif pot > 0:
+                if to_call > 0:
+                    denom = pot + to_call
+                    pct = int(round(
+                        100 * (bet_amount - to_call) / max(denom, 1)))
+                    labels.append(f"Raise {pct}%")
+                else:
+                    pct = int(round(100 * bet_amount / pot))
+                    labels.append(f"Bet {pct}%")
+            else:
+                labels.append("Bet" if to_call == 0 else "Raise")
+            continue
+
+        if child.type == 1:  # FOLD
+            labels.append("Fold")
+        elif child.type == 2 or child.type == 4:  # SHOWDOWN or LEAF
+            labels.append("Call" if to_call > 0 else "Check")
+        elif child.type == 0:  # DECISION
+            # Determine bet amount from the change in acting player's bet
+            child_bet = child.bets[acting] if acting >= 0 else 0
+            bet_amount = child_bet - acting_bet
+
+            if bet_amount == 0:
+                labels.append("Check")
+            elif bet_amount >= acting_remaining and acting_remaining > 0:
+                # Bet/raise that consumes the rest of acting player's stack.
+                # Emits "All-in" so a label-to-action mapper can route it
+                # to ("allin", None) — without this guard a jam at
+                # 0.5×pot when 0.5×pot >= stack (or the explicit-allin
+                # branch when add_explicit_allin=True) renders as a confusing
+                # "Raise 1996%".
+                labels.append("All-in")
+            elif pot > 0:
+                pct = int(round(100 * bet_amount / pot))
+                if to_call > 0:
+                    labels.append(f"Raise {pct}%")
+                else:
+                    labels.append(f"Bet {pct}%")
+            else:
+                labels.append("Bet" if to_call == 0 else "Raise")
+        else:
+            labels.append(f"Action {i}")
+
+    return labels
+
+# ── Main solver class ────────────────────────────────────────────────────
+
+class StreetSolverGPU:
+    """N-player GPU-accelerated single-street solver.
+
+    Supports 2-6 players in a single betting round with depth-limited
+    leaf values and continuation strategy expansion (Pluribus approach).
+    """
+
+    def __init__(self, board, pot_bb, stack_bb,
+                 # 2-player interface (backward compat)
+                 oop_range=None, ip_range=None,
+                 # N-player interface
+                 player_ranges=None,
+                 acting_order=None,
+                 # Common options
+                 bet_sizes=None, leaf_values=None,
+                 use_cont_strats=True, leaf_value_fn=None,
+                 add_explicit_allin=True,
+                 # Per-level bet_sizes (raises after the first)
+                 subsequent_bet_sizes=None,
+                 # Pick a non-default street_solve
+                 # variant (e.g. "street_solve_joint.so" compiled with
+                 # -DSS_CONT_STRAT_MODE=0). None → platform default.
+                 lib_filename: Optional[str] = None,
+                 # Additive native-river ABI: compact-player remaining stacks
+                 # at the subgame root. None preserves the scalar path exactly.
+                 root_stacks_bb: Optional[Sequence[float]] = None):
+        """
+        Args:
+            board: list of card strings or ints
+            pot_bb: pot in BB
+            stack_bb: effective stack in BB
+            oop_range/ip_range: 2-player mode (backward compat)
+            player_ranges: list of [(c0,c1,w), ...] per player (N-player mode)
+            acting_order: list of player indices in acting order (default: [0,1,...,N-1])
+            bet_sizes: first-raise bet fractions (default [0.33, 0.75, 1.5]).
+                Used at every node where num_raises == 0.
+            subsequent_bet_sizes: bet fractions for raises 2..max (num_raises > 0).
+                Default None → replicate `bet_sizes` (matches kernel's
+                NULL/0 fallback in ss_build_tree2 backward-compat shim).
+                For the published blueprint: pass [1.0] to mirror the
+                trainer's subsequent_bet_sizes.
+            leaf_values: np.array or None
+            use_cont_strats: expand leaves with continuation strategies
+            leaf_value_fn: callback to compute leaf values from tree
+            add_explicit_allin: True (default) appends an unconditional all-in
+                raise child whenever no bet_sizes-derived raise reached the stack;
+                False omits it for blueprints whose training action set excluded
+                all-in (off-tree branches get uniform-on-zero σ̄ substitution
+                and CFR can pick the artifact).
+            root_stacks_bb: optional per-player remaining stacks at a river
+                subgame root. Zero means already all-in but still contesting.
+                Unequal flop/turn leaf-oracle settlement is not yet supported.
+        """
+        self.lib = _get_lib(lib_filename)
+
+        # Parse board
+        if isinstance(board[0], str):
+            self.board_cards = [card_to_int(c) for c in board]
+        else:
+            self.board_cards = list(board)
+        self.num_board = len(self.board_cards)
+        self.is_river = (self.num_board == 5)
+
+        # Build player ranges
+        board_set = set(self.board_cards)
+
+        if player_ranges is not None:
+            # N-player mode
+            self.num_players = len(player_ranges)
+            self.player_hands = []
+            for p_range in player_ranges:
+                if isinstance(p_range, str):
+                    hands = parse_range_string(p_range)
+                else:
+                    hands = list(p_range)
+                # Filter + validate the native/Python cap.
+                hands = [(c0, c1, w) for c0, c1, w in hands
+                         if c0 not in board_set and c1 not in board_set]
+                if len(hands) > SS_MAX_HANDS:
+                    raise ValueError(
+                        f"street_solver_gpu: {len(hands)} hands exceeds "
+                        f"SS_MAX_HANDS={SS_MAX_HANDS} "
+                        "(silent-truncation removed for the 1a probe — "
+                        "rebuild the C lib with a higher cap)"
+                    )
+                self.player_hands.append(hands)
+        elif oop_range is not None and ip_range is not None:
+            # 2-player backward compat
+            self.num_players = 2
+            self.player_hands = []
+            for p_range in [oop_range, ip_range]:
+                if isinstance(p_range, str):
+                    hands = parse_range_string(p_range)
+                else:
+                    hands = list(p_range)
+                hands = [(c0, c1, w) for c0, c1, w in hands
+                         if c0 not in board_set and c1 not in board_set]
+                if len(hands) > SS_MAX_HANDS:
+                    raise ValueError(
+                        f"street_solver_gpu: {len(hands)} hands exceeds "
+                        f"SS_MAX_HANDS={SS_MAX_HANDS} "
+                        "(silent-truncation removed for the 1a probe — "
+                        "rebuild the C lib with a higher cap)"
+                    )
+                self.player_hands.append(hands)
+        else:
+            raise ValueError("Provide oop_range+ip_range or player_ranges")
+
+        # Backward compat aliases
+        if self.num_players >= 1:
+            self.oop_hands = self.player_hands[0]
+        if self.num_players >= 2:
+            self.ip_hands = self.player_hands[1]
+
+        if bet_sizes is None:
+            bet_sizes = [0.33, 0.75, 1.5]
+        self.bet_sizes = bet_sizes
+        self.subsequent_bet_sizes = subsequent_bet_sizes
+
+        if acting_order is None:
+            acting_order = list(range(self.num_players))
+        self.acting_order = acting_order
+
+        self.root_stacks_chips = None
+        if root_stacks_bb is not None:
+            if not self.is_river:
+                raise ValueError(
+                    "root_stacks_bb currently supports native river solves only"
+                )
+            if self.num_players < 2 or self.num_players > 3:
+                raise ValueError(
+                    "root_stacks_bb requires 2-3 compact players"
+                )
+            if len(root_stacks_bb) != self.num_players:
+                raise ValueError(
+                    f"root_stacks_bb has {len(root_stacks_bb)} entries; "
+                    f"expected {self.num_players}"
+                )
+            if len(acting_order) != self.num_players \
+                    or sorted(acting_order) != list(range(self.num_players)):
+                raise ValueError(
+                    "acting_order must be a permutation of compact players"
+                )
+            root_stack_values = tuple(float(x) for x in root_stacks_bb)
+            if any(not np.isfinite(x) or x < 0.0
+                   for x in root_stack_values):
+                raise ValueError(
+                    "root_stacks_bb entries must be finite and non-negative"
+                )
+            root_stack_chips = tuple(
+                int(round(x * SCALE)) for x in root_stack_values
+            )
+            if any(x > np.iinfo(np.int32).max for x in root_stack_chips):
+                raise ValueError("root_stacks_bb entries exceed native int32 chips")
+            self.root_stacks_chips = root_stack_chips
+
+        if self.root_stacks_chips is None:
+            pot = int(pot_bb * SCALE)
+        else:
+            pot_value = float(pot_bb)
+            if not np.isfinite(pot_value) or pot_value < 0.0:
+                raise ValueError("pot_bb must be finite and non-negative")
+            pot = int(round(pot_value * SCALE))
+            if pot > np.iinfo(np.int32).max:
+                raise ValueError("pot_bb exceeds native int32 chips")
+        stack = int(stack_bb * SCALE)
+
+        # Build tree
+        board_arr = (ctypes.c_int * self.num_board)(*self.board_cards)
+        bet_arr = (ctypes.c_float * len(bet_sizes))(*bet_sizes)
+        order_arr = (ctypes.c_int * len(acting_order))(*acting_order)
+
+        self._tree = SSTreeData()
+        use_cs = 1 if (use_cont_strats and not self.is_river) else 0
+
+        if self.root_stacks_chips is not None:
+            if not hasattr(self.lib, "ss_build_tree_stacks"):
+                raise RuntimeError(
+                    "ss_build_tree_stacks is missing; rebuild street_solve"
+                )
+            stack_arr = (ctypes.c_int * self.num_players)(
+                *self.root_stacks_chips)
+            if subsequent_bet_sizes is not None:
+                sub_arr = (ctypes.c_float * len(subsequent_bet_sizes))(
+                    *subsequent_bet_sizes)
+                sub_ptr = sub_arr
+                sub_count = len(subsequent_bet_sizes)
+            else:
+                sub_arr = None
+                sub_ptr = None
+                sub_count = 0
+            err = self.lib.ss_build_tree_stacks(
+                board_arr, self.num_board,
+                pot, stack_arr,
+                bet_arr, len(bet_sizes),
+                sub_ptr, sub_count,
+                self.num_players, order_arr,
+                1, 0,
+                1 if add_explicit_allin else 0,
+                ctypes.byref(self._tree))
+        # If the caller provided
+        # subsequent_bet_sizes, route through ss_build_tree2 (per-level
+        # bet_sizes API). Otherwise fall through to the legacy
+        # ss_build_tree shim, which forwards subsequent=NULL/0 → kernel
+        # replicates first. This branch is intentionally unchanged for scalar
+        # callers.
+        elif subsequent_bet_sizes is not None:
+            sub_arr = (ctypes.c_float * len(subsequent_bet_sizes))(*subsequent_bet_sizes)
+            err = self.lib.ss_build_tree2(
+                board_arr, self.num_board,
+                pot, stack,
+                bet_arr, len(bet_sizes),
+                sub_arr, len(subsequent_bet_sizes),
+                self.num_players, order_arr,
+                1 if self.is_river else 0,
+                use_cs,
+                1 if add_explicit_allin else 0,
+                ctypes.byref(self._tree))
+        else:
+            err = self.lib.ss_build_tree(
+                board_arr, self.num_board,
+                pot, stack,
+                bet_arr, len(bet_sizes),
+                self.num_players, order_arr,
+                1 if self.is_river else 0,
+                use_cs,
+                1 if add_explicit_allin else 0,
+                ctypes.byref(self._tree))
+        if err != 0:
+            symbol = ("ss_build_tree_stacks" if self.root_stacks_chips is not None
+                      else "ss_build_tree")
+            raise RuntimeError(f"{symbol} failed")
+
+        # Populate hands and weights
+        for p in range(self.num_players):
+            self._tree.num_hands[p] = len(self.player_hands[p])
+            for i, (c0, c1, w) in enumerate(self.player_hands[p]):
+                self._tree.hands[p][i][0] = c0
+                self._tree.hands[p][i][1] = c1
+                self._tree.weights[p][i] = w
+
+        max_h = max(len(h) for h in self.player_hands)
+        self._max_hands = max_h
+
+        # Compute leaf values via callback if provided
+        if leaf_values is None and leaf_value_fn is not None and self._tree.num_leaves > 0:
+            leaf_values = leaf_value_fn(
+                self._tree, self.player_hands,
+                max_h, int(pot_bb * SCALE))
+
+        # Upload leaf values
+        if leaf_values is not None and self._tree.num_leaves > 0:
+            expected = self._tree.num_leaves * self.num_players * max_h
+            flat = leaf_values.astype(np.float32).flatten()
+            if len(flat) != expected:
+                raise ValueError(
+                    f"leaf_values mismatch: {len(flat)} vs {expected} "
+                    f"(leaves={self._tree.num_leaves}, players={self.num_players}, "
+                    f"max_hands={max_h})")
+            arr = (ctypes.c_float * len(flat))(*flat)
+            self._leaf_arr = arr
+            self._tree.leaf_values = ctypes.cast(arr, ctypes.POINTER(ctypes.c_float))
+        elif not self.is_river and self._tree.num_leaves > 0:
+            print("[WARNING] Zero leaf values — no blueprint data.", file=sys.stderr)
+            n = self._tree.num_leaves * self.num_players * max_h
+            arr = (ctypes.c_float * n)()
+            self._leaf_arr = arr
+            self._tree.leaf_values = ctypes.cast(arr, ctypes.POINTER(ctypes.c_float))
+
+        self._frozen_arr = None  # prevent GC of frozen_action array
+
+        self._output = SSOutput()
+        self._solved = False
+        self._freed = False
+
+    def set_frozen_actions(self, frozen_actions, hero_player):
+        """Set hero strategy freezing for Pluribus safe re-solving.
+
+        Walks the tree following the sequence of actions (both hero and
+        opponent) and marks hero's decision nodes with the action taken.
+        This freezes hero's strategy at those nodes during CFR iterations.
+
+        Args:
+            frozen_actions: list of action labels in order (e.g., ["Check", "Bet 50%", "Call"])
+            hero_player: hero's player index (0..N-1)
+        """
+        n = self._tree.num_nodes
+        frozen = (ctypes.c_int * n)(*[-1] * n)
+
+        current = 0  # start at root
+        for action_label in frozen_actions:
+            node = self._tree.nodes[current]
+            if node.type != 0:  # not decision
+                break
+
+            # Find matching child action
+            labels = _build_labels_at_node(
+                self._tree, current, self.root_stacks_chips)
+            matched = -1
+            for i, lbl in enumerate(labels):
+                if lbl.lower() == action_label.lower():
+                    matched = i
+                    break
+
+            if matched < 0:
+                break  # action not found in tree
+
+            # If this is hero's node, freeze the strategy
+            if node.player == hero_player:
+                frozen[current] = matched
+
+            # Follow the child
+            current = self._tree.children[node.first_child + matched]
+
+        self._frozen_arr = frozen
+        self._tree.frozen_action = ctypes.cast(frozen, ctypes.POINTER(ctypes.c_int))
+
+    def set_frozen_action_indices(self, pairs):
+        """Freeze hero's earlier decisions on this street by node index.
+
+        ``pairs`` is an iterable of ``(node_index, action_index)``: at each
+        listed decision node the solver must take ``action_index`` with
+        probability one and accumulate no regret there (Pluribus safe
+        re-solving: the re-solve cannot revise what hero already did). The
+        node index comes from the api's replay walk of the recorded street,
+        so no label matching is needed. An empty iterable clears freezing.
+        Fails loud on a non-decision node or an action outside the node's
+        children. Consumed by the C external-sampling resolver through
+        ``SSTreeData.frozen_action`` (-1 = not frozen).
+        """
+        n = int(self._tree.num_nodes)
+        frozen = (ctypes.c_int * n)(*[-1] * n)
+        for node_index, action_index in pairs:
+            node_index = int(node_index)
+            action_index = int(action_index)
+            if node_index < 0 or node_index >= n:
+                raise ValueError(
+                    f"frozen node {node_index} outside the tree ({n} nodes)")
+            node = self._tree.nodes[node_index]
+            if int(node.type) != 0:
+                raise ValueError(
+                    f"frozen node {node_index} is not a decision node "
+                    f"(type={int(node.type)})")
+            if action_index < 0 or action_index >= int(node.num_children):
+                raise ValueError(
+                    f"frozen action {action_index} outside node {node_index}'s "
+                    f"{int(node.num_children)} children")
+            frozen[node_index] = action_index
+        self._frozen_arr = frozen
+        self._tree.frozen_action = ctypes.cast(
+            frozen, ctypes.POINTER(ctypes.c_int))
+
+    def solve(self, iterations=200):
+        if self.root_stacks_chips is not None:
+            raise RuntimeError(
+                "root_stacks_bb trees are CPU-ES-only; GPU terminal kernels "
+                "do not receive root-pot eligibility"
+            )
+        err = self.lib.ss_solve_gpu(
+            ctypes.byref(self._tree), iterations, ctypes.byref(self._output))
+        if err != 0:
+            raise RuntimeError("ss_solve_gpu failed")
+        self._solved = True
+
+    def get_strategy(self, player, hand_str=None, hand_idx=None,
+                     frozen_actions=None):
+        """Get PLAY strategy (final iteration, Pluribus §4) for a specific hand
+        at this player's CURRENT decision.
+
+        Play vs belief update: this method returns the FINAL-iteration
+        regret-matched strategy — the Pluribus play-path at postflop subgame
+        roots. For range narrowing / Bayesian belief updates, use
+        get_avg_strategy() which returns sigma-bar.
+
+        Implements Pluribus strategy freezing: when hero has already
+        acted at a node earlier this street, the strategy at that node is
+        frozen to 100% on the previously-chosen action FOR HERO'S HAND ONLY.
+        Other hands at that info set remain free.
+
+        The solver walks the tree following the frozen action sequence to find
+        hero's actual current decision node, then returns the solver's strategy
+        at that node.
+
+        Args:
+            player: int (0..N-1) or "oop"(0) / "ip"(1) for 2-player
+            hand_str: e.g., "AhKh"
+            hand_idx: index into player's hand array
+            frozen_actions: list of action labels that hero took at previous
+                decision nodes this street, in order. The solver follows these
+                actions through the tree to find the current decision node.
+                If None or empty, returns strategy at hero's first decision.
+
+        Returns:
+            dict {action_label: frequency}
+        """
+        if not self._solved:
+            raise RuntimeError("Must call solve() first")
+
+        player_idx = self._resolve_player(player)
+        if hand_idx is None:
+            hand_idx = self._find_hand(player_idx, hand_str)
+
+        max_h = self._max_hands
+
+        # If no frozen actions, return strategy at hero's first decision
+        if not frozen_actions:
+            if self._output.root_player == player_idx:
+                root_nh = len(self.player_hands[player_idx])
+                root_na = self._output.root_num_actions
+                labels = _build_labels_at_node(
+                    self._tree, 0, self.root_stacks_chips)
+                result = {}
+                for a in range(min(root_na, len(labels))):
+                    freq = self._output.root_strategy[a * root_nh + hand_idx]
+                    if freq > 0.001:
+                        result[labels[a]] = float(freq)
+                return result
+            else:
+                return self._get_final_strategy_at_player_node(player_idx, hand_idx)
+
+        # Walk the tree following frozen actions to find the current node.
+        # frozen_actions contains ALL actions (both hero and opponent) that
+        # led to the current state, in sequence. We follow each action
+        # through the tree regardless of whose decision node it is.
+        frozen_idx = 0
+        current_node = 0  # start at root
+
+        while frozen_idx < len(frozen_actions) and current_node < self._tree.num_nodes:
+            node = self._tree.nodes[current_node]
+            if node.type != 0:  # not a decision node
+                break
+
+            # Follow the next frozen action at this node (any player's node)
+            frozen_label = frozen_actions[frozen_idx]
+            labels = _build_labels_at_node(
+                self._tree, current_node, self.root_stacks_chips)
+
+            matched = False
+            for c in range(node.num_children):
+                if c < len(labels) and self._match_action_label(
+                        labels[c], frozen_label):
+                    child_idx = self._tree.children[node.first_child + c]
+                    current_node = child_idx
+                    frozen_idx += 1
+                    matched = True
+                    break
+
+            if not matched:
+                # Frozen action not found in tree — stop walking
+                break
+
+        # Now current_node should be at hero's next decision (or we exhausted frozen actions)
+        node = self._tree.nodes[current_node]
+        if node.type == 0 and node.player == player_idx:
+            # Found hero's current decision — use final-iter (play path).
+            return self._get_final_strategy_at_node(current_node, player_idx, hand_idx)
+
+        # Fallback: return strategy at hero's first unfrozen decision node
+        return self._get_final_strategy_at_player_node(player_idx, hand_idx)
+
+    @staticmethod
+    def _match_action_label(tree_label, frozen_label):
+        """Fuzzy match action labels (e.g. "Check" matches "check")."""
+        return tree_label.lower().strip() == frozen_label.lower().strip()
+
+    def _get_final_strategy_at_node(self, node_idx, player_idx, hand_idx):
+        """PLAY PATH: final-iteration strategy at a specific tree node.
+        Reads from final_strategies (Pluribus §4 iter-N for play)."""
+        max_h = self._max_hands
+        for di in range(self._output.num_final_nodes):
+            nidx = self._output.final_strategy_node_ids[di]
+            if nidx != node_idx:
+                continue
+            node = self._tree.nodes[nidx]
+            if node.player != player_idx or node.type != 0:
+                continue
+            na = node.num_children
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
+            result = {}
+            for a in range(min(na, len(labels))):
+                freq = self._output.final_strategies[
+                    di * SS_MAX_ACTIONS * max_h + a * max_h + hand_idx]
+                if freq > 0.001:
+                    result[labels[a]] = float(freq)
+            return result
+        return {}
+
+    def _get_final_strategy_at_player_node(self, player_idx, hand_idx):
+        """PLAY PATH: final-iter strategy at this player's first decision node."""
+        max_h = self._max_hands
+        for di in range(self._output.num_final_nodes):
+            nidx = self._output.final_strategy_node_ids[di]
+            node = self._tree.nodes[nidx]
+            if node.player != player_idx or node.type != 0:
+                continue
+            na = node.num_children
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
+            result = {}
+            for a in range(min(na, len(labels))):
+                freq = self._output.final_strategies[
+                    di * SS_MAX_ACTIONS * max_h + a * max_h + hand_idx]
+                if freq > 0.001:
+                    result[labels[a]] = float(freq)
+            return result
+        return {}
+
+    def get_all_strategies(self, player):
+        """Get strategies for ALL hands at player's first decision node.
+
+        Reads the FINAL-iteration regret-matched strategy (Pluribus §4
+        play-path) — by design this is often pure-deterministic per hand.
+        For chart display or Bayesian narrowing of an equilibrium mix,
+        use `get_all_avg_strategies` instead, which reads the sigma-bar
+        average that CFR actually converges.
+        """
+        if not self._solved:
+            raise RuntimeError("Must call solve() first")
+        player_idx = self._resolve_player(player)
+        result = {}
+        for h in range(len(self.player_hands[player_idx])):
+            strat = self.get_strategy(player_idx, hand_idx=h)
+            if strat:
+                result[h] = strat
+        return result
+
+    def get_all_avg_strategies(self, player):
+        """Get AVERAGE (sigma-bar) strategies for ALL hands at player's first
+        decision node — same shape as `get_all_strategies` but reads from
+        `avg_strategies` instead of `final_strategies`.
+
+        Use this for chart-display / equilibrium-policy consumers. The
+        final-iter strategy CFR ends on is a pure regret-matched argmax
+        per hand (Pluribus §4 play-path) which collapses display to one
+        action per hand even when the converged mix is non-degenerate.
+        """
+        if not self._solved:
+            raise RuntimeError("Must call solve() first")
+        player_idx = self._resolve_player(player)
+        max_h = self._max_hands
+        for di in range(self._output.num_avg_nodes):
+            nidx = self._output.avg_strategy_node_ids[di]
+            node = self._tree.nodes[nidx]
+            if node.type != 0 or node.player != player_idx:
+                continue
+            na = node.num_children
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
+            result = {}
+            for h in range(len(self.player_hands[player_idx])):
+                strat = {}
+                for a in range(min(na, len(labels))):
+                    freq = self._output.avg_strategies[
+                        di * SS_MAX_ACTIONS * max_h + a * max_h + h]
+                    if freq > 0.001:
+                        strat[labels[a]] = float(freq)
+                if strat:
+                    result[h] = strat
+            return result
+        return {}
+
+    def get_avg_strategy(self, player):
+        """Get weighted-average strategy at player's first decision.
+        Returns {(card0,card1): {action: freq}}."""
+        if not self._solved:
+            raise RuntimeError("Must call solve() first")
+        player_idx = self._resolve_player(player)
+        hands = self.player_hands[player_idx]
+        max_h = self._max_hands
+
+        for di in range(self._output.num_avg_nodes):
+            nidx = self._output.avg_strategy_node_ids[di]
+            node = self._tree.nodes[nidx]
+            if node.type != 0 or node.player != player_idx:
+                continue
+            na = node.num_children
+            labels = _build_labels_at_node(
+                self._tree, nidx, self.root_stacks_chips)
+            result = {}
+            for h in range(len(hands)):
+                c0, c1, w = hands[h]
+                key = (min(c0, c1), max(c0, c1))
+                strat = {}
+                for a in range(min(na, len(labels))):
+                    freq = self._output.avg_strategies[
+                        di * SS_MAX_ACTIONS * max_h + a * max_h + h]
+                    if freq > 0.001:
+                        strat[labels[a]] = float(freq)
+                result[key] = strat
+            return result
+        return {}
+
+    def get_avg_strategy_probs(self, player, action_label):
+        """Get P(action|hand) for all hands. For range narrowing."""
+        avg = self.get_avg_strategy(player)
+        return {k: v.get(action_label, 0.0) for k, v in avg.items()}
+
+    def _resolve_player(self, player):
+        if isinstance(player, int):
+            return player
+        if player == "oop":
+            return 0
+        if player == "ip":
+            return 1
+        return int(player)
+
+    def _find_hand(self, player_idx, hand_str):
+        c0 = card_to_int(hand_str[:2])
+        c1 = card_to_int(hand_str[2:])
+        key = (min(c0, c1), max(c0, c1))
+        for i, (h0, h1, w) in enumerate(self.player_hands[player_idx]):
+            if (h0, h1) == key or (h1, h0) == key:
+                return i
+        raise ValueError(f"Hand {hand_str} not in player {player_idx}'s range")
+
+    def free(self):
+        # Defensive: __init__ can raise before _freed is set. Use getattr
+        # everywhere so __del__ on a partially-constructed instance is safe.
+        if getattr(self, "_freed", False):
+            return
+        self._freed = True
+        tree = getattr(self, "_tree", None)
+        if tree is not None and getattr(tree, "nodes", None):
+            # leaf_values points into self._leaf_arr, a ctypes array Python owns
+            # (the C side never allocates it). Detach it so ss_free_tree does not
+            # free() Python memory, which aborted the process (double free).
+            tree.leaf_values = None
+            try:
+                self.lib.ss_free_tree(ctypes.byref(tree))
+            except Exception:
+                pass
+        output = getattr(self, "_output", None)
+        if output is not None and getattr(self, "_solved", False):
+            try:
+                self.lib.ss_free_output(ctypes.byref(output))
+            except Exception:
+                pass
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass

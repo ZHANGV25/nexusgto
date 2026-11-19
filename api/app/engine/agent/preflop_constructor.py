@@ -1,0 +1,412 @@
+"""Preflop action-index prefix constructor.
+
+Builds the preflop action_history prefix from an EXPLICIT ordered list of
+preflop actions, walking the canonical 6-max acting order and emitting
+fold0 / call1 / raise-size indices exactly as the trainer
+(mccfr_blueprint.c generate_actions) does.
+
+This is the GameState.preflop_prefix seed for the agent. It covers THREE
+capture-verified shapes:
+
+  1. CANONICAL SINGLE-OPEN (open + flat callers) — bit-exact against
+     the capture-verified prefixes (tests).
+
+  2. 3-BET HEADS-UP (open → 3-bet → folds back → opener calls → flop HU) —
+     capture-verified for ALL 15 (opener, 3-bettor) seat pairs:
+     the literal trainer C function (bp_generate_actions) replayed every
+     line's index sequence + chips, and the 8.05B blueprint HIT present +
+     trained σ̄ at every flop-root key with wrong-seat / truncated /
+     extended / out-of-vocab-index discriminators MISSING. The 3-bet SIZE
+     is parametrized
+     (threebet_size_idx): 0 → the SMALLEST (0.7x) trainer size = action
+     index 2 (the verified default, same smallest-size convention the open
+     uses); 1 → the 1.0x size = action index 3 (vs-open node layout
+     [fold=0, call=1, 3bet-0.7x=2, 3bet-1.0x=3], na=4 — tier 1 of
+     PREFLOP_TIERS {0:[0.7,1.0], 1:[0.7,1.0], 2:[1.0]}). The index-3 path
+     is capture-verified for BTN-open/BB-3bet only (root present and
+     trained, discriminators MISS, σ̄-length walks clean); other pairs are
+     not capture-verified at the 1.0x size.
+
+  3. HEADS-UP LIMP-CHECK (one limper → folds → BB checks → flop HU) —
+     capture-verified for THREE lines (every probe consistent):
+       L1 UTG-limp  → prefix [1,0,0,0,0,0], flop pot 250, BB vs UTG
+       L2 BTN-limp  → prefix [0,0,0,1,0,0], flop pot 250, BB vs BTN
+       L3 SB-complete → prefix [0,0,0,0,1,0], flop pot 200, SB vs BB
+     Index semantics from the capture: a LIMP is the call action (index 1)
+     at the facing-the-blind node; the BB's closing CHECK is index 0 at the
+     BB-option node (trainer layout na=3: [check(type 1), 0.7x, 1.0x] —
+     check_idx=0, NOT the facing-bet call index 1). Each line's flop root
+     was present + trained with wrong-seat / truncated / extended /
+     out-of-vocab discriminators MISSING, and σ̄-length walks were clean
+     st1–st3. The 3-way limp lines (UTG+BTN, UTG+SB) are ROOT-CAPTURED ONLY
+     and stay rejected, as do MP/CO limps and every limp-raise shape.
+
+Anything beyond — multi-limper pots, limp-raises, squeezes (callers +
+3-bet), 4-bet+, multiway 3-bet pots — is NOT capture-verified and raises
+PreflopConstructionUnsupported rather than emit an unverifiable key (a
+silently wrong key reads another node's strategy).
+
+NOTE: the index sequences are constructed by REASONING about the canonical
+tree, which is acceptable ONLY because every covered shape is bit-exact
+validated against independent ground truth (trainer-C replay + blueprint
+probes). Do not extend to unvalidated shapes without new ground truth.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+# Canonical 6-max preflop acting order (matches the trainer's enumeration).
+PREFLOP_ORDER = ["UTG", "MP", "CO", "BTN", "SB", "BB"]
+_ORDER_SET = set(PREFLOP_ORDER)
+
+# Action indices when FACING a bet (preflop is always facing the blinds, so
+# the first raiser already "faces" the BB): [fold0, call1, raise2(smallest)].
+# The smallest-raise = index 2 invariant holds across all blueprint tier
+# vocabs (capture-verified at the vs-open node too:
+# [fold, call, 3bet-0.7x, 3bet-1.0x] with na=4, so the smallest
+# 3-bet is also index 2).
+_FOLD = 0
+_CALL = 1
+_RAISE = 2
+# The BB-OPTION node (nothing to call — every limper matched the blind) has
+# the trainer layout [check, raise(0.7x), raise(1.0x)] (na=3): the CHECK is
+# index 0, NOT the facing-bet call index 1. Capture-verified (every
+# BB-option node na=3 types=[1,3,3] check_idx=0).
+_CHECK = 0
+
+# Limp seats whose HU limp-check line is capture-verified (σ̄-length walks
+# st1-st3 clean): UTG (L1), BTN (L2), SB (L3 = the SB complete). MP/CO limps
+# and multi-limper pots are NOT verified and stay rejected.
+_VERIFIED_LIMP_SEATS = ("UTG", "BTN", "SB")
+
+# Valid 3-bet size indices: 0 → 0.7x (action index 2), 1 → 1.0x (action
+# index 3). Mirrors PREFLOP_TIERS tier 1 == [0.7, 1.0].
+THREEBET_SIZE_INDICES = (0, 1)
+
+
+class PreflopConstructionUnsupported(Exception):  # noqa: N818 - matches sibling naming
+    """The preflop line is outside the capture-verified shapes.
+
+    Covered: single open + flat callers; 3-bet heads-up; the three HU
+    limp-check lines (UTG-limp, BTN-limp, SB-complete → BB checks).
+    Multi-limper pots, limp-raises, squeezes, 4-bet+, multiway 3-bet pots
+    and other shapes are not covered: building their index sequence
+    by reasoning would be unverifiable and risk a silent wrong key.
+    """
+
+
+@dataclass(frozen=True)
+class PreflopAction:
+    """One voluntary preflop action.
+
+    position: seat name (UTG..BB).
+    action: "fold" | "call" | "raise" | "check" ("check" exists ONLY as the
+        BB's option-closure of a limped pot; a "call" with no raise in the
+        line is a limp).
+    amount: chips committed (informational; the index doesn't encode size —
+        both the open and the 3-bet map to the SMALLEST trainer size,
+        index 2, unless threebet_size_idx selects the 1.0x 3-bet).
+    """
+
+    position: str
+    action: str
+    amount: float = 0.0
+
+
+def build_preflop_prefix(
+    actions: List[PreflopAction], *, threebet_size_idx: int = 0,
+) -> List[int]:
+    """Construct the preflop action-index prefix for `actions`.
+
+    `actions` is the ordered list of VOLUNTARY actions (raises/calls);
+    intervening folds are inferred from acting-order gaps. The returned list
+    is the preflop portion of action_history (one index per action taken,
+    including inferred folds).
+
+    `threebet_size_idx` selects the 3-bet's trainer size on the 3-bet HU
+    shape: 0 → 0.7x (action index 2, the verified default), 1 → 1.0x
+    (action index 3). It applies ONLY to the 3-bet; the open is always the
+    smallest size.
+
+    Lines with NO raise are limped pots: only the three capture-verified HU
+    limp-check lines are emitted (one limper from UTG/BTN/SB, folds, the
+    BB's explicit "check" closing the round — see _limp_check_prefix).
+
+    Raises:
+        ValueError: empty list, an unknown position, an out-of-range
+            threebet_size_idx, or a nonzero threebet_size_idx on a line
+            without a 3-bet.
+        PreflopConstructionUnsupported: a non-capture-verified shape
+            (multi-limper pot, limp-raise, squeeze, 4bet+, out-of-order
+            action).
+    """
+    if not actions:
+        raise ValueError("actions must be non-empty")
+    if threebet_size_idx not in THREEBET_SIZE_INDICES:
+        raise ValueError(
+            f"threebet_size_idx {threebet_size_idx!r} not in "
+            f"{THREEBET_SIZE_INDICES} (0 = 0.7x, 1 = 1.0x)"
+        )
+    for a in actions:
+        if a.position not in _ORDER_SET:
+            raise ValueError(
+                f"unknown position {a.position!r}; expected one of {PREFLOP_ORDER}"
+            )
+
+    raisers = [a for a in actions if a.action == "raise"]
+    checks = [a for a in actions if a.action == "check"]
+    if checks and raisers:
+        raise PreflopConstructionUnsupported(
+            "a preflop 'check' exists only as the BB's option-closure of a "
+            "LIMPED pot — a check inside a raised line is not a trainer node"
+        )
+    if len(raisers) == 0:
+        if threebet_size_idx != 0:
+            raise ValueError(
+                "threebet_size_idx given but the line has no 3-bet "
+                "(limp-check shape)"
+            )
+        return _limp_check_prefix(actions)
+    if len(raisers) == 1:
+        if threebet_size_idx != 0:
+            raise ValueError(
+                "threebet_size_idx given but the line has no 3-bet "
+                "(single-open shape)"
+            )
+        return _single_open_prefix(actions)
+    if len(raisers) == 2:
+        return _threebet_hu_prefix(actions, raisers, threebet_size_idx)
+    raise PreflopConstructionUnsupported(
+        "more than two raises (4bet+) is not capture-verified"
+    )
+
+
+# ── Shape 1: canonical single open + flat callers (verified) ───────────────
+
+
+def _single_open_prefix(actions: List[PreflopAction]) -> List[int]:
+    # Map position -> its voluntary action. Reject duplicate actors (with a
+    # single raise, nobody legally acts twice before the round closes).
+    acted = {}
+    for a in actions:
+        if a.position in acted:
+            raise PreflopConstructionUnsupported(
+                f"{a.position} acts more than once without a re-raise — not "
+                f"a canonical single-open line"
+            )
+        acted[a.position] = a
+
+    # Actions must be in canonical acting order.
+    order_idx = [PREFLOP_ORDER.index(a.position) for a in actions]
+    if order_idx != sorted(order_idx):
+        raise PreflopConstructionUnsupported(
+            "preflop actions are not in canonical acting order "
+            "(UTG,MP,CO,BTN,SB,BB) — non-canonical multiway line"
+        )
+
+    opener_idx = PREFLOP_ORDER.index(
+        next(a.position for a in actions if a.action == "raise")
+    )
+    last_actor_idx = max(order_idx)
+
+    prefix: List[int] = []
+    for seat_idx in range(last_actor_idx + 1):
+        pos = PREFLOP_ORDER[seat_idx]
+        a = acted.get(pos)
+        if a is None:
+            # Seat between/ before the actors that didn't voluntarily act:
+            # they folded (everyone folds around the single open).
+            prefix.append(_FOLD)
+            continue
+        if a.action == "fold":
+            prefix.append(_FOLD)
+        elif a.action == "call":
+            # A call BEFORE the opener acts = a limp (no bet to call yet) →
+            # unsupported. After the opener it's a flat call of the open.
+            if seat_idx < opener_idx:
+                raise PreflopConstructionUnsupported(
+                    f"{pos} calls before the opener (limp) — not "
+                    f"capture-verified"
+                )
+            prefix.append(_CALL)
+        elif a.action == "raise":
+            prefix.append(_RAISE)
+        else:
+            raise PreflopConstructionUnsupported(
+                f"unsupported preflop action {a.action!r} for {pos}"
+            )
+    return prefix
+
+
+# ── Shape 2: 3-bet heads-up (capture-verified) ────────────────────────────
+
+
+def _threebet_hu_prefix(
+    actions: List[PreflopAction],
+    raisers: List[PreflopAction],
+    threebet_size_idx: int = 0,
+) -> List[int]:
+    """open → 3-bet → folds back → opener calls, heads-up to the flop.
+
+    The emitted prefix is always length 7: one index per seat in the first
+    orbit (UTG..BB — folds for everyone but the opener and the 3-bettor),
+    then the opener's closing call. Capture-verified for all 15
+    (opener, 3-bettor) pairs at the smallest size — e.g. BTN-open/BB-3bet →
+    [0,0,0,2,0,2,1], UTG-open/BTN-3bet → [2,0,0,2,0,0,1]. With
+    threebet_size_idx=1 the 3-bettor's slot emits index 3 (the 1.0x size):
+    BTN-open/BB-3bet → [0,0,0,2,0,3,1] (capture-verified for that pair
+    only).
+    """
+    opener, threebettor = raisers[0].position, raisers[1].position
+    if opener == threebettor:
+        raise PreflopConstructionUnsupported(
+            f"{opener} raises twice (limp-reraise or 4-bet shape) — not "
+            f"capture-verified"
+        )
+    if PREFLOP_ORDER.index(threebettor) <= PREFLOP_ORDER.index(opener):
+        raise PreflopConstructionUnsupported(
+            f"{threebettor} re-raises from an earlier seat than the opener "
+            f"{opener} (limp-reraise shape) — not capture-verified"
+        )
+
+    calls = [a for a in actions if a.action == "call"]
+    if len(calls) != 1 or calls[0].position != opener:
+        raise PreflopConstructionUnsupported(
+            "3-bet line must close with EXACTLY the opener's call (squeeze/"
+            "cold-call/multiway 3-bet pots are not capture-verified; an "
+            "opener fold ends the hand preflop — no flop key exists)"
+        )
+
+    folds = [a for a in actions if a.action == "fold"]
+    fold_seen: set = set()
+    for f in folds:
+        if f.position in (opener, threebettor):
+            raise PreflopConstructionUnsupported(
+                f"{f.position} both folds and raises/calls — inconsistent line"
+            )
+        if f.position in fold_seen:
+            raise PreflopConstructionUnsupported(
+                f"{f.position} folds twice — inconsistent line"
+            )
+        fold_seen.add(f.position)
+    if any(a.action not in ("fold", "call", "raise") for a in actions):
+        bad = next(a for a in actions if a.action not in ("fold", "call", "raise"))
+        raise PreflopConstructionUnsupported(
+            f"unsupported preflop action {bad.action!r} for {bad.position}"
+        )
+
+    # Chronological-order validation: orbit-1 rank = seat index; the opener's
+    # closing call ranks AFTER the whole orbit.
+    def _rank(a: PreflopAction) -> int:
+        if a.action == "call" and a.position == opener:
+            return len(PREFLOP_ORDER)
+        return PREFLOP_ORDER.index(a.position)
+
+    ranks = [_rank(a) for a in actions]
+    if ranks != sorted(ranks):
+        raise PreflopConstructionUnsupported(
+            "preflop actions are not in chronological acting order for a "
+            "3-bet heads-up line (UTG..BB orbit, then the opener's call)"
+        )
+
+    # Emission: full first orbit + the opener's closing call (length 7).
+    prefix = []
+    for pos in PREFLOP_ORDER:
+        if pos == opener:
+            prefix.append(_RAISE)
+        elif pos == threebettor:
+            prefix.append(_RAISE + threebet_size_idx)
+        else:
+            prefix.append(_FOLD)
+    prefix.append(_CALL)
+    return prefix
+
+
+# ── Shape 3: heads-up limp-check (capture-verified) ───────────────────────
+
+
+def _limp_check_prefix(actions: List[PreflopAction]) -> List[int]:
+    """One limper → folds around → the BB checks the option; flop HU.
+
+    Emits the full first orbit (length 6): the limper's call (index 1),
+    folds (index 0) everywhere else, and the BB's CHECK — index 0 at the
+    BB-option node (trainer layout [check, 0.7x, 1.0x], capture-verified).
+    The three verified lines:
+      UTG-limp     → [1, 0, 0, 0, 0, 0]
+      BTN-limp     → [0, 0, 0, 1, 0, 0]
+      SB-complete  → [0, 0, 0, 0, 1, 0]
+    """
+    # Duplicate actors: in a limped pot nobody legally acts twice.
+    acted = {}
+    for a in actions:
+        if a.position in acted:
+            raise PreflopConstructionUnsupported(
+                f"{a.position} acts more than once in a limped pot — "
+                f"inconsistent line"
+            )
+        acted[a.position] = a
+
+    # Vocabulary: only fold / call(limp) / the BB's check exist here (a
+    # raise was excluded by the dispatcher).
+    for a in actions:
+        if a.action not in ("fold", "call", "check"):
+            raise PreflopConstructionUnsupported(
+                f"unsupported preflop action {a.action!r} for {a.position}"
+            )
+
+    # Chronological order: a limped pot closes within the first orbit, so
+    # actions must follow the canonical seat order (BB, seat 6, is last).
+    order_idx = [PREFLOP_ORDER.index(a.position) for a in actions]
+    if order_idx != sorted(order_idx):
+        raise PreflopConstructionUnsupported(
+            "preflop actions are not in canonical acting order "
+            "(UTG,MP,CO,BTN,SB,BB) for a limped pot"
+        )
+
+    checks = [a for a in actions if a.action == "check"]
+    if len(checks) != 1 or checks[0].position != "BB":
+        raise PreflopConstructionUnsupported(
+            "a limped pot must close with EXACTLY the BB's 'check' (a check "
+            "by any other seat is not a trainer node; without the BB's "
+            "check the line is unclosed)"
+        )
+
+    limpers = [a for a in actions if a.action == "call"]
+    if any(a.position == "BB" for a in limpers):
+        raise PreflopConstructionUnsupported(
+            "the BB closes a limped pot with 'check', not 'call' (there is "
+            "nothing to call at the BB-option node)"
+        )
+    if len(limpers) != 1:
+        raise PreflopConstructionUnsupported(
+            "limped pots are capture-verified HEADS-UP only (exactly one "
+            "limper); multi-limper (3-way) limped pots are root-captured "
+            "but their postflop walks are not verified — rejected rather "
+            "than served wrong"
+        )
+    limper = limpers[0].position
+    if limper not in _VERIFIED_LIMP_SEATS:
+        raise PreflopConstructionUnsupported(
+            f"a {limper} limp is not capture-verified (verified HU "
+            f"limp-check lines: UTG-limp, BTN-limp, SB-complete)"
+        )
+    if any(a.position == "BB" for a in actions if a.action == "fold"):
+        raise PreflopConstructionUnsupported(
+            "the BB cannot fold a limped pot (nothing to call) — "
+            "inconsistent line"
+        )
+
+    # Emission: full first orbit, length 6. The BB slot is the CHECK
+    # (index 0 — same integer as a fold, but a distinct trainer action type;
+    # the capture pins the combined sequence).
+    prefix: List[int] = []
+    for pos in PREFLOP_ORDER:
+        if pos == limper:
+            prefix.append(_CALL)
+        elif pos == "BB":
+            prefix.append(_CHECK)
+        else:
+            prefix.append(_FOLD)
+    return prefix

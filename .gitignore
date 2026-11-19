@@ -1,0 +1,15 @@
+# build outputs (make)
+solver/build/
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+# the results release asset, unpacked for results/reproduce.py
+results/data/
+# caches the blueprint reader writes next to a .bps
+*.bps.cache
+*.bps.preflop_cache.npz
+# the results release asset, when downloaded into the repository root
+/nexusgto-results.tar

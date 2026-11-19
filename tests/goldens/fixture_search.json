@@ -1,0 +1,168 @@
+{
+ "name": "fixture_search",
+ "blueprint": "fixture",
+ "description": "The headline configuration (every-street search with own-range tracking) against the blueprint field on the fixture, one solve thread and a fixed 1,000-iteration ceiling so the solves are deterministic.",
+ "args": [
+  "--mode",
+  "ab",
+  "--deals",
+  "2",
+  "--master-seed",
+  "4242",
+  "--hero-source",
+  "production",
+  "--field-source",
+  "lookup",
+  "--live-threads",
+  "1",
+  "--production-iterations",
+  "1000",
+  "--production-deadline-ms",
+  "60000",
+  "--hero-own-reach",
+  "--production-env",
+  "NEXUS_FLOP_CHANCE_SOLVE=1",
+  "--production-env",
+  "NEXUS_VEC_SAMPLED_OPP_HAND=root",
+  "--production-env",
+  "NEXUS_RANGE_COMBO_PRIOR=1",
+  "--production-env",
+  "NEXUS_RANGE_POSTFLOP_CONDITIONING=1",
+  "--aivat"
+ ],
+ "env": {
+  "NEXUS_HU_LEAF_MIRROR": "1",
+  "NEXUS_MAX_PROJECTED_FILL_BYTES": "7000000",
+  "NEXUS_LEAF_VEC_SAMPLED": "1",
+  "NEXUS_OFFTREE_ADD": "1",
+  "PYTHONIOENCODING": "utf-8",
+  "PYTHONUTF8": "1"
+ },
+ "timeout_s": 1800,
+ "recorded": "Recorded on the original code this release was cut from and on this release: identical; this release run a second time: identical.",
+ "digest": {
+  "lookup": {
+   "count": 73485,
+   "sha256": "347ad210089bd20443062bd76c4bf20f055954cc758fd2e4b19836c20f16fc33"
+  },
+  "search": {
+   "count": 10,
+   "sha256": "2052004a2297e1f86706a88a17c7d3cccc9cf4f7278af74d723c75e23f198621"
+  },
+  "solve": {
+   "count": 15,
+   "sha256": "7c4f0498942a1f06cfbf1d9c38fcc18fa06585f250827ac462d29c88ae64f70d"
+  }
+ },
+ "first_rows": {
+  "search": [
+   {
+    "board": [
+     19,
+     45,
+     30,
+     28,
+     0
+    ],
+    "freqs": [
+     [
+      0,
+      1.0
+     ]
+    ],
+    "hero": [
+     36,
+     18
+    ],
+    "key": [
+     [
+      2,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0
+     ],
+     0,
+     2
+    ],
+    "kind": "search"
+   },
+   {
+    "board": [
+     19,
+     45,
+     30,
+     28,
+     0
+    ],
+    "freqs": [
+     [
+      1,
+      1.0
+     ]
+    ],
+    "hero": [
+     36,
+     18
+    ],
+    "key": [
+     [
+      2,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1
+     ],
+     0,
+     2
+    ],
+    "kind": "search"
+   }
+  ],
+  "solve": [
+   {
+    "board": [
+     19,
+     45,
+     30,
+     28
+    ],
+    "inputs_sha256": "ddda9bdf984740a0a4d7f27ff514ef1632cb6da92858d05ba9734c6300a54e60",
+    "iterations": 1000,
+    "iterations_run": 1000,
+    "kind": "solve",
+    "output_sha256": "e59f96bc8d2f8a31b76c15ffb94ac87edfc5df9b4381ad316e5694523c986d89",
+    "players": 3
+   },
+   {
+    "board": [
+     19,
+     45,
+     30,
+     28
+    ],
+    "inputs_sha256": "4d81985ec974116b9c664c7ffaf25669f05ecdd62face167fb7907c3dc07347c",
+    "iterations": 1000,
+    "iterations_run": 1000,
+    "kind": "solve",
+    "output_sha256": "c7c556efe72cdecee7f1478774b3d48fd8dad852bebc1cf3bfda90735a597a75",
+    "players": 3
+   }
+  ]
+ }
+}

@@ -1,0 +1,1051 @@
+/**
+ * mccfr_blueprint.h - N-player external-sampling MCCFR blueprint trainer
+ *
+ * Matches the exact Pluribus blueprint training algorithm:
+ *   - N-player (2-6) external-sampling MCCFR
+ *   - Multi-street: flop -> turn -> river -> showdown
+ *   - Linear CFR discount: every DISCOUNT_INTERVAL iters for first DISCOUNT_PERIOD iters
+ *   - Regret-based pruning: skip actions with regret < PRUNE_THRESHOLD (95% of iters)
+ *   - Integer regrets (int32) with floor at REGRET_FLOOR
+ *   - Card abstraction: hand_to_bucket mapping (200 buckets per street)
+ *   - OpenMP parallel iterations with thread-local RNG (Hogwild-style)
+ *   - Strategy snapshots to disk (not continuous accumulation for rounds 2-4)
+ *
+ * Pluribus parameters (from supplementary):
+ *   - 64 cores, 8 days, 12400 CPU-hours, <512GB RAM
+ *   - Discount: d = (T/interval)/(T/interval+1) every 10 min for first 400 min
+ *   - Pruning: after 200 min, threshold -300M, 95% of iterations
+ *   - Regret floor: -310M
+ *   - 665M action sequences, 414M encountered
+ *   - Regrets as int32, lazy allocation
+ */
+#ifndef MCCFR_BLUEPRINT_H
+#define MCCFR_BLUEPRINT_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include "mccfr_cont_ev_table.h"
+#include "mccfr_bias_regrets.h"
+
+/* ── Limits ──────────────────────────────────────────────────────────── */
+
+#define BP_MAX_PLAYERS    6
+#define BP_MAX_HANDS      1326   /* max hands per player (all possible 2-card combos) */
+#define BP_MAX_ACTIONS    16
+#define BP_MAX_BOARD      5
+
+/* Action-type tags. Mirrors the static ACT_* defines inside
+ * mccfr_blueprint.c, exposed in the header so the depth-limit helpers in
+ * mccfr_phase_r.c can classify actions for cont-bias reweighting. */
+#define BP_ACT_FOLD     0
+#define BP_ACT_CHECK    1
+#define BP_ACT_CALL     2
+#define BP_ACT_BET      3
+
+/* Mean-field bias-as-action mode.
+ *
+ * Governs HOW opponents' continuation-strategy bias is drawn at the
+ * boundary HEADS branches (flop AND turn) during the EV-only walk:
+ *   UNIFORM (0)   = legacy — every opponent bias is rng_int(rng, 4), a
+ *                   chance node; ev_sum[b] = E[value | my bias b, opps ~
+ *                   Uniform]. Default; byte-identical to a run without
+ *                   the mean-field code.
+ *   MEANFIELD (1) = each opponent samples its bias by regret matching over
+ *                   a per-opponent-slot mix maintained in the bias-regret
+ *                   sidecar (mccfr_bias_regrets.{c,h}); ev_sum[b] = E[value
+ *                   | my bias b, opps playing their learned bias mix]. */
+#define BP_BIAS_MODE_UNIFORM    0
+#define BP_BIAS_MODE_MEANFIELD  1
+
+/* BPAction — single emitted action from the trainer's
+ * generate_actions(). Exposed in the header so the encoding-alignment
+ * test can drive a pure-C trainer-walker against the same emission
+ * contract the trainer's traverse() uses. */
+typedef struct {
+    int type;     /* BP_ACT_FOLD/CHECK/CALL/BET */
+    int bet_idx;  /* -1 for non-bet; index into bet_sizes[] for bet/raise */
+    int amount;   /* total chips committed by this action (call=to_call, raise=to_call+raise) */
+} BPAction;
+
+#define BP_MAX_GEN_ACTIONS 16
+
+/* Hash table sizing.
+ * Per-texture: ~5-50M info sets depending on player count and bet sizes.
+ * BP_HASH_SIZE_MEDIUM (64M slots) fits ~45M info sets at 70% load.
+ * Memory: 64M * (key=20 + set=16 + occupied=4) = ~2.5GB metadata.
+ * For small test runs, use BP_HASH_SIZE_SMALL. */
+#define BP_HASH_SIZE_3B     ((int64_t)3000000000) /* 3B slots (~180GB metadata) — full unified solve */
+#define BP_HASH_SIZE_LARGE  (1 << 30)   /* 1.07B slots (~44GB metadata) — bucket-in-key needs more */
+#define BP_HASH_SIZE_MEDIUM (1 << 26)   /* 64M slots (~2.5GB metadata) — per-texture */
+#define BP_HASH_SIZE_SMALL  (1 << 22)   /* 4M slots (~160MB metadata) — testing only */
+
+/* Pluribus-matched constants */
+#define BP_REGRET_FLOOR      (-310000000)   /* minimum regret per action */
+#define BP_REGRET_CEILING     2000000000    /* ~int32 max. Pluribus has no explicit ceiling (only
+                                            * the implicit int32 max). A 310M ceiling makes
+                                            * dominant actions saturate 7x too early, losing
+                                            * ordering information when multiple actions compete.
+                                            * int64 intermediate arithmetic prevents overflow. */
+#define BP_PRUNE_THRESHOLD   (-300000000)   /* Pluribus standard: Linear CFR regrets hit this naturally */
+#define BP_PRUNE_PROB        0.95f          /* fraction of iters that prune */
+
+/* ── Data structures ─────────────────────────────────────────────────── */
+
+/* Info set key — includes bucket (Pluribus-style: one info set per bucket).
+ * This means each hash table slot stores regrets[num_actions] only,
+ * reducing memory ~200x vs storing regrets[num_actions * num_buckets]. */
+typedef struct {
+    int player;
+    int street;              /* 0=preflop, 1=flop, 2=turn, 3=river */
+    int bucket;              /* card abstraction bucket index */
+    uint64_t board_hash;
+    uint64_t action_hash;
+} BPInfoKey;
+
+/* Info set data — integer regrets for memory efficiency.
+ * Pluribus stores regrets as int32, strategies derived from regrets.
+ * With bucket-in-key, each info set stores regrets for ONE bucket only.
+ *
+ * strategy_sum lifecycle (NOTE: this differs from Pluribus, see below):
+ *   - Round 1: accumulated continuously by traverse() in mccfr_blueprint.c
+ *     on every traverser visit (full regret-matched distribution added).
+ *   - Rounds 2-4: accumulated in-memory by accumulate_snapshot() in
+ *     mccfr_blueprint.c, called from bp_solve at snapshot barriers.
+ *     accumulate_snapshot skips street 0, so round 1 is not double-counted
+ *     by snapshots on top of per-visit accumulation.
+ *
+ * Pluribus uses a sparse sampled UPDATE-STRATEGY for round 1 (every 10K iters,
+ * one path sampled, single phi[I,a] += 1) and on-disk snapshots for rounds 2-4
+ * to halve memory. This trainer uses full-distribution per-visit + in-memory
+ * snapshots, which is algorithmically defensible (lower variance, more memory). */
+typedef struct {
+    int num_actions;
+    int *regrets;          /* [num_actions], int32 */
+    float *strategy_sum;   /* [num_actions] or NULL (lazy) */
+    float *action_evs;     /* [num_actions] or NULL (populated by bp_compute_action_evs).
+                            * Sum of per-action expected values observed during
+                            * the σ̄-sampled EV walk. Average EV = action_evs[a] / ev_visit_count.
+                            * Arena-allocated lazily on first traverser visit during the EV
+                            * walk; NULL until then. */
+    int ev_visit_count;    /* Number of traverser visits that contributed to
+                            * action_evs during the EV walk. Used to normalize the
+                            * accumulated EVs into averages at export time. Relaxed atomic. */
+} BPInfoSet;
+
+/* Hash table (open addressing, linear probing) */
+typedef struct {
+    BPInfoKey *keys;
+    BPInfoSet *sets;
+    int *occupied;
+    int64_t num_entries;
+    int64_t table_size;             /* actual hash table size (supports up to 4B+) */
+    int64_t insertion_failures;     /* atomic, lifetime count of probe-cap-exceeded returns */
+    int64_t max_probe_observed;     /* atomic, lifetime maximum probe distance */
+} BPInfoTable;
+
+/* Blueprint solver configuration */
+typedef struct {
+    /* Timing-based thresholds (converted to iteration counts).
+     * Pluribus used wall-clock minutes; the trainer converts to iterations
+     * based on estimated iterations/minute on the target hardware.
+     * Uses int64 because full Pluribus-equivalent compute on fast hardware
+     * requires ~100B+ iterations, exceeding INT32_MAX. */
+    int64_t discount_stop_iter;     /* stop Linear CFR discount after this (Pluribus: 400 min) */
+    int64_t discount_interval;      /* apply discount every N iterations (Pluribus: ~10 min) */
+    int64_t prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
+    int64_t snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
+    int64_t snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
+    /* DEPRECATED: set by ctypes callers but never read by
+     * mccfr_blueprint.c. The original Pluribus design uses Strategy Interval
+     * = 10K to gate sampled UPDATE-STRATEGY for round 1; this implementation
+     * accumulates strategy_sum on every visit, so this field is dead code.
+     * Kept in the struct for ABI safety with ctypes callers; ignore in new
+     * code. */
+    int64_t strategy_interval;
+    int num_threads;            /* OpenMP threads (0 = auto) */
+    int64_t hash_table_size;    /* 0 = auto. Supports >2B (e.g. 3B on a 376 GB machine) */
+    const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
+    int include_preflop;        /* 1 = start from preflop (unified Pluribus-style), 0 = start from flop */
+    int postflop_num_buckets;   /* 0 = default (200). Reduce to shrink game tree. */
+    int river_ochs_enabled;     /* 0 = EHS-percentile (legacy); 1 = OCHS (Johanson 2013, Pluribus-faithful) */
+    int river_ochs_num_clusters;/* 0 = default (8) opponent clusters */
+} BPConfig;
+
+/* Blueprint solver state */
+typedef struct {
+    /* Players */
+    int num_players;
+    int hands[BP_MAX_PLAYERS][BP_MAX_HANDS][2]; /* actual cards */
+    float weights[BP_MAX_PLAYERS][BP_MAX_HANDS];
+    int num_hands[BP_MAX_PLAYERS];
+
+    /* Card abstraction: hand -> bucket mapping per street.
+     * bucket_map[street][player][hand_idx] = bucket index.
+     * street: 0=preflop, 1=flop, 2=turn, 3=river.
+     * When use_buckets=0, bucket = hand_idx (identity mapping). */
+    int use_buckets;
+    int bucket_map[4][BP_MAX_PLAYERS][BP_MAX_HANDS];
+    int num_buckets[4][BP_MAX_PLAYERS]; /* buckets per street per player */
+
+    /* Board */
+    int flop[3];
+
+    /* Bet sizing (postflop first raise: Pluribus turn/river = 0.5x, 1x, all-in) */
+    float bet_sizes[BP_MAX_ACTIONS];
+    int num_bet_sizes;
+
+    /* Postflop subsequent raises (Pluribus turn/river = 1x, all-in) */
+    float subsequent_bet_sizes[BP_MAX_ACTIONS];
+    int num_subsequent_bet_sizes;
+
+    /* Preflop bet sizing (Pluribus: 1-14 sizes per decision point) */
+    float preflop_bet_sizes[BP_MAX_ACTIONS];
+    int num_preflop_bet_sizes;
+
+    /* Tiered preflop sizing: per-raise-level arrays (Pluribus-style).
+     * Level 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+     * If num_preflop_tiers > 0, these override preflop_bet_sizes. */
+    float preflop_tiered_sizes[4][BP_MAX_ACTIONS];
+    int num_preflop_tiered_sizes[4];  /* sizes per level */
+    int num_preflop_tiers;            /* 0 = use flat preflop_bet_sizes */
+    int preflop_max_raises;           /* 0 = default (4) */
+
+    /* Gate the implicit-allin block in generate_actions().
+     * 1 = legacy behavior (always append explicit all-in raise when no
+     *     bet_size already clamped to stack). Older blueprints were
+     *     trained with 1.
+     * 0 = no implicit all-in. Used by the warm-restart retrain so allin
+     *     is never an option at deep-stack nodes (where stack
+     *     >> any bet_size-derived raise). Short-stack scenarios where
+     *     a bet_size genuinely clamps to all-in (mccfr_blueprint.c:913)
+     *     are unaffected. */
+    int add_explicit_allin;
+
+    /* Depth-limit dispatch + cont-strat sampling at the multiway-flop
+     * boundary (the trainer's version of the subgame solver's depth-limit
+     * dispatch).
+     *
+     * depth_limit_cont_strats:
+     *   0 = legacy full-game-depth MCCFR (default; existing checkpoints
+     *       carry forward unchanged).
+     *   1 = at end-of-multiway-flop, with probability cont_strat_prob,
+     *       terminate the recursion and accumulate to the cont-strat EV
+     *       slot table; otherwise recurse legacy. The HEADS branch runs
+     *       the boundary rollout.
+     *
+     * cont_strat_prob:
+     *   p_boundary in [0, 1]; default 0.5. Probability that a multiway-
+     *   flop iter terminates at the boundary (HEADS) vs. recurses past
+     *   it (TAILS). TAILS keeps multiway turn/river σ̄ co-evolving;
+     *   HEADS accumulates cont-bias EVs against the running σ̄.
+     *
+     * INVARIANT (byte-identical regression): when
+     * depth_limit_cont_strats == 0, the dispatch helper returns 0
+     * deterministically without consuming RNG. The new field's
+     * presence in BPSolver does NOT change traversal behavior unless
+     * the flag is explicitly enabled. */
+    int depth_limit_cont_strats;
+    float cont_strat_prob;
+
+    /* Dual-boundary mode: TURN-boundary dispatch, parallel
+     * to depth_limit_cont_strats (the FLOP one above).
+     *
+     * depth_limit_cont_strats_turn:
+     *   0 = no turn-boundary dispatch (default; the FLOP path and all
+     *       existing checkpoints/tests are byte-unaffected).
+     *   1 = at end-of-multiway-TURN (num_board==4, n_active>=3), with
+     *       probability cont_strat_prob, terminate the recursion, deal the
+     *       river, roll out to showdown under bias-reweighted σ̄, and
+     *       accumulate to the cont_ev slot table keyed with the TURN street
+     *       salt (bp_cont_ev_boundary_key_hash). Mirrors the flop HEADS
+     *       branch one street later (river leaf instead of turn leaf).
+     *
+     * This flag is INDEPENDENT of depth_limit_cont_strats: either, both, or
+     * neither may be on. The same byte-identity invariant holds — with this
+     * flag 0 the turn-dispatch helper returns 0 without consuming RNG, so a
+     * turn-flag-OFF run is byte-equivalent to legacy. cont_strat_prob is
+     * shared (one knob governs the HEADS probability at both boundaries). */
+    int depth_limit_cont_strats_turn;
+
+    /* Boundary EV slot table.
+     *
+     * Allocated lazily on bp_set_depth_limit_cont_strats(s, 1) using
+     * cont_ev_table_size_hint (see below) as the requested capacity.
+     * Stays NULL when the feature is OFF.
+     *
+     * Storage: float ev_sum[4] (Linear-CFR-discounted via the same
+     * periodic-discount tick that scales the regret table) + int64
+     * ev_count[4] (unweighted visit count) per slot, keyed on
+     * (action_hash_at_boundary, traverser, bucket).
+     *
+     * Free'd by bp_free. */
+    BPContEVTable cont_ev_table;
+
+    /* Requested capacity for cont_ev_table at allocation time.
+     * 0 → use the default (1<<26 ≈ 67M slots, ~5GB at 72B/slot).
+     * Tests override via bp_set_cont_ev_table_size to keep the unit-test
+     * footprint small (~MB). */
+    int64_t cont_ev_table_size_hint;
+
+    /* Pot, stacks, and blinds */
+    int starting_pot;       /* pot at start of postflop (when include_preflop=0) */
+    int effective_stack;    /* stack at start of postflop (when include_preflop=0) */
+    int small_blind;        /* SB amount in chips (e.g. 50 for $50/$100) */
+    int big_blind;          /* BB amount in chips (e.g. 100) */
+    int initial_stack;      /* starting stack per player (e.g. 10000 for 100BB) */
+
+    /* Info set storage */
+    BPInfoTable info_table;
+
+    /* Config */
+    BPConfig config;
+
+    /* RNG state — one per thread for OpenMP */
+    uint64_t *rng_states;    /* [num_threads] */
+    int num_rng_states;
+
+    /* Postflop bucket config for unified solver.
+     * When include_preflop=1, postflop buckets are precomputed for all 1,755
+     * flop textures at init time. During traversal, the canonical flop hash
+     * is used to look up the precomputed 200-bucket mapping. */
+    int postflop_num_buckets;  /* target buckets per street (Pluribus: 200) */
+    int postflop_ehs_samples;  /* MC samples for EHS precompute (Pluribus: ~500) */
+
+    /* Precomputed flop texture bucket cache.
+     * Key: canonical flop hash (from 3 sorted ranks + suit pattern).
+     * Value: bucket_map[1326] for that texture.
+     * Allocated at init, freed by bp_free. */
+    #define BP_MAX_TEXTURES 1760
+    /* Open-addressing hashmap on top of texture_hash_keys[].
+     * Sized to next power of 2 above 2 * BP_MAX_TEXTURES → 4096 buckets,
+     * load factor ≤43% so probe chains stay under 3-4 on average. The hash
+     * mixer is splitmix64-style. Avoids an O(N) linear scan
+     * (~1755 comparisons per flop deal). Populated by
+     * `texture_index_rebuild()` after the texture cache is loaded or
+     * precomputed. */
+    #define BP_TEXTURE_INDEX_SIZE 4096
+    int *texture_bucket_cache;     /* [BP_MAX_TEXTURES * BP_MAX_HANDS] flat array */
+    uint64_t texture_hash_keys[BP_MAX_TEXTURES];  /* hash key per texture */
+    int texture_hash_index[BP_TEXTURE_INDEX_SIZE]; /* open-addressed: -1 = empty, else idx into texture_hash_keys */
+    int num_cached_textures;
+
+    /* Precomputed turn k-means centroids for bucketing.
+     * 200 centroids in [EHS, PPot, NPot] feature space.
+     * During traversal, each hand's features are computed inline and
+     * mapped to nearest centroid. Matches Pluribus bucketing approach. */
+    float turn_centroids[200][3];
+    int turn_centroids_k;
+
+    /* River OCHS abstraction (Johanson 2013, AAMAS). When
+     * config.river_ochs_enabled == 1, the river bucket comes from nearest
+     * centroid in OCHS feature space instead of EHS percentile.
+     *
+     * ochs_cluster_of_169: preflop class -> opponent cluster. Fixed at init.
+     * river_centroids: flat [river_centroids_k * river_ochs_num_clusters].
+     *   Per-run single global centroid set: the same centroid set is
+     *   reused across boards with on-the-fly per-hand feature compute at
+     *   deal time (cached in river_bucket[p]). */
+    int ochs_enabled;            /* mirror of config.river_ochs_enabled */
+    int ochs_num_clusters;       /* k for opponent clusters, typically 8 */
+    int ochs_cluster_of_169[169];
+    float *river_centroids;      /* [river_centroids_k * ochs_num_clusters] */
+    int river_centroids_k;
+
+    /* Stats */
+    int64_t iterations_run;
+    int64_t snapshots_saved;
+
+    /* Zero-strategy-drift warm-start mode.
+     *
+     * When set (via BP_BOUNDARY_EV_ONLY=1 at solver init), traverse()
+     * skips ALL writes to is->regrets[] and is->strategy_sum[], and
+     * bp_solve() skips apply_discount() + accumulate_snapshot(). The
+     * cont-strat HEADS-branch path remains active so cont_ev_table
+     * keeps accumulating boundary EV slots — that is the whole point
+     * of EV-only mode: regenerate the BPR5 trailer from a frozen
+     * blueprint without drifting the underlying regrets/strategies.
+     *
+     * Default 0 (legacy CFR with regret + strategy_sum updates). */
+    int boundary_ev_only;
+
+    /* All-biases boundary accumulation.
+     *
+     * When set (via BP_CONT_EV_ALL_BIASES=1 at solver init, honored ONLY
+     * together with BP_BOUNDARY_EV_ONLY=1), every HEADS boundary visit
+     * runs BP_CONT_EV_NUM_BIASES independent rollouts — one per
+     * traverser bias, each with a freshly sampled opponent-bias tuple
+     * and a fresh turn deal — and accumulates each rollout's EV into its
+     * bias's ev_sum/ev_count entry. 4x rollout cost per visit, 4x
+     * coupon-collector coverage win (every visited slot becomes all-4-
+     * bias immediately).
+     *
+     * Per-bias estimates keep EXACTLY the sampled-bias path's
+     * conditional distribution: the bias only reweights the acting
+     * player's frozen-σ̄ action sampling inside the rollout (read-only
+     * descend, no regret/strategy_sum writes), and ev_sum[b] is keyed
+     * per bias, so forcing a deterministic sweep over b changes nothing
+     * about each bias's estimator. The boundary's RETURN value becomes
+     * the mean over the 4 rollouts — unbiased for the same expectation
+     * but a different per-sample distribution, which is why the flag is
+     * refused (warn + ignore) without boundary_ev_only=1: in normal
+     * training the returned value feeds upstream regret updates.
+     *
+     * Default 0 (single sampled bias per visit — legacy behavior). */
+    int cont_ev_all_biases;
+
+    /* Mean-field opponent-bias-as-action mode.
+     *
+     * cont_ev_bias_mode ∈ {BP_BIAS_MODE_UNIFORM, BP_BIAS_MODE_MEANFIELD}:
+     *   UNIFORM (0, default): opponents' boundary bias is rng_int(rng, 4)
+     *       (a chance node), BYTE-IDENTICAL to a run without the mean-field
+     *       code. The mean-field
+     *       code paths short-circuit and consume NO extra RNG.
+     *   MEANFIELD (1): at the HEADS branches each opponent's bias is sampled
+     *       by regret matching over its bias_regrets sidecar slot (uniform
+     *       fallback when the slot is unseen or all-regrets<=0), and the
+     *       sampled opponents' regrets are updated after the sweep from the
+     *       realized boundary value. The traverser still sweeps all 4 biases.
+     *
+     * Set via bp_set_cont_ev_bias_mode / env BPS_CONT_EV_BIAS_MODE. */
+    int cont_ev_bias_mode;
+
+    /* Per-opponent-slot bias-regret sidecar (mean-field state).
+     * Allocated ONLY when cont_ev_bias_mode == BP_BIAS_MODE_MEANFIELD, at
+     * the same time as (and to the same requested capacity as) the cont_ev
+     * table. NEVER serialized — transient training state whose effect is
+     * baked into the cont_ev ev_sum values. Free'd by bp_free. */
+    BPBiasRegretTable bias_regrets_table;
+} BPSolver;
+
+/* ── Public API ──────────────────────────────────────────────────────── */
+
+#ifdef _WIN32
+#define BP_EXPORT __declspec(dllexport)
+#else
+#define BP_EXPORT
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Initialize with default Pluribus-matched config.
+ */
+BP_EXPORT void bp_default_config(BPConfig *config);
+
+/**
+ * Initialize the blueprint solver.
+ */
+BP_EXPORT int bp_init(BPSolver *s, int num_players,
+                      const int *flop,
+                      const int hands[][BP_MAX_HANDS][2],
+                      const float weights[][BP_MAX_HANDS],
+                      const int *num_hands,
+                      int starting_pot, int effective_stack,
+                      const float *bet_sizes, int num_bet_sizes);
+
+/**
+ * Initialize with explicit config.
+ */
+BP_EXPORT int bp_init_ex(BPSolver *s, int num_players,
+                          const int *flop,
+                          const int hands[][BP_MAX_HANDS][2],
+                          const float weights[][BP_MAX_HANDS],
+                          const int *num_hands,
+                          int starting_pot, int effective_stack,
+                          const float *bet_sizes, int num_bet_sizes,
+                          const BPConfig *config);
+
+/**
+ * Set card abstraction buckets for a given street.
+ * Must be called after bp_init, before bp_solve.
+ *
+ * street: 0=preflop, 1=flop, 2=turn, 3=river
+ * bucket_map[player][hand_idx] = bucket index
+ * num_buckets[player] = number of buckets for this player
+ */
+BP_EXPORT int bp_set_buckets(BPSolver *s, int street,
+                              const int bucket_map[][BP_MAX_HANDS],
+                              const int *num_buckets);
+
+/**
+ * Set tiered preflop bet sizes (Pluribus-style: fewer sizes at higher raise levels).
+ * level: 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+ * Call once per level after bp_init_unified, before bp_solve.
+ * max_raises: total preflop raise cap (set on first call, e.g. 4).
+ */
+BP_EXPORT int bp_set_preflop_tier(BPSolver *s, int level,
+                                   const float *sizes, int num_sizes,
+                                   int max_raises);
+
+/**
+ * Gate the implicit-allin block in generate_actions().
+ * Pass 0 to disable (used by the warm-restart retrain); default is 1
+ * (legacy training behavior: append an explicit all-in raise to every
+ * betting node when no bet_size already clamped to stack).
+ */
+BP_EXPORT int bp_set_add_explicit_allin(BPSolver *s, int enabled);
+
+/**
+ * Enable/disable the depth-limit + cont-strat-sampling dispatch at the
+ * multiway-flop boundary.
+ *
+ * enabled = 0 → legacy full-game-depth MCCFR (default).
+ * enabled = 1 → boundary dispatch active; the HEADS branch runs the
+ *               boundary rollout.
+ *
+ * With enabled=0, the trainer is byte-identical to legacy on every iter:
+ * the dispatch helper short-circuits before consuming RNG.
+ */
+BP_EXPORT int bp_set_depth_limit_cont_strats(BPSolver *s, int enabled);
+
+/**
+ * Set the boundary-coin-flip probability `p_boundary`.
+ *
+ * prob = probability of HEADS (terminate) vs TAILS (continue legacy)
+ * at the multiway-flop boundary, used only when
+ * depth_limit_cont_strats == 1. Default 0.5. Must be in [0, 1].
+ *
+ * Returns 0 on success, -1 if prob is out of range.
+ */
+BP_EXPORT int bp_set_cont_strat_prob(BPSolver *s, float prob);
+
+/**
+ * Set the cont-ev table size hint.
+ *
+ * Must be called BEFORE bp_set_depth_limit_cont_strats(s, 1) for the
+ * setting to take effect — the table is allocated lazily on the first
+ * call to bp_set_depth_limit_cont_strats with enabled=1, using this
+ * hint as the requested capacity (prime-promoted internally).
+ *
+ * Pass `size_hint = 0` to fall back to the default (1<<26).
+ *
+ * Returns 0 on success, -1 on invalid args.
+ */
+BP_EXPORT int bp_set_cont_ev_table_size(BPSolver *s, int64_t size_hint);
+
+/**
+ * Set the opponent-bias-as-action mode for the boundary EV walk.
+ *
+ *   mode = BP_BIAS_MODE_UNIFORM (0, default) → legacy: opponents' bias drawn
+ *          uniformly (rng_int). Byte-identical to a run without the
+ *          mean-field code on every iter.
+ *   mode = BP_BIAS_MODE_MEANFIELD (1) → opponents sample their bias by regret
+ *          matching over the per-slot bias_regrets sidecar; the sidecar table
+ *          is lazily allocated here (to cont_ev_table_size_hint, or the
+ *          default) so it must be sized via bp_set_cont_ev_table_size BEFORE
+ *          this call if a non-default capacity is wanted. Idempotent.
+ *
+ * With mode == UNIFORM the mean-field code paths short-circuit before
+ * consuming any RNG — the flag-OFF path is byte-identical to legacy, which
+ * the test_depth_limit_smoke contract enforces.
+ *
+ * Returns 0 on success, -1 on invalid solver / unknown mode / OOM.
+ */
+BP_EXPORT int bp_set_cont_ev_bias_mode(BPSolver *s, int mode);
+
+/**
+ * Depth-limit helper: pure dispatch decision for the depth-limit boundary.
+ *
+ * Returns 1 if the trainer should TERMINATE at this end-of-street (HEADS
+ * branch — sample joint cont-bias and accumulate EV slot). Returns 0 if
+ * the trainer should continue legacy recursion (TAILS branch or non-
+ * boundary site).
+ *
+ * Pure function (no global state). Exposed so tests can verify the
+ * dispatch matrix without exercising the full traverse() path.
+ *
+ * Invariant: when flag == 0, returns 0 without touching `*rng_state`.
+ * (Required by the bit-identical regression test,
+ * tests/test_depth_limit_smoke.c.)
+ *
+ * Called at end-of-street sites where round_done() has fired:
+ *   - num_board: current board count (3 = end-of-flop, 4 = end-of-turn,
+ *                5 = end-of-river → caller already has showdown branch).
+ *   - n_active: number of non-folded players at this site.
+ *   - flag: 0 or 1 (BPSolver::depth_limit_cont_strats).
+ *   - prob: BPSolver::cont_strat_prob, ignored when flag == 0.
+ *   - rng_state: per-thread xorshift state; consumed only on multiway
+ *                flop with flag == 1.
+ */
+BP_EXPORT int bp_should_dispatch_to_boundary(int num_board, int n_active,
+                                              int flag, float prob,
+                                              uint64_t *rng_state);
+
+/**
+ * Dual-boundary mode: enable/disable the TURN-boundary
+ * dispatch, parallel to bp_set_depth_limit_cont_strats (the FLOP one).
+ * INDEPENDENT flag — either, both, or neither boundary may be armed.
+ *
+ * enabled = 0 → no turn-boundary dispatch (default; flop path + existing
+ *               checkpoints/tests byte-unaffected).
+ * enabled = 1 → at end-of-multiway-TURN (num_board==4, n_active>=3),
+ *               coin-flip on cont_strat_prob, HEADS deals the river and
+ *               rolls out to showdown, accumulating to the cont_ev table
+ *               with the TURN street salt.
+ *
+ * Like the flop setter, this lazily allocates the cont_ev_table on first
+ * enable (idempotent if already allocated by the flop path). With
+ * enabled=0 the turn-dispatch helper consumes zero RNG (byte-identity).
+ */
+BP_EXPORT int bp_set_depth_limit_cont_strats_turn(BPSolver *s, int enabled);
+
+/**
+ * Dual-boundary mode: the TURN analogue of bp_should_dispatch_to_boundary.
+ * Returns 1 iff the trainer should TERMINATE at the end-of-TURN multiway
+ * boundary (HEADS — deal river, roll out, accumulate). Returns 0 otherwise.
+ *
+ * Pure function. Same contract as the flop helper one street later:
+ *   - num_board != 4 → return 0 (only end-of-turn is a turn boundary).
+ *   - n_active < 3   → return 0 (HU/2p turn continues to showdown).
+ *   - flag == 0      → return 0 WITHOUT touching *rng_state (byte-identity).
+ *   - else coin-flip on `prob` consuming exactly one RNG draw (prob in
+ *     (0,1)); prob<=0 → 0, prob>=1 → 1, neither consumes RNG.
+ *
+ * Kept structurally separate from the flop helper so the flop dispatch
+ * matrix + its tests (which assert num_board==4 NEVER dispatches) stay
+ * byte-identical.
+ */
+BP_EXPORT int bp_should_dispatch_to_turn_boundary(int num_board, int n_active,
+                                                   int flag, float prob,
+                                                   uint64_t *rng_state);
+
+/**
+ * Pure-math cont-bias reweighting helper.
+ *
+ * Applies one of the four Pluribus continuation-strategy reweightings to an
+ * already-computed average strategy:
+ *   bias 0: baseline (no reweight) — out = avg_strategy
+ *   bias 1: fold-bias — ×5 weight on actions with type BP_ACT_FOLD
+ *   bias 2: call-bias — ×5 weight on actions with BP_ACT_CHECK or BP_ACT_CALL
+ *   bias 3: raise-bias — ×5 weight on actions with type BP_ACT_BET
+ *
+ * The reweighted distribution is L1-normalized into `out[]`. If the
+ * reweighted sum is zero (e.g., all input probabilities are zero AND
+ * the bias targets a non-existent action class), `out[]` falls back
+ * to a uniform distribution.
+ *
+ * Pure function: no allocation, no global state, no RNG.
+ *
+ * Args:
+ *   avg_strategy   [num_actions]   probabilities (need not sum to 1; will be
+ *                                  used as relative weights then renormalized)
+ *   action_types   [num_actions]   BP_ACT_FOLD / CHECK / CALL / BET
+ *   num_actions                    1..BP_MAX_ACTIONS
+ *   bias                           0..3 — out-of-range produces baseline
+ *   out            [num_actions]   reweighted, L1-normalized distribution
+ */
+BP_EXPORT void bp_apply_cont_bias(const float *avg_strategy,
+                                   const int *action_types,
+                                   int num_actions, int bias,
+                                   float *out);
+
+/**
+ * Pure action-history hash (mirrors trainer-internal
+ * `compute_action_hash` at mccfr_blueprint.c:526).
+ *
+ * Exposed in the header so a regression test can pin the invariant
+ * that cont-bias does NOT enter the action_hash
+ * computation. The function signature takes only `(actions, n_actions)`
+ * — by construction cont_bias cannot affect the output. A test asserts
+ * that the returned hash is deterministic and unaffected by depth-limit
+ * state (flag, prob, cont_bias_per_player) by re-deriving from the
+ * raw action history alone.
+ *
+ * Pure function: no global state read or written beyond the legacy
+ * mixer mode flag (set via bp_set_legacy_hash_mixer).
+ */
+BP_EXPORT uint64_t bp_compute_action_hash(const int *actions, int num_actions);
+
+/**
+ * Opaque-pointer accessor for the cont_ev_table.
+ *
+ * Returns a `BPContEVTable *` (cast to void* in the header to keep
+ * mccfr_cont_ev_table.h out of the dependency surface for clients that
+ * just want to forward the pointer to another consumer).
+ *
+ * Used by the Python bridge to retrieve the cont_ev_table populated by
+ * bp_load_regrets's BPR5 trailer parser, then hand the pointer to
+ * rollout_set_cont_ev_table (solver/src/search/rollout.c).
+ *
+ * The returned pointer aliases s->cont_ev_table — caller does NOT free
+ * it; lifetime is tied to the BPSolver. Returns NULL only if `s` is NULL
+ * (does NOT return NULL when the table is unallocated — the address of
+ * the embedded table is stable across the BPSolver's lifetime; check
+ * bp_cont_ev_count via the returned pointer to detect emptiness).
+ */
+BP_EXPORT void *bp_get_cont_ev_table_ptr(BPSolver *s);
+
+/**
+ * cont_ev_table saturation observability.
+ *
+ * Lifetime count of bp_cont_ev_find_or_create calls that exhausted the
+ * probe cap and returned NULL (slot creation silently skipped). Must be
+ * 0 for a trustworthy coverage curve: nonzero means the cont_ev_table
+ * saturated and new boundary slots are being DROPPED, which flattens
+ * slot growth and confounds coverage extrapolation. Walk drivers must
+ * poll this per chunk and abort on nonzero.
+ *
+ * Relaxed atomic load; safe to call concurrently with bp_solve.
+ * Returns -1 if `s` is NULL. Additive ABI: new symbol only.
+ */
+BP_EXPORT int64_t bp_get_cont_ev_insertion_failures(const BPSolver *s);
+
+/* Exposed wrapper for the static
+ * generate_actions inside mccfr_blueprint.c. Mirrors the trainer's
+ * action-emission contract byte-for-byte (same indices, same
+ * fold/check/call/raise ordering, same allin saturation + dedup,
+ * same explicit-allin gate). The encoding-alignment test drives a
+ * pure-C trainer-walker against this wrapper to cross-validate the
+ * search-built tree.
+ *
+ * Args mirror generate_actions:
+ *   out, max_out         — output buffer for emitted BPAction[].
+ *   pot, stack, to_call  — current decision-node state.
+ *   num_raises, max_raises — raise-cap state.
+ *   bet_sizes, num_bet_sizes — current per-level bet-size fractions.
+ *     (Caller selects between *_first / *_subsequent via num_raises,
+ *     same as the trainer's traverse() does at mccfr_blueprint.c:
+ *     1581-1602.)
+ *   add_explicit_allin   — global flag (s->add_explicit_allin).
+ *
+ * Returns: number of actions emitted (≥ 1, ≤ max_out, ≤ BP_MAX_GEN_ACTIONS).
+ */
+BP_EXPORT int bp_generate_actions(BPAction *out, int max_out,
+                                   int pot, int stack, int to_call,
+                                   int num_raises, int max_raises,
+                                   const float *bet_sizes, int num_bet_sizes,
+                                   int add_explicit_allin);
+
+/**
+ * Post-load fixup: drop the trailing allin slot from infosets
+ * saved by the legacy trainer (where the implicit-allin block fired).
+ * Call after bp_load_regrets when add_explicit_allin = 0 and resuming
+ * from a checkpoint that was trained with add_explicit_allin = 1.
+ *
+ * Returns the number of infosets dropped.
+ */
+BP_EXPORT int64_t bp_drop_trailing_allin_slot(BPSolver *s);
+
+/**
+ * Run external-sampling MCCFR with Pluribus optimizations.
+ * Supports OpenMP parallelism, pruning, Linear CFR discount.
+ */
+BP_EXPORT int bp_solve(BPSolver *s, int64_t max_iterations);
+
+/**
+ * Extract weighted-average strategy at a specific info set.
+ */
+BP_EXPORT int bp_get_strategy(const BPSolver *s, int player,
+                               const int *board, int num_board,
+                               const int *action_seq, int seq_len,
+                               float *strategy_out, int bucket);
+
+/**
+ * Extract raw integer regrets at a specific info set.
+ * regrets_out must have space for at least BP_MAX_ACTIONS ints.
+ * Returns num_actions, or 0 if info set not found.
+ */
+BP_EXPORT int bp_get_regrets(const BPSolver *s, int player,
+                              const int *board, int num_board,
+                              const int *action_seq, int seq_len,
+                              int *regrets_out, int bucket);
+
+BP_EXPORT int64_t bp_num_info_sets(const BPSolver *s);
+BP_EXPORT void bp_free(BPSolver *s);
+
+/**
+ * Hash table health stats. All four out-pointers may be NULL to skip.
+ * Safe to call concurrently with bp_solve (counters use relaxed atomics).
+ *
+ * insertion_failures: lifetime count of info_table_find_or_create calls that
+ *   exhausted the 4096-probe cap and silently returned -1. Should always be 0
+ *   in a properly-sized table. Nonzero indicates strategy_sum corruption.
+ * max_probe_observed: lifetime maximum probe distance for any successful
+ *   insertion. Approaching 4096 indicates the table is too full.
+ */
+BP_EXPORT void bp_get_table_stats(const BPSolver *s,
+                                   int64_t *out_entries,
+                                   int64_t *out_table_size,
+                                   int64_t *out_insertion_failures,
+                                   int64_t *out_max_probe_observed);
+
+/**
+ * Enable the legacy boost-style hash_combine mixer. Must be called BEFORE
+ * bp_load_regrets when loading an older checkpoint trained with the
+ * boost-style mixer. Its stored action_hash values were computed with
+ * that mixer; if the EV walk's traverse_ev runs with splitmix64, every
+ * non-root info set lookup fails because the recomputed action_hashes
+ * don't match the stored ones.
+ */
+BP_EXPORT void bp_set_legacy_hash_mixer(int enabled);
+
+/**
+ * Save/load precomputed texture bucket cache to skip the 65-90 min
+ * precompute on subsequent launches. Format: TXC1 header + hash keys
+ * + bucket mappings. ~9.3 MB file for 1755 textures × 1326 hands.
+ */
+BP_EXPORT int bp_save_texture_cache(const BPSolver *s, const char *path);
+BP_EXPORT int bp_load_texture_cache(BPSolver *s, const char *path);
+
+/**
+ * Initialize a unified preflop-through-river solver (Pluribus-style).
+ *
+ * All 6 players get all 1326 hands. Preflop uses 169 lossless classes.
+ * Postflop uses card abstraction via bp_set_buckets().
+ *
+ * Traversal starts from preflop with SB/BB posting, then UTG→MP→CO→BTN→SB→BB
+ * acting in order. After preflop round, 3 flop cards are dealt, then
+ * flop→turn→river betting rounds proceed as in the standard postflop solver.
+ *
+ * This matches Pluribus Algorithm 1 exactly: one unified MCCFR solve.
+ *
+ * Args:
+ *   s: solver state (caller allocates)
+ *   num_players: 6 for full table (2-6 supported)
+ *   small_blind, big_blind: blind amounts in chips (e.g. 50, 100)
+ *   initial_stack: starting stack per player in chips (e.g. 10000 for 100BB)
+ *   postflop_bet_sizes, num_postflop_bet_sizes: bet fractions for flop/turn/river
+ *   preflop_bet_sizes, num_preflop_bet_sizes: bet fractions for preflop raises
+ *   config: solver configuration
+ */
+BP_EXPORT int bp_init_unified(BPSolver *s, int num_players,
+                                int small_blind, int big_blind, int initial_stack,
+                                const float *postflop_bet_sizes, int num_postflop_bet_sizes,
+                                const float *preflop_bet_sizes, int num_preflop_bet_sizes,
+                                const BPConfig *config);
+
+/**
+ * Export ALL info set strategies to a binary buffer.
+ *
+ * For each occupied slot in the hash table, writes:
+ *   BPInfoKey (player, board_hash, action_hash)  — 20 bytes
+ *   uint8 num_actions                             — 1 byte
+ *   uint8 num_hands                               — 1 byte (actually num_buckets)
+ *   uint8[num_actions * num_hands] strategy       — quantized to 0-255
+ *
+ * Strategies are derived from regrets via regret matching (not raw regrets).
+ * Quantization: strategy[a] * 255, rounded, clamped to [0, 255].
+ *
+ * Args:
+ *   s: solved state
+ *   buf: output buffer (must be pre-allocated)
+ *   buf_size: size of buf in bytes
+ *   bytes_written: output, actual bytes written
+ *
+ * Returns 0 on success, -1 if buffer too small.
+ * Call with buf=NULL to query required buffer size via bytes_written.
+ */
+BP_EXPORT int bp_export_strategies(const BPSolver *s,
+                                    unsigned char *buf, size_t buf_size,
+                                    size_t *bytes_written);
+
+/**
+ * Save the full regret table to a binary file for checkpoint/resume.
+ *
+ * Writes all occupied hash table slots (keys + regrets + strategy_sum)
+ * to a binary file that can be reloaded via bp_load_regrets().
+ *
+ * Format:
+ *   Header: "BPRG" (4B) + table_size (4B) + num_entries (4B) + iterations_run (4B)
+ *   For each occupied slot:
+ *     BPInfoKey (player 4B, street 4B, board_hash 8B, action_hash 8B) = 24B
+ *     num_actions (4B), num_hands (4B) = 8B
+ *     regrets[num_actions * num_hands] (int32) = variable
+ *     has_strategy_sum (4B)
+ *     if has_strategy_sum: strategy_sum[num_actions * num_hands] (float32) = variable
+ *
+ * Returns 0 on success, -1 on write error.
+ */
+BP_EXPORT int bp_save_regrets(const BPSolver *s, const char *path);
+
+/**
+ * Load a previously saved regret table from a checkpoint file.
+ *
+ * Must be called AFTER bp_init_unified or bp_init_ex (hash table must exist).
+ * Loaded entries are inserted into the existing hash table. If the table is
+ * too small for the saved entries, excess entries are silently dropped.
+ *
+ * Returns number of entries loaded, or -1 on error.
+ */
+BP_EXPORT int64_t bp_load_regrets(BPSolver *s, const char *path);
+
+/**
+ * Compute per-action expected values under the average strategy σ̄.
+ *
+ * Runs num_iterations of a modified MCCFR traversal where:
+ *   - Strategies at all decision nodes are sampled from strategy_sum (the
+ *     average strategy), not regret-matched from current regrets.
+ *   - At traverser nodes, per-action EVs `action_values[a]` are accumulated
+ *     into `is->action_evs[a]` and `is->ev_visit_count` is incremented.
+ *   - Regrets and strategy_sum are NOT updated (read-only with respect to
+ *     the underlying blueprint).
+ *
+ * After this runs, `action_evs[a] / ev_visit_count` is an unbiased estimator
+ * of `v̄(I, a)` — the counterfactual value of action `a` at info set `I`
+ * under the average strategy. Math: action_evs[a] / ev_visit_count is an
+ * unbiased σ̄-weighted counterfactual value estimator.
+ *
+ * Must be called AFTER bp_load_regrets or bp_solve so that strategy_sum is
+ * populated. Must be called BEFORE bp_export_action_evs.
+ *
+ * Multi-threaded via OpenMP (same thread count as bp_solve).
+ *
+ * Returns 0 on success.
+ */
+BP_EXPORT int bp_compute_action_evs(BPSolver *s, int64_t num_iterations);
+
+/**
+ * Export per-action EVs to a binary buffer.
+ *
+ * For each occupied slot with ev_visit_count > 0, writes:
+ *   player(1) + street(1) + bucket(2) + action_hash(8) + num_actions(1)
+ *   + float32[num_actions] avg_ev (= action_evs[a] / ev_visit_count)
+ *
+ * Header: "BPR3" (4) + u32 num_entries
+ *
+ * Info sets with ev_visit_count == 0 are skipped. Consumer should fall back
+ * to equity approximation at those info sets.
+ *
+ * Args:
+ *   s: solver state (after bp_compute_action_evs)
+ *   buf: output buffer (pre-allocated; pass NULL to query required size)
+ *   buf_size: size of buf in bytes
+ *   bytes_written: output, actual bytes written (or required size if buf=NULL)
+ *
+ * Returns 0 on success, -1 if buffer too small.
+ */
+BP_EXPORT int bp_export_action_evs(const BPSolver *s,
+                                    unsigned char *buf, size_t buf_size,
+                                    size_t *bytes_written);
+
+/**
+ * Aggregate visit count statistics across all info sets that
+ * the EV walk touched (ev_visit_count > 0).
+ *
+ * The exported BPR3 section only writes the NORMALIZED average EV per
+ * action, not the raw visit count. Downstream sentinels need the visit
+ * distribution to judge EV confidence and flag low-traffic info sets.
+ * This function reports the aggregate stats cheaply at export time.
+ *
+ * Fills the caller-provided struct with:
+ *   total_visited: number of info sets with ev_visit_count > 0
+ *   min/p10/p50/p90/p99/max: percentile visit counts across those sets
+ *   below_5: count with ev_visit_count < 5 (low-confidence)
+ *   below_100: count with ev_visit_count < 100
+ *   above_1000: count with ev_visit_count >= 1000 (high-confidence)
+ *
+ * Safe to call after bp_compute_action_evs. Iterates the hash table once.
+ */
+typedef struct {
+    int64_t total_visited;
+    int64_t min_visits;
+    int64_t p10_visits;
+    int64_t p50_visits;
+    int64_t p90_visits;
+    int64_t p99_visits;
+    int64_t max_visits;
+    int64_t below_5;
+    int64_t below_100;
+    int64_t above_1000;
+} BPEVVisitStats;
+
+BP_EXPORT int bp_get_ev_visit_stats(const BPSolver *s, BPEVVisitStats *out);
+
+/**
+ * Export EHS values and bucket assignments for all hands.
+ *
+ * Writes per-hand: float32 EHS, int32 bucket_index
+ * Total: num_hands * 8 bytes
+ *
+ * Args:
+ *   s: solver state (after bp_set_buckets)
+ *   street: which street's bucketing (1=flop, 2=turn, 3=river)
+ *   player: which player
+ *   bucket_out: [num_hands] bucket assignments
+ *
+ * Returns num_hands.
+ */
+BP_EXPORT int bp_export_buckets(const BPSolver *s, int street, int player,
+                                 int *bucket_out);
+
+/**
+ * Test wrapper for the multiway-flop boundary
+ * bucket-lookup helper. Exposed because the static helper takes a
+ * private TraversalState; the wrapper accepts the raw inputs needed
+ * to drive the same logic from a unit test.
+ *
+ * Mirrors compute_boundary_flop_bucket() inside mccfr_blueprint.c:
+ *   1. Canonicalize the 3 dealt flop cards (rank-descending, suit-pattern
+ *      → canonical suit assignment).
+ *   2. compute_board_hash on the canonical board.
+ *   3. texture_index_lookup → texture_idx.
+ *   4. Read s->texture_bucket_cache[texture_idx * BP_MAX_HANDS + hand_idx].
+ *
+ * Args:
+ *   s       — initialized BPSolver with texture cache loaded.
+ *   board   — 3 dealt flop cards (raw, NOT canonicalized).
+ *   player  — only used for bounds-checking; bucket lookup is player-
+ *             agnostic at the postflop layer.
+ *   hand_idx — full-deck pair index in [0, BP_MAX_HANDS).
+ *
+ * Returns:
+ *   ≥0  — flop bucket in [0, postflop_num_buckets).
+ *   -1  — texture cache empty or texture not found (defensive).
+ */
+BP_EXPORT int bp_compute_flop_bucket_for_test(const BPSolver *s,
+                                                const int *board,
+                                                int player,
+                                                int hand_idx);
+
+/**
+ * Test wrapper for the cont_ev boundary SLOT-KEY
+ * helper (bp_boundary_slot_hand_index). The trainer's call site keys
+ * cont_ev_table slots by the traverser's CANONICAL FULL-DECK PAIR INDEX
+ * in [0, 1326) — computed from the sampled hand's actual cards (sort
+ * c0 < c1; c0*51 - c0*(c0-1)/2 + c1 - c0 - 1) — matching the consumer
+ * (rollout.c rollout_hand_index_for_flop). It never consults the texture
+ * cache: slots keyed with [0,200) texture buckets would never be queried
+ * by the consumer.
+ *
+ * Args:
+ *   s        — initialized BPSolver (hands[player] populated).
+ *   board    — 3 dealt flop cards (raw).
+ *   player   — player whose sampled hand is keyed.
+ *   hand_idx — index into s->hands[player] (the per-player hand list),
+ *              NOT a full-deck pair index (they coincide only under
+ *              bp_init_unified's full-1326 deal).
+ *
+ * Returns:
+ *   ≥0 — canonical full-deck pair index in [0, 1326).
+ *   -1 — out-of-range index, malformed cards, or hand blocked by the
+ *        flop (slot would be skipped; EV still computed).
+ */
+BP_EXPORT int bp_boundary_slot_hand_index_for_test(const BPSolver *s,
+                                                   const int *board,
+                                                   int player,
+                                                   int hand_idx);
+
+/**
+ * Dual-boundary mode: TURN analogue of the above. Same
+ * canonical full-deck pair-index encoding, but the blocking set is the
+ * 4-card TURN board (board[0..3]); a hand using the turn card returns -1.
+ * The index VALUE is identical to the flop wrapper for the same hole cards
+ * (the formula depends only on the two hole cards) — street disambiguation
+ * lives in the key-hash, not in this index.
+ *
+ * Args:
+ *   board — 4 dealt board cards (flop + turn, raw).
+ * Returns: ≥0 canonical pair index in [0,1326); -1 on out-of-range/blocked.
+ */
+BP_EXPORT int bp_boundary_slot_hand_index_turn_for_test(const BPSolver *s,
+                                                        const int *board,
+                                                        int player,
+                                                        int hand_idx);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MCCFR_BLUEPRINT_H */

@@ -1,0 +1,14 @@
+# gitleaks configuration: the default rules plus one allowlist entry.
+#
+# The decision-audit data (results/data/decision_audit.*, a release asset)
+# labels each spot's cell with strings such as "river_2p_facing_acted" under a
+# "key" field. The generic-api-key rule flags them (7,196 matches when the
+# files are scanned decompressed); they are cell names, not secrets.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Decision-audit cell labels: street, player count, betting state"
+regexTarget = "secret"
+regexes = ['''^(flop|turn|river)_[2-6]p_[a-z]+(_[a-z]+)*$''']

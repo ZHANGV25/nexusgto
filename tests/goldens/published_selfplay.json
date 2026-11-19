@@ -1,0 +1,46 @@
+{
+ "name": "published_selfplay",
+ "blueprint": "8.05B",
+ "description": "Blueprint self-play on the 8.05B, the first 240 deals of published seed 9101.",
+ "args": [
+  "--mode",
+  "aa",
+  "--deals",
+  "240",
+  "--master-seed",
+  "9101",
+  "--hero-source",
+  "lookup",
+  "--field-source",
+  "lookup",
+  "--aivat"
+ ],
+ "env": {
+  "NEXUS_HU_LEAF_MIRROR": "1",
+  "NEXUS_MAX_PROJECTED_FILL_BYTES": "7000000",
+  "NEXUS_LEAF_VEC_SAMPLED": "1",
+  "NEXUS_OFFTREE_ADD": "1",
+  "PYTHONIOENCODING": "utf-8",
+  "PYTHONUTF8": "1"
+ },
+ "timeout_s": 14400,
+ "recorded": "Recorded on the original code this release was cut from and on this release: identical; this release run a second time: identical.",
+ "digest": {
+  "lookup": {
+   "count": 12840,
+   "sha256": "46be1427775a63f455b33b975d5189618d9255075c5934162f17f56d82b43c76"
+  },
+  "search": {
+   "count": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "solve": {
+   "count": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+ },
+ "first_rows": {
+  "search": [],
+  "solve": []
+ }
+}
